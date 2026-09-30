@@ -124,11 +124,17 @@ fn trimmed_starts(line: &[Cell], prefix: &str) -> bool {
     text(line).trim_start().starts_with(prefix)
 }
 
-/// A horizontal rule: a line of box-drawing `─` only.
+/// A horizontal rule: a line of box-drawing `─`, possibly carrying one label
+/// among the dashes. Claude Code 2.1.277+ writes the session name or its
+/// auto-generated title into the input box's top border: between dashes
+/// (`──── hp-demo-t-0001 ─`) or at the line's end, where the title reaches
+/// the pane's right edge and no dashes follow.
 fn is_rule(line: &[Cell]) -> bool {
     let t = text(line);
     let t = t.trim();
-    t.chars().count() >= 10 && t.chars().all(|c| c == '─')
+    t.chars().filter(|c| *c == '─').count() >= 10
+        && t.starts_with("──")
+        && t.split('─').filter(|s| !s.trim().is_empty()).count() <= 1
 }
 
 /// The typed text in a box's cells: non-blank, not dim, and not a
@@ -263,6 +269,21 @@ mod tests {
         }
         assert_eq!(check("claude", &fixture("claude-empty-after-turn")), Draft::Empty);
         assert_eq!(check("opencode", &fixture("opencode-empty-session")), Draft::Empty);
+    }
+
+    #[test]
+    fn a_border_carrying_a_session_title_is_still_a_rule() {
+        // Between dashes: `──── name ─`.
+        let named = format!("{} verify-jumpbox-ct203 ─\n❯ \n{}\n", "─".repeat(40), "─".repeat(60));
+        assert_eq!(check("claude", &named), Draft::Empty);
+        // At the line's end, no dashes after it: an auto title that reached
+        // the pane's right edge (fixture modeled on a real capture).
+        assert_eq!(check("claude", &fixture("claude-titled-border")), Draft::Empty);
+        // Two labels, or text before the dashes, is not a rule.
+        let two = format!("── a ── b ──\n❯ \n{}\n", "─".repeat(60));
+        assert_eq!(check("claude", &two), Draft::Unknown);
+        let leading = format!("note {}\n❯ \n{}\n", "─".repeat(40), "─".repeat(60));
+        assert_eq!(check("claude", &leading), Draft::Unknown);
     }
 
     #[test]
