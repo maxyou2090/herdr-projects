@@ -51,11 +51,12 @@ pub fn record(project: &Project, herdr: &Herdr) {
     }
 }
 
-/// Spaces `project`'s threads recorded that are safe to close: no open thread
-/// of any project uses it, it is no project's coordinator Space, herdr still
-/// shows it as the repository's primary Space with no worktree Space under
-/// it, no agent runs in it, and every pane is an idle shell. A focused Space
-/// or pane is kept unless `include_focused`.
+/// Spaces safe to close: those `project`'s worktree threads recorded — herdr
+/// must still show them as the repository's primary Space with no worktree
+/// Space under it — plus orphan home Spaces, plain Spaces still carrying the
+/// project's home label that no open thread and no coordinator uses. None of
+/// them may hold an agent, and every pane must be an idle shell. A focused
+/// Space or pane is kept unless `include_focused`.
 pub fn empty(ctx: &Ctx, project: &Project, herdr: &Herdr, include_focused: bool) -> Vec<Space> {
     let mut recorded: Vec<(String, String)> = thread::list(project).into_iter().filter(|t| local_worktree(t) && !t.repo_workspace.is_empty()).map(|t| (t.repo_workspace, t.repo)).collect();
     let mut in_use = Vec::new();
@@ -64,13 +65,25 @@ pub fn empty(ctx: &Ctx, project: &Project, herdr: &Herdr, include_focused: bool)
         let Ok(other) = Project::load(&ctx.root, &slug) else {
             continue;
         };
-        in_use.extend(thread::list(&other).into_iter().filter(|t| t.status != Status::Resolved && !t.repo_workspace.is_empty()).map(|t| t.repo_workspace));
+        for t in thread::list(&other).into_iter().filter(|t| t.status != Status::Resolved) {
+            if !t.repo_workspace.is_empty() {
+                in_use.push(t.repo_workspace);
+            }
+            if !t.workspace_id.is_empty() {
+                in_use.push(t.workspace_id);
+            }
+        }
         coordinators.extend(other.coordinator().map(|c| c.workspace_id));
     }
     recorded.retain(|(id, _)| !in_use.contains(id) && !coordinators.contains(id));
     recorded.sort();
     recorded.dedup_by(|a, b| a.0 == b.0);
-    if recorded.is_empty() {
+    // A twin can only exist where a thread was placed outside the home:
+    // without one, the cheap early return spares every project's tick three
+    // lists it cannot need.
+    let home_id = project.coordinator().map(|c| c.workspace_id).unwrap_or_default();
+    let twins = thread::list(project).iter().any(|t| t.kind != Kind::Worktree && !t.workspace_id.is_empty() && t.workspace_id != home_id);
+    if recorded.is_empty() && !twins {
         return Vec::new();
     }
     let (Ok(workspaces), Ok(panes), Ok(agents)) = (herdr.workspace_list(), herdr.pane_list(), herdr.agent_list()) else {
@@ -96,6 +109,25 @@ pub fn empty(ctx: &Ctx, project: &Project, herdr: &Herdr, include_focused: bool)
             continue;
         }
         found.push(Space { id, label: space.label.clone() });
+    }
+    // Orphan home Spaces: plain Spaces still carrying the project's home
+    // label that no open thread and no coordinator uses — the twins left
+    // behind when a tab thread reopened the project's workspace next to its
+    // old one. Worktree-backed Spaces belong to the primary logic above.
+    if let Ok((settings, _)) = project.read_project_md() {
+        let home = project::home_label(&settings.name, &project.slug);
+        for w in workspaces.iter().filter(|w| w.worktree.is_none() && w.label == home && !in_use.contains(&w.workspace_id) && !coordinators.contains(&w.workspace_id)) {
+            let own: Vec<_> = panes.iter().filter(|p| p.workspace_id == w.workspace_id).collect();
+            if own.is_empty()
+                || own.len() != w.pane_count
+                || agents.iter().any(|a| a.workspace_id == w.workspace_id)
+                || (!include_focused && (w.focused || own.iter().any(|p| p.focused)))
+                || !own.iter().all(|p| herdr.pane_idle_shell(&p.pane_id))
+            {
+                continue;
+            }
+            found.push(Space { id: w.workspace_id.clone(), label: w.label.clone() });
+        }
     }
     found
 }
@@ -139,7 +171,6 @@ pub fn close_empty(ctx: &Ctx, project: &Project, herdr: &Herdr) -> Vec<anyhow::E
     errors
 }
 
-
 #[cfg(test)]
 mod tests {
     use std::cell::RefCell;
@@ -165,6 +196,14 @@ mod tests {
 
     fn child_json(id: &str, repo: &str) -> String {
         format!(r#"{{"workspace_id":"{id}","label":"x","pane_count":1,"worktree":{{"repo_key":"{repo}/.git","checkout_path":"/wt/{id}","is_linked_worktree":true}}}}"#)
+    }
+
+    /// A plain Space carrying the project's home label: a twin left behind by
+    /// a tab thread that reopened the workspace next to its old one.
+    fn home_json(f: &Fixture) -> String {
+        let (settings, _) = f.project.read_project_md().unwrap();
+        let label = crate::project::home_label(&settings.name, &f.project.slug);
+        format!(r#"{{"workspace_id":"w8","label":"{label}","pane_count":1}}"#)
     }
 
     /// A resolved worktree thread that recorded `w9`, the repository's primary
@@ -316,4 +355,44 @@ mod tests {
         record(&f.project, &herdr);
         assert_eq!(thread::load(&f.project, "t-0001").unwrap().repo_workspace, "w9");
     }
+
+    #[test]
+    fn an_orphan_home_space_is_closed_once_no_thread_uses_it() {
+        let f = fixture();
+        f.workspaces.borrow_mut().push(home_json(&f));
+        *f.world.panes.borrow_mut() = format!(
+            "[{},{},{}]",
+            f.world.coordinator_pane(&f.project),
+            pane_json("w9", "w9:t1", "w9:p1", &f.repo),
+            pane_json("w8", "w8:t2", "w8:p2", "/tmp")
+        );
+        // While the thread is open it keeps both the primary and its twin.
+        thread::update(&f.project, "t-0001", |t| {
+            t.status = Status::Open;
+            t.workspace_id = "w8".into();
+        })
+        .unwrap();
+        assert_eq!(close(&f), 0);
+        thread::update(&f.project, "t-0001", |t| t.status = Status::Resolved).unwrap();
+        assert_eq!(close(&f), 2);
+        let calls = f.world.runner.calls.borrow();
+        assert!(calls.iter().any(|c| c.args.ends_with(&["close".to_string(), "w8".to_string()])));
+    }
+
+    #[test]
+    fn an_orphan_home_space_with_an_agent_is_kept() {
+        let f = fixture();
+        f.workspaces.borrow_mut().push(home_json(&f));
+        *f.world.panes.borrow_mut() = format!(
+            "[{},{},{}]",
+            f.world.coordinator_pane(&f.project),
+            pane_json("w9", "w9:t1", "w9:p1", &f.repo),
+            pane_json("w8", "w8:t2", "w8:p2", "/tmp")
+        );
+        *f.world.agents.borrow_mut() = format!("[{}]", agent_json("w8", "w8:t2", "w8:p2", "/tmp", "some-agent", "idle"));
+        assert_eq!(close(&f), 1);
+        // Closing the primary forgot it on the thread.
+        assert_eq!(thread::load(&f.project, "t-0001").unwrap().repo_workspace, "");
+    }
+
 }
