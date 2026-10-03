@@ -171,6 +171,28 @@ pub fn close_empty(ctx: &Ctx, project: &Project, herdr: &Herdr) -> Vec<anyhow::E
     errors
 }
 
+/// Renames the project's home Space to the label its `PROJECT.md` name spells:
+/// a name changed outside `herdr-projects rename` would otherwise leave the
+/// old label in the sidebar until the next `open`. Silent, so a ticker tick
+/// never prints.
+pub fn sync_home_label(project: &Project, herdr: &Herdr) {
+    let Some(record) = project.coordinator() else {
+        return;
+    };
+    if record.workspace_id.is_empty() {
+        return;
+    }
+    let Ok((settings, _)) = project.read_project_md() else {
+        return;
+    };
+    let label = project::home_label(&settings.name, &project.slug);
+    if let Ok(current) = herdr.workspace_label(&record.workspace_id)
+        && current != label
+    {
+        let _ = herdr.workspace_rename(&record.workspace_id, &label);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::cell::RefCell;
@@ -395,4 +417,31 @@ mod tests {
         assert_eq!(thread::load(&f.project, "t-0001").unwrap().repo_workspace, "");
     }
 
+    #[test]
+    fn sync_home_label_renames_when_project_md_changed() {
+        let f = fixture();
+        let md = f.project.dir().join("PROJECT.md");
+        let text = std::fs::read_to_string(&md).unwrap();
+        std::fs::write(&md, text.replace(r#"name = "Demo""#, r#"name = "Beta""#)).unwrap();
+        let old = format!("Demo{}", crate::grouping::HOME_MARK);
+        let new = format!("Beta{}", crate::grouping::HOME_MARK);
+        let label = Rc::new(RefCell::new(old));
+        let shown = label.clone();
+        f.world.runner.on_fn(
+            |c| c.display().contains("workspace get"),
+            move |_| Ok(ok(&format!(r#"{{"result":{{"workspace":{{"label":"{}"}}}}}}"#, shown.borrow()))),
+        );
+        f.world.runner.on("workspace rename", ok(r#"{"result":{}}"#));
+        let herdr = Herdr::new(f.world.env.herdr_bin(), f.project.coordinator().unwrap().socket, &f.world.runner);
+        sync_home_label(&f.project, &herdr);
+        assert_eq!(f.world.runner.count("workspace rename"), 1);
+        let calls = f.world.runner.calls.borrow();
+        let renamed = calls.iter().find(|c| c.display().contains("workspace rename")).unwrap();
+        assert!(renamed.args.contains(&new));
+        drop(calls);
+        // Already right: no second rename.
+        *label.borrow_mut() = new;
+        sync_home_label(&f.project, &herdr);
+        assert_eq!(f.world.runner.count("workspace rename"), 1);
+    }
 }
