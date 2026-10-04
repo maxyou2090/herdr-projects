@@ -61,7 +61,7 @@ scripts/dev-herdr pane read <pane>                   # read a pane; `pane send-k
 | 6 | Always-on recipe: open a project on the second machine, reattach from this Mac with `herdr --remote <target> --session <name>`, answer a blocked prompt through it | Builder |
 | 7 | `thread adopt` gives a thread with a brief; two adopted panes in one directory get separate thread directories; an adopted agent that ends in `done` still gets its pending prompt | Builder (first), unit (all three) |
 | 7 | `adopt-workspace` creates a project from the current workspace | Builder: the action's handoff live, then the popup's core through the CLI. The popup itself: client-witnessed |
-| 7 | A paused project refuses `thread start` and is skipped by the ticker; an archived one is hidden and its tokens are gone; `delete` refuses while the coordinator is alive, `--force` moves the folder to `.trash/` and leaves worktrees alone | Builder, unit |
+| 7 | A paused project refuses `thread start` and is skipped by the ticker; an archived one is marked `archived` in `list` and its tokens are gone; `delete` refuses while the coordinator is alive, `--force` moves the folder to `.trash/` and leaves worktrees alone | Builder, unit |
 | 7 | `new ../x`, `open ../x`, `thread list ../x` are refused | Unit (`tests/cli.rs`) |
 
 ## Client-witnessed checks

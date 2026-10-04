@@ -58,12 +58,8 @@ enum Command {
         #[arg(long, value_name = "NAME")]
         coordinator_profile: Option<String>,
     },
-    /// List projects
-    List {
-        /// Include archived projects
-        #[arg(long)]
-        all: bool,
-    },
+    /// List projects, archived ones marked `archived`
+    List,
     /// Open a project: start a coordinator agent in its folder, in this pane when
     /// run from a shell pane inside Herdr, else in the project's workspace
     Open {
@@ -656,13 +652,10 @@ pub fn run() -> Result<()> {
             println!("next: {prefix} open {}", project.slug);
             Ok(())
         }
-        Command::List { all } => {
+        Command::List => {
             for slug in project::list_slugs(&ctx.root) {
                 let project = Project::load(&ctx.root, &slug)?;
                 let status = project.status();
-                if status == Status::Archived && !all {
-                    continue;
-                }
                 let mut counts = std::collections::BTreeMap::new();
                 for row in threads::rows(&ctx, &project) {
                     *counts.entry(row.group.rank()).or_insert((row.group.label(), 0)) = (row.group.label(), counts.get(&row.group.rank()).map_or(0, |c: &(&str, usize)| c.1) + 1);
