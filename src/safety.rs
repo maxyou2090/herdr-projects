@@ -162,6 +162,15 @@ pub fn set_in(text: &str, table: &str, key: &str, item: Option<Item>) -> Result<
     Ok(edited)
 }
 
+/// Whether config.toml carries a `[safety."<path>"]` table for `canonical`:
+/// project-specific settings that outlive the project folder.
+pub fn project_table_exists(config_dir: &Path, canonical: &Path) -> bool {
+    let text = std::fs::read_to_string(config_dir.join("config.toml")).unwrap_or_default();
+    text.parse::<DocumentMut>().ok().is_some_and(|doc| {
+        doc.get("safety").and_then(Item::as_table).is_some_and(|safety| safety.contains_key(canonical.to_string_lossy().as_ref()))
+    })
+}
+
 /// Writes one change and returns what the popup and the CLI print.
 pub fn apply(ctx: &Ctx, target: &Target, key: &str, words: &[String]) -> Result<String> {
     let item = value_item(key, words)?;
@@ -373,6 +382,18 @@ mod tests {
         let back = set_in(&back, "default", "yolo", None).unwrap();
         assert!(!back.contains("safety."), "{back}");
         assert!(back.contains("[machines.box]"));
+    }
+
+    #[test]
+    fn project_table_exists_checks_only_that_project() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("config.toml"), "").unwrap();
+        let mine = Path::new("/p/demo");
+        assert!(!project_table_exists(dir.path(), mine));
+        let text = set_in("", "/p/demo", "yolo", Some(toml_edit::value(true))).unwrap();
+        std::fs::write(dir.path().join("config.toml"), text).unwrap();
+        assert!(project_table_exists(dir.path(), mine));
+        assert!(!project_table_exists(dir.path(), Path::new("/p/other")));
     }
 
     #[test]

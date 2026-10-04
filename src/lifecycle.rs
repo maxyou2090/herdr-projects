@@ -142,11 +142,20 @@ pub fn delete(ctx: &Ctx, slug: &str, force: bool) -> Result<()> {
             println!("  {}: worktree {}{place}, branch {} in {}", t.id, if t.worktree_path.is_empty() { "-" } else { &t.worktree_path }, if t.branch.is_empty() { "-" } else { &t.branch }, t.repo);
         }
     }
-    println!(
-        "The `[safety.\"{}\"]` table and any routine approvals for this path remain in {} and would apply to a new project at the same path.",
-        canonical.display(),
-        ctx.config_dir.display()
-    );
+    // Only point at leftovers that actually exist: the per-project safety
+    // table and this project's routine approvals both live in the user config
+    // and would silently apply to a new project at the same path.
+    let table = crate::safety::project_table_exists(&ctx.config_dir, &canonical);
+    let path_key = canonical.to_string_lossy().into_owned();
+    let approvals = crate::routine::approvals(&ctx.config_dir).iter().any(|a| a.project == path_key);
+    if table || approvals {
+        let subject = match (table, approvals) {
+            (true, true) => format!("The `[safety.\"{}\"]` table and routine approvals for this path remain", canonical.display()),
+            (true, false) => format!("The `[safety.\"{}\"]` table for this path remains", canonical.display()),
+            (false, _) => "Routine approvals for this path remain".to_string(),
+        };
+        println!("{subject} in {} and would apply to a new project at the same path.", ctx.config_dir.display());
+    }
     Ok(())
 }
 
