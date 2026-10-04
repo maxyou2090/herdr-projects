@@ -84,7 +84,7 @@ pub fn set_status(ctx: &Ctx, slug: &str, status: Status) -> Result<()> {
             }
         }
         Status::Archived => {
-            println!("It is hidden from `list` and the popup, the ticker skips it, and `open` is refused until `unarchive`. Its folder and every unresolved thread's worktree stay.");
+            println!("It is marked `archived` in `list`, skipped by the projects picker, overviews and the ticker, and `open` is refused until `unarchive`. Its folder and every unresolved thread's worktree stay.");
             if let Some(view) = &view {
                 for (_, pane, _) in alive_panes(&project, view) {
                     crate::sidebar::clear_pane(&view.herdr, &pane);
