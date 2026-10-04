@@ -2139,6 +2139,8 @@ fn open_from_a_shell_pane_runs_the_coordinator_there_then_focuses_it_and_new_sta
         ("w5", "w5:t1", "w5:p1", "hpc-demo", h.dir.as_str(), "sess-7")
     );
     assert!(h.world.runner.calls.borrow().iter().any(|c| c.display().contains("report-metadata") && c.args.contains(&"w5:p1".to_string())));
+    // The coordinator's tab carries the same label the tab creation paths use.
+    assert_eq!(h.world.runner.count("tab rename w5:t1 coordinator"), 1);
 
     // Running it again, from another shell pane, focuses it: no second agent.
     *h.world.agents.borrow_mut() = format!("[{}]", h.child_agent("w5:p1", "hpc-demo", "sess-7"));
@@ -2147,6 +2149,8 @@ fn open_from_a_shell_pane_runs_the_coordinator_there_then_focuses_it_and_new_sta
     h.open_with(&other, true, false).unwrap();
     assert_eq!(h.foreground().len(), 1);
     assert_eq!(h.world.runner.count("agent focus w5:p1"), 1);
+    // Refocusing leaves the tab's name alone.
+    assert_eq!(h.world.runner.count("tab rename w5:t1 coordinator"), 1);
 
     // --new from that pane starts a second coordinator there, never resuming.
     *h.world.panes.borrow_mut() = format!("[{},{}]", pane_json("w5", "w5:t1", "w5:p1", "/tmp"), pane_json("w6", "w6:t1", "w6:p1", "/tmp"));
@@ -2156,6 +2160,7 @@ fn open_from_a_shell_pane_runs_the_coordinator_there_then_focuses_it_and_new_sta
     assert_eq!(runs.len(), 2);
     assert!(runs[1].args.is_empty(), "{}", runs[1].display());
     assert_eq!(h.world.runner.count("agent rename w6:p1 hpc-demo-1"), 1);
+    assert_eq!(h.world.runner.count("tab rename w6:t1 coordinator"), 1);
     let record = h.project.coordinator().unwrap();
     assert_eq!((record.pane_id.as_str(), record.agent_session.as_str()), ("w6:p1", "sess-8"));
 }
@@ -2187,6 +2192,28 @@ fn open_in_a_pane_resumes_the_recorded_session_and_starts_fresh_when_that_fails(
     assert_eq!(runs[1].args, ["--resume", "sess-42"]);
     assert!(runs[2].args.is_empty(), "{}", runs[2].display());
     assert_eq!(h.project.coordinator().unwrap().agent_session, "sess-9");
+}
+
+#[test]
+fn open_renames_the_recorded_tab_when_it_restarts_a_coordinator_in_its_old_pane() {
+    let h = Here::new(&[]);
+    h.world.runner.on("workspace rename", ok(r#"{"result":{}}"#));
+    h.project
+        .update_coordinator(|c| {
+            c.socket = h.socket.to_string_lossy().into_owned();
+            c.agent = "claude".into();
+            c.workspace_id = "w5".into();
+            c.tab_id = "w5:t1".into();
+            c.pane_id = "w5:p1".into();
+            c.cwd = "/tmp".into();
+        })
+        .unwrap();
+    // The recorded pane is still there at a shell prompt: open restarts the
+    // coordinator in it and names its tab, instead of making a new one.
+    h.open(false, false).unwrap();
+    assert_eq!(h.world.runner.count("tab create"), 0);
+    assert_eq!(h.world.runner.count("agent start"), 1);
+    assert_eq!(h.world.runner.count("tab rename w5:t1 coordinator"), 1);
 }
 
 #[test]

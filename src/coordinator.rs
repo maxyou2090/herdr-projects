@@ -294,9 +294,11 @@ pub fn open(ctx: &Ctx, slug: &str, options: &OpenOptions) -> Result<()> {
     });
     let (workspace_id, tab_id, pane_id) = if let Some(pane) = &here {
         let pane = panes.iter().find(|p| &p.pane_id == pane).with_context(|| format!("pane {pane} is not listed by the herdr session at {socket}"))?;
+        name_tab(&herdr, &pane.tab_id);
         (pane.workspace_id.clone(), pane.tab_id.clone(), pane.pane_id.clone())
     } else if let Some(record) = reusable {
         sync_label(&herdr, &record.workspace_id, &label);
+        name_tab(&herdr, &record.tab_id);
         (record.workspace_id.clone(), record.tab_id.clone(), record.pane_id.clone())
     } else {
         let workspace = previous
@@ -310,10 +312,7 @@ pub fn open(ctx: &Ctx, slug: &str, options: &OpenOptions) -> Result<()> {
             }
             None => {
                 let created = herdr.workspace_create(&dir, &label, true)?;
-                let _ = herdr.call(
-                    &["tab", "rename", &created.tab_id, "coordinator"],
-                    crate::herdr::CALL_TIMEOUT,
-                );
+                name_tab(&herdr, &created.tab_id);
                 created
             }
         };
@@ -494,6 +493,17 @@ fn sync_label(herdr: &Herdr, workspace_id: &str, label: &str) {
             }
         }
         _ => {}
+    }
+}
+
+/// Labels the tab a coordinator starts in `coordinator`, like the tab and
+/// workspace creation paths do. Never fails: a wrong label is cosmetic.
+fn name_tab(herdr: &Herdr, tab_id: &str) {
+    if tab_id.is_empty() {
+        return;
+    }
+    if let Err(error) = herdr.tab_rename(tab_id, "coordinator") {
+        println!("could not rename tab {tab_id} to `coordinator` ({error})");
     }
 }
 

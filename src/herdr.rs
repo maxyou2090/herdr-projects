@@ -418,6 +418,10 @@ impl<'a> Herdr<'a> {
         self.call(&["workspace", "rename", workspace, label], CALL_TIMEOUT).map(|_| ())
     }
 
+    pub fn tab_rename(&self, tab: &str, label: &str) -> Result<(), HerdrError> {
+        self.call(&["tab", "rename", tab, label], CALL_TIMEOUT).map(|_| ())
+    }
+
     /// The working directory herdr reports for a new tab's pane.
     pub fn pane_cwd(&self, pane: &str) -> Result<String, HerdrError> {
         let result = self.call(&["pane", "get", pane], CALL_TIMEOUT)?;
