@@ -47,6 +47,8 @@ pub struct State {
     pub box_pane: String,
     pub box_empty_since: String,
     pub session_item_written: bool,
+    /// thread id -> the retry-failure line last reported from its pane.
+    pub error_seen: BTreeMap<String, String>,
     /// thread id -> when the ticker first saw its pull request merged.
     pub merged_seen: BTreeMap<String, String>,
 }
@@ -177,6 +179,15 @@ pub struct Transition {
     pub note: String,
 }
 
+/// A thread seen idle with a retry failure on its pane.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Stuck {
+    pub id: String,
+    pub pane: String,
+    /// The pane line the report is about; also the dedup signature.
+    pub line: String,
+}
+
 pub fn thread_label(t: &Thread) -> String {
     format!("{} \"{}\"", t.id, t.title)
 }
@@ -242,6 +253,37 @@ pub fn write_thread_items(project: &Project, state: &mut State, transitions: &[T
         notifier.send(&t.id, &format!("review · new report: {}", t.title), crate::notify::Sound::Done, false);
         let hash = t.report_hash.clone();
         thread::update(project, &t.id, |t| t.last_review_item_hash = hash)?;
+    }
+    Ok(())
+}
+
+/// A thread left idle with a failed retry on its pane has lost its turn: its
+/// task is open but nothing more happens by itself, and no report is written,
+/// so no other step would tell the coordinator. One `thread-error` item per
+/// failure line, repeated only when the line changes; when the error leaves
+/// the screen the thread is armed again.
+pub fn write_stuck_items(project: &Project, state: &mut State, stuck: &[Stuck], notifier: &crate::notify::Notifier) -> Result<()> {
+    state.error_seen.retain(|id, _| stuck.iter().any(|s| &s.id == id));
+    for s in stuck {
+        if state.error_seen.get(&s.id).map(String::as_str) == Some(s.line.as_str()) {
+            continue;
+        }
+        state.error_seen.insert(s.id.clone(), s.line.clone());
+        let Ok(t) = thread::load(project, &s.id) else {
+            continue;
+        };
+        let summary = format!(
+            "{} has been idle with a failed retry on its pane {} ({}). Its task is still open, but it will not continue by itself, and its report may not cover the work it lost. Check `overview` for other threads that also wait, then either continue it with `thread prompt {} {} ...` or resolve it with `thread resolve {} {}`.",
+            thread_label(&t),
+            s.pane,
+            s.line,
+            project.slug,
+            t.id,
+            project.slug,
+            t.id,
+        );
+        inbox::write(project, "thread-error", &t.id, "stalled on a failed retry", &summary, "")?;
+        notifier.send(&t.id, &format!("stalled · {}", s.line), crate::notify::Sound::Request, false);
     }
     Ok(())
 }

@@ -33,6 +33,7 @@ mod setup;
 mod sidebar;
 mod spaces;
 mod steps;
+mod stuck;
 mod sweep;
 mod tasks;
 mod thread;

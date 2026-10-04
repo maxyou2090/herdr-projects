@@ -43,7 +43,7 @@ pub fn detect(kind: &str, screen: &str) -> Option<&'static str> {
 
 /// The screen's text with escape sequences dropped and runs of spaces joined,
 /// so a phrase drawn with styled or padded words still matches.
-fn plain_text(screen: &str) -> String {
+pub(crate) fn plain_text(screen: &str) -> String {
     let mut out = String::new();
     let mut chars = screen.chars().peekable();
     while let Some(ch) = chars.next() {

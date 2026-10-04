@@ -574,6 +574,8 @@ pub struct Seen {
     panes: Vec<Pane>,
     /// Group changes of this tick, turned into inbox items after the copies.
     transitions: Vec<Transition>,
+    /// Threads seen idle with a failed retry on their pane.
+    stuck: Vec<crate::steps::Stuck>,
     /// At least one agent works in the project folder: routines may fire.
     coordinator: bool,
     /// The session answered, the project has at least two recorded local
@@ -605,6 +607,8 @@ pub fn tick_project_with(ctx: &Ctx, project: &Project, memory: &mut Memory) -> R
 /// one herdr server (the local session, or one remote machine).
 struct Pass {
     transitions: Vec<Transition>,
+    /// Threads seen idle with a failed retry on their pane.
+    stuck: Vec<crate::steps::Stuck>,
     recorded_panes: usize,
     missing_panes: usize,
     error: Option<anyhow::Error>,
@@ -613,7 +617,7 @@ struct Pass {
 fn thread_pass(project: &Project, herdr: &Herdr, socket: &str, threads: &[thread::Thread], agents: &[Agent], panes: &[Pane], hashes: Option<&std::collections::BTreeMap<String, String>>) -> Result<Pass> {
     let slug = &project.slug;
     let now = jiff::Timestamp::now();
-    let mut pass = Pass { transitions: Vec::new(), recorded_panes: 0, missing_panes: 0, error: None };
+    let mut pass = Pass { transitions: Vec::new(), stuck: Vec::new(), recorded_panes: 0, missing_panes: 0, error: None };
     for t in threads {
         if t.status == thread::Status::Starting {
             if thread::seconds_since(&t.created, now) >= thread::STARTING_TIMEOUT_SECS {
@@ -708,6 +712,14 @@ fn thread_pass(project: &Project, herdr: &Herdr, socket: &str, threads: &[thread
         }
         if live.pane_exists {
             crate::sidebar::report_pane(herdr, &t.pane_id, &crate::sidebar::thread_display(t), slug, group);
+        }
+        // A thread sitting idle with a failed retry on its pane has lost its
+        // turn: no report is coming, so it is reported for the coordinator
+        // instead. Local threads only: a remote screen costs an ssh call.
+        if !t.is_remote() && live.pane_exists && state == "idle"
+            && let Some(line) = crate::stuck::retry_failure(&herdr.agent_screen(&t.pane_id).unwrap_or_default())
+        {
+            pass.stuck.push(crate::steps::Stuck { id: t.id.clone(), pane: t.pane_id.clone(), line });
         }
     }
     Ok(pass)
@@ -895,6 +907,7 @@ fn tick_cheap(ctx: &Ctx, project: &Project, sessions: &mut Sessions) -> Result<O
             agents,
             panes,
             transitions: pass.transitions,
+            stuck: pass.stuck,
             coordinator: !coordinators.is_empty(),
             session_lost: recorded_panes >= 2 && missing_panes == recorded_panes,
         })),
@@ -997,6 +1010,7 @@ fn tick_slow(ctx: &Ctx, project: &Project, seen: &Seen, memory: &mut Memory) -> 
 
     let notifier = crate::notify::Notifier::new(ctx, project);
     errors.extend(steps::write_thread_items(project, &mut state, &transitions, seen.session_lost, &copy_notes, &notifier).err());
+    errors.extend(steps::write_stuck_items(project, &mut state, &seen.stuck, &notifier).err());
     errors.extend(steps::pull_requests(ctx, project, &mut state, memory, now));
     errors.extend(steps::resolve_merged(ctx, project, &mut state, now));
     errors.extend(routine_pass(ctx, project, &mut state, seen.coordinator));

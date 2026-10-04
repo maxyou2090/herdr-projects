@@ -832,6 +832,59 @@ fn set_agents(world: &World, project: &Project, thread_state: &str) {
 }
 
 #[test]
+fn an_idle_thread_stuck_on_a_failed_retry_is_reported_once_per_failure() {
+    let (world, project, _) = finished_world("idle");
+    set_front_matter(&project, "nudge = true");
+    settle(&project);
+    // The failure sits above an empty input box, as on a real pane.
+    *world.screen.borrow_mut() = format!(
+        "Error: terminated\nError: Retry failed after 3 attempts: terminated\n\n{}",
+        claude_screen(None)
+    );
+    let ctx = world.ctx();
+    let mut memory = Memory::new(&ctx);
+    ticker::tick_project_with(&ctx, &project, &mut memory).unwrap();
+
+    let items = items_of(&project, "thread-error");
+    assert_eq!(items.len(), 1, "{items:?}");
+    assert_eq!(items[0].event, "stalled on a failed retry");
+    assert!(items[0].summary.contains("t-0001 \"Task\""), "{}", items[0].summary);
+    assert!(items[0].summary.contains("Retry failed after 3 attempts"), "{}", items[0].summary);
+    assert!(items[0].summary.contains("thread prompt demo t-0001"), "{}", items[0].summary);
+
+    // The same failure on the next tick reports nothing more, and the nudge
+    // reaches the coordinator once the idle and quiet guards pass.
+    idle_for_a_minute(&project);
+    ticker::tick_project_with(&ctx, &project, &mut memory).unwrap();
+    assert_eq!(items_of(&project, "thread-error").len(), 1);
+    box_empty_for_a_while(&project);
+    ticker::tick_project_with(&ctx, &project, &mut memory).unwrap();
+    assert_eq!(nudges(&world), ["[hp inbox] t-0001 stalled on a failed retry"]);
+    assert_eq!(world.runner.count("agent prompt"), 1);
+
+    // With the error gone the thread is armed again, and a different failure
+    // reports once more.
+    *world.screen.borrow_mut() = claude_screen(None);
+    ticker::tick_project_with(&ctx, &project, &mut memory).unwrap();
+    assert!(crate::steps::load_state(&project).error_seen.is_empty());
+    *world.screen.borrow_mut() = format!("Error: Retry failed after 5 attempts: crashed\n\n{}", claude_screen(None));
+    ticker::tick_project_with(&ctx, &project, &mut memory).unwrap();
+    assert_eq!(items_of(&project, "thread-error").len(), 2);
+    assert_eq!(nudges(&world).len(), 1, "the same items are not nudged again");
+}
+
+#[test]
+fn a_thread_whose_agent_is_not_idle_is_not_reported_for_a_screen_failure() {
+    let (world, project, _) = finished_world("working");
+    *world.screen.borrow_mut() = format!("Error: Retry failed after 3 attempts: terminated\n\n{}", claude_screen(None));
+    let ctx = world.ctx();
+    let mut memory = Memory::new(&ctx);
+    ticker::tick_project_with(&ctx, &project, &mut memory).unwrap();
+    assert!(items_of(&project, "thread-error").is_empty());
+    assert!(crate::steps::load_state(&project).error_seen.is_empty());
+}
+
+#[test]
 fn a_finishing_thread_gives_one_item_and_one_nudge_until_a_new_item_arrives() {
     let (world, project, t) = finished_world("done");
     set_front_matter(&project, "nudge = true");
