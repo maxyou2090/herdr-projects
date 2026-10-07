@@ -50,9 +50,16 @@ pub fn pane_matches(record: &Coordinator, pane: &Pane) -> bool {
 
 /// A coordinator of the project: any agent whose working directory is the
 /// project home (the canonical path the record stores), including one `open`
-/// started in a shell pane elsewhere.
+/// started in a shell pane elsewhere. The recorded pane also counts while
+/// its shell sits in another folder: a coordinator runs commands wherever,
+/// and the folder check alone would hide it from every nudge until it
+/// comes home. Its native session id keeps a reused pane id from counting.
 pub fn is_coordinator(record: &Coordinator, agent: &Agent) -> bool {
     agent.works_in(&record.cwd)
+        || (!record.pane_id.is_empty()
+            && !record.agent_session.is_empty()
+            && agent.pane_id == record.pane_id
+            && agent.session_id() == record.agent_session)
 }
 
 /// True when the pane sits in the project folder: its shell's directory, or
@@ -702,6 +709,31 @@ mod tests {
         // `open` ran it in a shell pane elsewhere: its own directory counts.
         let child = Agent { foreground_cwd: "/r/demo".into(), ..agent("w5:p1", "/tmp", "idle", 1) };
         assert!(is_coordinator(&record, &child));
+    }
+
+    #[test]
+    fn the_recorded_pane_counts_from_any_folder_while_its_session_matches() {
+        let mut record = Coordinator {
+            cwd: "/r/demo".into(),
+            pane_id: "w1:p1".into(),
+            agent_session: "/sessions/demo.jsonl".into(),
+            ..Coordinator::default()
+        };
+        // Its shell works in another folder for a while.
+        let drifted = Agent {
+            agent_session: Some(crate::herdr::AgentSession { value: "/sessions/demo.jsonl".into() }),
+            ..agent("w1:p1", "/elsewhere", "idle", 1)
+        };
+        assert!(is_coordinator(&record, &drifted));
+        // A reused pane id running a different session does not count.
+        let reused = Agent {
+            agent_session: Some(crate::herdr::AgentSession { value: "/sessions/other.jsonl".into() }),
+            ..agent("w1:p1", "/elsewhere", "idle", 1)
+        };
+        assert!(!is_coordinator(&record, &reused));
+        // Without a recorded session only the folder counts.
+        record.agent_session.clear();
+        assert!(!is_coordinator(&record, &drifted));
     }
 
     #[test]
