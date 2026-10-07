@@ -353,11 +353,13 @@ fn hash_ids(ids: &BTreeSet<String>) -> String {
 
 /// Step 6. A given set of unseen items is announced once; there is no timed
 /// re-nudge. With `nudge = false` the user gets a herdr notification instead
-/// of a prompt in the coordinator; with no live coordinator the same.
-/// `coordinator_ready` is a coordinator idle long enough to be prompted (see
-/// `coordinator::nudge_target`). A prompt is typed only into an input box
-/// that has looked empty for `NUDGE_QUIET_SECS`, so it never merges with text
-/// someone is typing; until then the nudge waits for a later tick.
+/// of a prompt in the coordinator. `coordinator_ready` is a coordinator idle
+/// long enough to be prompted (see `coordinator::nudge_target`); until one
+/// is, nothing is announced and nothing is spent, so a coordinator that
+/// appears or quiets down on a later tick still hears about the items. A
+/// prompt is typed only into an input box that has looked empty for
+/// `NUDGE_QUIET_SECS`, so it never merges with text someone is typing; until
+/// then the nudge waits for a later tick.
 pub fn nudge(project: &Project, state: &mut State, settings: &Settings, herdr: &Herdr, coordinator_ready: Option<&crate::coordinator::LivePane>, now: jiff::Timestamp) -> Result<()> {
     let seen = inbox::seen(project);
     let unseen: Vec<inbox::Item> = inbox::unhandled(project).into_iter().filter(|i| !seen.contains(&i.id)).collect();
@@ -367,21 +369,22 @@ pub fn nudge(project: &Project, state: &mut State, settings: &Settings, herdr: &
         return Ok(());
     }
     // The user already got a specific notification per event; this step only
-    // wakes a coordinator. Without one (or with `nudge = false`) the items
-    // wait for its next turn.
-    let no_coordinator = crate::coordinator::live(project).is_empty();
-    if settings.nudge && !no_coordinator {
-        let Some(pane) = coordinator_ready else {
-            forget_box(state);
-            return Ok(()); // not idle long enough: try again on a later tick
-        };
-        if !box_quiet(state, herdr, pane, now)? {
-            return Ok(());
-        }
-        // `agent_blocked` and other errors are returned, logged by the caller,
-        // and the nudge is retried on a later tick.
-        herdr.agent_prompt(&pane.pane_id, &nudge_text(&unseen))?;
+    // wakes a coordinator. Without one ready (or with `nudge = false`) the
+    // one announcement is not spent: the items wait for a later tick.
+    if !settings.nudge {
+        forget_box(state);
+        return Ok(());
     }
+    let Some(pane) = coordinator_ready else {
+        forget_box(state);
+        return Ok(()); // not idle long enough: try again on a later tick
+    };
+    if !box_quiet(state, herdr, pane, now)? {
+        return Ok(());
+    }
+    // `agent_blocked` and other errors are returned, logged by the caller,
+    // and the nudge is retried on a later tick.
+    herdr.agent_prompt(&pane.pane_id, &nudge_text(&unseen))?;
     state.nudged = hash;
     forget_box(state);
     Ok(())

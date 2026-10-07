@@ -1028,6 +1028,78 @@ fn a_blocked_nudge_is_retried_and_a_busy_coordinator_is_not_prompted() {
 }
 
 #[test]
+fn a_nudge_without_a_live_coordinator_is_not_spent() {
+    let (world, project, t) = finished_world("done");
+    set_front_matter(&project, "nudge = true");
+    std::fs::create_dir_all(&t.thread_dir).unwrap();
+    std::fs::write(Path::new(&t.thread_dir).join("report.md"), "## Report\ndone\n").unwrap();
+    *world.panes.borrow_mut() = format!("[{}]", world.coordinator_pane(&project));
+    let ctx = world.ctx();
+    let mut memory = Memory::new(&ctx);
+
+    // The coordinator's agent is gone: the item is written, nothing is
+    // announced, and the one announcement is not spent.
+    let home = world.home.path().to_string_lossy().into_owned();
+    let thread_only = agent_json("w2", "w2:t1", "w2:p1", &home, &format!("hp-{}-t-0001", project.slug), "done");
+    *world.agents.borrow_mut() = format!("[{thread_only}]");
+    ticker::tick_project_with(&ctx, &project, &mut memory).unwrap();
+    assert_eq!(items_of(&project, "thread-state").len(), 1);
+    assert_eq!(world.runner.count("agent prompt"), 0);
+    assert!(crate::steps::load_state(&project).nudged.is_empty(), "the announcement is not spent while no coordinator is live");
+
+    // A coordinator appears: the same item still gets its one nudge once the
+    // idle and quiet guards pass.
+    set_agents(&world, &project, "done");
+    ticker::tick_project_with(&ctx, &project, &mut memory).unwrap();
+    idle_for_a_minute(&project);
+    ticker::tick_project_with(&ctx, &project, &mut memory).unwrap();
+    box_empty_for_a_while(&project);
+    ticker::tick_project_with(&ctx, &project, &mut memory).unwrap();
+    assert_eq!(nudges(&world), ["[hp inbox] t-0001 new report"]);
+}
+
+#[test]
+fn a_coordinator_whose_shell_works_elsewhere_is_still_nudged() {
+    let (world, project, t) = finished_world("done");
+    set_front_matter(&project, "nudge = true");
+    std::fs::create_dir_all(&t.thread_dir).unwrap();
+    std::fs::write(Path::new(&t.thread_dir).join("report.md"), "## Report\ndone\n").unwrap();
+    *world.panes.borrow_mut() = format!("[{}]", world.coordinator_pane(&project));
+    let ctx = world.ctx();
+    let mut memory = Memory::new(&ctx);
+    let dir = project.canonical_dir().to_string_lossy().into_owned();
+
+    // One tick with the coordinator home records its native session.
+    let session = r#", "agent_session":{"value":"/sessions/demo.jsonl"}"#;
+    let home_coordinator = format!(
+        r#"{{"pane_id":"w1:p1","tab_id":"w1:t1","workspace_id":"w1","cwd":"{dir}","name":"hp-{}-coordinator","agent":"claude","agent_status":"idle"{session}}}"#,
+        project.slug
+    );
+    let thread = agent_json("w2", "w2:t1", "w2:p1", &world.home.path().to_string_lossy(), &format!("hp-{}-t-0001", project.slug), "done");
+    *world.agents.borrow_mut() = format!("[{home_coordinator},{thread}]");
+    ticker::tick_project_with(&ctx, &project, &mut memory).unwrap();
+    assert_eq!(project.coordinator().unwrap_or_default().agent_session, "/sessions/demo.jsonl");
+
+    // Its shell then sits in another folder; the pane and session still
+    // identify it, and the nudge reaches it once the guards pass.
+    let drifted_coordinator = format!(
+        r#"{{"pane_id":"w1:p1","tab_id":"w1:t1","workspace_id":"w1","cwd":"/elsewhere","name":"hp-{}-coordinator","agent":"claude","agent_status":"idle"{session}}}"#,
+        project.slug
+    );
+    *world.agents.borrow_mut() = format!("[{drifted_coordinator},{thread}]");
+    ticker::tick_project_with(&ctx, &project, &mut memory).unwrap();
+    assert_eq!(crate::coordinator::live(&project).len(), 1, "the drifted pane is still discovered");
+    idle_for_a_minute(&project);
+    ticker::tick_project_with(&ctx, &project, &mut memory).unwrap();
+    box_empty_for_a_while(&project);
+    ticker::tick_project_with(&ctx, &project, &mut memory).unwrap();
+    assert_eq!(nudges(&world), ["[hp inbox] t-0001 new report"]);
+    let calls = world.runner.calls.borrow();
+    let nudge = calls.iter().find(|c| c.args.last().is_some_and(|a| a.starts_with("[hp inbox]"))).unwrap();
+    assert!(nudge.args.contains(&"w1:p1".to_string()));
+}
+
+#[test]
 fn a_restarted_session_gives_one_session_item_not_one_per_thread() {
     let world = World::new();
     let project = world.project("demo", "a.sock");
