@@ -609,12 +609,12 @@ fn thread_start_and_open_refuse_profiles_off_the_allow_list() {
         let args = StartArgs { title: "x".into(), repo: None, machine: None, profile: Some(bad.into()), kind: Some(Kind::Tab), base: None, task: "t".into() };
         let error = threads::start(&world.ctx(), "demo", args).unwrap_err().to_string();
         assert!(error.contains("not allowed for threads") || error.contains("no profile `nope`"), "{error}");
-        let options = coordinator::OpenOptions { session: Default::default(), rebind: false, profile: Some(bad.into()), new: true, here: false };
+        let options = coordinator::OpenOptions { session: Default::default(), rebind: false, profile: Some(bad.into()), new: true, here: false, person: false };
         let error = coordinator::open(&world.ctx(), "demo", &options).unwrap_err().to_string();
         assert!(error.contains("not allowed for the coordinator") || error.contains("no profile `nope`"), "{error}");
     }
     // `luna` is allowed for threads, not for the coordinator.
-    let options = coordinator::OpenOptions { session: Default::default(), rebind: false, profile: Some("luna".into()), new: true, here: false };
+    let options = coordinator::OpenOptions { session: Default::default(), rebind: false, profile: Some("luna".into()), new: true, here: false, person: false };
     assert!(coordinator::open(&world.ctx(), "demo", &options).unwrap_err().to_string().contains("allowed: claude"));
     assert!(threads::restart(&world.ctx(), "demo", "t-0001", Some("deep")).is_err());
     assert!(thread::list(&project).is_empty());
@@ -1816,6 +1816,7 @@ fn open_alive(world: &World, project: &Project) -> anyhow::Result<()> {
         profile: None,
         new: false,
         here: false,
+        person: false,
     };
     crate::coordinator::open(&world.ctx(), &project.slug, &options)
 }
@@ -1845,6 +1846,32 @@ fn open_leaves_a_matching_label_alone_and_a_failed_rename_does_not_block_it() {
     world.runner.on("workspace rename", fail(1, "boom"));
     open_alive(&world, &project).unwrap();
     assert_eq!(world.runner.count("workspace rename"), 1);
+}
+
+#[test]
+fn a_persons_open_resumes_a_paused_project_an_agents_open_only_notes_it() {
+    let world = World::new();
+    let project = world.project("demo", "a.sock");
+    crate::lifecycle::set_status(&world.ctx(), "demo", crate::project::Status::Paused).unwrap();
+    assert_eq!(project.status(), crate::project::Status::Paused);
+
+    // An agent's `open` still starts and focuses the coordinator, but it
+    // never flips a lifecycle state the user set.
+    open_alive(&world, &project).unwrap();
+    assert_eq!(project.status(), crate::project::Status::Paused);
+
+    // A person's `open` resumes it: the ticker picks the project up again.
+    let socket = world.home.path().join("a.sock");
+    let options = crate::coordinator::OpenOptions {
+        session: crate::paths::SessionFlags { session: None, socket: Some(socket) },
+        rebind: false,
+        profile: None,
+        new: false,
+        here: false,
+        person: true,
+    };
+    crate::coordinator::open(&world.ctx(), "demo", &options).unwrap();
+    assert_eq!(project.status(), crate::project::Status::Active);
 }
 
 #[test]
@@ -1883,6 +1910,7 @@ fn open_starts_a_coordinator_without_a_priming_prompt_then_focuses_it_and_resume
         profile: None,
         new,
         here: false,
+        person: false,
     };
     let ctx = world.ctx();
 
@@ -1946,6 +1974,7 @@ fn open_new_starts_a_fresh_coordinator_beside_a_live_one_without_its_session() {
         profile: None,
         new,
         here: false,
+        person: false,
     };
     let ctx = world.ctx();
     crate::coordinator::open(&ctx, "demo", &options(false)).unwrap();
@@ -2164,6 +2193,7 @@ impl Here {
             profile: None,
             new,
             here,
+            person: false,
         };
         crate::coordinator::open(&Ctx { env, ..self.world.ctx() }, "demo", &options)
     }

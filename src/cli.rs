@@ -665,19 +665,23 @@ pub fn run() -> Result<()> {
             }
             Ok(())
         }
-        Command::Open { slug, profile, new, tab, rebind, session } => coordinator::open(
-            &ctx,
-            &slug,
-            &OpenOptions {
-                session: session.into(),
-                rebind,
-                profile,
-                new,
-                // Only a person at a terminal gets the agent in place; the
-                // popup and agents' shell tools run `open` without one.
-                here: !tab && std::io::stdin().is_terminal() && std::io::stdout().is_terminal(),
-            },
-        ),
+        Command::Open { slug, profile, new, tab, rebind, session } => {
+            let person = std::io::stdin().is_terminal() && std::io::stdout().is_terminal();
+            coordinator::open(
+                &ctx,
+                &slug,
+                &OpenOptions {
+                    session: session.into(),
+                    rebind,
+                    profile,
+                    new,
+                    // Only a person at a terminal gets the agent in place; the
+                    // popup and agents' shell tools run `open` without one.
+                    here: !tab && person,
+                    person,
+                },
+            )
+        }
         Command::Coordinator { command } => match command {
             CoordinatorCommand::Prompt { slug, text_file } => {
                 let text = read_text(&text_file)?;

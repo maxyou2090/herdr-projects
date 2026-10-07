@@ -498,6 +498,9 @@ fn advance(ctx: &Ctx, pending: &Pending) -> Result<Option<Next>> {
             profile: None,
             new: false,
             here: false,
+            // The ticker reopens after a rename: it must not resume a project
+            // the user paused.
+            person: false,
         };
         match crate::coordinator::open(ctx, to, &options) {
             Ok(()) => reopened = project.coordinator().filter(|c| !c.pane_id.is_empty()),

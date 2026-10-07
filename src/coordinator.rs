@@ -174,6 +174,10 @@ pub struct OpenOptions {
     /// Start the agent in the pane this command runs in, when that is a shell
     /// pane of the session (false: a new tab, as the popup and actions do).
     pub here: bool,
+    /// Whether a person ran this `open` — at a terminal or through the popup —
+    /// rather than an agent's shell or the ticker: a paused project is then
+    /// resumed, not only noted.
+    pub person: bool,
 }
 
 /// The pane `open` runs in, when the coordinator can start right there: the
@@ -191,6 +195,17 @@ pub fn open(ctx: &Ctx, slug: &str, options: &OpenOptions) -> Result<()> {
     let project = Project::load(&ctx.root, slug)?;
     if project.status() == Status::Archived {
         bail!("`{slug}` is archived; run `unarchive {slug}` first");
+    }
+    // Opening a paused project means to work on it: a person's `open` resumes
+    // it, or the coordinator would run with no ticker behind it. An agent's
+    // `open` never flips a lifecycle state the user set; it only notes it.
+    if project.status() == Status::Paused {
+        if options.person {
+            project.set_status(Status::Active)?;
+            println!("`{slug}` was paused; it is active again, and the ticker picks it up");
+        } else {
+            println!("`{slug}` is paused: the ticker skips it and `thread start` is refused; `resume {slug}` makes it active again");
+        }
     }
     let (settings, body) = project.read_project_md()?;
     if body.chars().count() > crate::project::BODY_WARN_CHARS {
