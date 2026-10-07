@@ -294,6 +294,9 @@ pub fn open(ctx: &Ctx, slug: &str, options: &OpenOptions) -> Result<()> {
     });
     let (workspace_id, tab_id, pane_id) = if let Some(pane) = &here {
         let pane = panes.iter().find(|p| &p.pane_id == pane).with_context(|| format!("pane {pane} is not listed by the herdr session at {socket}"))?;
+        // This pane's Space becomes the project's recorded home: its label
+        // follows, like every other path that adopts or creates one.
+        sync_label(&herdr, &pane.workspace_id, &label);
         name_tab(&herdr, &pane.tab_id);
         (pane.workspace_id.clone(), pane.tab_id.clone(), pane.pane_id.clone())
     } else if let Some(record) = reusable {
@@ -479,9 +482,10 @@ pub fn report_tokens(herdr: &Herdr, project: &Project, pane_id: &str) {
     crate::sidebar::report_pane(herdr, pane_id, &crate::sidebar::coordinator_display(project), &project.slug, crate::thread::Group::Idle);
 }
 
-/// Renames a recorded workspace whose label is not the project's display name,
-/// so a `name` edited in PROJECT.md shows on the next `open`. Never fails: a
-/// wrong label is cosmetic.
+/// Renames a workspace whose label is not the project's display name — the
+/// recorded one, or the one a pane `open` runs in — so a `name` edited in
+/// PROJECT.md shows on the next `open` and an adopted Space drops the label
+/// it was made with. Never fails: a wrong label is cosmetic.
 fn sync_label(herdr: &Herdr, workspace_id: &str, label: &str) {
     if workspace_id.is_empty() {
         return;

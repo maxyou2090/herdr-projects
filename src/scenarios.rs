@@ -2100,13 +2100,15 @@ fn sweep_leaves_kept_worktrees_and_copies_a_resolved_threads_files_first() {
 
 /// `open` run from shell pane `w5:p1` (working in /tmp) of the session at
 /// `a.sock`, with `vars` added to the pane's variables. Each run of the fake
-/// `claude` executable takes the next (exit code, `agent list`) from `runs`.
+/// `claude` executable takes the next (exit code, `agent list`) from `runs`;
+/// `label` is what `workspace get` reports for the pane's Space.
 struct Here {
     world: World,
     project: Project,
     socket: PathBuf,
     dir: String,
     runs: Rc<RefCell<Vec<(i32, String)>>>,
+    label: Rc<RefCell<String>>,
 }
 
 impl Here {
@@ -2122,7 +2124,12 @@ impl Here {
         *world.panes.borrow_mut() = format!("[{}]", pane_json("w5", "w5:t1", "w5:p1", "/tmp"));
         world.runner.on("agent rename", ok(r#"{"result":{}}"#));
         world.runner.on("agent focus", ok(r#"{"result":{}}"#));
-        world.runner.on("workspace get", ok(r#"{"result":{"workspace":{"label":"Demo"}}}"#));
+        let label = Rc::new(RefCell::new("Demo\u{2800}".to_string()));
+        let shown = label.clone();
+        world.runner.on_fn(
+            |cmd| cmd.display().contains("workspace get"),
+            move |_| Ok(ok(&format!(r#"{{"result":{{"workspace":{{"label":"{}"}}}}}}"#, shown.borrow()))),
+        );
         world.runner.on("workspace create", ok(r#"{"result":{"root_pane":{"workspace_id":"w3","tab_id":"w3:t1","pane_id":"w3:p1"}}}"#));
         world.runner.on("tab rename", ok(r#"{"result":{}}"#));
         world.runner.on("agent start", ok(r#"{"result":{"agent":{"pane_id":"w3:p1","tab_id":"w3:t1","workspace_id":"w3","name":"hpc-demo","agent":"claude","agent_status":"idle"}}}"#));
@@ -2137,7 +2144,7 @@ impl Here {
             },
         );
         let dir = project.canonical_dir().to_string_lossy().into_owned();
-        Here { world, project, socket, dir, runs }
+        Here { world, project, socket, dir, runs, label }
     }
 
     /// An agent Herdr detects in `pane` as a child of `open`: the shell stays
@@ -2216,6 +2223,26 @@ fn open_from_a_shell_pane_runs_the_coordinator_there_then_focuses_it_and_new_sta
     assert_eq!(h.world.runner.count("tab rename w6:t1 coordinator"), 1);
     let record = h.project.coordinator().unwrap();
     assert_eq!((record.pane_id.as_str(), record.agent_session.as_str()), ("w6:p1", "sess-8"));
+}
+
+#[test]
+fn open_in_a_shell_pane_renames_that_panes_space_to_the_home_label() {
+    let h = Here::new(&[]);
+    // The pane sits in a Space made at the home directory: herdr labeled it `~`.
+    *h.label.borrow_mut() = "~\u{2800}".to_string();
+    h.world.runner.on("workspace rename", ok(r#"{"result":{}}"#));
+    h.runs.borrow_mut().push((0, format!("[{}]", h.child_agent("w5:p1", "", "sess-7"))));
+    h.open(true, false).unwrap();
+    let calls = h.world.runner.calls.borrow();
+    let rename = calls.iter().find(|c| c.display().contains("workspace rename")).unwrap();
+    assert!(rename.args.ends_with(&["w5".to_string(), "Demo\u{2800}".to_string()]), "{}", rename.display());
+    drop(calls);
+
+    // The label already matches: a later open does not rename again.
+    *h.label.borrow_mut() = "Demo\u{2800}".to_string();
+    *h.world.agents.borrow_mut() = format!("[{}]", h.child_agent("w5:p1", "hpc-demo", "sess-7"));
+    h.open(false, false).unwrap();
+    assert_eq!(h.world.runner.count("workspace rename"), 1);
 }
 
 #[test]
