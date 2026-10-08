@@ -24,8 +24,10 @@ pub const RE_NUDGE_AFTER_SECS: i64 = 30 * 60;
 /// At most one aged reminder per project per this long: a coordinator that
 /// leaves items sitting is reminded, not spammed.
 pub const RE_NUDGE_EVERY_SECS: i64 = 30 * 60;
-/// A thread whose last state change trails its last report change by at
-/// least this long ended its turn without touching the report.
+/// Without a watched turn to compare against, a thread whose last state
+/// change trails its last report change by at least this long ended its
+/// turn without touching the report. A turn the ticker watched working is
+/// proof either way through [`State::working_report`].
 pub const IDLE_NOTE_GAP_SECS: i64 = 20 * 60;
 /// The idle itself must be at least this old before it is reported, so a
 /// thread that is still settling does not fire.
@@ -62,6 +64,10 @@ pub struct State {
     /// thread id -> the last_state_change an idle-without-report item was
     /// written for.
     pub idle_noted: BTreeMap<String, String>,
+    /// thread id -> the report hash its current turn started from, recorded
+    /// at the first sight of work. An idle thread whose report still matches
+    /// it ended a turn that touched no report.
+    pub working_report: BTreeMap<String, String>,
     /// The coordinator pane whose input box was seen empty since
     /// `box_empty_since`, while a nudge waits for it.
     pub box_pane: String,
@@ -314,28 +320,61 @@ pub fn write_stuck_items(project: &Project, state: &mut State, stuck: &[Stuck], 
 
 /// A thread that ended a turn without changing its report: what it did may
 /// live only on its pane, and no other step would tell the coordinator. One
-/// item per idle spell, written only when the state change trails the last
+/// item per idle spell. A turn the ticker watched working is direct proof:
+/// `working_report` holds the hash the turn started from, so an idle whose
+/// report still matches it ended a report-less turn however soon the
+/// previous report was written. Without a watched turn (a ticker restart, a
+/// span the polls missed) the state change must instead trail the last
 /// report change by `IDLE_NOTE_GAP_SECS` (a report written just before a
-/// turn ends is the normal flow) and the idle is at least
-/// `IDLE_NOTE_AFTER_SECS` old. Waiting-on-you threads are skipped: their own
-/// transitions already report them.
+/// turn ends is the normal flow). Either way the idle must be at least
+/// `IDLE_NOTE_AFTER_SECS` old, and waiting-on-you threads are skipped:
+/// their own transitions already report them.
 pub fn write_idle_notes(project: &Project, state: &mut State, now: jiff::Timestamp) -> Result<()> {
     let threads = thread::list(project);
     state.idle_noted.retain(|id, _| threads.iter().any(|t| &t.id == id));
+    state.working_report.retain(|id, _| threads.iter().any(|t| &t.id == id));
     for t in &threads {
-        if t.status != Status::Open
-            || t.prompt_pending
-            || t.last_state != "idle"
+        if t.status != Status::Open || t.prompt_pending {
+            continue;
+        }
+        // The first sight of work fixes the hash the turn started from;
+        // later sightings keep it, so a report written mid-turn still counts
+        // as the turn's own.
+        if t.last_state == "working" {
+            state.working_report.entry(t.id.clone()).or_insert_with(|| t.report_hash.clone());
+            continue;
+        }
+        if t.last_state != "idle"
             || t.report_hash.is_empty()
             || t.report_hash != t.last_review_item_hash
             || t.last_group == Group::WaitingOnYou.token()
         {
             continue;
         }
-        let (Ok(idle_at), Ok(report_at)) = (t.last_state_change.parse::<jiff::Timestamp>(), t.last_report_change.parse::<jiff::Timestamp>()) else {
+        let Ok(idle_at) = t.last_state_change.parse::<jiff::Timestamp>() else {
             continue;
         };
-        if idle_at.as_second() - report_at.as_second() < IDLE_NOTE_GAP_SECS || now.as_second() - idle_at.as_second() < IDLE_NOTE_AFTER_SECS {
+        match state.working_report.get(&t.id) {
+            // The watched turn never touched the report: whatever it did
+            // lives on the pane alone, gap or no gap.
+            Some(h) if h == &t.report_hash => {}
+            // The watched turn wrote the report: the normal flow, and the
+            // entry is spent.
+            Some(_) => {
+                state.working_report.remove(&t.id);
+                continue;
+            }
+            // No watched turn to vouch for the report: fall back to the clock.
+            None => {
+                let Ok(report_at) = t.last_report_change.parse::<jiff::Timestamp>() else {
+                    continue;
+                };
+                if idle_at.as_second() - report_at.as_second() < IDLE_NOTE_GAP_SECS {
+                    continue;
+                }
+            }
+        }
+        if now.as_second() - idle_at.as_second() < IDLE_NOTE_AFTER_SECS {
             continue;
         }
         if state.idle_noted.get(&t.id).map(String::as_str) == Some(t.last_state_change.as_str()) {
@@ -349,6 +388,7 @@ pub fn write_idle_notes(project: &Project, state: &mut State, now: jiff::Timesta
         );
         inbox::write(project, "thread-state", &t.id, "idle without report", &summary, "")?;
         state.idle_noted.insert(t.id.clone(), t.last_state_change.clone());
+        state.working_report.remove(&t.id);
     }
     Ok(())
 }
@@ -1006,6 +1046,69 @@ mod tests {
         assert_eq!(items[0].event, "idle without report");
         // The same idle spell is never noted twice.
         write_idle_notes(&project, &mut state, at("2026-10-08T15:20:00Z")).unwrap();
+        assert_eq!(inbox::unhandled(&project).len(), 1);
+    }
+
+    #[test]
+    fn a_watched_turn_without_a_report_change_is_noted_despite_a_small_gap() {
+        let root = tempfile::tempdir().unwrap();
+        let project = project::create(root.path(), "demo", "", vec![]).unwrap();
+        // The blind spot the gap check could not see: a second turn ends
+        // soon after the previous report, but the ticker watched it work.
+        let quiet = thread::allocate(&project, |t| {
+            t.title = "quiet turn".into();
+            t.status = Status::Open;
+            t.last_state = "working".into();
+            t.last_group = "working".into();
+            t.report_hash = "abc".into();
+            t.last_review_item_hash = "abc".into();
+            t.last_report_change = "2026-10-08T13:00:00Z".into();
+            t.last_state_change = "2026-10-08T13:02:00Z".into();
+        })
+        .unwrap();
+        // The normal flow under the same direct proof: the watched turn
+        // wrote its report right before going idle.
+        let fresh = thread::allocate(&project, |t| {
+            t.title = "fresh report".into();
+            t.status = Status::Open;
+            t.last_state = "working".into();
+            t.last_group = "working".into();
+            t.report_hash = "abc".into();
+            t.last_review_item_hash = "abc".into();
+            t.last_report_change = "2026-10-08T13:00:00Z".into();
+            t.last_state_change = "2026-10-08T13:02:00Z".into();
+        })
+        .unwrap();
+        let mut state = State::default();
+        // Both threads are seen working: the hash each turn started from is
+        // recorded.
+        write_idle_notes(&project, &mut state, at("2026-10-08T13:03:00Z")).unwrap();
+        assert!(inbox::unhandled(&project).is_empty());
+        let idle = |id: &str, hash: &'static str, report_at: &'static str| {
+            thread::update(&project, id, |t| {
+                t.last_state = "idle".into();
+                t.last_group = "ready-for-review".into();
+                t.report_hash = hash.into();
+                t.last_review_item_hash = hash.into();
+                t.last_report_change = report_at.into();
+                t.last_state_change = "2026-10-08T13:12:00Z".into();
+            })
+            .unwrap();
+        };
+        idle(&quiet.id, "abc", "2026-10-08T13:00:00Z");
+        idle(&fresh.id, "def", "2026-10-08T13:11:30Z");
+        // Still settling: the idle is too young to be reported.
+        write_idle_notes(&project, &mut state, at("2026-10-08T13:13:00Z")).unwrap();
+        assert!(inbox::unhandled(&project).is_empty());
+        // Twelve minutes of idle with a twelve-minute-old report: only the
+        // watched turn that touched no report is noted.
+        write_idle_notes(&project, &mut state, at("2026-10-08T13:25:00Z")).unwrap();
+        let items = inbox::unhandled(&project);
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].subject, quiet.id);
+        assert_eq!(items[0].event, "idle without report");
+        // The same idle spell is never noted twice.
+        write_idle_notes(&project, &mut state, at("2026-10-08T13:40:00Z")).unwrap();
         assert_eq!(inbox::unhandled(&project).len(), 1);
     }
 
