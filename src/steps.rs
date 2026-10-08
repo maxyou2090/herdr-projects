@@ -18,8 +18,23 @@ use crate::{inbox, pr, routine};
 /// long: Herdr 0.9.1 cannot say when a key was last pressed in a pane, and
 /// typing shows in the box.
 pub const NUDGE_QUIET_SECS: i64 = 10;
+/// A shown-but-unhandled item is reminded about once the oldest one is this
+/// old, so an interrupted coordinator turn cannot strand it silently.
+pub const RE_NUDGE_AFTER_SECS: i64 = 30 * 60;
+/// At most one aged reminder per project per this long: a coordinator that
+/// leaves items sitting is reminded, not spammed.
+pub const RE_NUDGE_EVERY_SECS: i64 = 30 * 60;
+/// A thread whose last state change trails its last report change by at
+/// least this long ended its turn without touching the report.
+pub const IDLE_NOTE_GAP_SECS: i64 = 20 * 60;
+/// The idle itself must be at least this old before it is reported, so a
+/// thread that is still settling does not fire.
+pub const IDLE_NOTE_AFTER_SECS: i64 = 10 * 60;
 /// At most this many subjects are named in one nudge line.
 const NUDGE_SUBJECTS: usize = 5;
+/// Item kinds an aged reminder covers: the coordinator's own work. Others
+/// (`routine-approval`, `config-error`, `outage`) wait on the user instead.
+const RE_NUDGE_KINDS: [&str; 2] = ["thread-state", "routine"];
 pub const PR_INTERVAL_SECS: i64 = 120;
 /// A merged thread whose agent is not busy, reports no progress and wrote no
 /// report since the merge is resolved after this long.
@@ -42,6 +57,11 @@ pub struct State {
     pub config_errors: BTreeSet<String>,
     /// Hash of the set of unseen item ids that was last nudged.
     pub nudged: String,
+    /// When the aged reminder last went out, to space repeats.
+    pub renudged_at: String,
+    /// thread id -> the last_state_change an idle-without-report item was
+    /// written for.
+    pub idle_noted: BTreeMap<String, String>,
     /// The coordinator pane whose input box was seen empty since
     /// `box_empty_since`, while a nudge waits for it.
     pub box_pane: String,
@@ -119,6 +139,9 @@ pub struct Memory {
     pub machines: BTreeMap<String, MachineMemory>,
     /// The sidebar grouping tokens last sent.
     pub grouping: crate::grouping::Sent,
+    /// project slug -> the nudge-hold reason last logged, so a hold is
+    /// written once per reason, not once per tick.
+    pub nudge_held: std::collections::HashMap<String, String>,
 }
 
 impl Memory {
@@ -132,6 +155,7 @@ impl Memory {
             tick: 0,
             machines: BTreeMap::new(),
             grouping: Default::default(),
+            nudge_held: Default::default(),
         }
     }
 
@@ -288,6 +312,47 @@ pub fn write_stuck_items(project: &Project, state: &mut State, stuck: &[Stuck], 
     Ok(())
 }
 
+/// A thread that ended a turn without changing its report: what it did may
+/// live only on its pane, and no other step would tell the coordinator. One
+/// item per idle spell, written only when the state change trails the last
+/// report change by `IDLE_NOTE_GAP_SECS` (a report written just before a
+/// turn ends is the normal flow) and the idle is at least
+/// `IDLE_NOTE_AFTER_SECS` old. Waiting-on-you threads are skipped: their own
+/// transitions already report them.
+pub fn write_idle_notes(project: &Project, state: &mut State, now: jiff::Timestamp) -> Result<()> {
+    let threads = thread::list(project);
+    state.idle_noted.retain(|id, _| threads.iter().any(|t| &t.id == id));
+    for t in &threads {
+        if t.status != Status::Open
+            || t.prompt_pending
+            || t.last_state != "idle"
+            || t.report_hash.is_empty()
+            || t.report_hash != t.last_review_item_hash
+            || t.last_group == Group::WaitingOnYou.token()
+        {
+            continue;
+        }
+        let (Ok(idle_at), Ok(report_at)) = (t.last_state_change.parse::<jiff::Timestamp>(), t.last_report_change.parse::<jiff::Timestamp>()) else {
+            continue;
+        };
+        if idle_at.as_second() - report_at.as_second() < IDLE_NOTE_GAP_SECS || now.as_second() - idle_at.as_second() < IDLE_NOTE_AFTER_SECS {
+            continue;
+        }
+        if state.idle_noted.get(&t.id).map(String::as_str) == Some(t.last_state_change.as_str()) {
+            continue;
+        }
+        let summary = format!(
+            "{} went idle without updating its report; its pane may hold a handoff the report misses: `thread read {} {}` shows it",
+            thread_label(t),
+            project.slug,
+            t.id
+        );
+        inbox::write(project, "thread-state", &t.id, "idle without report", &summary, "")?;
+        state.idle_noted.insert(t.id.clone(), t.last_state_change.clone());
+    }
+    Ok(())
+}
+
 /// A thread-state item's event, from the group it moved to.
 fn transition_event(change: &Transition) -> &'static str {
     match (change.to, change.note.as_str()) {
@@ -351,43 +416,105 @@ fn hash_ids(ids: &BTreeSet<String>) -> String {
     thread::sha256_hex(ids.iter().cloned().collect::<Vec<_>>().join("\n").as_bytes())
 }
 
-/// Step 6. A given set of unseen items is announced once; there is no timed
-/// re-nudge. With `nudge = false` the user gets a herdr notification instead
-/// of a prompt in the coordinator. `coordinator_ready` is a coordinator idle
-/// long enough to be prompted (see `coordinator::nudge_target`); until one
-/// is, nothing is announced and nothing is spent, so a coordinator that
-/// appears or quiets down on a later tick still hears about the items. A
-/// prompt is typed only into an input box that has looked empty for
-/// `NUDGE_QUIET_SECS`, so it never merges with text someone is typing; until
-/// then the nudge waits for a later tick.
-pub fn nudge(project: &Project, state: &mut State, settings: &Settings, herdr: &Herdr, coordinator_ready: Option<&crate::coordinator::LivePane>, now: jiff::Timestamp) -> Result<()> {
+/// What a nudge step ended up doing.
+#[derive(Debug, Clone, PartialEq)]
+pub enum NudgeOutcome {
+    /// Nothing waits on a coordinator.
+    Quiet,
+    /// The prompt went out.
+    Delivered,
+    /// Items wait but no prompt went out; why, for the ticker's log.
+    Held(&'static str),
+}
+
+const NO_COORDINATOR: &str = "items wait but no coordinator is idle long enough";
+const BOX_NOT_QUIET: &str = "items wait for the coordinator's input box to look empty";
+const WAITING_FOR_READ: &str = "items were announced and wait for the coordinator to read them";
+const NOT_AGED: &str = "shown items sit unhandled but none is old enough for a reminder";
+const REMINDED: &str = "a reminder went out recently; the next waits for its spacing";
+
+/// Step 6. A given set of unseen items is announced once. With `nudge =
+/// false` the user gets a herdr notification instead of a prompt in the
+/// coordinator. `coordinator_ready` is a coordinator idle long enough to be
+/// prompted (see `coordinator::nudge_target`); until one is, nothing is
+/// announced and nothing is spent, so a coordinator that appears or quiets
+/// down on a later tick still hears about the items. A prompt is typed only
+/// into an input box that has looked empty for `NUDGE_QUIET_SECS`, so it
+/// never merges with text someone is typing; until then the nudge waits for
+/// a later tick.
+///
+/// Items the coordinator was already shown (its `context` marks them seen)
+/// but never moved to `done` get one reminder once the oldest is
+/// `RE_NUDGE_AFTER_SECS` old, at most every `RE_NUDGE_EVERY_SECS`: an
+/// interrupted turn cannot strand them silently.
+pub fn nudge(project: &Project, state: &mut State, settings: &Settings, herdr: &Herdr, coordinator_ready: Option<&crate::coordinator::LivePane>, now: jiff::Timestamp) -> Result<NudgeOutcome> {
     let seen = inbox::seen(project);
-    let unseen: Vec<inbox::Item> = inbox::unhandled(project).into_iter().filter(|i| !seen.contains(&i.id)).collect();
-    let hash = hash_ids(&unseen.iter().map(|i| i.id.clone()).collect());
-    if unseen.is_empty() || hash == state.nudged {
+    let unhandled = inbox::unhandled(project);
+    if unhandled.is_empty() {
         forget_box(state);
-        return Ok(());
+        return Ok(NudgeOutcome::Quiet);
+    }
+    let unseen: Vec<inbox::Item> = unhandled.iter().filter(|i| !seen.contains(&i.id)).cloned().collect();
+    if unseen.is_empty() {
+        return aged_renudge(state, settings, herdr, coordinator_ready, &unhandled, now);
+    }
+    let hash = hash_ids(&unseen.iter().map(|i| i.id.clone()).collect());
+    if hash == state.nudged {
+        forget_box(state);
+        return Ok(NudgeOutcome::Held(WAITING_FOR_READ));
     }
     // The user already got a specific notification per event; this step only
     // wakes a coordinator. Without one ready (or with `nudge = false`) the
     // one announcement is not spent: the items wait for a later tick.
     if !settings.nudge {
         forget_box(state);
-        return Ok(());
+        return Ok(NudgeOutcome::Quiet);
     }
     let Some(pane) = coordinator_ready else {
         forget_box(state);
-        return Ok(()); // not idle long enough: try again on a later tick
+        return Ok(NudgeOutcome::Held(NO_COORDINATOR)); // not idle long enough: try again on a later tick
     };
     if !box_quiet(state, herdr, pane, now)? {
-        return Ok(());
+        return Ok(NudgeOutcome::Held(BOX_NOT_QUIET));
     }
     // `agent_blocked` and other errors are returned, logged by the caller,
     // and the nudge is retried on a later tick.
     herdr.agent_prompt(&pane.pane_id, &nudge_text(&unseen))?;
     state.nudged = hash;
     forget_box(state);
-    Ok(())
+    Ok(NudgeOutcome::Delivered)
+}
+
+/// The aged reminder: every unhandled item has been shown to a coordinator
+/// that never finished with it.
+fn aged_renudge(state: &mut State, settings: &Settings, herdr: &Herdr, coordinator_ready: Option<&crate::coordinator::LivePane>, unhandled: &[inbox::Item], now: jiff::Timestamp) -> Result<NudgeOutcome> {
+    let quiet: Vec<inbox::Item> = unhandled.iter().filter(|i| RE_NUDGE_KINDS.contains(&i.kind.as_str())).cloned().collect();
+    if quiet.is_empty() || !settings.nudge {
+        forget_box(state);
+        return Ok(NudgeOutcome::Quiet);
+    }
+    let oldest = quiet.iter().filter_map(|i| i.created.parse::<jiff::Timestamp>().ok()).min();
+    let Some(oldest) = oldest else {
+        forget_box(state);
+        return Ok(NudgeOutcome::Quiet);
+    };
+    if now.as_second() - oldest.as_second() < RE_NUDGE_AFTER_SECS {
+        return Ok(NudgeOutcome::Held(NOT_AGED));
+    }
+    if state.renudged_at.parse::<jiff::Timestamp>().is_ok_and(|at| now.as_second() - at.as_second() < RE_NUDGE_EVERY_SECS) {
+        return Ok(NudgeOutcome::Held(REMINDED));
+    }
+    let Some(pane) = coordinator_ready else {
+        forget_box(state);
+        return Ok(NudgeOutcome::Held(NO_COORDINATOR));
+    };
+    if !box_quiet(state, herdr, pane, now)? {
+        return Ok(NudgeOutcome::Held(BOX_NOT_QUIET));
+    }
+    herdr.agent_prompt(&pane.pane_id, &nudge_text(&quiet))?;
+    state.renudged_at = now.to_string();
+    forget_box(state);
+    Ok(NudgeOutcome::Delivered)
 }
 
 fn forget_box(state: &mut State) {
@@ -792,9 +919,94 @@ pub fn routines(ctx: &Ctx, project: &Project, state: &mut State, routine_command
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::herdr::Herdr;
+    use crate::runner::fake::FakeRunner;
 
     fn at(text: &str) -> jiff::Timestamp {
         text.parse().unwrap()
+    }
+
+    /// One unhandled `thread-state` item created at `created` and marked seen.
+    fn seen_item(project: &Project, id: &str, created: &str) {
+        let text = format!(
+            "+++\nid = \"{id}\"\nkind = \"thread-state\"\nsubject = \"t-0001\"\ncreated = \"{created}\"\nsummary = \"s\"\nevent = \"new report\"\n+++\n"
+        );
+        std::fs::create_dir_all(project.dir().join("inbox")).unwrap();
+        std::fs::write(project.dir().join("inbox").join(format!("{id}.md")), text).unwrap();
+        let ids = vec![id.to_string()];
+        inbox::mark_seen(project, &ids).unwrap();
+    }
+
+    #[test]
+    fn fresh_seen_items_are_not_reminded_and_nothing_is_spent() {
+        let root = tempfile::tempdir().unwrap();
+        let project = project::create(root.path(), "demo", "", vec![]).unwrap();
+        seen_item(&project, "20261008T140000Z-thread-state-t-0001-1", "2026-10-08T14:00:00Z");
+        let runner = FakeRunner::new();
+        let herdr = Herdr::new("herdr", "sock", &runner);
+        let mut state = State::default();
+        let settings = Settings::default();
+        let now = at("2026-10-08T14:10:00Z");
+        // No coordinator: with nothing aged there is no delivery attempt at all.
+        assert_eq!(nudge(&project, &mut state, &settings, &herdr, None, now).unwrap(), NudgeOutcome::Held(NOT_AGED));
+        assert_eq!(state.nudged, "");
+        assert_eq!(state.renudged_at, "");
+    }
+
+    #[test]
+    fn aged_seen_items_ask_for_a_coordinator_but_are_not_spent() {
+        let root = tempfile::tempdir().unwrap();
+        let project = project::create(root.path(), "demo", "", vec![]).unwrap();
+        seen_item(&project, "20261008T130000Z-thread-state-t-0001-1", "2026-10-08T13:00:00Z");
+        let runner = FakeRunner::new();
+        let herdr = Herdr::new("herdr", "sock", &runner);
+        let mut state = State::default();
+        let settings = Settings::default();
+        let now = at("2026-10-08T14:10:00Z");
+        assert_eq!(nudge(&project, &mut state, &settings, &herdr, None, now).unwrap(), NudgeOutcome::Held(NO_COORDINATOR));
+        assert_eq!(state.renudged_at, "", "a held reminder is not spent");
+        // A recent reminder spaces the next one out, coordinator or not.
+        state.renudged_at = "2026-10-08T14:05:00Z".into();
+        assert_eq!(nudge(&project, &mut state, &settings, &herdr, None, now).unwrap(), NudgeOutcome::Held(REMINDED));
+    }
+
+    #[test]
+    fn an_idle_thread_without_a_report_change_is_noted_once() {
+        let root = tempfile::tempdir().unwrap();
+        let project = project::create(root.path(), "demo", "", vec![]).unwrap();
+        // A verbal handoff: idle half an hour after its report stopped changing.
+        let stale = thread::allocate(&project, |t| {
+            t.title = "slow hands".into();
+            t.status = Status::Open;
+            t.last_state = "idle".into();
+            t.last_group = "ready-for-review".into();
+            t.report_hash = "abc".into();
+            t.last_review_item_hash = "abc".into();
+            t.last_report_change = "2026-10-08T13:00:00Z".into();
+            t.last_state_change = "2026-10-08T13:40:00Z".into();
+        })
+        .unwrap();
+        // The normal flow: the report changed right before the turn ended.
+        thread::allocate(&project, |t| {
+            t.title = "fresh report".into();
+            t.status = Status::Open;
+            t.last_state = "idle".into();
+            t.last_group = "ready-for-review".into();
+            t.report_hash = "def".into();
+            t.last_review_item_hash = "def".into();
+            t.last_report_change = "2026-10-08T13:39:00Z".into();
+            t.last_state_change = "2026-10-08T13:40:00Z".into();
+        })
+        .unwrap();
+        let mut state = State::default();
+        write_idle_notes(&project, &mut state, at("2026-10-08T14:20:00Z")).unwrap();
+        let items = inbox::unhandled(&project);
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].subject, stale.id);
+        assert_eq!(items[0].event, "idle without report");
+        // The same idle spell is never noted twice.
+        write_idle_notes(&project, &mut state, at("2026-10-08T15:20:00Z")).unwrap();
+        assert_eq!(inbox::unhandled(&project).len(), 1);
     }
 
     #[test]

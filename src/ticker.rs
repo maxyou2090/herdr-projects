@@ -317,7 +317,20 @@ pub fn tick(ctx: &Ctx, log: &Log, memory: &mut Memory) -> bool {
             continue;
         }
         match tick_cheap(ctx, &project, &mut sessions) {
-            Ok(Some(seen)) => reachable.push((project, seen)),
+            Ok(Some(seen)) => {
+                match (&seen.nudge_held, memory.nudge_held.get(&slug)) {
+                    (Some(held), previous) if previous.map(String::as_str) != Some(held.as_str()) => {
+                        log.line(&format!("{slug}: nudge held: {held}"));
+                        memory.nudge_held.insert(slug.clone(), held.clone());
+                    }
+                    (None, Some(previous)) => {
+                        log.line(&format!("{slug}: nudge no longer held (was: {previous})"));
+                        memory.nudge_held.remove(&slug);
+                    }
+                    _ => {}
+                }
+                reachable.push((project, seen))
+            }
             Ok(None) => unreachable.push(project),
             Err(error) => log.line(&format!("{slug}: {error:#}")),
         }
@@ -581,6 +594,9 @@ pub struct Seen {
     /// The session answered, the project has at least two recorded local
     /// panes, and every one of them is missing: herdr was restarted.
     session_lost: bool,
+    /// Why a nudge had items to send but sent nothing this tick, for the
+    /// ticker's log.
+    nudge_held: Option<String>,
 }
 
 /// Both passes for one project; `Ok(false)` when its session is unreachable.
@@ -887,13 +903,18 @@ fn tick_cheap(ctx: &Ctx, project: &Project, sessions: &mut Sessions) -> Result<O
     let missing_panes = pass.missing_panes + coordinator_missing;
 
     // Nudge (or notify) about inbox items `context` has not shown yet.
+    let mut nudge_held = None;
     if let Ok((settings, _)) = project.read_project_md() {
         let mut state = steps::load_state(project);
         let before = state.clone();
         let now = jiff::Timestamp::now();
         let target = coordinator::nudge_target(&coordinators, now);
-        if let Err(error) = steps::nudge(project, &mut state, &settings, &herdr, target, now) {
-            first_error = first_error.or(Some(error.context("nudge")));
+        match steps::nudge(project, &mut state, &settings, &herdr, target, now) {
+            Ok(steps::NudgeOutcome::Delivered) | Ok(steps::NudgeOutcome::Quiet) => {}
+            Ok(steps::NudgeOutcome::Held(why)) => nudge_held = Some(why.to_string()),
+            Err(error) => {
+                first_error = first_error.or(Some(error.context("nudge")));
+            }
         }
         if state != before {
             steps::save_state(project, &state)?;
@@ -910,6 +931,7 @@ fn tick_cheap(ctx: &Ctx, project: &Project, sessions: &mut Sessions) -> Result<O
             stuck: pass.stuck,
             coordinator: !coordinators.is_empty(),
             session_lost: recorded_panes >= 2 && missing_panes == recorded_panes,
+            nudge_held,
         })),
     }
 }
@@ -1011,6 +1033,7 @@ fn tick_slow(ctx: &Ctx, project: &Project, seen: &Seen, memory: &mut Memory) -> 
     let notifier = crate::notify::Notifier::new(ctx, project);
     errors.extend(steps::write_thread_items(project, &mut state, &transitions, seen.session_lost, &copy_notes, &notifier).err());
     errors.extend(steps::write_stuck_items(project, &mut state, &seen.stuck, &notifier).err());
+    errors.extend(steps::write_idle_notes(project, &mut state, now).err());
     errors.extend(steps::pull_requests(ctx, project, &mut state, memory, now));
     errors.extend(steps::resolve_merged(ctx, project, &mut state, now));
     errors.extend(routine_pass(ctx, project, &mut state, seen.coordinator));
