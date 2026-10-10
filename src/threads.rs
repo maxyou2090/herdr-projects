@@ -306,7 +306,7 @@ fn write_brief(ctx: &Ctx, project: &Project, placed: &Thread, restart: bool) -> 
 /// repo's main checkout for a checkout thread.
 fn place_tab(project: &Project, view: &SessionView, record: &Thread) -> Result<Thread> {
     let coordinator = project.coordinator().context("the project has never been opened")?;
-    let workspace = coordinator::project_workspace(&coordinator, &view.panes);
+    let workspace = coordinator::project_workspace(&coordinator, &view.panes, &view.agents);
     if workspace.is_none() && !view.agents.iter().any(|a| coordinator::is_coordinator(&coordinator, a)) {
         bail!("the project's workspace is not open; run `open {}` first", project.slug);
     }

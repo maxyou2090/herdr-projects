@@ -55,11 +55,17 @@ pub fn pane_matches(record: &Coordinator, pane: &Pane) -> bool {
 /// and the folder check alone would hide it from every nudge until it
 /// comes home. Its native session id keeps a reused pane id from counting.
 pub fn is_coordinator(record: &Coordinator, agent: &Agent) -> bool {
-    agent.works_in(&record.cwd)
-        || (!record.pane_id.is_empty()
-            && !record.agent_session.is_empty()
-            && agent.pane_id == record.pane_id
-            && agent.session_id() == record.agent_session)
+    agent.works_in(&record.cwd) || session_matches(record, agent)
+}
+
+/// True when `agent` is the very one the record names by pane and native
+/// session id. Workspace and pane ids repeat after a server restart; a
+/// session match proves the pane was not recycled.
+fn session_matches(record: &Coordinator, agent: &Agent) -> bool {
+    !record.pane_id.is_empty()
+        && !record.agent_session.is_empty()
+        && agent.pane_id == record.pane_id
+        && agent.session_id() == record.agent_session
 }
 
 /// True when the pane sits in the project folder: its shell's directory, or
@@ -76,13 +82,22 @@ pub fn workspace_open(record: &Coordinator, panes: &[Pane]) -> bool {
 }
 
 /// The workspace thread tabs go to: the recorded one while open, else any
-/// workspace with a shell in the project folder. A coordinator `open` started
-/// in some other workspace's pane leaves the record pointing there.
-pub fn project_workspace(record: &Coordinator, panes: &[Pane]) -> Option<String> {
+/// workspace with a shell in the project folder (where earlier thread tabs
+/// run, so the threads stay together). A coordinator `open` started in some
+/// other workspace's pane leaves the record pointing there. The recorded
+/// one also counts, last, while its pane still runs the recorded coordinator
+/// session: the id is then no recycled one, only the pane's directory left
+/// the project folder (a deleted folder strands its shell at the home
+/// directory), and a second home workspace would split the project across
+/// two same-named spaces.
+pub fn project_workspace(record: &Coordinator, panes: &[Pane], agents: &[Agent]) -> Option<String> {
     if workspace_open(record, panes) {
         return Some(record.workspace_id.clone());
     }
-    panes.iter().find(|p| pane_in_project(record, p)).map(|p| p.workspace_id.clone())
+    if let Some(found) = panes.iter().find(|p| pane_in_project(record, p)).map(|p| p.workspace_id.clone()) {
+        return Some(found);
+    }
+    (!record.workspace_id.is_empty() && agents.iter().any(|a| session_matches(record, a))).then(|| record.workspace_id.clone())
 }
 
 /// The record `open` would write for the most recently active agent working
@@ -749,11 +764,33 @@ mod tests {
             ..Pane::default()
         };
         assert!(workspace_open(&record, std::slice::from_ref(&pane)));
-        assert_eq!(project_workspace(&record, &[pane]).as_deref(), Some("w1"));
+        assert_eq!(project_workspace(&record, &[pane], &[]).as_deref(), Some("w1"));
         // A pane in neither directory is still not the project's.
         let other = Pane { workspace_id: "w2".into(), cwd: "/tmp".into(), ..Pane::default() };
         assert!(!workspace_open(&record, std::slice::from_ref(&other)));
-        assert_eq!(project_workspace(&record, &[other]), None);
+        assert_eq!(project_workspace(&record, &[other.clone()], &[]), None);
+        // ...unless its pane still runs the recorded coordinator session:
+        // the workspace stays the project's home instead of splitting it
+        // across a second same-named one. A workspace with a shell in the
+        // project folder still wins, so the threads stay together.
+        let mut recorded = record.clone();
+        recorded.workspace_id = "w2".into();
+        recorded.pane_id = "w2:p1".into();
+        recorded.agent_session = "/sessions/demo.jsonl".into();
+        let drifted = Agent {
+            agent_session: Some(crate::herdr::AgentSession { value: "/sessions/demo.jsonl".into() }),
+            ..agent("w2:p1", "/home/me", "idle", 1)
+        };
+        assert_eq!(project_workspace(&record, &[other.clone()], &[drifted.clone()]), None);
+        assert_eq!(project_workspace(&recorded, &[other.clone()], &[drifted]).as_deref(), Some("w2"));
+        let tabbed = Pane { workspace_id: "w3".into(), pane_id: "w3:p9".into(), cwd: "/r/demo/threads/t-0001".into(), ..Pane::default() };
+        let reused = Agent {
+            agent_session: Some(crate::herdr::AgentSession { value: "/sessions/other.jsonl".into() }),
+            ..agent("w2:p1", "/home/me", "idle", 1)
+        };
+        assert_eq!(project_workspace(&recorded, &[other, tabbed], &[reused.clone()]).as_deref(), Some("w3"));
+        // A recycled pane id running another session does not win.
+        assert_eq!(project_workspace(&recorded, &[], &[reused]), None);
     }
 
     #[test]

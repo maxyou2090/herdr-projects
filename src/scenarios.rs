@@ -2425,29 +2425,28 @@ fn open_makes_a_tab_outside_a_shell_pane_from_the_popup_with_tab_or_from_an_agen
 }
 
 #[test]
-fn a_tab_thread_of_a_coordinator_running_in_another_workspace_opens_the_project_workspace() {
+fn a_tab_thread_of_a_coordinator_whose_pane_left_the_project_folder_joins_its_workspace() {
     let h = Here::new(&[]);
     h.runs.borrow_mut().push((0, format!("[{}]", h.child_agent("w5:p1", "", "sess-7"))));
     h.open(true, false).unwrap();
     let folder = h.project.dir().join("threads/t-0001");
     h.world.runner.on("pane get", ok(r#"{"result":{"pane":{"cwd":""}}}"#));
+    h.world.runner.on("tab create", ok(r#"{"result":{"root_pane":{"workspace_id":"w5","tab_id":"w5:t2","pane_id":"w5:p2"}}}"#));
+    h.world.runner.on("agent start", ok(r#"{"result":{"agent":{"pane_id":"w5:p2","tab_id":"w5:t2","workspace_id":"w5","name":"hp-demo-t-0001","agent":"claude","agent_status":"idle"}}}"#));
     let args = |title: &str| StartArgs { title: title.into(), repo: None, machine: None, profile: None, kind: Some(Kind::Tab), base: None, task: "Look.".into() };
     let t = threads::start(&h.world.ctx(), "demo", args("Research")).unwrap();
-    let calls = h.world.runner.calls.borrow();
-    let create = calls.iter().filter(|c| c.display().contains("workspace create")).last().unwrap();
-    assert!(create.display().contains("threads/t-0001") && create.args.contains(&"Demo\u{2800}".to_string()), "{}", create.display());
-    drop(calls);
-    // (`Here` scripts every new workspace as w3.)
-    assert_eq!(h.world.runner.count("tab rename w3:t1 Research"), 1);
-    assert_eq!((t.workspace_id.as_str(), t.pane_id.as_str()), ("w3", "w3:p1"));
+    // The recorded pane still runs the recorded session: its workspace stays
+    // the project's home instead of opening a second same-named one.
+    assert_eq!(h.world.runner.count("tab create --workspace w5"), 1);
+    assert_eq!(h.world.runner.count("workspace create"), 0);
+    assert_eq!((t.workspace_id.as_str(), t.pane_id.as_str()), ("w5", "w5:p2"));
 
     // The next tab thread finds that workspace by its shell in the project folder.
     let folder = std::fs::canonicalize(&folder).unwrap();
-    *h.world.panes.borrow_mut() = format!("[{},{}]", pane_json("w5", "w5:t1", "w5:p1", "/tmp"), pane_json("w3", "w3:t1", "w3:p1", &folder.to_string_lossy()));
-    h.world.runner.on("tab create", ok(r#"{"result":{"root_pane":{"workspace_id":"w3","tab_id":"w3:t2","pane_id":"w3:p2"}}}"#));
+    *h.world.panes.borrow_mut() = format!("[{},{}]", pane_json("w5", "w5:t1", "w5:p1", "/tmp"), pane_json("w5", "w5:t2", "w5:p2", &folder.to_string_lossy()));
     threads::start(&h.world.ctx(), "demo", args("More")).unwrap();
-    assert_eq!(h.world.runner.count("tab create --workspace w3"), 1);
-    assert_eq!(h.world.runner.count("workspace create"), 1);
+    assert_eq!(h.world.runner.count("tab create --workspace w5"), 2);
+    assert_eq!(h.world.runner.count("workspace create"), 0);
 }
 
 /// Herdr's default socket, where the ticker looks for hand-started agents.
