@@ -45,8 +45,13 @@ fn close_workspaces(project: &Project, view: &SessionView) -> Vec<String> {
         Err(error) => notes.push(format!("could not close {what}: {error}")),
     };
     let mut done = Vec::new();
-    for t in thread::list(project).iter().filter(|t| t.status != thread::Status::Resolved && !t.is_remote() && t.kind == thread::Kind::Worktree) {
-        let workspace = view.panes.iter().find(|p| !t.worktree_path.is_empty() && std::path::Path::new(&p.cwd).starts_with(&t.worktree_path)).map(|p| p.workspace_id.clone());
+    let home = project.coordinator().map(|c| c.workspace_id).unwrap_or_default();
+    for t in thread::list(project).iter().filter(|t| t.status != thread::Status::Resolved && !t.is_remote() && matches!(t.kind, thread::Kind::Worktree | thread::Kind::Tab)) {
+        // A worktree thread's Space is on its worktree, a tab thread's on its
+        // own `threads/<id>/` folder; one still living in the home (placed
+        // before it got a Space of its own) is closed with the home below.
+        let root = if t.kind == thread::Kind::Worktree { t.worktree_path.as_str() } else { t.cwd.as_str() };
+        let workspace = view.panes.iter().find(|p| !root.is_empty() && p.workspace_id != home && std::path::Path::new(&p.cwd).starts_with(root)).map(|p| p.workspace_id.clone());
         if let Some(workspace) = workspace
             && !done.contains(&workspace)
         {

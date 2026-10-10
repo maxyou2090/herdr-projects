@@ -302,8 +302,9 @@ fn write_brief(ctx: &Ctx, project: &Project, placed: &Thread, restart: bool) -> 
     Ok(())
 }
 
-/// A tab in the project workspace: in `threads/<id>/` for a tab thread, in the
-/// repo's main checkout for a checkout thread.
+/// A workspace of the thread's own on `threads/<id>/` for a tab thread, so
+/// the coordinator keeps its Space to itself; a tab of the project's own
+/// workspace, in the repo's main checkout, for a checkout thread.
 fn place_tab(project: &Project, view: &SessionView, record: &Thread) -> Result<Thread> {
     let coordinator = project.coordinator().context("the project has never been opened")?;
     let workspace = coordinator::project_workspace(&coordinator, &view.panes, &view.agents);
@@ -321,16 +322,39 @@ fn place_tab(project: &Project, view: &SessionView, record: &Thread) -> Result<T
         folder
     };
     let folder = std::fs::canonicalize(&folder)?;
-    let created = match workspace {
-        Some(id) => view.herdr.tab_create(&id, &folder, &record.title, false)?,
-        // The coordinator runs in a pane of another workspace: the thread
-        // opens the project's own.
-        None => {
-            let (settings, _) = project.read_project_md()?;
-            let created = view.herdr.workspace_create(&folder, &crate::project::home_label(&settings.name, &project.slug), false)?;
-            let _ = view.herdr.call(&["tab", "rename", &created.tab_id, &record.title], crate::herdr::CALL_TIMEOUT);
-            created
-        }
+    // A tab thread reuses a Space of its own, never the project's home: a
+    // pane working in its folder names it, unless it sits in the recorded
+    // home (a thread placed before it got a Space of its own).
+    let own_space = if record.kind == Kind::Tab {
+        let home = coordinator.workspace_id.as_str();
+        view.panes.iter().find(|p| Path::new(&p.cwd).starts_with(&folder) && p.workspace_id != home).map(|p| p.workspace_id.clone())
+    } else {
+        None
+    };
+    let created = match record.kind {
+        // Its own Space, never a tab of the project's home: a restart first
+        // reuses the Space the thread already has, found by a pane working
+        // in its folder.
+        Kind::Tab => match own_space {
+            Some(id) => view.herdr.tab_create(&id, &folder, &record.title, false)?,
+            None => {
+                let created = view.herdr.workspace_create(&folder, &record.title, false)?;
+                let _ = view.herdr.call(&["tab", "rename", &created.tab_id, &record.title], crate::herdr::CALL_TIMEOUT);
+                created
+            }
+        },
+        // A checkout thread runs in a tab of the project's own workspace.
+        _ => match workspace {
+            Some(id) => view.herdr.tab_create(&id, &folder, &record.title, false)?,
+            // The coordinator runs in a pane of another workspace: the thread
+            // opens the project's own.
+            None => {
+                let (settings, _) = project.read_project_md()?;
+                let created = view.herdr.workspace_create(&folder, &crate::project::home_label(&settings.name, &project.slug), false)?;
+                let _ = view.herdr.call(&["tab", "rename", &created.tab_id, &record.title], crate::herdr::CALL_TIMEOUT);
+                created
+            }
+        },
     };
     let cwd = view.herdr.pane_cwd(&created.pane_id).unwrap_or_default();
     let cwd = if cwd.is_empty() { folder.to_string_lossy().into_owned() } else { cwd };
