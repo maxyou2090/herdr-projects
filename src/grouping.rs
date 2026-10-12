@@ -10,7 +10,11 @@
 //! because a client draws another machine's rows with its own config.
 //!
 //! Agents sort by `$hp_group` in the agent view; Spaces are moved into one
-//! block per project with `workspace.move`. Anything in no project comes last.
+//! block per project with `workspace.move`. Only Spaces of this root's own
+//! projects are ever moved, and a block that already stands somewhere is
+//! left alone: another root's ticker sharing the session settles beside it
+//! instead of the two trading the head of the list every tick. Anything in
+//! no project comes last.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::time::{Duration, Instant};
@@ -83,14 +87,12 @@ pub type Tokens = Vec<(String, Option<String>)>;
 #[derive(Debug, Default, PartialEq)]
 pub struct Plan {
     pub agents: Vec<(String, Tokens)>,
-    /// The Space order Herdr should end up with.
-    pub order: Vec<String>,
 }
 
-/// The whole layout of one session. Agents: projects by slug, each in its own
-/// key order, then every other agent in Herdr's order. Spaces: the same
-/// blocks, then every other Space in Herdr's order.
-pub fn plan(parts: &Parts, agents: &[Agent], workspaces: &[Workspace]) -> Plan {
+/// The agents' half of one session's layout: projects by slug, each in its
+/// own key order, then every other agent in Herdr's order. The Spaces' half
+/// is [`owned`] and [`moves`], which read the live list each time.
+pub fn plan(parts: &Parts, agents: &[Agent]) -> Plan {
     let mut out = Plan::default();
     if parts.is_empty() {
         return out;
@@ -115,36 +117,55 @@ pub fn plan(parts: &Parts, agents: &[Agent], workspaces: &[Workspace]) -> Plan {
         out.agents.push((pane.to_string(), tokens));
     }
 
-    // Spaces: a stable sort into blocks.
-    let mut space_owner: HashMap<&str, (&str, usize)> = HashMap::new();
-    for (slug, part) in parts {
-        for (i, id) in part.spaces.iter().enumerate() {
-            space_owner.entry(id.as_str()).or_insert((slug.as_str(), i));
-        }
-    }
-    let mut ordered: Vec<(&str, usize, &Workspace)> = workspaces
-        .iter()
-        .enumerate()
-        .map(|(i, w)| match space_owner.get(w.workspace_id.as_str()) {
-            Some((slug, pos)) => (*slug, *pos, w),
-            None => (OTHER, i, w),
-        })
-        .collect();
-    ordered.sort_by(|a, b| (a.0, a.1).cmp(&(b.0, b.1)));
-    out.order = ordered.iter().map(|(_, _, w)| w.workspace_id.clone()).collect();
     out
 }
 
-/// The `workspace.move` calls that turn `current` into `wanted`: each Space
-/// in turn goes to its index, so at most one call per misplaced Space.
-pub fn moves(current: &[String], wanted: &[String]) -> Vec<(String, usize)> {
+/// The Spaces of this root's projects in sidebar order — projects by slug,
+/// each project's Spaces in its `part` order — keeping only the ones Herdr
+/// lists. A Space two projects both claim belongs to the first (slugs sort).
+pub fn owned(parts: &Parts, current: &[String]) -> Vec<String> {
+    let listed: HashSet<&str> = current.iter().map(String::as_str).collect();
+    let mut out: Vec<String> = Vec::new();
+    for part in parts.values() {
+        for id in &part.spaces {
+            if listed.contains(id.as_str()) && !out.iter().any(|x| x == id) {
+                out.push(id.clone());
+            }
+        }
+    }
+    out
+}
+
+/// Whether this root's Spaces already stand as one block, in [`owned`]'s
+/// order, wherever in the list that block happens to be. The block's place
+/// is no part of the target: another root's ticker may hold the head of the
+/// list, and this one leaves it be instead of the two trading places every
+/// tick. A Space of ours the list does not show (closed, not yet opened)
+/// does not count.
+pub fn settled(current: &[String], own: &[String]) -> bool {
+    let positions: Vec<usize> = own.iter().filter_map(|id| current.iter().position(|x| x == id)).collect();
+    positions.windows(2).all(|w| w[1] == w[0] + 1)
+}
+
+/// The `workspace.move` calls that turn `current` into this root's layout:
+/// its own Spaces one block, in order, ahead of everything else, with the
+/// rest keeping their relative order. Nothing moves while the block already
+/// stands somewhere ([`settled`]); when it does not, each Space in turn goes
+/// to its index, so at most one call per misplaced Space — and every moved
+/// Space is one of ours, so a second root sharing the session is never
+/// reordered, only shifted, and the two alternating `apply`s settle instead
+/// of swinging the sidebar back and forth.
+pub fn moves(current: &[String], own: &[String]) -> Vec<(String, usize)> {
+    if settled(current, own) {
+        return Vec::new();
+    }
     let mut now = current.to_vec();
     let mut out = Vec::new();
-    for (i, id) in wanted.iter().enumerate() {
+    for (i, id) in own.iter().enumerate() {
         let Some(at) = now.iter().position(|x| x == id) else {
             continue;
         };
-        if at != i && i < now.len() {
+        if at != i {
             let moved = now.remove(at);
             now.insert(i, moved);
             out.push((id.clone(), i));
@@ -226,9 +247,9 @@ pub fn apply(herdr: &Herdr, socket: &str, parts: &Parts, agents: &[Agent], sent:
             w.label = label;
         }
     }
-    let layout = plan(parts, agents, &workspaces);
+    let layout = plan(parts, agents);
     let current: Vec<String> = workspaces.iter().map(|w| w.workspace_id.clone()).collect();
-    for (id, index) in moves(&current, &layout.order) {
+    for (id, index) in moves(&current, &owned(parts, &current)) {
         if herdr.workspace_move(&id, index).is_err() {
             break;
         }
@@ -258,6 +279,21 @@ mod tests {
         PaneRow { pane: pane.into(), key, sub: sub.into() }
     }
 
+    fn s(v: &[&str]) -> Vec<String> {
+        v.iter().map(|x| x.to_string()).collect()
+    }
+
+    /// Herdr's side of the calls: a Space comes out of the list and goes back
+    /// at the index given, a gap in the list before the removal.
+    fn herdr_moves(list: &mut Vec<String>, steps: &[(String, usize)]) {
+        for (id, i) in steps {
+            let at = list.iter().position(|x| x == id).unwrap();
+            let target = if at < *i { *i - 1 } else { *i };
+            let moved = list.remove(at);
+            list.insert(target, moved);
+        }
+    }
+
     fn parts() -> Parts {
         let mut parts = Parts::new();
         parts.insert("beta".into(), ProjectPart { panes: vec![row("b1", coordinator_key("beta", "b1"), "")], home: "wb".into(), spaces: vec!["wb".into()] });
@@ -283,7 +319,7 @@ mod tests {
     #[test]
     fn agents_sort_into_projects_with_their_own_sub_lines_and_others_last() {
         let agents: Vec<Agent> = ["x1", "a2", "b1", "a3", "x2", "a1"].into_iter().map(agent).collect();
-        let layout = plan(&parts(), &agents, &[]);
+        let layout = plan(&parts(), &agents);
         let order: Vec<&str> = layout.agents.iter().map(|(p, _)| p.as_str()).collect();
         assert_eq!(order, ["a1", "a3", "a2", "b1", "x1", "x2"]);
         let t: HashMap<&str, &Tokens> = layout.agents.iter().map(|(p, t)| (p.as_str(), t)).collect();
@@ -300,18 +336,33 @@ mod tests {
     }
 
     #[test]
-    fn spaces_move_into_project_blocks_and_others_keep_their_order_last() {
-        let workspaces = vec![
-            space("mine", "", false),
-            space("wt3", "r", true),
-            space("wb", "", false),
-            space("repo", "r", false),
-            space("wa", "", false),
-            space("wt2", "r", true),
-            space("other2", "", false),
-        ];
-        let layout = plan(&parts(), &[], &workspaces);
-        assert_eq!(layout.order, ["wa", "repo", "wt2", "wt3", "wb", "mine", "other2"]);
+    fn spaces_gather_into_project_blocks_and_others_keep_their_order_last() {
+        let list = s(&["mine", "wt3", "wb", "repo", "wa", "wt2", "other2"]);
+        let own = owned(&parts(), &list);
+        assert_eq!(own, s(&["wa", "repo", "wt2", "wt3", "wb"]));
+        let steps = moves(&list, &own);
+        assert!(steps.iter().all(|(id, _)| own.contains(id)), "no foreign Space is moved");
+        let mut after = list.clone();
+        herdr_moves(&mut after, &steps);
+        assert_eq!(after, s(&["wa", "repo", "wt2", "wt3", "wb", "mine", "other2"]));
+    }
+
+    #[test]
+    fn a_block_standing_somewhere_needs_no_move() {
+        // Another root's three Spaces hold the head of the list; ours stand
+        // behind them, one block in order. That is the target: no call.
+        let list = s(&["wP2", "wP3", "wP4", "wa", "repo", "wt2", "wt3", "wb", "mine"]);
+        assert!(settled(&list, &owned(&parts(), &list)));
+        assert!(moves(&list, &owned(&parts(), &list)).is_empty());
+    }
+
+    #[test]
+    fn a_foreign_space_inside_the_block_is_pushed_out_again() {
+        let list = s(&["wa", "mine", "repo", "wt2", "wt3", "wb"]);
+        let steps = moves(&list, &owned(&parts(), &list));
+        let mut after = list.clone();
+        herdr_moves(&mut after, &steps);
+        assert_eq!(after, s(&["wa", "repo", "wt2", "wt3", "wb", "mine"]));
     }
 
     #[test]
@@ -334,26 +385,113 @@ mod tests {
     }
 
     #[test]
-    fn moves_are_minimal_and_reach_the_wanted_order() {
-        let s = |v: &[&str]| v.iter().map(|x| x.to_string()).collect::<Vec<_>>();
-        assert!(moves(&s(&["a", "b", "c"]), &s(&["a", "b", "c"])).is_empty());
-        let current = s(&["c", "a", "b", "d"]);
-        let wanted = s(&["a", "b", "c", "d"]);
-        let steps = moves(&current, &wanted);
-        let mut now = current.clone();
-        for (id, i) in &steps {
-            // Herdr's insert index is a gap in the list before removal.
-            let at = now.iter().position(|x| x == id).unwrap();
-            let target = if at < *i { i - 1 } else { *i };
-            let moved = now.remove(at);
-            now.insert(target, moved);
+    fn moves_are_minimal_and_reach_the_block() {
+        let own = s(&["a1", "a2"]);
+        let list = s(&["b", "a2", "x", "a1"]);
+        let steps = moves(&list, &own);
+        assert_eq!(steps.len(), 2, "one call per misplaced Space");
+        let mut after = list.clone();
+        herdr_moves(&mut after, &steps);
+        assert_eq!(after, s(&["a1", "a2", "b", "x"]));
+        assert!(moves(&after, &own).is_empty());
+    }
+
+    #[test]
+    fn two_roots_alternating_settle_instead_of_trading_the_head() {
+        // A second root's projects in the same session: a skill trial with
+        // three Spaces of its own.
+        let mut theirs = Parts::new();
+        theirs.insert("skills".into(), ProjectPart { panes: vec![], home: "wP2".into(), spaces: s(&["wP2", "wP3", "wP4"]) });
+        let mine = parts();
+        // Both roots scrambled around one foreign Space.
+        let mut list = s(&["wP3", "wt3", "wb", "wP2", "mine", "wa", "repo", "wt2", "wP4"]);
+        let mut quiet = 0;
+        for _ in 0..8 {
+            let before = list.clone();
+            let mut moved = false;
+            for root in [&mine, &theirs] {
+                let own = owned(root, &list);
+                let foreign: Vec<String> = list.iter().filter(|id| !own.contains(*id)).cloned().collect();
+                let steps = moves(&list, &own);
+                moved |= !steps.is_empty();
+                herdr_moves(&mut list, &steps);
+                // Whoever's Spaces move, the ones this root does not own keep
+                // their relative order, the other root's block included.
+                let kept: Vec<String> = list.iter().filter(|id| foreign.contains(id)).cloned().collect();
+                assert_eq!(kept, foreign);
+            }
+            if moved {
+                assert_ne!(before, list, "Spaces moved without the order changing");
+                quiet = 0;
+            } else {
+                quiet += 1;
+            }
         }
-        assert_eq!(now, wanted);
-        assert_eq!(steps.len(), 2);
+        // Converged: neither root moves any more, and each stands as one
+        // block in order, the root that settled first keeping the head.
+        assert!(quiet >= 5, "the two roots kept trading places: {list:?}");
+        assert_eq!(list, s(&["wP2", "wP3", "wP4", "wa", "repo", "wt2", "wt3", "wb", "mine"]));
+    }
+
+    #[test]
+    fn two_tickers_on_one_session_stop_calling_workspace_move() {
+        use crate::runner::fake::{FakeRunner, ok};
+        use std::cell::RefCell;
+        use std::rc::Rc;
+
+        // The session both roots share, scripted: `workspace list` answers
+        // with the live order, and each `workspace.move` (a socket call) is
+        // applied to it the way Herdr applies one.
+        let list = Rc::new(RefCell::new(s(&["wP3", "wt3", "wb", "wP2", "mine", "wa", "repo", "wt2", "wP4"])));
+        let runner = FakeRunner::new();
+        {
+            let list = list.clone();
+            runner.on_fn(
+                |cmd| cmd.display().contains("workspace list"),
+                move |_| {
+                    let spaces: Vec<String> = list.borrow().iter().map(|id| format!(r#"{{"workspace_id":"{id}"}}"#)).collect();
+                    Ok(ok(&format!(r#"{{"result":{{"workspaces":[{}]}}}}"#, spaces.join(","))))
+                },
+            );
+        }
+        let herdr = Herdr::new("herdr", "/tmp/herdr-grouping.sock", &runner);
+        let mut theirs = Parts::new();
+        theirs.insert("skills".into(), ProjectPart { panes: vec![], home: "wP2".into(), spaces: s(&["wP2", "wP3", "wP4"]) });
+        let mut mine_sent = Sent::default();
+        let mut their_sent = Sent::default();
+        let mut seen = 0;
+        let mut quiet = 0;
+        for _ in 0..8 {
+            apply(&herdr, "sock", &parts(), &[], &mut mine_sent);
+            apply(&herdr, "sock", &theirs, &[], &mut their_sent);
+            let requests = runner.socket_requests.borrow().clone();
+            let mut calls = 0;
+            for (_, line) in &requests[seen..] {
+                let Ok(value) = serde_json::from_str::<serde_json::Value>(line) else { continue };
+                if value["method"] != "workspace.move" {
+                    continue;
+                }
+                calls += 1;
+                let id = value["params"]["workspace_id"].as_str().unwrap().to_string();
+                let i = value["params"]["insert_index"].as_u64().unwrap() as usize;
+                let mut live = list.borrow_mut();
+                let at = live.iter().position(|x| *x == id).unwrap();
+                let target = if at < i { i - 1 } else { i };
+                let moved = live.remove(at);
+                live.insert(target, moved);
+            }
+            seen = requests.len();
+            quiet = if calls > 0 { 0 } else { quiet + 1 };
+        }
+        assert!(quiet >= 5, "workspace.move kept firing: {:?}", list.borrow());
+        assert_eq!(*list.borrow(), s(&["wP2", "wP3", "wP4", "wa", "repo", "wt2", "wt3", "wb", "mine"]));
     }
 
     #[test]
     fn no_project_means_no_layout() {
-        assert_eq!(plan(&Parts::new(), &[agent("x")], &[space("w", "", false)]), Plan::default());
+        assert_eq!(plan(&Parts::new(), &[agent("x")]), Plan::default());
+        let list = s(&["w"]);
+        assert!(owned(&Parts::new(), &list).is_empty());
+        assert!(moves(&list, &owned(&Parts::new(), &list)).is_empty());
     }
 }
