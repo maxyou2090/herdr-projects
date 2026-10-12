@@ -1599,6 +1599,31 @@ fn a_pull_request_opened_and_merged_between_two_passes_is_linked_and_its_branch_
     assert!(item.summary.contains("deleted (its pull request is merged)"), "{}", item.summary);
 }
 
+#[test]
+fn coordinator_resolving_a_thread_archives_its_redundant_notification() {
+    let mut world = World::new();
+    let project = world.project("demo", "a.sock");
+    world.thread(&project, world.home.path(), |_| {});
+    let record = project.coordinator().unwrap();
+    world.env = Env::for_test(
+        world.home.path(),
+        &[
+            ("HERDR_SOCKET_PATH", &record.socket),
+            ("HERDR_WORKSPACE_ID", &record.workspace_id),
+            ("HERDR_TAB_ID", &record.tab_id),
+            ("HERDR_PANE_ID", &record.pane_id),
+        ],
+    );
+
+    threads::resolve(&world.ctx(), "demo", "t-0001", &ResolveArgs::default()).unwrap();
+
+    assert!(crate::inbox::unhandled(&project).is_empty());
+    let archived = std::fs::read_dir(project.dir().join("inbox/done"))
+        .unwrap()
+        .count();
+    assert_eq!(archived, 1);
+}
+
 /// Resolved before the ticker ever looked at its merged pull request, with and
 /// without a `PR:` line: resolve looks once more and deletes the branch.
 #[test]

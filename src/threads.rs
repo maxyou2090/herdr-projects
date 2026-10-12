@@ -876,8 +876,34 @@ pub fn resolve(ctx: &Ctx, slug: &str, id: &str, args: &ResolveArgs) -> Result<()
     for note in &notes {
         println!("  - {note}");
     }
-    crate::inbox::write(&project, "thread-state", id, "resolved", &format!("{id} \"{}\" was resolved: {}", resolved.title, notes.join("; ")), "")?;
+    let event_id = crate::inbox::write(
+        &project,
+        "thread-state",
+        id,
+        "resolved",
+        &format!(
+            "{id} \"{}\" was resolved: {}",
+            resolved.title,
+            notes.join("; ")
+        ),
+        "",
+    )?;
+    if called_from_coordinator(ctx, &project) {
+        crate::inbox::done(&project, &[event_id], false)?;
+    }
     Ok(())
+}
+
+/// A coordinator already knows the result of a resolve it initiated, so keep
+/// its audit event without putting a redundant item back in its own inbox.
+fn called_from_coordinator(ctx: &Ctx, project: &Project) -> bool {
+    let Some(record) = project.coordinator() else {
+        return false;
+    };
+    ctx.env.var("HERDR_SOCKET_PATH") == Some(record.socket.as_str())
+        && ctx.env.var("HERDR_WORKSPACE_ID") == Some(record.workspace_id.as_str())
+        && ctx.env.var("HERDR_TAB_ID") == Some(record.tab_id.as_str())
+        && ctx.env.var("HERDR_PANE_ID") == Some(record.pane_id.as_str())
 }
 
 pub struct Clean {
