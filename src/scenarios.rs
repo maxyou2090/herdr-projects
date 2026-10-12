@@ -179,6 +179,13 @@ fn thread_start_preflights_skills_before_launch_and_failed_preparation_can_retry
     std::fs::create_dir_all(nested.join("references")).unwrap();
     std::fs::write(nested.join("SKILL.md"), "---\nname: nested-rules\ndescription: Nested isolated test skill.\n---\n\nRead references/nested-marker.md.\n").unwrap();
     std::fs::write(nested.join("references/nested-marker.md"), "nested marker").unwrap();
+    let outside_skill = world.home.path().join("outside-skill.md");
+    let outside_note = world.home.path().join("outside-note.md");
+    std::fs::write(&outside_skill, "external Skill").unwrap();
+    std::fs::write(&outside_note, "external note").unwrap();
+    let group = repo.join(".agents/skills/group");
+    std::os::unix::fs::symlink(&outside_skill, group.join("SKILL.md")).unwrap();
+    std::os::unix::fs::symlink(&outside_note, group.join("note.md")).unwrap();
     git(&["-C", repo.to_str().unwrap(), "worktree", "add", "--detach", "--no-checkout", worktree.to_str().unwrap()]);
     let conflict = worktree.join(".agents/skills/z-rules");
     std::fs::create_dir_all(&conflict).unwrap();
@@ -206,16 +213,24 @@ fn thread_start_preflights_skills_before_launch_and_failed_preparation_can_retry
         title: "Inherited rules".into(), repo: Some(repo_text.clone()), machine: None,
         profile: Some("fixture".into()), kind: None, base: None, task: "Verify startup ordering.".into(),
     }).unwrap_err();
-    assert!(format!("{error:#}").contains("skill path already exists"), "{error:#}");
+    assert!(format!("{error:#}").contains("escapes"), "{error:#}");
     let failed = thread::load(&project, "t-0001").unwrap();
     assert_eq!(failed.status, Status::Failed);
     assert_eq!(failed.worktree_path, worktree_text);
-    assert!(!worktree.join(".agents/skills/a-rules").exists(), "preflight left a partial link behind");
+    assert!(!worktree.join(".agents/skills/a-rules").exists(), "source preflight left a partial Skill link behind");
+    assert!(!worktree.join(".agents/skills/group").exists(), "source preflight left a partial grouping directory behind");
     assert_eq!(std::fs::read_to_string(conflict.join("SKILL.md")).unwrap(), "keep me");
     assert_eq!(world.runner.count("agent start"), 0);
 
-    std::fs::remove_dir_all(&conflict).unwrap();
+    std::fs::remove_file(group.join("SKILL.md")).unwrap();
+    std::fs::remove_file(group.join("note.md")).unwrap();
     *world.panes.borrow_mut() = format!("[{},{}]", world.coordinator_pane(&project), pane_json("w2", "w2:t1", "w2:p1", &worktree_text));
+    let conflict_error = threads::restart(&ctx, "demo", "t-0001", None).unwrap_err();
+    assert!(format!("{conflict_error:#}").contains("skill path already exists"), "{conflict_error:#}");
+    assert!(!worktree.join(".agents/skills/a-rules").exists(), "destination preflight left a partial Skill link behind");
+    assert_eq!(world.runner.count("agent start"), 0);
+
+    std::fs::remove_dir_all(&conflict).unwrap();
     let retried = threads::restart(&ctx, "demo", "t-0001", None).unwrap();
     assert_eq!(retried.status, Status::Open);
     assert!(worktree.join(".agents/skills/a-rules/SKILL.md").is_file());

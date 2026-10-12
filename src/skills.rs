@@ -49,7 +49,7 @@ pub fn prepare(repo: &Path, worktree: &Path) -> Result<()> {
     let repo_root = fs::canonicalize(worktree).context("could not resolve worktree repository")?;
     let tracked = tracked_paths(&repo_root)?;
     let mut skills = Vec::new();
-    collect_skills(&source_root, &mut skills)?;
+    collect_skills(&source_root, &mut skills, false)?;
     for parent in &skills {
         if let Some(nested) = skills.iter().find(|skill| *skill != parent && skill.starts_with(parent)) {
             bail!(
@@ -70,6 +70,10 @@ pub fn prepare(repo: &Path, worktree: &Path) -> Result<()> {
 
     let mut plan = Vec::new();
     for (from, to) in links {
+        let canonical = fs::canonicalize(&from).with_context(|| format!("could not resolve Skill source {}", from.display()))?;
+        if !canonical.starts_with(&source_root) || !canonical.starts_with(&primary) || !canonical.is_dir() {
+            bail!("Skill source {} resolves outside the primary checkout's Skills root", from.display());
+        }
         let relative = to.strip_prefix(worktree).context("skill target escaped worktree")?;
         if tracked.iter().any(|path| path == relative || path.starts_with(relative) || relative.starts_with(path)) {
             bail!("refusing to replace tracked skill path {}", relative.display());
@@ -118,53 +122,51 @@ pub fn prepare(repo: &Path, worktree: &Path) -> Result<()> {
 }
 
 /// Finds Skills at any depth, including under grouping directories without Skills of their own.
-fn collect_skills(dir: &Path, skills: &mut Vec<PathBuf>) -> Result<()> {
+/// Hidden directories and node_modules are skipped to match Pi's structural scan.
+fn collect_skills(dir: &Path, skills: &mut Vec<PathBuf>, inside_skill: bool) -> Result<()> {
     for entry in fs::read_dir(dir).with_context(|| format!("could not read {}", dir.display()))? {
         let entry = entry?;
         let path = entry.path();
+        let name = entry.file_name();
+        if name.to_string_lossy().starts_with('.') || name == "node_modules" {
+            continue;
+        }
         let kind = entry.file_type()?;
         if kind.is_symlink() {
-            if path.join("SKILL.md").is_file() {
-                bail!("skill source directory must not be a symlink: {}", path.display());
+            if inside_skill {
+                // validate_tree already proved these resolve inside the Skill root.
+                continue;
             }
-            if fs::canonicalize(&path).is_ok_and(|resolved| resolved.is_dir()) {
-                bail!("directory symlink in skill hierarchy is not supported: {}", path.display());
-            }
-            continue;
+            bail!("symlink in Skill grouping hierarchy is not supported: {}", path.display());
         }
         if !kind.is_dir() {
             continue;
         }
-        if path.join("SKILL.md").is_file() {
+        let is_skill = path.join("SKILL.md").is_file();
+        if is_skill {
             validate_tree(&path)?;
             skills.push(path.clone());
         }
-        collect_skills(&path, skills)?;
+        collect_skills(&path, skills, inside_skill || is_skill)?;
     }
     Ok(())
 }
 
-/// Mirrors only paths needed to expose nested Skills, symlinking all content to its source.
+/// Creates only grouping directories and links Skill roots; unrelated group files are not exposed.
 fn plan_node(from: &Path, to: &Path, skills: &[PathBuf], directories: &mut Vec<PathBuf>, links: &mut Vec<(PathBuf, PathBuf)>) -> Result<()> {
-    let contains_skill = skills.iter().any(|skill| skill == from || skill.starts_with(from));
-    if !contains_skill {
+    if skills.iter().any(|skill| skill == from) {
         links.push((from.to_path_buf(), to.to_path_buf()));
         return Ok(());
     }
-    let has_nested = skills.iter().any(|skill| skill != from && skill.starts_with(from));
-    if skills.iter().any(|skill| skill == from) && !has_nested {
-        links.push((from.to_path_buf(), to.to_path_buf()));
+    if !skills.iter().any(|skill| skill.starts_with(from)) {
         return Ok(());
     }
     directories.push(to.to_path_buf());
     for entry in fs::read_dir(from).with_context(|| format!("could not read {}", from.display()))? {
         let entry = entry?;
         let child = entry.path();
-        let target = to.join(entry.file_name());
-        if entry.file_type()?.is_dir() {
-            plan_node(&child, &target, skills, directories, links)?;
-        } else {
-            links.push((child, target));
+        if entry.file_type()?.is_dir() && skills.iter().any(|skill| skill.starts_with(&child)) {
+            plan_node(&child, &to.join(entry.file_name()), skills, directories, links)?;
         }
     }
     Ok(())
@@ -423,6 +425,58 @@ mod tests {
         assert!(fs::symlink_metadata(&link).unwrap().file_type().is_symlink());
         assert_eq!(fs::canonicalize(&link).unwrap(), fs::canonicalize(&nested).unwrap());
         assert_eq!(fs::read_to_string(link.join("references/note.md")).unwrap(), "nested reference");
+    }
+
+    #[test]
+    fn refuses_external_group_skill_file_symlink_before_linking_nested_skills() {
+        let f = fixture();
+        let external = f._tmp.path().join("outside-skill.md");
+        fs::write(&external, "external Skill").unwrap();
+        let group = f.primary.join(".agents/skills/group");
+        let child = group.join("child");
+        fs::create_dir_all(&child).unwrap();
+        fs::write(child.join("SKILL.md"), "nested Skill").unwrap();
+        symlink(&external, group.join("SKILL.md")).unwrap();
+
+        let error = prepare(&f.worktree, &f.worktree).unwrap_err().to_string();
+        assert!(error.contains("escapes"), "{error}");
+        assert!(!f.worktree.join(".agents/skills/group").exists(), "preflight must not leave grouping paths or Skill links");
+    }
+
+    #[test]
+    fn refuses_an_external_non_skill_file_symlink_in_a_group_without_partial_links() {
+        let f = fixture();
+        let external = f._tmp.path().join("outside-note.md");
+        fs::write(&external, "external note").unwrap();
+        let group = f.primary.join(".agents/skills/group");
+        let child = group.join("child");
+        fs::create_dir_all(&child).unwrap();
+        fs::write(child.join("SKILL.md"), "nested Skill").unwrap();
+        symlink(&external, group.join("note.md")).unwrap();
+
+        let error = prepare(&f.worktree, &f.worktree).unwrap_err().to_string();
+        assert!(error.contains("symlink in Skill grouping hierarchy"), "{error}");
+        assert!(!f.worktree.join(".agents/skills/group").exists(), "preflight must not leave grouping paths or Skill links");
+    }
+
+    #[test]
+    fn skips_hidden_and_node_modules_skill_directories() {
+        let f = fixture();
+        let hidden = f.primary.join(".agents/skills/group/.hidden");
+        let dependency = f.primary.join(".agents/skills/group/node_modules/package");
+        fs::create_dir_all(&hidden).unwrap();
+        fs::create_dir_all(&dependency).unwrap();
+        fs::write(hidden.join("SKILL.md"), "hidden").unwrap();
+        fs::write(dependency.join("SKILL.md"), "dependency").unwrap();
+        let visible = f.primary.join(".agents/skills/group/visible");
+        fs::create_dir_all(&visible).unwrap();
+        fs::write(visible.join("SKILL.md"), "visible").unwrap();
+
+        prepare(&f.worktree, &f.worktree).unwrap();
+
+        assert!(f.worktree.join(".agents/skills/group/visible/SKILL.md").is_file());
+        assert!(!f.worktree.join(".agents/skills/group/.hidden").exists());
+        assert!(!f.worktree.join(".agents/skills/group/node_modules").exists());
     }
 
     #[test]
