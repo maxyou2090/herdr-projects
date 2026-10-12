@@ -151,7 +151,7 @@ fn socket_of(cmd: &Cmd) -> String {
 }
 
 #[test]
-fn thread_start_preflights_skills_before_launch_and_failed_preparation_can_retry() {
+fn thread_start_preflights_agents_link_before_launch_and_failed_preparation_can_retry() {
     use std::process::Command;
 
     let world = World::new();
@@ -179,17 +179,14 @@ fn thread_start_preflights_skills_before_launch_and_failed_preparation_can_retry
     std::fs::create_dir_all(nested.join("references")).unwrap();
     std::fs::write(nested.join("SKILL.md"), "---\nname: nested-rules\ndescription: Nested isolated test skill.\n---\n\nRead references/nested-marker.md.\n").unwrap();
     std::fs::write(nested.join("references/nested-marker.md"), "nested marker").unwrap();
-    let outside_skill = world.home.path().join("outside-skill.md");
-    let outside_note = world.home.path().join("outside-note.md");
-    std::fs::write(&outside_skill, "external Skill").unwrap();
-    std::fs::write(&outside_note, "external note").unwrap();
-    let group = repo.join(".agents/skills/group");
-    std::os::unix::fs::symlink(&outside_skill, group.join("SKILL.md")).unwrap();
-    std::os::unix::fs::symlink(&outside_note, group.join("note.md")).unwrap();
+    std::fs::write(repo.join(".agents/NOT_A_SKILL.md"), "shared ordinary file").unwrap();
+    std::fs::create_dir_all(repo.join(".agents/scripts")).unwrap();
+    let script_sentinel = world.home.path().join("should-not-exist");
+    std::fs::write(repo.join(".agents/scripts/must-not-run.sh"), format!("#!/bin/sh\ntouch {}\n", script_sentinel.display())).unwrap();
     git(&["-C", repo.to_str().unwrap(), "worktree", "add", "--detach", "--no-checkout", worktree.to_str().unwrap()]);
-    let conflict = worktree.join(".agents/skills/z-rules");
-    std::fs::create_dir_all(&conflict).unwrap();
-    std::fs::write(conflict.join("SKILL.md"), "keep me").unwrap();
+    let local_agents = worktree.join(".agents");
+    std::fs::create_dir_all(&local_agents).unwrap();
+    std::fs::write(local_agents.join("local.md"), "keep local content").unwrap();
 
     let repo_text = repo.to_string_lossy().into_owned();
     let worktree_text = worktree.to_string_lossy().into_owned();
@@ -200,9 +197,14 @@ fn thread_start_preflights_skills_before_launch_and_failed_preparation_can_retry
     world.runner.on("symbolic-ref", ok("origin/main\n"));
     world.runner.on("rev-parse --git-path", fail(1, "not a repo"));
     world.runner.on("worktree create", ok(&format!(r#"{{"result":{{"root_pane":{{"workspace_id":"w2","tab_id":"w2:t1","pane_id":"w2:p1","cwd":"{worktree_text}"}},"worktree":{{"path":"{worktree_text}"}}}}}}"#)));
-    let expected_skill = worktree.join(".agents/skills/a-rules");
+    let expected_agents = worktree.join(".agents");
+    let source_note = repo.join(".agents/NOT_A_SKILL.md");
+    use sha2::{Digest, Sha256};
+    let source_note_hash = Sha256::digest(std::fs::read(&source_note).unwrap());
     world.runner.on_fn(|cmd| cmd.display().contains("agent start"), move |_| {
-        assert!(expected_skill.join("SKILL.md").is_file(), "agent start ran before Skills preparation");
+        assert!(std::fs::symlink_metadata(&expected_agents).unwrap().file_type().is_symlink(), "agent start ran before .agents link preparation");
+        assert_eq!(std::fs::read_to_string(expected_agents.join("NOT_A_SKILL.md")).unwrap(), "shared ordinary file");
+        assert!(expected_agents.join("skills/a-rules/SKILL.md").is_file());
         Ok(ok(r#"{"result":{"agent":{"pane_id":"w2:p1","tab_id":"w2:t1","workspace_id":"w2"}}}"#))
     });
     let ctx = world.ctx();
@@ -213,44 +215,50 @@ fn thread_start_preflights_skills_before_launch_and_failed_preparation_can_retry
         title: "Inherited rules".into(), repo: Some(repo_text.clone()), machine: None,
         profile: Some("fixture".into()), kind: None, base: None, task: "Verify startup ordering.".into(),
     }).unwrap_err();
-    assert!(format!("{error:#}").contains("escapes"), "{error:#}");
+    assert!(format!("{error:#}").contains("existing worktree .agents directory conflicts"), "{error:#}");
     let failed = thread::load(&project, "t-0001").unwrap();
     assert_eq!(failed.status, Status::Failed);
     assert_eq!(failed.worktree_path, worktree_text);
-    assert!(!worktree.join(".agents/skills/a-rules").exists(), "source preflight left a partial Skill link behind");
-    assert!(!worktree.join(".agents/skills/group").exists(), "source preflight left a partial grouping directory behind");
-    assert_eq!(std::fs::read_to_string(conflict.join("SKILL.md")).unwrap(), "keep me");
+    assert!(!std::fs::symlink_metadata(&local_agents).unwrap().file_type().is_symlink(), "conflict must not be replaced");
+    assert_eq!(std::fs::read_to_string(local_agents.join("local.md")).unwrap(), "keep local content");
     assert_eq!(world.runner.count("agent start"), 0);
 
-    std::fs::remove_file(group.join("SKILL.md")).unwrap();
-    std::fs::remove_file(group.join("note.md")).unwrap();
     *world.panes.borrow_mut() = format!("[{},{}]", world.coordinator_pane(&project), pane_json("w2", "w2:t1", "w2:p1", &worktree_text));
     let conflict_error = threads::restart(&ctx, "demo", "t-0001", None).unwrap_err();
-    assert!(format!("{conflict_error:#}").contains("skill path already exists"), "{conflict_error:#}");
-    assert!(!worktree.join(".agents/skills/a-rules").exists(), "destination preflight left a partial Skill link behind");
+    assert!(format!("{conflict_error:#}").contains("existing worktree .agents directory conflicts"), "{conflict_error:#}");
     assert_eq!(world.runner.count("agent start"), 0);
 
-    std::fs::remove_dir_all(&conflict).unwrap();
+    let backup = worktree.with_file_name(".agents.manual-backup");
+    std::fs::rename(&local_agents, &backup).unwrap();
     let retried = threads::restart(&ctx, "demo", "t-0001", None).unwrap();
     assert_eq!(retried.status, Status::Open);
-    assert!(worktree.join(".agents/skills/a-rules/SKILL.md").is_file());
+    assert!(std::fs::symlink_metadata(worktree.join(".agents")).unwrap().file_type().is_symlink());
+    assert_eq!(std::fs::read_to_string(backup.join("local.md")).unwrap(), "keep local content");
     assert_eq!(world.runner.count("agent start"), 0);
+    let added = repo.join(".agents/skills/added-after-link/SKILL.md");
+    std::fs::create_dir_all(added.parent().unwrap()).unwrap();
+    std::fs::write(&added, "---\nname: added-after-link\ndescription: Shared after link creation.\n---\n").unwrap();
+    assert!(worktree.join(".agents/skills/added-after-link/SKILL.md").is_file());
 
     if let Ok(loader_module) = std::env::var("PI_RESOURCE_LOADER_MODULE") {
         let script = r#"import fs from 'node:fs'; import path from 'node:path'; import { pathToFileURL } from 'node:url';
 const { DefaultResourceLoader } = await import(pathToFileURL(process.env.PI_RESOURCE_LOADER_MODULE));
 const { SettingsManager } = await import(pathToFileURL(process.env.PI_SETTINGS_MANAGER_MODULE));
 const cwd = process.env.TEST_WORKTREE; const agentDir = path.join(process.env.TEST_HOME, 'agent');
+if (!fs.lstatSync(path.join(cwd, '.agents')).isSymbolicLink()) throw new Error('the whole .agents parent is not a symlink');
+if (fs.readFileSync(path.join(cwd, '.agents/NOT_A_SKILL.md'), 'utf8') !== 'shared ordinary file') throw new Error('non-Skill content was not shared');
 const settings = SettingsManager.create(cwd, agentDir, { projectTrusted: true });
 const loader = new DefaultResourceLoader({ cwd, agentDir, settingsManager: settings }); await loader.reload();
-const found = loader.getSkills().skills.find(skill => skill.name === 'a-rules'); if (!found) throw new Error('generated link not discovered');
+const found = loader.getSkills().skills.find(skill => skill.name === 'a-rules'); if (!found) throw new Error('Skill under linked .agents not discovered');
 const marker = fs.realpathSync(path.join(path.dirname(found.filePath), 'references/marker.md'));
 if (!marker.endsWith('/a-rules/references/marker.md') || fs.readFileSync(marker, 'utf8') !== 'marker from a-rules') throw new Error(`bad source/reference: ${marker}`);
 const nested = loader.getSkills().skills.find(skill => skill.name === 'nested-rules'); if (!nested) throw new Error('nested generated link not discovered');
 if (!nested.filePath.includes('/.agents/skills/group/nested-rules/SKILL.md')) throw new Error(`nested path was flattened: ${nested.filePath}`);
 const nestedMarker = fs.realpathSync(path.join(path.dirname(nested.filePath), 'references/nested-marker.md'));
 if (fs.readFileSync(nestedMarker, 'utf8') !== 'nested marker') throw new Error(`bad nested reference: ${nestedMarker}`);
-console.log(found.filePath, nested.filePath);"#;
+const added = loader.getSkills().skills.find(skill => skill.name === 'added-after-link'); if (!added) throw new Error('Skill added after linking was not discovered');
+if (fs.existsSync(path.join(process.env.TEST_HOME, 'should-not-exist'))) throw new Error('unexpected script marker');
+console.log(found.filePath, nested.filePath, added.filePath);"#;
         let isolated_home = world.home.path().join("isolated-node-home");
         std::fs::create_dir_all(&isolated_home).unwrap();
         let output = Command::new("node").args(["--input-type=module", "-e", script])
@@ -260,6 +268,8 @@ console.log(found.filePath, nested.filePath);"#;
             .env("TEST_WORKTREE", &worktree).env("TEST_HOME", world.home.path()).output().unwrap();
         assert!(output.status.success(), "Pi loader failed: {}", String::from_utf8_lossy(&output.stderr));
         assert!(String::from_utf8_lossy(&output.stdout).contains("a-rules/SKILL.md"));
+        assert_eq!(Sha256::digest(std::fs::read(&source_note).unwrap()), source_note_hash, "Pi loader changed source bytes");
+        assert!(!world.home.path().join("should-not-exist").exists(), "a shared script was executed");
     }
 
     assert!(ticker::tick_project(&ctx, &project).unwrap());
@@ -267,7 +277,7 @@ console.log(found.filePath, nested.filePath);"#;
 }
 
 #[test]
-fn restart_reopen_holds_launch_barrier_and_persists_skill_failure_for_retry() {
+fn restart_reopen_holds_launch_barrier_and_persists_agents_conflict_for_retry() {
     use std::process::Command;
 
     let world = World::new();
@@ -291,9 +301,9 @@ fn restart_reopen_holds_launch_barrier_and_persists_skill_failure_for_retry() {
         std::fs::write(source.join("SKILL.md"), format!("---\nname: {skill}\ndescription: Restart fixture.\n---\n")).unwrap();
     }
     git(&["-C", repo.to_str().unwrap(), "worktree", "add", "--detach", "--no-checkout", worktree.to_str().unwrap()]);
-    let conflict = worktree.join(".agents/skills/z-rules");
+    let conflict = worktree.join(".agents");
     std::fs::create_dir_all(&conflict).unwrap();
-    std::fs::write(conflict.join("SKILL.md"), "keep me").unwrap();
+    std::fs::write(conflict.join("local.md"), "keep me").unwrap();
 
     let repo_text = repo.to_string_lossy().into_owned();
     let worktree_text = worktree.to_string_lossy().into_owned();
@@ -326,27 +336,29 @@ fn restart_reopen_holds_launch_barrier_and_persists_skill_failure_for_retry() {
     world.runner.on("rev-parse --git-path", fail(1, "not a repo"));
     let ctx = world.ctx();
     let error = threads::restart(&ctx, "demo", &id, None).unwrap_err();
-    assert!(format!("{error:#}").contains("skill path already exists"), "{error:#}");
+    assert!(format!("{error:#}").contains("existing worktree .agents directory conflicts"), "{error:#}");
     let failed = thread::load(&project, &id).unwrap();
     assert_eq!(failed.status, Status::Failed);
     assert!(!failed.prompt_pending);
-    assert!(failed.error.contains("skill path already exists"), "{}", failed.error);
-    assert!(threads::rows(&ctx, &project).iter().any(|row| row.thread.id == id && row.note.contains("failed:") && row.note.contains("skill path already exists")));
+    assert!(failed.error.contains("existing worktree .agents directory conflicts"), "{}", failed.error);
+    assert!(threads::rows(&ctx, &project).iter().any(|row| row.thread.id == id && row.note.contains("failed:") && row.note.contains(".agents directory conflicts")));
     assert_eq!(world.runner.count("agent start"), 0);
 
     *world.panes.borrow_mut() = format!("[{},{}]", world.coordinator_pane(&project), pane_json("w2", "w2:t1", "w2:p1", &worktree_text));
     let reuse_error = threads::restart(&ctx, "demo", &id, None).unwrap_err();
-    assert!(format!("{reuse_error:#}").contains("skill path already exists"), "{reuse_error:#}");
+    assert!(format!("{reuse_error:#}").contains("existing worktree .agents directory conflicts"), "{reuse_error:#}");
     let reuse_failed = thread::load(&project, &id).unwrap();
     assert_eq!(reuse_failed.status, Status::Failed);
-    assert!(reuse_failed.error.contains("skill path already exists"));
+    assert!(reuse_failed.error.contains("existing worktree .agents directory conflicts"));
     assert_eq!(world.runner.count("agent start"), 0);
 
-    std::fs::remove_dir_all(&conflict).unwrap();
+    let backup = worktree.with_file_name(".agents.manual-backup");
+    std::fs::rename(&conflict, &backup).unwrap();
     let retried = threads::restart(&ctx, "demo", &id, None).unwrap();
     assert_eq!(retried.status, Status::Open);
     assert!(retried.prompt_pending);
-    assert!(worktree.join(".agents/skills/a-rules/SKILL.md").is_file());
+    assert!(std::fs::symlink_metadata(worktree.join(".agents")).unwrap().file_type().is_symlink());
+    assert_eq!(std::fs::read_to_string(backup.join("local.md")).unwrap(), "keep me");
     assert_eq!(world.runner.count("agent start"), 0);
 }
 

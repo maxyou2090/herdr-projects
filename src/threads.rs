@@ -276,21 +276,21 @@ fn place_and_brief(ctx: &Ctx, project: &Project, view: &SessionView, id: &str, r
         Kind::Tab | Kind::Checkout => place_tab(project, view, &record)?,
         Kind::Adopted => bail!("an adopted thread is not placed by the binary"),
     };
-    prepare_thread_skills(&placed)?;
+    prepare_thread_agents(&placed)?;
     write_brief(ctx, project, &placed, restart)?;
     finish_placement(project, view, id)
 }
 
-fn prepare_thread_skills(thread: &Thread) -> Result<()> {
+fn prepare_thread_agents(thread: &Thread) -> Result<()> {
     if thread.kind != Kind::Worktree {
         return Ok(());
     }
     if thread.is_remote() {
-        eprintln!("warning: skill inheritance is not prepared for remote worktree {}; its remote source and target must be configured on that machine", thread.id);
+        eprintln!("warning: sharing the primary checkout's .agents directory is not prepared for remote worktree {}; its source and target must be configured on that machine", thread.id);
         return Ok(());
     }
     crate::skills::prepare(std::path::Path::new(&thread.repo), std::path::Path::new(&thread.worktree_path))
-        .with_context(|| format!("could not prepare inherited skills for thread {}", thread.id))
+        .with_context(|| format!("could not prepare shared .agents directory for thread {}", thread.id))
 }
 
 /// The repository's primary Space herdr grouped a new worktree Space under,
@@ -559,7 +559,7 @@ pub fn restart(ctx: &Ctx, slug: &str, id: &str, profile: Option<&str>) -> Result
             },
         }
         let placed = thread::load(&project, id)?;
-        prepare_thread_skills(&placed)?;
+        prepare_thread_agents(&placed)?;
         write_brief(ctx, &project, &placed, true)?;
         finish_placement(&project, &view, id)
     })();
