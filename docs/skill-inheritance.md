@@ -1,0 +1,9 @@
+# Worktree skill inheritance
+
+When a local worktree thread is created or explicitly restarted, herdr-projects looks for `.agents/skills` in the repository's primary checkout and links each valid immediate skill directory into the worktree. The preparation runs synchronously before the thread is marked ready for its agent. An explicit restart only reaches a fresh agent after the old agent has exited; a running agent is refused. This does not retroactively refresh existing worktrees or sessions natively resumed by Herdr. The behavior is enabled by default for local worktree threads; tab, checkout, and adopted threads are unaffected. Remote worktree threads print a warning and continue without inherited Skills; this implementation does not guarantee remote discovery.
+
+The worktree keeps its own `.agents` and `skills` directories. Existing local skills are retained. A conflicting skill path, invalid source link, or failed link preparation aborts thread setup rather than silently starting without inherited skills. Repeating setup keeps already-correct links. No global Git settings, ignore files, trust settings, permissions, or skill contents are changed. Skill scripts are not run.
+
+These are ordinary symbolic links, not read-only mounts: writes through a link change the primary checkout. Do not edit inherited skills through a worktree. Git may report or ignore the link according to the machine's Git ignore configuration; herdr-projects does not stage links or change ignore rules. Skills remain subject to the agent's normal project-trust and resource-discovery behavior. Discovery does not prove that an agent read or followed a skill.
+
+To back out, stop using the candidate binary and remove the links from affected worktrees manually; do not delete the primary-checkout skills. This implementation does not modify the installed executable or activate itself in an existing runtime.

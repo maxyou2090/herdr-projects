@@ -151,6 +151,99 @@ fn socket_of(cmd: &Cmd) -> String {
 }
 
 #[test]
+fn thread_start_preflights_skills_before_launch_and_failed_preparation_can_retry() {
+    use std::process::Command;
+
+    let world = World::new();
+    let project = world.project("demo", "a.sock");
+    let repo = world.home.path().join("source repo");
+    let worktree = world.home.path().join("target worktree");
+    std::fs::create_dir_all(&repo).unwrap();
+    let git = |args: &[&str]| {
+        let output = Command::new("git").args(args).output().unwrap();
+        assert!(output.status.success(), "git {:?}: {}", args, String::from_utf8_lossy(&output.stderr));
+    };
+    git(&["init", "-q", repo.to_str().unwrap()]);
+    git(&["-C", repo.to_str().unwrap(), "config", "user.email", "fixture@example.invalid"]);
+    git(&["-C", repo.to_str().unwrap(), "config", "user.name", "Fixture"]);
+    std::fs::write(repo.join("README.md"), "base").unwrap();
+    git(&["-C", repo.to_str().unwrap(), "add", "README.md"]);
+    git(&["-C", repo.to_str().unwrap(), "commit", "-qm", "base"]);
+    for skill in ["a-rules", "z-rules"] {
+        let source = repo.join(".agents/skills").join(skill);
+        std::fs::create_dir_all(source.join("references")).unwrap();
+        std::fs::write(source.join("SKILL.md"), format!("---\nname: {skill}\ndescription: Isolated test skill.\n---\n\nRead references/marker.md.\n")).unwrap();
+        std::fs::write(source.join("references/marker.md"), format!("marker from {skill}")).unwrap();
+    }
+    git(&["-C", repo.to_str().unwrap(), "worktree", "add", "--detach", "--no-checkout", worktree.to_str().unwrap()]);
+    let conflict = worktree.join(".agents/skills/z-rules");
+    std::fs::create_dir_all(&conflict).unwrap();
+    std::fs::write(conflict.join("SKILL.md"), "keep me").unwrap();
+
+    let repo_text = repo.to_string_lossy().into_owned();
+    let worktree_text = worktree.to_string_lossy().into_owned();
+    *world.panes.borrow_mut() = format!("[{}]", world.coordinator_pane(&project));
+    world.runner.on("rev-parse --show-toplevel", ok(&format!("{repo_text}\n")));
+    world.runner.on("remote get-url origin", ok("git@example.invalid:fixture/repo.git\n"));
+    world.runner.on("fetch origin", fail(1, "offline"));
+    world.runner.on("symbolic-ref", ok("origin/main\n"));
+    world.runner.on("rev-parse --git-path", fail(1, "not a repo"));
+    world.runner.on("worktree create", ok(&format!(r#"{{"result":{{"root_pane":{{"workspace_id":"w2","tab_id":"w2:t1","pane_id":"w2:p1","cwd":"{worktree_text}"}},"worktree":{{"path":"{worktree_text}"}}}}}}"#)));
+    let expected_skill = worktree.join(".agents/skills/a-rules");
+    world.runner.on_fn(|cmd| cmd.display().contains("agent start"), move |_| {
+        assert!(expected_skill.join("SKILL.md").is_file(), "agent start ran before Skills preparation");
+        Ok(ok(r#"{"result":{"agent":{"pane_id":"w2:p1","tab_id":"w2:t1","workspace_id":"w2"}}}"#))
+    });
+    let ctx = world.ctx();
+    std::fs::create_dir_all(&ctx.config_dir).unwrap();
+    std::fs::write(ctx.config_dir.join("config.toml"), "[profiles.fixture]\nagent = \"claude\"\n").unwrap();
+
+    let error = threads::start(&ctx, "demo", StartArgs {
+        title: "Inherited rules".into(), repo: Some(repo_text.clone()), machine: None,
+        profile: Some("fixture".into()), kind: None, base: None, task: "Verify startup ordering.".into(),
+    }).unwrap_err();
+    assert!(format!("{error:#}").contains("skill path already exists"), "{error:#}");
+    let failed = thread::load(&project, "t-0001").unwrap();
+    assert_eq!(failed.status, Status::Failed);
+    assert_eq!(failed.worktree_path, worktree_text);
+    assert!(!worktree.join(".agents/skills/a-rules").exists(), "preflight left a partial link behind");
+    assert_eq!(std::fs::read_to_string(conflict.join("SKILL.md")).unwrap(), "keep me");
+    assert_eq!(world.runner.count("agent start"), 0);
+
+    std::fs::remove_dir_all(&conflict).unwrap();
+    *world.panes.borrow_mut() = format!("[{},{}]", world.coordinator_pane(&project), pane_json("w2", "w2:t1", "w2:p1", &worktree_text));
+    let retried = threads::restart(&ctx, "demo", "t-0001", None).unwrap();
+    assert_eq!(retried.status, Status::Open);
+    assert!(worktree.join(".agents/skills/a-rules/SKILL.md").is_file());
+    assert_eq!(world.runner.count("agent start"), 0);
+
+    if let Ok(loader_module) = std::env::var("PI_RESOURCE_LOADER_MODULE") {
+        let script = r#"import fs from 'node:fs'; import path from 'node:path'; import { pathToFileURL } from 'node:url';
+const { DefaultResourceLoader } = await import(pathToFileURL(process.env.PI_RESOURCE_LOADER_MODULE));
+const { SettingsManager } = await import(pathToFileURL(process.env.PI_SETTINGS_MANAGER_MODULE));
+const cwd = process.env.TEST_WORKTREE; const agentDir = path.join(process.env.TEST_HOME, 'agent');
+const settings = SettingsManager.create(cwd, agentDir, { projectTrusted: true });
+const loader = new DefaultResourceLoader({ cwd, agentDir, settingsManager: settings }); await loader.reload();
+const found = loader.getSkills().skills.find(skill => skill.name === 'a-rules'); if (!found) throw new Error('generated link not discovered');
+const marker = fs.realpathSync(path.join(path.dirname(found.filePath), 'references/marker.md'));
+if (!marker.endsWith('/a-rules/references/marker.md') || fs.readFileSync(marker, 'utf8') !== 'marker from a-rules') throw new Error(`bad source/reference: ${marker}`);
+console.log(found.filePath);"#;
+        let isolated_home = world.home.path().join("isolated-node-home");
+        std::fs::create_dir_all(&isolated_home).unwrap();
+        let output = Command::new("node").args(["--input-type=module", "-e", script])
+            .env("HOME", &isolated_home).env("XDG_CONFIG_HOME", isolated_home.join(".config"))
+            .env("PI_RESOURCE_LOADER_MODULE", loader_module)
+            .env("PI_SETTINGS_MANAGER_MODULE", std::env::var("PI_SETTINGS_MANAGER_MODULE").unwrap())
+            .env("TEST_WORKTREE", &worktree).env("TEST_HOME", world.home.path()).output().unwrap();
+        assert!(output.status.success(), "Pi loader failed: {}", String::from_utf8_lossy(&output.stderr));
+        assert!(String::from_utf8_lossy(&output.stdout).contains("a-rules/SKILL.md"));
+    }
+
+    assert!(ticker::tick_project(&ctx, &project).unwrap());
+    assert_eq!(world.runner.count("agent start"), 1);
+}
+
+#[test]
 fn thread_start_returns_without_an_agent_and_the_ticker_launches_then_prompts() {
     let world = World::new();
     let project = world.project("demo", "a.sock");

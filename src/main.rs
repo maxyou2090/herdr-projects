@@ -26,6 +26,7 @@ mod rename;
 mod routine;
 mod runner;
 mod safety;
+mod skills;
 #[cfg(test)]
 mod scenarios;
 mod settings;
