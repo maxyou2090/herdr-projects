@@ -175,6 +175,10 @@ fn thread_start_preflights_skills_before_launch_and_failed_preparation_can_retry
         std::fs::write(source.join("SKILL.md"), format!("---\nname: {skill}\ndescription: Isolated test skill.\n---\n\nRead references/marker.md.\n")).unwrap();
         std::fs::write(source.join("references/marker.md"), format!("marker from {skill}")).unwrap();
     }
+    let nested = repo.join(".agents/skills/group/nested-rules");
+    std::fs::create_dir_all(nested.join("references")).unwrap();
+    std::fs::write(nested.join("SKILL.md"), "---\nname: nested-rules\ndescription: Nested isolated test skill.\n---\n\nRead references/nested-marker.md.\n").unwrap();
+    std::fs::write(nested.join("references/nested-marker.md"), "nested marker").unwrap();
     git(&["-C", repo.to_str().unwrap(), "worktree", "add", "--detach", "--no-checkout", worktree.to_str().unwrap()]);
     let conflict = worktree.join(".agents/skills/z-rules");
     std::fs::create_dir_all(&conflict).unwrap();
@@ -227,7 +231,11 @@ const loader = new DefaultResourceLoader({ cwd, agentDir, settingsManager: setti
 const found = loader.getSkills().skills.find(skill => skill.name === 'a-rules'); if (!found) throw new Error('generated link not discovered');
 const marker = fs.realpathSync(path.join(path.dirname(found.filePath), 'references/marker.md'));
 if (!marker.endsWith('/a-rules/references/marker.md') || fs.readFileSync(marker, 'utf8') !== 'marker from a-rules') throw new Error(`bad source/reference: ${marker}`);
-console.log(found.filePath);"#;
+const nested = loader.getSkills().skills.find(skill => skill.name === 'nested-rules'); if (!nested) throw new Error('nested generated link not discovered');
+if (!nested.filePath.includes('/.agents/skills/group/nested-rules/SKILL.md')) throw new Error(`nested path was flattened: ${nested.filePath}`);
+const nestedMarker = fs.realpathSync(path.join(path.dirname(nested.filePath), 'references/nested-marker.md'));
+if (fs.readFileSync(nestedMarker, 'utf8') !== 'nested marker') throw new Error(`bad nested reference: ${nestedMarker}`);
+console.log(found.filePath, nested.filePath);"#;
         let isolated_home = world.home.path().join("isolated-node-home");
         std::fs::create_dir_all(&isolated_home).unwrap();
         let output = Command::new("node").args(["--input-type=module", "-e", script])
@@ -241,6 +249,90 @@ console.log(found.filePath);"#;
 
     assert!(ticker::tick_project(&ctx, &project).unwrap());
     assert_eq!(world.runner.count("agent start"), 1);
+}
+
+#[test]
+fn restart_reopen_holds_launch_barrier_and_persists_skill_failure_for_retry() {
+    use std::process::Command;
+
+    let world = World::new();
+    let project = world.project("demo", "a.sock");
+    let repo = world.home.path().join("source repo");
+    let worktree = world.home.path().join("target worktree");
+    std::fs::create_dir_all(&repo).unwrap();
+    let git = |args: &[&str]| {
+        let output = Command::new("git").args(args).output().unwrap();
+        assert!(output.status.success(), "git {:?}: {}", args, String::from_utf8_lossy(&output.stderr));
+    };
+    git(&["init", "-q", repo.to_str().unwrap()]);
+    git(&["-C", repo.to_str().unwrap(), "config", "user.email", "fixture@example.invalid"]);
+    git(&["-C", repo.to_str().unwrap(), "config", "user.name", "Fixture"]);
+    std::fs::write(repo.join("README.md"), "base").unwrap();
+    git(&["-C", repo.to_str().unwrap(), "add", "README.md"]);
+    git(&["-C", repo.to_str().unwrap(), "commit", "-qm", "base"]);
+    for skill in ["a-rules", "z-rules"] {
+        let source = repo.join(".agents/skills").join(skill);
+        std::fs::create_dir_all(&source).unwrap();
+        std::fs::write(source.join("SKILL.md"), format!("---\nname: {skill}\ndescription: Restart fixture.\n---\n")).unwrap();
+    }
+    git(&["-C", repo.to_str().unwrap(), "worktree", "add", "--detach", "--no-checkout", worktree.to_str().unwrap()]);
+    let conflict = worktree.join(".agents/skills/z-rules");
+    std::fs::create_dir_all(&conflict).unwrap();
+    std::fs::write(conflict.join("SKILL.md"), "keep me").unwrap();
+
+    let repo_text = repo.to_string_lossy().into_owned();
+    let worktree_text = worktree.to_string_lossy().into_owned();
+    *world.panes.borrow_mut() = format!("[{}]", world.coordinator_pane(&project));
+    let id = "t-0001".to_string();
+    thread::allocate(&project, |t| {
+        t.title = "Restart barrier".into();
+        t.status = Status::Open;
+        t.prompt_pending = true;
+        t.kind = Kind::Worktree;
+        t.repo = repo_text.clone();
+        t.worktree_path = worktree_text.clone();
+        t.cwd = worktree_text.clone();
+        t.workspace_id = "w2".into();
+        t.tab_id = "w2:t1".into();
+        t.pane_id = "w2:p1".into();
+        t.agent = "claude".into();
+        t.agent_name = "hp-demo-t-0001".into();
+    }).unwrap();
+    let reply = format!(r#"{{"result":{{"root_pane":{{"workspace_id":"w2","tab_id":"w2:t1","pane_id":"w2:p1","cwd":"{worktree_text}"}},"worktree":{{"path":"{worktree_text}"}}}}}}"#);
+    let callback_project = project.clone();
+    let callback_id = id.clone();
+    world.runner.on_fn(|cmd| cmd.display().contains("worktree open"), move |_| {
+        let current = thread::load(&callback_project, &callback_id).unwrap();
+        assert_eq!(current.status, Status::Starting, "barrier must precede workspace reopen");
+        assert!(!current.prompt_pending);
+        assert!(thread::claim_launch(&callback_project, &callback_id).unwrap().is_none(), "a stale ticker attempt must be rejected");
+        Ok(ok(&reply))
+    });
+    world.runner.on("rev-parse --git-path", fail(1, "not a repo"));
+    let ctx = world.ctx();
+    let error = threads::restart(&ctx, "demo", &id, None).unwrap_err();
+    assert!(format!("{error:#}").contains("skill path already exists"), "{error:#}");
+    let failed = thread::load(&project, &id).unwrap();
+    assert_eq!(failed.status, Status::Failed);
+    assert!(!failed.prompt_pending);
+    assert!(failed.error.contains("skill path already exists"), "{}", failed.error);
+    assert!(threads::rows(&ctx, &project).iter().any(|row| row.thread.id == id && row.note.contains("failed:") && row.note.contains("skill path already exists")));
+    assert_eq!(world.runner.count("agent start"), 0);
+
+    *world.panes.borrow_mut() = format!("[{},{}]", world.coordinator_pane(&project), pane_json("w2", "w2:t1", "w2:p1", &worktree_text));
+    let reuse_error = threads::restart(&ctx, "demo", &id, None).unwrap_err();
+    assert!(format!("{reuse_error:#}").contains("skill path already exists"), "{reuse_error:#}");
+    let reuse_failed = thread::load(&project, &id).unwrap();
+    assert_eq!(reuse_failed.status, Status::Failed);
+    assert!(reuse_failed.error.contains("skill path already exists"));
+    assert_eq!(world.runner.count("agent start"), 0);
+
+    std::fs::remove_dir_all(&conflict).unwrap();
+    let retried = threads::restart(&ctx, "demo", &id, None).unwrap();
+    assert_eq!(retried.status, Status::Open);
+    assert!(retried.prompt_pending);
+    assert!(worktree.join(".agents/skills/a-rules/SKILL.md").is_file());
+    assert_eq!(world.runner.count("agent start"), 0);
 }
 
 #[test]
@@ -433,6 +525,9 @@ fn starting_for_more_than_five_minutes_becomes_failed() {
         t.status = Status::Starting;
         t.created = "2026-01-01T00:00:00Z".into();
     });
+    let mut stale = thread::load(&project, "t-0001").unwrap();
+    stale.updated = "2026-01-01T00:00:00Z".into();
+    std::fs::write(thread::record_path(&project, "t-0001"), toml::to_string(&stale).unwrap()).unwrap();
     ticker::tick_project(&world.ctx(), &project).unwrap();
     assert_eq!(thread::load(&project, "t-0001").unwrap().status, Status::Failed);
 }

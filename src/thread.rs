@@ -204,6 +204,55 @@ pub fn update(project: &Project, id: &str, change: impl FnOnce(&mut Thread)) -> 
     Ok(thread)
 }
 
+/// Atomically claims a pending launch only if the current record is still eligible.
+/// This prevents a ticker snapshot taken before a restart barrier from launching it.
+pub fn claim_launch(project: &Project, id: &str) -> Result<Option<Thread>> {
+    let _lock = project.lock()?;
+    let mut thread = load(project, id)?;
+    if thread.status != Status::Open || !thread.prompt_pending {
+        return Ok(None);
+    }
+    if thread.launch_attempts >= MAX_LAUNCH_ATTEMPTS {
+        thread.status = Status::Failed;
+        thread.error = format!("no `{}` agent appeared in the pane after {} launch attempts", thread.agent, MAX_LAUNCH_ATTEMPTS);
+        thread.updated = project::now();
+        write_record(project, &thread)?;
+        return Ok(None);
+    }
+    thread.launch_attempts += 1;
+    thread.launched_at = project::now();
+    thread.updated = project::now();
+    write_record(project, &thread)?;
+    Ok(Some(thread))
+}
+
+/// Puts a restart behind the ticker's launch gate before changing a pane or workspace.
+pub fn begin_restart(project: &Project, id: &str, change: impl FnOnce(&mut Thread)) -> Result<Thread> {
+    let _lock = project.lock()?;
+    let mut thread = load(project, id)?;
+    if thread.status == Status::Resolved {
+        bail!("{} is resolved; `thread resolve --reopen` first", thread.id);
+    }
+    if thread.status == Status::Open
+        && thread.prompt_pending
+        && thread.launch_attempts > 0
+        && !thread.launched_at.is_empty()
+        && seconds_since(&thread.launched_at, jiff::Timestamp::now()) < NOT_READY_SECS
+    {
+        bail!("{} has a pending ticker launch; wait for it to appear or fail before restarting", thread.id);
+    }
+    if thread.status == Status::Starting && seconds_since(&thread.updated, jiff::Timestamp::now()) < STARTING_TIMEOUT_SECS {
+        bail!("{} is already restarting", thread.id);
+    }
+    change(&mut thread);
+    thread.status = Status::Starting;
+    thread.prompt_pending = false;
+    thread.error.clear();
+    thread.updated = project::now();
+    write_record(project, &thread)?;
+    Ok(thread)
+}
+
 /// Allocates the next id under the project lock and writes the first record.
 pub fn allocate(project: &Project, fill: impl FnOnce(&mut Thread)) -> Result<Thread> {
     let _lock = project.lock()?;
@@ -571,7 +620,7 @@ pub fn group(thread: &Thread, live: &Live, now: jiff::Timestamp) -> Group {
     }
     // 2
     if thread.status == Status::Starting {
-        return if seconds_since(&thread.created, now) < STARTING_TIMEOUT_SECS {
+        return if seconds_since(&thread.updated, now) < STARTING_TIMEOUT_SECS {
             Group::Working
         } else {
             Group::WaitingOnYou
@@ -932,9 +981,9 @@ mod tests {
 
     #[test]
     fn row2_starting_is_working_for_five_minutes() {
-        let young = Thread { status: Status::Starting, created: ago(10), ..open_thread() };
+        let young = Thread { status: Status::Starting, created: ago(10), updated: ago(10), ..open_thread() };
         assert_eq!(group(&young, &Live::default(), now()), Group::Working);
-        let old = Thread { status: Status::Starting, created: ago(301), ..open_thread() };
+        let old = Thread { status: Status::Starting, created: ago(301), updated: ago(301), ..open_thread() };
         assert_eq!(group(&old, &Live::default(), now()), Group::WaitingOnYou);
     }
 

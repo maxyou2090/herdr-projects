@@ -457,7 +457,7 @@ pub fn restart_plan(thread: &Thread, live: &Live, branch_exists: bool, now: jiff
     if thread.status == Status::Resolved {
         bail!("{} is resolved; `thread resolve --reopen` first", thread.id);
     }
-    if thread.status == Status::Starting && thread::seconds_since(&thread.created, now) < thread::STARTING_TIMEOUT_SECS {
+    if thread.status == Status::Starting && thread::seconds_since(&thread.updated, now) < thread::STARTING_TIMEOUT_SECS {
         bail!("{} is still starting", thread.id);
     }
     // (d)
@@ -504,16 +504,11 @@ fn lists_for(view: &SessionView, record: &Thread) -> Result<(Vec<Agent>, Vec<Pan
 /// worktree or a new tab, with the same or another profile.
 pub fn restart(ctx: &Ctx, slug: &str, id: &str, profile: Option<&str>) -> Result<Thread> {
     let project = Project::load(&ctx.root, slug)?;
-    if let Some(name) = profile {
-        let machine = thread::load(&project, id)?.machine;
-        let profile = thread_profile(ctx, &project, &machine, Some(name))?;
-        // The profile carries the whole setup: old model flags no longer apply.
-        thread::update(&project, id, |t| {
-            profile.apply(t);
-            t.agent_args.clear();
-        })?;
-    }
     let record = thread::load(&project, id)?;
+    let profile = profile
+        .map(|name| thread_profile(ctx, &project, &record.machine, Some(name)))
+        .transpose()?;
+    // Settle any older ticker before examining the pane state; no restart pane changes happen yet.
     ticker::start(ctx)?;
     let view = require_session(ctx, &project)?;
     let (agents, panes) = lists_for(&view, &record)?;
@@ -528,34 +523,61 @@ pub fn restart(ctx: &Ctx, slug: &str, id: &str, profile: Option<&str>) -> Result
             git(ctx.runner, &record.repo, &["rev-parse", "--verify", "--quiet", &format!("refs/heads/{branch}")], GIT_TIMEOUT).is_ok()
         }
     };
+    let plan = restart_plan(&record, &live, branch_exists, now)?;
 
-    match restart_plan(&record, &live, branch_exists, now)? {
-        RestartPlan::Create => return place_and_brief(ctx, &project, &view, id, true),
-        RestartPlan::ReusePane => {}
-        RestartPlan::Reopen => match record.kind {
-            Kind::Worktree => {
-                let (created, path, cwd) = view.herdr.on_machine(&record.machine).worktree_open(&record.repo, &record.worktree_path, &record.title)?;
-                let repo_workspace = if record.is_remote() { String::new() } else { repo_space(&view.herdr, &record.repo) };
-                thread::update(&project, id, |t| {
-                    if !repo_workspace.is_empty() {
-                        t.repo_workspace = repo_workspace;
-                    }
-                    t.worktree_path = path;
-                    t.cwd = cwd;
-                    t.workspace_id = created.workspace_id;
-                    t.tab_id = created.tab_id;
-                    t.pane_id = created.pane_id;
-                })?;
-            }
-            _ => {
-                place_tab(&project, &view, &record)?;
-            }
-        },
+    // This atomic state transition is the launch barrier. The ticker claims a launch
+    // under the same project lock and re-reads the record before invoking Herdr.
+    thread::begin_restart(&project, id, |t| {
+        if let Some(profile) = &profile {
+            profile.apply(t);
+            t.agent_args.clear();
+        }
+    })?;
+
+    let attempt = (|| -> Result<Thread> {
+        match plan {
+            RestartPlan::Create => return place_and_brief(ctx, &project, &view, id, true),
+            RestartPlan::ReusePane => {}
+            RestartPlan::Reopen => match record.kind {
+                Kind::Worktree => {
+                    let (created, path, cwd) = view.herdr.on_machine(&record.machine).worktree_open(&record.repo, &record.worktree_path, &record.title)?;
+                    let repo_workspace = if record.is_remote() { String::new() } else { repo_space(&view.herdr, &record.repo) };
+                    thread::update(&project, id, |t| {
+                        if !repo_workspace.is_empty() {
+                            t.repo_workspace = repo_workspace;
+                        }
+                        t.worktree_path = path;
+                        t.cwd = cwd;
+                        t.workspace_id = created.workspace_id;
+                        t.tab_id = created.tab_id;
+                        t.pane_id = created.pane_id;
+                    })?;
+                }
+                _ => {
+                    place_tab(&project, &view, &record)?;
+                }
+            },
+        }
+        let placed = thread::load(&project, id)?;
+        prepare_thread_skills(&placed)?;
+        write_brief(ctx, &project, &placed, true)?;
+        finish_placement(&project, &view, id)
+    })();
+
+    match attempt {
+        Ok(thread) => Ok(thread),
+        Err(error) => {
+            let message = format!("{error:#}");
+            let _ = thread::update(&project, id, |t| {
+                if t.status == Status::Starting {
+                    t.status = Status::Failed;
+                    t.prompt_pending = false;
+                    t.error = message.clone();
+                }
+            });
+            Err(error.context(format!("thread {id} failed to restart; `thread restart {slug} {id}` retries")))
+        }
     }
-    let placed = thread::load(&project, id)?;
-    prepare_thread_skills(&placed)?;
-    write_brief(ctx, &project, &placed, true)?;
-    finish_placement(&project, &view, id)
 }
 
 /// Sends a follow-up. The one sender that does not use the ready-for-a-prompt
@@ -1262,9 +1284,9 @@ mod tests {
         let resolved = Thread { status: Status::Resolved, ..worktree_thread() };
         assert!(restart_plan(&resolved, &gone(), false, now()).is_err());
 
-        let young = Thread { status: Status::Starting, created: "2026-09-17T11:59:00Z".into(), worktree_path: String::new(), ..worktree_thread() };
+        let young = Thread { status: Status::Starting, created: "2026-09-17T11:59:00Z".into(), updated: "2026-09-17T11:59:00Z".into(), worktree_path: String::new(), ..worktree_thread() };
         assert!(restart_plan(&young, &gone(), false, now()).is_err());
-        let stale = Thread { created: "2026-09-17T11:00:00Z".into(), ..young };
+        let stale = Thread { created: "2026-09-17T11:00:00Z".into(), updated: "2026-09-17T11:00:00Z".into(), ..young };
         assert_eq!(restart_plan(&stale, &gone(), false, now()).unwrap(), RestartPlan::Create);
     }
 

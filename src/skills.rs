@@ -12,17 +12,33 @@ pub fn prepare(repo: &Path, worktree: &Path) -> Result<()> {
         Err(_error) if !repo.join(".agents/skills").exists() => return Ok(()),
         Err(error) => return Err(error),
     };
-    let source = primary.join(".agents/skills");
+    let primary = fs::canonicalize(&primary).context("could not normalize primary checkout")?;
+    let agents = primary.join(".agents");
+    match fs::symlink_metadata(&agents) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error.into()),
+        Ok(meta) if meta.file_type().is_symlink() || !meta.is_dir() => {
+            bail!("{} must be a real directory", agents.display());
+        }
+        Ok(_) => {}
+    }
+    let canonical_agents = fs::canonicalize(&agents)?;
+    if !canonical_agents.starts_with(&primary) {
+        bail!("{} resolves outside the primary checkout", agents.display());
+    }
+
+    let source = agents.join("skills");
     match fs::symlink_metadata(&source) {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
         Err(error) => return Err(error.into()),
         Ok(meta) if meta.file_type().is_symlink() || !meta.is_dir() => {
-            bail!(
-                "{} must be a real .agents/skills directory",
-                source.display()
-            );
+            bail!("{} must be a real directory", source.display());
         }
         Ok(_) => {}
+    }
+    let source_root = fs::canonicalize(&source)?;
+    if !source_root.starts_with(&canonical_agents) || !source_root.starts_with(&primary) {
+        bail!("{} resolves outside the primary checkout's .agents directory", source.display());
     }
 
     let destination = worktree.join(".agents/skills");
@@ -32,61 +48,61 @@ pub fn prepare(repo: &Path, worktree: &Path) -> Result<()> {
 
     let repo_root = fs::canonicalize(worktree).context("could not resolve worktree repository")?;
     let tracked = tracked_paths(&repo_root)?;
-    let mut plan = Vec::new();
-    let entries =
-        fs::read_dir(&source).with_context(|| format!("could not read {}", source.display()))?;
-    for entry in entries {
+    let mut skills = Vec::new();
+    collect_skills(&source_root, &mut skills)?;
+    for parent in &skills {
+        if let Some(nested) = skills.iter().find(|skill| *skill != parent && skill.starts_with(parent)) {
+            bail!(
+                "nested Skill {} is below Skill root {}; Pi stops scanning below a directory containing SKILL.md",
+                nested.display(), parent.display()
+            );
+        }
+    }
+    let mut directories = Vec::new();
+    let mut links = Vec::new();
+    for entry in fs::read_dir(&source_root).with_context(|| format!("could not read {}", source_root.display()))? {
         let entry = entry?;
         let from = entry.path();
-        let name = entry.file_name();
-        let kind = entry.file_type()?;
-        if kind.is_symlink() && from.join("SKILL.md").is_file() {
-            bail!(
-                "skill source directory must not be a symlink: {}",
-                from.display()
-            );
-        }
-        if !kind.is_dir() || !from.join("SKILL.md").is_file() {
-            continue;
-        }
-        validate_tree(&from)?;
-        let to = destination.join(&name);
-        let relative = PathBuf::from(".agents/skills").join(&name);
-        if tracked.contains(&relative) || tracked.iter().any(|p| p.starts_with(&relative)) {
-            bail!(
-                "refusing to replace tracked skill path {}",
-                relative.display()
-            );
-        }
-        match fs::symlink_metadata(&to) {
-            Ok(meta) if meta.file_type().is_symlink() => {
-                let actual = fs::canonicalize(&to)
-                    .with_context(|| format!("broken skill link {}", to.display()))?;
-                let expected = fs::canonicalize(&from)?;
-                if actual != expected {
-                    bail!(
-                        "skill link conflict at {}; expected {}",
-                        to.display(),
-                        expected.display()
-                    );
-                }
-                plan.push((from, to, false));
-            }
-            Ok(_) => bail!(
-                "skill path already exists; refusing to replace {}",
-                to.display()
-            ),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                plan.push((from, to, true))
-            }
-            Err(error) => return Err(error.into()),
+        if entry.file_type()?.is_dir() && skills.iter().any(|skill| skill.starts_with(&from)) {
+            plan_node(&from, &destination.join(entry.file_name()), &skills, &mut directories, &mut links)?;
         }
     }
 
+    let mut plan = Vec::new();
+    for (from, to) in links {
+        let relative = to.strip_prefix(worktree).context("skill target escaped worktree")?;
+        if tracked.iter().any(|path| path == relative || path.starts_with(relative) || relative.starts_with(path)) {
+            bail!("refusing to replace tracked skill path {}", relative.display());
+        }
+        let mut ancestor = to.parent();
+        while let Some(path) = ancestor {
+            if path == worktree.join(".agents") {
+                break;
+            }
+            check_directory(path)?;
+            ancestor = path.parent();
+        }
+        match fs::symlink_metadata(&to) {
+            Ok(meta) if meta.file_type().is_symlink() => {
+                let actual = fs::canonicalize(&to).with_context(|| format!("broken skill link {}", to.display()))?;
+                let expected = fs::canonicalize(&from)?;
+                if actual != expected {
+                    bail!("skill link conflict at {}; expected {}", to.display(), expected.display());
+                }
+                plan.push((from, to, false));
+            }
+            Ok(_) => bail!("skill path already exists; refusing to replace {}", to.display()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => plan.push((from, to, true)),
+            Err(error) => return Err(error.into()),
+        }
+    }
+    for directory in &directories {
+        check_directory(directory)?;
+    }
+
     // No filesystem writes occur until every source and destination has passed preflight.
-    if plan.iter().any(|(_, _, create)| *create) {
-        fs::create_dir_all(&destination)
-            .with_context(|| format!("could not create {}", destination.display()))?;
+    for directory in directories {
+        fs::create_dir_all(&directory).with_context(|| format!("could not create {}", directory.display()))?;
     }
     for (from, to, create) in plan {
         if create {
@@ -95,16 +111,67 @@ pub fn prepare(repo: &Path, worktree: &Path) -> Result<()> {
             std::os::unix::fs::symlink(&target, &to)
                 .with_context(|| format!("could not create skill link {}", to.display()))?;
             #[cfg(not(unix))]
-            bail!(
-                "skill links are not supported on this platform: {}",
-                to.display()
-            );
+            bail!("skill links are not supported on this platform: {}", to.display());
+        }
+    }
+    Ok(())
+}
+
+/// Finds Skills at any depth, including under grouping directories without Skills of their own.
+fn collect_skills(dir: &Path, skills: &mut Vec<PathBuf>) -> Result<()> {
+    for entry in fs::read_dir(dir).with_context(|| format!("could not read {}", dir.display()))? {
+        let entry = entry?;
+        let path = entry.path();
+        let kind = entry.file_type()?;
+        if kind.is_symlink() {
+            if path.join("SKILL.md").is_file() {
+                bail!("skill source directory must not be a symlink: {}", path.display());
+            }
+            if fs::canonicalize(&path).is_ok_and(|resolved| resolved.is_dir()) {
+                bail!("directory symlink in skill hierarchy is not supported: {}", path.display());
+            }
+            continue;
+        }
+        if !kind.is_dir() {
+            continue;
+        }
+        if path.join("SKILL.md").is_file() {
+            validate_tree(&path)?;
+            skills.push(path.clone());
+        }
+        collect_skills(&path, skills)?;
+    }
+    Ok(())
+}
+
+/// Mirrors only paths needed to expose nested Skills, symlinking all content to its source.
+fn plan_node(from: &Path, to: &Path, skills: &[PathBuf], directories: &mut Vec<PathBuf>, links: &mut Vec<(PathBuf, PathBuf)>) -> Result<()> {
+    let contains_skill = skills.iter().any(|skill| skill == from || skill.starts_with(from));
+    if !contains_skill {
+        links.push((from.to_path_buf(), to.to_path_buf()));
+        return Ok(());
+    }
+    let has_nested = skills.iter().any(|skill| skill != from && skill.starts_with(from));
+    if skills.iter().any(|skill| skill == from) && !has_nested {
+        links.push((from.to_path_buf(), to.to_path_buf()));
+        return Ok(());
+    }
+    directories.push(to.to_path_buf());
+    for entry in fs::read_dir(from).with_context(|| format!("could not read {}", from.display()))? {
+        let entry = entry?;
+        let child = entry.path();
+        let target = to.join(entry.file_name());
+        if entry.file_type()?.is_dir() {
+            plan_node(&child, &target, skills, directories, links)?;
+        } else {
+            links.push((child, target));
         }
     }
     Ok(())
 }
 
 fn primary_checkout(repo: &Path) -> Result<PathBuf> {
+    let repo = fs::canonicalize(repo).with_context(|| format!("could not resolve repository {}", repo.display()))?;
     let repo_arg = repo.to_str().context("repository path is not UTF-8")?;
     let bare = git_value(repo_arg, "--is-bare-repository")?;
     if bare == "true" {
@@ -148,10 +215,11 @@ fn primary_checkout(repo: &Path) -> Result<PathBuf> {
             .context("primary checkout path is not UTF-8")?,
         "--show-toplevel",
     )?;
-    if fs::canonicalize(check)? != fs::canonicalize(primary)? {
+    let primary = fs::canonicalize(primary)?;
+    if fs::canonicalize(check)? != primary {
         bail!("could not verify primary checkout at {}", primary.display());
     }
-    Ok(primary.to_path_buf())
+    Ok(primary)
 }
 
 fn git_value_with(repo: &str, arg: &str, extra: &str) -> Result<String> {
@@ -339,6 +407,49 @@ mod tests {
             fs::canonicalize(f.worktree.join(".agents/skills/sample")).unwrap(),
             fs::canonicalize(f.primary.join(".agents/skills/sample")).unwrap()
         );
+    }
+
+    #[test]
+    fn links_nested_skills_at_their_original_relative_paths() {
+        let f = fixture();
+        let nested = f.primary.join(".agents/skills/group/deep/sample");
+        fs::create_dir_all(nested.join("references")).unwrap();
+        fs::write(nested.join("SKILL.md"), "nested").unwrap();
+        fs::write(nested.join("references/note.md"), "nested reference").unwrap();
+
+        prepare(&f.worktree, &f.worktree).unwrap();
+
+        let link = f.worktree.join(".agents/skills/group/deep/sample");
+        assert!(fs::symlink_metadata(&link).unwrap().file_type().is_symlink());
+        assert_eq!(fs::canonicalize(&link).unwrap(), fs::canonicalize(&nested).unwrap());
+        assert_eq!(fs::read_to_string(link.join("references/note.md")).unwrap(), "nested reference");
+    }
+
+    #[test]
+    fn refuses_nested_skills_below_a_skill_root_with_a_loader_diagnostic() {
+        let f = fixture();
+        let nested = f.primary.join(".agents/skills/sample/child");
+        fs::create_dir_all(&nested).unwrap();
+        fs::write(nested.join("SKILL.md"), "nested").unwrap();
+
+        let error = prepare(&f.worktree, &f.worktree).unwrap_err().to_string();
+        assert!(error.contains("Pi stops scanning below a directory containing SKILL.md"), "{error}");
+        assert!(!f.worktree.join(".agents/skills/sample").exists());
+    }
+
+    #[test]
+    fn refuses_skills_reached_through_an_external_agents_parent_link() {
+        let f = fixture();
+        let external = f._tmp.path().join("external skills");
+        let skill = external.join("skills/external-rule");
+        fs::create_dir_all(&skill).unwrap();
+        fs::write(skill.join("SKILL.md"), "external").unwrap();
+        fs::remove_dir_all(f.primary.join(".agents")).unwrap();
+        symlink(&external, f.primary.join(".agents")).unwrap();
+
+        let error = prepare(&f.worktree, &f.worktree).unwrap_err().to_string();
+        assert!(error.contains("must be a real directory"), "{error}");
+        assert!(!f.worktree.join(".agents/skills/external-rule").exists());
     }
 
     #[test]

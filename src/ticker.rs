@@ -636,10 +636,15 @@ fn thread_pass(project: &Project, herdr: &Herdr, socket: &str, threads: &[thread
     let mut pass = Pass { transitions: Vec::new(), stuck: Vec::new(), recorded_panes: 0, missing_panes: 0, error: None };
     for t in threads {
         if t.status == thread::Status::Starting {
-            if thread::seconds_since(&t.created, now) >= thread::STARTING_TIMEOUT_SECS {
+            if thread::seconds_since(&t.updated, now) >= thread::STARTING_TIMEOUT_SECS {
                 thread::update(project, &t.id, |t| {
-                    t.status = thread::Status::Failed;
-                    t.error = "still starting after five minutes".into();
+                    if t.status == thread::Status::Starting
+                        && thread::seconds_since(&t.updated, jiff::Timestamp::now()) >= thread::STARTING_TIMEOUT_SECS
+                    {
+                        t.status = thread::Status::Failed;
+                        t.prompt_pending = false;
+                        t.error = "still starting after five minutes".into();
+                    }
                 })?;
             }
             continue;
@@ -755,23 +760,19 @@ fn launch_pass(ctx: &Ctx, project: &Project, herdr: &Herdr, threads: &[thread::T
         if live.agent_state.is_some() || !live.pane_exists {
             continue;
         }
-        if t.launch_attempts >= thread::MAX_LAUNCH_ATTEMPTS {
-            let failed = thread::update(project, &t.id, |t| {
-                t.status = thread::Status::Failed;
-                t.error = format!("no `{}` agent appeared in the pane after {} launch attempts", t.agent, thread::MAX_LAUNCH_ATTEMPTS);
-            });
-            errors.extend(failed.err());
-            continue;
-        }
         if !*may_start {
             continue;
         }
+        let t = match thread::claim_launch(project, &t.id) {
+            Ok(Some(t)) => t,
+            Ok(None) => continue,
+            Err(error) => {
+                errors.push(error);
+                continue;
+            }
+        };
         *may_start = false;
         let launched = (|| -> Result<()> {
-            thread::update(project, &t.id, |t| {
-                t.launch_attempts += 1;
-                t.launched_at = project::now();
-            })?;
             let safety = project.safety(&ctx.config_dir)?;
             let config = crate::profiles::load(&ctx.config_dir)?;
             let (settings, _) = project.read_project_md()?;
@@ -1157,6 +1158,53 @@ mod tests {
 
     fn with_cwd(json: &str, fixture: &Fixture) -> String {
         json.replace("CWD", &fixture.project.dir().to_string_lossy())
+    }
+
+    #[test]
+    fn a_stale_ticker_snapshot_cannot_launch_across_a_restart_barrier() {
+        let f = fixture();
+        let runner = FakeRunner::new();
+        let worktree = f._home.path().join("worktree");
+        std::fs::create_dir(&worktree).unwrap();
+        let pending = thread::allocate(&f.project, |t| {
+            t.status = thread::Status::Open;
+            t.prompt_pending = true;
+            t.kind = thread::Kind::Worktree;
+            t.repo = f._home.path().join("repo").to_string_lossy().into_owned();
+            t.worktree_path = worktree.to_string_lossy().into_owned();
+            t.cwd = worktree.to_string_lossy().into_owned();
+            t.pane_id = "w2:p1".into();
+            t.agent = "claude".into();
+            t.agent_name = "hp-demo-t-0001".into();
+        }).unwrap();
+        let stale_snapshot = thread::load(&f.project, &pending.id).unwrap();
+        thread::begin_restart(&f.project, &pending.id, |_| {}).unwrap();
+
+        let ctx = Ctx { env: &f.env, root: f.root.clone(), config_dir: f.root.join("cfg"), runner: &runner, detached_ticker: false };
+        let herdr = Herdr::new("herdr", f.project.coordinator().unwrap().socket, &runner);
+        let pane = Pane { pane_id: "w2:p1".into(), workspace_id: "w2".into(), tab_id: "w2:t1".into(), cwd: worktree.to_string_lossy().into_owned(), ..Pane::default() };
+        let mut may_start = true;
+        let mut errors = Vec::new();
+        launch_pass(&ctx, &f.project, &herdr, &[stale_snapshot], &[], &[pane], &mut may_start, &mut errors);
+        assert!(errors.is_empty(), "{errors:?}");
+        assert_eq!(runner.count("agent start"), 0);
+        let current = thread::load(&f.project, &pending.id).unwrap();
+        assert_eq!(current.status, thread::Status::Starting);
+        assert!(!current.prompt_pending);
+        assert_eq!(current.launch_attempts, 0);
+
+        let claimed = thread::allocate(&f.project, |t| {
+            t.status = thread::Status::Open;
+            t.prompt_pending = true;
+            t.launch_attempts = 0;
+            t.agent = "claude".into();
+        }).unwrap();
+        assert!(thread::claim_launch(&f.project, &claimed.id).unwrap().is_some());
+        let error = thread::begin_restart(&f.project, &claimed.id, |_| {}).unwrap_err().to_string();
+        assert!(error.contains("pending ticker launch"), "{error}");
+        let current = thread::load(&f.project, &claimed.id).unwrap();
+        assert_eq!(current.status, thread::Status::Open);
+        assert!(current.prompt_pending);
     }
 
     #[test]
