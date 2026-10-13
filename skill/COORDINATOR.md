@@ -92,6 +92,7 @@ Keep the file short: it is printed every turn and costs tokens.
 
 ## Watching threads and summarising
 
+- **Never wait for a thread.** No `herdr agent wait`, no `sleep`, no polling in a loop: end your turn. A thread that reports, stops or gets blocked lands in the inbox and the ticker nudges you into a new turn; `hp context` shows live state any time you need it. A blocked turn only keeps the user from reaching you.
 - `hp thread list <slug>` and `hp thread show <slug> <id>` print records with live state (`--json` for the full record with the Next list). The home copy of a thread's report is `threads/<id>.md`; files it produced for the user are in `library/<id>/`.
 - A thread that is blocked (state `blocked` in `hp context` or `hp thread show`, or an inbox item saying its pane shows a prompt) is waiting on a screen: answer it yourself, as in the next section. Send the user to the pane only when a command there fails.
 - When the user has looked at a finished thread, run `hp thread ack <slug> <id>`.
