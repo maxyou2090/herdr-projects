@@ -885,6 +885,32 @@ pub fn auto_resolve(ctx: &Ctx, project: &Project, settings: &Settings, memory: &
 }
 
 /// Step 3, plus `config-error` items for files that do not parse. A due
+/// What a prompt-only routine could act on: every thread that is not
+/// resolved (its status, report and pull request state), the inbox items that
+/// wait for someone to handle them, and the routine's own prompt (editing it
+/// re-arms the routine). Items of routine kinds are left out: they have their
+/// own wake paths, and their own lifecycle would otherwise change the
+/// fingerprint on every run, defeating the quiet check.
+fn prompt_fingerprint(project: &Project, routine: &routine::Routine) -> String {
+    let mut text = String::new();
+    for t in thread::list(project).into_iter().filter(|t| t.status != Status::Resolved) {
+        text.push_str(&format!("{} {:?} {} {}\n", t.id, t.status, t.report_hash, t.pr_state));
+    }
+    let seen = inbox::seen(project);
+    let mut items = inbox::unhandled(project);
+    items.retain(|i| i.kind != "routine" && i.kind != "routine-approval");
+    items.sort_by(|a, b| a.id.cmp(&b.id));
+    for i in &items {
+        text.push_str(&i.id);
+        if seen.contains(&i.id) {
+            text.push_str(" seen");
+        }
+        text.push('\n');
+    }
+    text.push_str(&routine.prompt);
+    thread::sha256_hex(text.as_bytes())
+}
+
 /// scheduled routine does nothing unless the project has a live coordinator
 /// (`coordinator`): no item, no command. The run still counts as its last, so
 /// a coordinator that appears later gets the next scheduled run, not a backlog.
@@ -933,7 +959,18 @@ pub fn routines(ctx: &Ctx, project: &Project, state: &mut State, routine_command
                 entry.skipped += 1;
                 continue;
             }
+            // A quiet run: nothing the prompt could act on has changed since
+            // the item this routine last fired on, so the coordinator would
+            // only re-derive what it already knows and wait for the user
+            // again. Counted, nothing delivered; any real change re-arms it.
+            let fingerprint = prompt_fingerprint(project, r);
+            if fingerprint == entry.output_hash {
+                entry.quiet += 1;
+                continue;
+            }
             entry.skipped = 0;
+            entry.quiet = 0;
+            entry.output_hash = fingerprint;
             errors.extend(inbox::write(project, "routine", &r.name, "due", &format!("routine `{}` is due", r.name), &r.prompt).err());
             crate::notify::Notifier::new(ctx, project).send(&r.name, "routine due; the coordinator handles it", crate::notify::Sound::None, false);
             continue;
@@ -984,6 +1021,58 @@ mod tests {
         std::fs::write(project.dir().join("inbox").join(format!("{id}.md")), text).unwrap();
         let ids = vec![id.to_string()];
         inbox::mark_seen(project, &ids).unwrap();
+    }
+
+    #[test]
+    fn a_prompt_routine_fires_on_change_and_stays_quiet_between_changes() {
+        let root = tempfile::tempdir().unwrap();
+        let project = project::create(root.path(), "demo", "", vec![]).unwrap();
+        std::fs::create_dir_all(project.dir().join("routines")).unwrap();
+        std::fs::write(
+            project.dir().join("routines").join("sweep.md"),
+            "+++\nschedule = \"every 1m\"\n+++\nGo.\n",
+        )
+        .unwrap();
+        let runner = FakeRunner::new();
+        let env = crate::paths::Env::for_test(root.path(), &[]);
+        let ctx = Ctx { env: &env, root: root.path().to_path_buf(), config_dir: root.path().join("cfg"), runner: &runner, detached_ticker: true };
+        let mut state = State::default();
+        let utc = "2026-10-08T14:00:00+00:00[UTC]".parse::<jiff::Zoned>().unwrap().time_zone().clone();
+        let zoned = |t: &str| at(t).to_zoned(utc.clone());
+
+        // The first look only records a last run; the first due run fires.
+        assert!(routines(&ctx, &project, &mut state, false, true, None, &zoned("2026-10-08T14:00:00Z")).is_empty());
+        assert!(routines(&ctx, &project, &mut state, false, true, None, &zoned("2026-10-08T14:01:00Z")).is_empty());
+        let fired = inbox::unhandled(&project);
+        assert_eq!(fired.len(), 1);
+        assert_eq!(fired[0].kind, "routine");
+        assert_eq!(state.routines["sweep"].quiet, 0);
+
+        // The coordinator handled the item and nothing else changed: the next
+        // due run is quiet, so a delivered project waiting on its user is not
+        // swept again every interval.
+        inbox::done(&project, &[fired[0].id.clone()], false).unwrap();
+        assert!(routines(&ctx, &project, &mut state, false, true, None, &zoned("2026-10-08T14:02:00Z")).is_empty());
+        assert!(inbox::unhandled(&project).is_empty());
+        assert_eq!(state.routines["sweep"].quiet, 1);
+
+        // Any real change re-arms it: a thread appears with a report.
+        thread::allocate(&project, |t| {
+            t.title = "hands".into();
+            t.status = Status::Open;
+            t.report_hash = "abc".into();
+        })
+        .unwrap();
+        assert!(routines(&ctx, &project, &mut state, false, true, None, &zoned("2026-10-08T14:03:00Z")).is_empty());
+        let rearm = inbox::unhandled(&project);
+        assert_eq!(rearm.len(), 1);
+        assert_eq!(state.routines["sweep"].quiet, 0, "a firing run resets the quiet count");
+
+        // Handling that item without further change goes quiet again.
+        inbox::done(&project, &[rearm[0].id.clone()], false).unwrap();
+        assert!(routines(&ctx, &project, &mut state, false, true, None, &zoned("2026-10-08T14:04:00Z")).is_empty());
+        assert!(inbox::unhandled(&project).is_empty());
+        assert_eq!(state.routines["sweep"].quiet, 1);
     }
 
     #[test]

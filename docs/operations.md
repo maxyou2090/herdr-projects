@@ -23,6 +23,10 @@ How Herdr Projects works, what it writes where, what its safety settings do and 
   MEMORY.md, memory/      project memory; the coordinator's
   TASKS.md                the task list, each task with optional indented notes; the coordinator's
   routines/<name>.md      routines, including pr-followup.md; the coordinator's
+                          a scheduled prompt fires only when the project changed
+                          since its last item: open threads' status, reports and
+                          pull requests, plus unhandled inbox items; `routine list`
+                          counts quiet runs, and editing the prompt re-arms it
   uploads/                files you give the threads
   scratch/                the coordinator's temporary files
   threads/<id>.toml       thread record          threads/<id>.md       home copy of its report
