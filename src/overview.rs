@@ -155,7 +155,7 @@ pub fn render(project: &Project, rows: &[Row]) -> String {
                 format!("{}@{}", t.branch, t.machine)
             } else if !t.branch.is_empty() {
                 t.branch.clone()
-            } else if t.kind == thread::Kind::Tab {
+            } else if matches!(t.kind, thread::Kind::Tab | thread::Kind::Home) {
                 "tab".to_string()
             } else {
                 "-".to_string()

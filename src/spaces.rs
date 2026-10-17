@@ -402,6 +402,29 @@ mod tests {
     }
 
     #[test]
+    fn an_open_home_thread_keeps_the_space_it_lives_in() {
+        let f = fixture();
+        f.workspaces.borrow_mut().push(home_json(&f));
+        *f.world.panes.borrow_mut() = format!(
+            "[{},{},{}]",
+            f.world.coordinator_pane(&f.project),
+            pane_json("w9", "w9:t1", "w9:p1", &f.repo),
+            pane_json("w8", "w8:t2", "w8:p2", "/tmp")
+        );
+        // A home thread lives in w8: the cleanup must not close the Space
+        // while its tab works there.
+        thread::update(&f.project, "t-0001", |t| {
+            t.kind = Kind::Home;
+            t.status = Status::Open;
+            t.workspace_id = "w8".into();
+        })
+        .unwrap();
+        assert_eq!(close(&f), 0);
+        thread::update(&f.project, "t-0001", |t| t.status = Status::Resolved).unwrap();
+        assert_eq!(close(&f), 1);
+    }
+
+    #[test]
     fn an_orphan_home_space_with_an_agent_is_kept() {
         let f = fixture();
         f.workspaces.borrow_mut().push(home_json(&f));

@@ -75,8 +75,9 @@ pub struct StartArgs {
     /// The profile (`--profile`), default `thread_profile` in PROJECT.md;
     /// it must be on the project's allow-list.
     pub profile: Option<String>,
-    /// Placement (`--kind worktree|tab|checkout`); default worktree with a
-    /// repo, tab without one.
+    /// Placement (`--kind worktree|tab|checkout|home`); default worktree
+    /// with a repo, tab without one. `home` is a tab of the project's own
+    /// workspace on `threads/<id>/`.
     pub kind: Option<Kind>,
     pub base: Option<String>,
     pub task: String,
@@ -125,7 +126,7 @@ pub fn placement(kind: Option<Kind>, has_repo: bool, remote: bool) -> Result<Kin
         (None, false) => Ok(Kind::Tab),
         (Some(Kind::Worktree), false) | (Some(Kind::Checkout), false) => bail!("a worktree or checkout thread needs --repo"),
         (Some(Kind::Adopted), _) => bail!("an adopted thread is made with `thread adopt`"),
-        (Some(Kind::Tab), _) | (Some(Kind::Checkout), _) if remote => bail!("a tab or checkout thread runs in the project's own workspace, which is local; a remote repo needs a worktree thread"),
+        (Some(Kind::Tab) | Some(Kind::Checkout) | Some(Kind::Home), _) if remote => bail!("a tab, checkout or home thread runs in the project's own workspace, which is local; a remote repo needs a worktree thread"),
         (Some(kind), _) => Ok(kind),
     }
 }
@@ -273,7 +274,7 @@ fn place_and_brief(ctx: &Ctx, project: &Project, view: &SessionView, id: &str, r
                 t.pane_id = created.pane_id;
             })?
         }
-        Kind::Tab | Kind::Checkout => place_tab(project, view, &record)?,
+        Kind::Tab | Kind::Checkout | Kind::Home => place_tab(project, view, &record)?,
         Kind::Adopted => bail!("an adopted thread is not placed by the binary"),
     };
     prepare_thread_agents(&placed)?;
@@ -317,7 +318,8 @@ fn write_brief(ctx: &Ctx, project: &Project, placed: &Thread, restart: bool) -> 
 
 /// A workspace of the thread's own on `threads/<id>/` for a tab thread, so
 /// the coordinator keeps its Space to itself; a tab of the project's own
-/// workspace, in the repo's main checkout, for a checkout thread.
+/// workspace, in the repo's main checkout, for a checkout thread; and a tab
+/// of the project's own workspace on `threads/<id>/` for a home thread.
 fn place_tab(project: &Project, view: &SessionView, record: &Thread) -> Result<Thread> {
     let coordinator = project.coordinator().context("the project has never been opened")?;
     let workspace = coordinator::project_workspace(&coordinator, &view.panes, &view.agents);
@@ -345,6 +347,20 @@ fn place_tab(project: &Project, view: &SessionView, record: &Thread) -> Result<T
         None
     };
     let created = match record.kind {
+        // A home thread is a tab of the project's own workspace on its
+        // `threads/<id>/` folder: never a Space of its own and never a second
+        // home. When the home cannot be named, say `open` first rather than
+        // make one (a twin by the same label, not the project's Space).
+        Kind::Home => {
+            let home = workspace.clone().context(format!("the project's workspace is not open; run `open {}` first", project.slug))?;
+            // A pane of the home working in the thread's folder is the tab the
+            // thread already has (ids move when the server restarts): reuse it
+            // rather than add a second tab for the same thread.
+            match view.panes.iter().find(|p| p.workspace_id == home && !p.cwd.is_empty() && Path::new(&p.cwd).starts_with(&folder)) {
+                Some(pane) => crate::herdr::Created { workspace_id: pane.workspace_id.clone(), tab_id: pane.tab_id.clone(), pane_id: pane.pane_id.clone() },
+                None => view.herdr.tab_create(&home, &folder, &record.title, false)?,
+            }
+        }
         // Its own Space, never a tab of the project's home: a restart first
         // reuses the Space the thread already has, found by a pane working
         // in its folder.
@@ -387,7 +403,7 @@ fn write_brief_local(ctx: &Ctx, project: &Project, placed: &Thread, restart: boo
     let brief = thread::brief_for(project, &with_dir, &task, restart)?;
 
     std::fs::create_dir_all(Path::new(&dir).join("library")).with_context(|| format!("could not create {dir}"))?;
-    if placed.kind != Kind::Tab {
+    if !matches!(placed.kind, Kind::Tab | Kind::Home) {
         exclude_from_git(ctx.runner, &placed.cwd)?;
     }
     project::write_atomic(&Path::new(&dir).join("brief.md"), brief.as_bytes())?;
@@ -452,7 +468,7 @@ pub enum RestartPlan {
 pub fn restart_plan(thread: &Thread, live: &Live, branch_exists: bool, now: jiff::Timestamp) -> Result<RestartPlan> {
     match thread.kind {
         Kind::Adopted => bail!("an adopted thread cannot be restarted; adopt a new pane instead"),
-        Kind::Worktree | Kind::Tab | Kind::Checkout => {}
+        Kind::Worktree | Kind::Tab | Kind::Checkout | Kind::Home => {}
     }
     if thread.status == Status::Resolved {
         bail!("{} is resolved; `thread resolve --reopen` first", thread.id);
@@ -480,7 +496,7 @@ pub fn restart_plan(thread: &Thread, live: &Live, branch_exists: bool, now: jiff
         }
         return Ok(RestartPlan::Create);
     }
-    if matches!(thread.kind, Kind::Tab | Kind::Checkout) && thread.pane_id.is_empty() {
+    if matches!(thread.kind, Kind::Tab | Kind::Checkout | Kind::Home) && thread.pane_id.is_empty() {
         return Ok(RestartPlan::Create);
     }
     if live.pane_exists {
@@ -971,7 +987,7 @@ pub fn clean(ctx: &Ctx, project: &Project, t: &Thread, options: &Clean) -> Vec<S
                 }
             }
         }
-        Kind::Tab | Kind::Checkout => match &view {
+        Kind::Tab | Kind::Checkout | Kind::Home => match &view {
             Some(view) if !t.pane_id.is_empty() && thread::live_state(t, &view.agents, &view.panes, jiff::Timestamp::now()).pane_exists => {
                 // The live pane's tab, not the recorded one: ids move after a restart.
                 let tab = view.panes.iter().find(|p| thread::pane_matches(t, p)).map(|p| p.tab_id.clone()).or_else(|| view.agents.iter().find(|a| thread::agent_matches(t, a)).map(|a| a.tab_id.clone())).unwrap_or_else(|| t.tab_id.clone());
@@ -1336,11 +1352,15 @@ mod tests {
         assert_eq!(placement(None, false, false).unwrap(), Kind::Tab);
         assert_eq!(placement(Some(Kind::Tab), true, false).unwrap(), Kind::Tab);
         assert_eq!(placement(Some(Kind::Checkout), true, false).unwrap(), Kind::Checkout);
+        assert_eq!(placement(Some(Kind::Home), false, false).unwrap(), Kind::Home);
+        assert_eq!(placement(Some(Kind::Home), true, false).unwrap(), Kind::Home);
         assert!(placement(Some(Kind::Checkout), false, false).is_err());
         assert!(placement(Some(Kind::Worktree), false, false).is_err());
         assert!(placement(Some(Kind::Tab), true, true).is_err());
+        assert!(placement(Some(Kind::Home), false, true).is_err());
         assert!(placement(Some(Kind::Adopted), true, false).is_err());
         assert_eq!(Kind::parse("checkout").unwrap(), Kind::Checkout);
+        assert_eq!(Kind::parse("home").unwrap(), Kind::Home);
         assert!(Kind::parse("popup").is_err());
     }
 

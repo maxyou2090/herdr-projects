@@ -2753,6 +2753,153 @@ fn a_tab_thread_gets_a_workspace_of_its_own_and_a_restart_reuses_it() {
     assert_eq!(h.world.runner.count("workspace create"), 2);
 }
 
+#[test]
+fn a_home_thread_joins_the_project_space_and_a_restart_reuses_its_tab() {
+    let world = World::new();
+    let project = world.project("demo", "a.sock");
+    let folder = std::fs::canonicalize(project.dir()).unwrap().join("threads/t-0001");
+    let folder_text = folder.to_string_lossy().into_owned();
+    world.runner.on("pane get", ok(r#"{"result":{"pane":{"cwd":""}}}"#));
+    world.runner.on("tab create", ok(&format!(r#"{{"result":{{"root_pane":{{"workspace_id":"w1","tab_id":"w1:t2","pane_id":"w1:p2","cwd":"{folder_text}"}}}}}}"#)));
+    *world.panes.borrow_mut() = format!("[{}]", world.coordinator_pane(&project));
+    let ctx = world.ctx();
+    let args = StartArgs { title: "Research".into(), repo: None, machine: None, profile: None, kind: Some(Kind::Home), base: None, task: "Look.".into() };
+    let t = threads::start(&ctx, "demo", args).unwrap();
+    assert_eq!((t.kind, t.workspace_id.as_str(), t.tab_id.as_str(), t.pane_id.as_str()), (Kind::Home, "w1", "w1:t2", "w1:p2"));
+    assert_eq!(t.cwd, folder_text);
+    // A tab of the project's own workspace: no Space was opened for it.
+    assert_eq!(world.runner.count("workspace create"), 0);
+    assert_eq!(world.runner.count("tab create --workspace w1"), 1);
+
+    // After a server restart the ids moved; the pane working in the thread's
+    // folder is its tab, so a restart reuses it instead of adding a second.
+    *world.panes.borrow_mut() = format!("[{},{}]", world.coordinator_pane(&project), pane_json("w1", "w1:t9", "w1:p9", &folder_text));
+    threads::restart(&ctx, "demo", "t-0001", None).unwrap();
+    assert_eq!(world.runner.count("tab create"), 1);
+    assert_eq!(world.runner.count("workspace create"), 0);
+    let t = thread::load(&project, "t-0001").unwrap();
+    assert_eq!((t.workspace_id.as_str(), t.tab_id.as_str(), t.pane_id.as_str()), ("w1", "w1:t9", "w1:p9"));
+}
+
+#[test]
+fn two_home_threads_share_the_project_space_in_tabs_of_their_own() {
+    let world = World::new();
+    let project = world.project("demo", "a.sock");
+    world.runner.on("pane get", ok(r#"{"result":{"pane":{"cwd":""}}}"#));
+    let next = Rc::new(RefCell::new(1usize));
+    let counter = next.clone();
+    world.runner.on_fn(
+        |c| c.display().contains("tab create") && c.display().contains("--workspace w1"),
+        move |c| {
+            let n = {
+                let mut n = counter.borrow_mut();
+                *n += 1;
+                *n
+            };
+            let cwd = c.args.iter().position(|a| a == "--cwd").map(|at| c.args[at + 1].clone()).unwrap_or_default();
+            Ok(ok(&format!(r#"{{"result":{{"root_pane":{{"workspace_id":"w1","tab_id":"w1:t{n}","pane_id":"w1:p{n}","cwd":"{cwd}"}}}}}}"#)))
+        },
+    );
+    *world.panes.borrow_mut() = format!("[{}]", world.coordinator_pane(&project));
+    let ctx = world.ctx();
+    let start = |title: &str| StartArgs { title: title.into(), repo: None, machine: None, profile: None, kind: Some(Kind::Home), base: None, task: "Look.".into() };
+    let one = threads::start(&ctx, "demo", start("One")).unwrap();
+    let two = threads::start(&ctx, "demo", start("Two")).unwrap();
+    assert_eq!((one.workspace_id.as_str(), two.workspace_id.as_str()), ("w1", "w1"));
+    assert_ne!((one.tab_id.as_str(), one.pane_id.as_str()), (two.tab_id.as_str(), two.pane_id.as_str()));
+    assert_ne!(one.cwd, two.cwd);
+    assert_eq!(world.runner.count("workspace create"), 0);
+    assert_eq!(world.runner.count("tab create --workspace w1"), 2);
+}
+
+#[test]
+fn resolving_a_home_thread_closes_only_its_tab_not_the_project_space() {
+    let world = World::new();
+    let project = world.project("demo", "a.sock");
+    let folder = project.dir().join("threads/t-0001");
+    std::fs::create_dir_all(&folder).unwrap();
+    let folder = std::fs::canonicalize(&folder).unwrap().to_string_lossy().into_owned();
+    let t = world.thread(&project, Path::new(&folder), |t| {
+        t.kind = Kind::Home;
+        t.repo.clear();
+        t.worktree_path.clear();
+        t.workspace_id = "w1".into();
+        t.tab_id = "w1:t2".into();
+        t.pane_id = "w1:p2".into();
+    });
+    *world.panes.borrow_mut() = format!("[{},{}]", world.coordinator_pane(&project), pane_json("w1", "w1:t2", "w1:p2", &folder));
+    world.runner.on("tab close", ok(r#"{"result":{}}"#));
+    world.runner.on("workspace close", ok(r#"{"result":{}}"#));
+    threads::resolve(&world.ctx(), "demo", "t-0001", &ResolveArgs::default()).unwrap();
+    assert_eq!(world.runner.count("tab close w1:t2"), 1);
+    // The coordinator's tab and the project's own Space are never touched.
+    assert_eq!(world.runner.count("tab close w1:t1"), 0);
+    assert_eq!(world.runner.count("workspace close"), 0);
+    assert_eq!(thread::load(&project, &t.id).unwrap().status, Status::Resolved);
+}
+
+#[test]
+fn a_home_thread_never_opens_a_second_home_space() {
+    // The coordinator's shell left the folder; only its recorded session says
+    // this is still the project's Space. The recorded home is used.
+    let world = World::new();
+    let project = world.project("demo", "a.sock");
+    project.update_coordinator(|c| c.agent_session = "sess-1".into()).unwrap();
+    let folder = std::fs::canonicalize(project.dir()).unwrap().join("threads/t-0001");
+    let folder_text = folder.to_string_lossy().into_owned();
+    world.runner.on("pane get", ok(r#"{"result":{"pane":{"cwd":""}}}"#));
+    world.runner.on("tab create", ok(&format!(r#"{{"result":{{"root_pane":{{"workspace_id":"w1","tab_id":"w1:t2","pane_id":"w1:p2","cwd":"{folder_text}"}}}}}}"#)));
+    *world.panes.borrow_mut() = format!("[{}]", pane_json("w1", "w1:t1", "w1:p1", "/tmp"));
+    *world.agents.borrow_mut() = r#"[{"pane_id":"w1:p1","tab_id":"w1:t1","workspace_id":"w1","cwd":"/tmp","name":"hp-demo-coordinator","agent":"claude","agent_status":"idle","agent_session":{"value":"sess-1"}}]"#.into();
+    let ctx = world.ctx();
+    let args = || StartArgs { title: "Research".into(), repo: None, machine: None, profile: None, kind: Some(Kind::Home), base: None, task: "Look.".into() };
+    let t = threads::start(&ctx, "demo", args()).unwrap();
+    assert_eq!((t.workspace_id.as_str(), t.tab_id.as_str()), ("w1", "w1:t2"));
+    assert_eq!(world.runner.count("workspace create"), 0);
+    assert_eq!(world.runner.count("tab create --workspace w1"), 1);
+
+    // A restart with the same drifted coordinator adds no Space either.
+    threads::restart(&ctx, "demo", "t-0001", None).unwrap();
+    assert_eq!(world.runner.count("workspace create"), 0);
+    assert_eq!(world.runner.count("tab create --workspace w1"), 2);
+
+    // Neither a pane in the folder nor a matching session names the home: the
+    // start refuses clearly instead of opening a second home Space.
+    let world = World::new();
+    world.project("demo", "a.sock");
+    *world.panes.borrow_mut() = format!("[{}]", pane_json("w5", "w5:t1", "w5:p1", "/tmp"));
+    *world.agents.borrow_mut() = "[]".into();
+    let error = threads::start(&world.ctx(), "demo", args()).unwrap_err();
+    let message = format!("{error:#}");
+    assert!(message.contains("the project's workspace is not open; run `open demo` first"), "{message}");
+    assert_eq!(world.runner.count("workspace create"), 0);
+    assert_eq!(world.runner.count("tab create"), 0);
+}
+
+#[test]
+fn archiving_closes_the_home_with_its_home_thread_aboard() {
+    let world = World::new();
+    let project = world.project("demo", "a.sock");
+    let folder = project.dir().join("threads/t-0001");
+    std::fs::create_dir_all(&folder).unwrap();
+    let folder = std::fs::canonicalize(&folder).unwrap().to_string_lossy().into_owned();
+    world.thread(&project, Path::new(&folder), |t| {
+        t.kind = Kind::Home;
+        t.repo.clear();
+        t.worktree_path.clear();
+        t.workspace_id = "w1".into();
+        t.tab_id = "w1:t2".into();
+        t.pane_id = "w1:p2".into();
+    });
+    *world.panes.borrow_mut() = format!("[{},{}]", world.coordinator_pane(&project), pane_json("w1", "w1:t2", "w1:p2", &folder));
+    world.runner.on("workspace close", ok(r#"{"result":{}}"#));
+    world.runner.on("tab close", ok(r#"{"result":{}}"#));
+    crate::lifecycle::set_status(&world.ctx(), "demo", crate::project::Status::Archived).unwrap();
+    assert_eq!(world.runner.count("workspace close w1"), 1);
+    // The tab closes with the home: it is not closed a second time.
+    assert_eq!(world.runner.count("tab close"), 0);
+}
+
 /// Herdr's default socket, where the ticker looks for hand-started agents.
 fn default_socket(world: &World) -> String {
     let socket = world.home.path().join(".config/herdr/herdr.sock");

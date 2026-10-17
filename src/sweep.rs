@@ -122,7 +122,7 @@ pub fn find(ctx: &Ctx, project: &Project) -> Vec<Orphan> {
     }
 
     for t in threads.iter().filter(|t| t.status == Status::Resolved && !t.is_remote()) {
-        if matches!(t.kind, Kind::Tab | Kind::Checkout)
+        if matches!(t.kind, Kind::Tab | Kind::Checkout | Kind::Home)
             && let Some(view) = &view
             && !t.pane_id.is_empty()
             && thread::live_state(t, &view.agents, &view.panes, now).pane_exists
@@ -136,7 +136,7 @@ pub fn find(ctx: &Ctx, project: &Project) -> Vec<Orphan> {
             orphans.push(Orphan::Workspace { id: t.id.clone(), workspace });
         }
         let folder = project.dir().join("threads").join(&t.id);
-        if t.kind == Kind::Tab && folder.is_dir() && older_than(&t.updated, settings.auto_resolve_days.max(1), now) && thread::home_report_path(project, &t.id).is_file() {
+        if matches!(t.kind, Kind::Tab | Kind::Home) && folder.is_dir() && older_than(&t.updated, settings.auto_resolve_days.max(1), now) && thread::home_report_path(project, &t.id).is_file() {
             orphans.push(Orphan::Folder { id: t.id.clone(), path: folder });
         }
     }

@@ -37,6 +37,10 @@ pub enum Kind {
     /// A tab in the project workspace whose working directory is the repo's
     /// main checkout, asked for explicitly with `thread start --kind checkout`.
     Checkout,
+    /// A tab of the project's own workspace (its home Space) whose working
+    /// directory is `threads/<id>/`, asked for explicitly with
+    /// `thread start --kind home`; never a Space of its own.
+    Home,
     Adopted,
 }
 
@@ -46,7 +50,8 @@ impl Kind {
             "worktree" => Ok(Kind::Worktree),
             "tab" => Ok(Kind::Tab),
             "checkout" => Ok(Kind::Checkout),
-            other => bail!("`{other}` is not a thread kind (worktree, tab or checkout)"),
+            "home" => Ok(Kind::Home),
+            other => bail!("`{other}` is not a thread kind (worktree, tab, checkout or home)"),
         }
     }
 }

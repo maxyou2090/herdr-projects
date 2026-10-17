@@ -50,6 +50,7 @@ scripts/dev-herdr pane read <pane>                   # read a pane; `pane send-k
 | 3 | `thread prompt` reaches the thread; the README allow-list suppresses the prompt for the standard-input form | Builder (also a control: an off-list subcommand did prompt) |
 | 3 | `--remove-worktree` refused for a tab thread and for a dirty worktree; with the ticker stopped, a late report survives `resolve --remove-worktree`; a tab thread starts in `threads/<id>/` | Builder, unit |
 | 4 | Two tab threads, each in its own workspace, show different `thread` tokens | Builder (`api snapshot`) |
+| 4 | A `--kind home` thread runs as a tab of the project's own Space on `threads/<id>/`; no new Space appears, a restart stays in that tab, and two of them coexist | Unit (scenario); manual run not done |
 | 4 | `overview` run without a terminal returns at once; a finished thread stays under Ready for review until `thread ack` | Builder |
 | 5 | A finishing thread gives one inbox item and one nudge, none after until a new item | Builder (with `nudge = true`), unit |
 | 5 | A second session with the plugin linked produces no "pane gone" items | Builder (`hp-dev2`) |

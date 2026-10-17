@@ -50,6 +50,8 @@ fn close_workspaces(project: &Project, view: &SessionView) -> Vec<String> {
         // A worktree thread's Space is on its worktree, a tab thread's on its
         // own `threads/<id>/` folder; one still living in the home (placed
         // before it got a Space of its own) is closed with the home below.
+        // A home thread's tab sits in the home itself and closes with it too,
+        // so it needs no entry here.
         let root = if t.kind == thread::Kind::Worktree { t.worktree_path.as_str() } else { t.cwd.as_str() };
         let workspace = view.panes.iter().find(|p| !root.is_empty() && p.workspace_id != home && std::path::Path::new(&p.cwd).starts_with(root)).map(|p| p.workspace_id.clone());
         if let Some(workspace) = workspace
