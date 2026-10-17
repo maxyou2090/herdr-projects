@@ -17,7 +17,7 @@
 
 ## Keep one conversation going while the work happens in parallel
 
-The coordinator never does the work itself, so it's always free to answer you. Each task runs in its own thread: a separate agent in its own git worktree and branch, or in its own folder when there's no repository. You read reports and answer the threads that need you instead of briefing every agent yourself.
+The coordinator never does the work itself, so it's always free to answer you. Each task runs in its own thread: a separate agent in its own git worktree and branch, or in a tab of the project's own Space when there's no repository. You read reports and answer the threads that need you instead of briefing every agent yourself.
 
 ## Choose between briefing each agent by hand, one long agent session, a cloud projects product, or a coordinator in Herdr
 

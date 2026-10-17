@@ -33,13 +33,16 @@ pub enum Status {
 pub enum Kind {
     #[default]
     Worktree,
+    /// A Space of the thread's own on `threads/<id>/`, asked for explicitly
+    /// with `thread start --kind tab`.
     Tab,
     /// A tab in the project workspace whose working directory is the repo's
     /// main checkout, asked for explicitly with `thread start --kind checkout`.
     Checkout,
     /// A tab of the project's own workspace (its home Space) whose working
-    /// directory is `threads/<id>/`, asked for explicitly with
-    /// `thread start --kind home`; never a Space of its own.
+    /// directory is `threads/<id>/`: the default for a thread without a
+    /// repo, or asked for with `thread start --kind home`; never a Space of
+    /// its own.
     Home,
     Adopted,
 }

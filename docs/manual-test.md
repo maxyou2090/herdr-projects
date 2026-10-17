@@ -49,8 +49,8 @@ scripts/dev-herdr pane read <pane>                   # read a pane; `pane send-k
 | 3 | `thread start` returns in under a minute; the ticker launches within two ticks; a missing agent binary gives `failed` after three attempts | Builder (1 s; 15 s; `--profile kimi`, not installed), unit |
 | 3 | `thread prompt` reaches the thread; the README allow-list suppresses the prompt for the standard-input form | Builder (also a control: an off-list subcommand did prompt) |
 | 3 | `--remove-worktree` refused for a tab thread and for a dirty worktree; with the ticker stopped, a late report survives `resolve --remove-worktree`; a tab thread starts in `threads/<id>/` | Builder, unit |
-| 4 | Two tab threads, each in its own workspace, show different `thread` tokens | Builder (`api snapshot`) |
-| 4 | A `--kind home` thread runs as a tab of the project's own Space on `threads/<id>/`; no new Space appears, a restart stays in that tab, and two of them coexist | Unit (scenario); manual run not done |
+| 4 | Two `--kind tab` threads, each in its own workspace, show different `thread` tokens | Builder (`api snapshot`) |
+| 4 | A thread with no repository (the default, and `--kind home`) runs as a tab of the project's own Space on `threads/<id>/`; no new Space appears, a restart stays in that tab, and two of them coexist | Unit (scenario); manual run not done |
 | 4 | A `--kind tab` thread whose pane is killed restarts into the Space it already has (no second Space); a Space herdr no longer shows gets exactly one replacement, recorded; an empty one a resolved thread left is closed by the tick, never the project's home | Unit (scenario, spaces); manual run not done |
 | 4 | `overview` run without a terminal returns at once; a finished thread stays under Ready for review until `thread ack` | Builder |
 | 5 | A finishing thread gives one inbox item and one nudge, none after until a new item | Builder (with `nudge = true`), unit |

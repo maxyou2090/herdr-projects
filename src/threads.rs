@@ -76,8 +76,8 @@ pub struct StartArgs {
     /// it must be on the project's allow-list.
     pub profile: Option<String>,
     /// Placement (`--kind worktree|tab|checkout|home`); default worktree
-    /// with a repo, tab without one. `home` is a tab of the project's own
-    /// workspace on `threads/<id>/`.
+    /// with a repo, home (a tab of the project's own workspace on
+    /// `threads/<id>/`) without one. `tab` asks for a Space of its own.
     pub kind: Option<Kind>,
     pub base: Option<String>,
     pub task: String,
@@ -123,7 +123,7 @@ pub fn thread_profile(ctx: &Ctx, project: &Project, machine: &str, requested: Op
 pub fn placement(kind: Option<Kind>, has_repo: bool, remote: bool) -> Result<Kind> {
     match (kind, has_repo) {
         (None, true) => Ok(Kind::Worktree),
-        (None, false) => Ok(Kind::Tab),
+        (None, false) => Ok(Kind::Home),
         (Some(Kind::Worktree), false) | (Some(Kind::Checkout), false) => bail!("a worktree or checkout thread needs --repo"),
         (Some(Kind::Adopted), _) => bail!("an adopted thread is made with `thread adopt`"),
         (Some(Kind::Tab) | Some(Kind::Checkout) | Some(Kind::Home), _) if remote => bail!("a tab, checkout or home thread runs in the project's own workspace, which is local; a remote repo needs a worktree thread"),
@@ -156,7 +156,7 @@ pub fn start(ctx: &Ctx, slug: &str, args: StartArgs) -> Result<Thread> {
     let listed = args.repo.as_ref().and_then(|repo| settings.repos.iter().find(|r| &r.path == repo));
     let machine = args.machine.clone().or_else(|| listed.and_then(|r| r.machine.clone())).unwrap_or_default();
     let repo = match (&args.repo, machine.is_empty()) {
-        (None, false) => bail!("a remote thread needs --repo: a task with no repository runs as a tab in the project's own workspace, which is local"),
+        (None, false) => bail!("a remote thread needs --repo: a task with no repository runs in the project's own workspace, which is local"),
         (None, true) => String::new(),
         // A remote path is stored as it is on its own machine.
         (Some(repo), false) => repo.clone(),
@@ -1382,8 +1382,9 @@ mod tests {
     #[test]
     fn placement_follows_the_request_then_the_repo() {
         assert_eq!(placement(None, true, false).unwrap(), Kind::Worktree);
-        assert_eq!(placement(None, false, false).unwrap(), Kind::Tab);
+        assert_eq!(placement(None, false, false).unwrap(), Kind::Home);
         assert_eq!(placement(Some(Kind::Tab), true, false).unwrap(), Kind::Tab);
+        assert_eq!(placement(Some(Kind::Tab), false, false).unwrap(), Kind::Tab);
         assert_eq!(placement(Some(Kind::Checkout), true, false).unwrap(), Kind::Checkout);
         assert_eq!(placement(Some(Kind::Home), false, false).unwrap(), Kind::Home);
         assert_eq!(placement(Some(Kind::Home), true, false).unwrap(), Kind::Home);

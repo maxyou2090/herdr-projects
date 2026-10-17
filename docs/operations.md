@@ -31,7 +31,7 @@ How Herdr Projects works, what it writes where, what its safety settings do and 
   scratch/                the coordinator's temporary files
   threads/<id>.toml       thread record          threads/<id>.md       home copy of its report
   threads/<id>.task.md    the task and every forwarded prompt (## Follow-ups)
-  threads/<id>.next.md    Next lines the coordinator added    threads/<id>/  a tab thread's folder
+  threads/<id>.next.md    Next lines the coordinator added    threads/<id>/  a no-repo thread's folder
   inbox/, inbox/done/     events for the coordinator
   library/<id>/           home copy of files a thread produced
   .state/                 status, coordinator record, live coordinators, ticker state, lock
@@ -54,7 +54,7 @@ Every thread works from `<its working directory>/.herdr-project/<project>-<id>/`
 | `context <project> [--peek]` | The digest the coordinator reads every turn. |
 | `assignable <project> [--refresh] [--check OWNER]` | Who TASKS.md tasks may be assigned to (see [Task owners](#task-owners)); `--check` refuses an owner that is not valid. |
 | `coordinator prompt <project> --text-file F` | A sentence to the coordinator (the popup's task keys use it). |
-| `thread start <project> --title T [--repo PATH] [--kind worktree\|tab\|checkout\|home] [--profile P] [--machine M] [--base REF] --task-file F [--from-task TITLE]` | New thread; `-` reads the task from standard input. `--kind` is the placement (`home`: a tab of the project's own Space on `threads/<id>/`); `--profile` is the agent, one the project allows. `--from-task` adds a TASKS.md task's notes and takes `--profile` and `--machine` from its owner. |
+| `thread start <project> --title T [--repo PATH] [--kind worktree\|tab\|checkout\|home] [--profile P] [--machine M] [--base REF] --task-file F [--from-task TITLE]` | New thread; `-` reads the task from standard input. `--kind` is the placement (default: worktree with `--repo`, home without; `tab` gives the thread a Space of its own; `checkout` runs on the repo's main checkout; `home` is a tab of the project's own Space on `threads/<id>/`); `--profile` is the agent, one the project allows. `--from-task` adds a TASKS.md task's notes and takes `--profile` and `--machine` from its owner. |
 | `thread prompt`, `thread next [--line N \| --add TEXT]`, `thread stop`, `thread restart [--profile P]` | Steer a thread. Prompts are recorded in its task file. |
 | `thread read [--lines N]`, `thread keys [KEY]... [--text T]`, `thread brief` | Answer a thread's pane without going there: print what it shows (a trust dialog, a question menu, a permission prompt), then type text and press keys (`up`, `down`, `enter`, `esc`, `tab`, a digit). `thread keys` refuses a trust screen when `trust_screens` is `user`. `thread brief` sends a brief the ticker has not delivered yet (the ticker waits for a settled, empty input box, counts a brief sent only once the agent starts working, never types it twice, and after three unconfirmed tries leaves an inbox item). |
 | `thread list/show [--json]`, `thread ack`, `thread adopt` | Look at threads. |
@@ -263,7 +263,7 @@ Save the machine with `herdr machine add --label <label> <ssh target>` (both mac
 - The worktree, the brief and the report live on the remote machine. The home ticker polls it once a minute and copies a changed report with `scp` and the thread's `library/` with `rsync -rt` (symbolic links are never followed; a library over 50 MB is not copied).
 - Remote threads get no self-reports: `report` writes on the machine where the agent runs. Their group comes from the agent state Herdr detects and from their pull request.
 - A machine that doesn't answer is left alone: no state is read, threads keep their last group, and after ten minutes you get one `outage` inbox item, and one more when it is back.
-- Tasks with no repository always run locally, as tabs.
+- Tasks with no repository always run locally, as tabs of the project's own Space (`--kind tab`: a Space of their own).
 
 ## Laptop-closed operation
 

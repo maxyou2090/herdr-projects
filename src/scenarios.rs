@@ -2822,7 +2822,8 @@ fn a_home_thread_joins_the_project_space_and_a_restart_reuses_its_tab() {
     world.runner.on("tab create", ok(&format!(r#"{{"result":{{"root_pane":{{"workspace_id":"w1","tab_id":"w1:t2","pane_id":"w1:p2","cwd":"{folder_text}"}}}}}}"#)));
     *world.panes.borrow_mut() = format!("[{}]", world.coordinator_pane(&project));
     let ctx = world.ctx();
-    let args = StartArgs { title: "Research".into(), repo: None, machine: None, profile: None, kind: Some(Kind::Home), base: None, task: "Look.".into() };
+    // No --repo and no --kind: a task with no repository defaults to the home.
+    let args = StartArgs { title: "Research".into(), repo: None, machine: None, profile: None, kind: None, base: None, task: "Look.".into() };
     let t = threads::start(&ctx, "demo", args).unwrap();
     assert_eq!((t.kind, t.workspace_id.as_str(), t.tab_id.as_str(), t.pane_id.as_str()), (Kind::Home, "w1", "w1:t2", "w1:p2"));
     assert_eq!(t.cwd, folder_text);
