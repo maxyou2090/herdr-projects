@@ -7,7 +7,7 @@ use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use crate::herdr::{Agent, Pane, ready_state};
+use crate::herdr::{Agent, Pane, Workspace, ready_state};
 use crate::project::{self, Project, slugify, write_atomic};
 use crate::runner::{Cmd, Runner};
 
@@ -94,6 +94,11 @@ pub struct Thread {
     /// The repository's primary Space herdr grouped this worktree under
     /// (made or reused by `worktree create`); closed once nothing uses it.
     pub repo_workspace: String,
+    /// A tab thread's own Space on `threads/<id>/`: reopened by a restart
+    /// after the pane is gone, and closed by `spaces::empty` once nothing
+    /// uses it. Herdr reuses workspace ids after a server restart, so the
+    /// id is checked before it is used (see [`recorded_own_space`]).
+    pub own_workspace: String,
     pub tab_id: String,
     pub pane_id: String,
     /// The Herdr agent kind: the profile's harness.
@@ -661,6 +666,27 @@ pub fn group(thread: &Thread, live: &Live, now: jiff::Timestamp) -> Group {
     }
     // 7
     Group::Idle
+}
+
+/// The Space id a tab thread recorded as its own: `own_workspace`, or the
+/// record's `workspace_id` from before that field existed (for a tab
+/// thread the two were the same).
+pub fn own_space_id(record: &Thread) -> &str {
+    if record.own_workspace.is_empty() { &record.workspace_id } else { &record.own_workspace }
+}
+
+/// The Space a tab thread recorded as its own, when the recorded id still
+/// names it. Herdr reuses workspace ids after a server restart, so the id
+/// alone proves nothing: the Space must be plain, carry the thread's title
+/// (its label at creation), and not be a project home (which ends with
+/// [`crate::grouping::HOME_MARK`]).
+pub fn recorded_own_space<'w>(record: &Thread, workspaces: &'w [Workspace]) -> Option<&'w Workspace> {
+    let remembered = own_space_id(record);
+    if remembered.is_empty() || record.title.is_empty() {
+        return None;
+    }
+    let space = workspaces.iter().find(|w| w.workspace_id == remembered)?;
+    (space.worktree.is_none() && !space.label.ends_with(crate::grouping::HOME_MARK) && space.label == record.title).then_some(space)
 }
 
 /// A pane is the thread's pane only when workspace, tab and working directory

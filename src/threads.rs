@@ -337,12 +337,17 @@ fn place_tab(project: &Project, view: &SessionView, record: &Thread) -> Result<T
         folder
     };
     let folder = std::fs::canonicalize(&folder)?;
-    // A tab thread reuses a Space of its own, never the project's home: a
-    // pane working in its folder names it, unless it sits in the recorded
-    // home (a thread placed before it got a Space of its own).
+    // The project's own Space, as well as it can be named: a tab thread must
+    // never reuse it, and a stale record may point at it.
+    let project_home = workspace.clone().unwrap_or_else(|| coordinator.workspace_id.clone());
+    // A tab thread reuses a Space of its own, never the project's home: the
+    // recorded one when the id still names it (the pane may be gone while
+    // the Space stays open), else one named by a pane working in its folder.
     let own_space = if record.kind == Kind::Tab {
-        let home = coordinator.workspace_id.as_str();
-        view.panes.iter().find(|p| Path::new(&p.cwd).starts_with(&folder) && p.workspace_id != home).map(|p| p.workspace_id.clone())
+        let listed = view.herdr.workspace_list().unwrap_or_default();
+        thread::recorded_own_space(record, &listed).filter(|w| w.workspace_id != project_home).map(|w| w.workspace_id.clone()).or_else(|| {
+            view.panes.iter().find(|p| !p.cwd.is_empty() && Path::new(&p.cwd).starts_with(&folder) && p.workspace_id != project_home).map(|p| p.workspace_id.clone())
+        })
     } else {
         None
     };
@@ -362,8 +367,8 @@ fn place_tab(project: &Project, view: &SessionView, record: &Thread) -> Result<T
             }
         }
         // Its own Space, never a tab of the project's home: a restart first
-        // reuses the Space the thread already has, found by a pane working
-        // in its folder.
+        // reuses the Space the thread already has (see `own_space`), and
+        // opens one only when that is really gone.
         Kind::Tab => match own_space {
             Some(id) => view.herdr.tab_create(&id, &folder, &record.title, false)?,
             None => {
@@ -389,9 +394,14 @@ fn place_tab(project: &Project, view: &SessionView, record: &Thread) -> Result<T
     let cwd = if cwd.is_empty() { folder.to_string_lossy().into_owned() } else { cwd };
     thread::update(project, &record.id, |t| {
         t.cwd = cwd;
-        t.workspace_id = created.workspace_id;
+        t.workspace_id = created.workspace_id.clone();
         t.tab_id = created.tab_id;
         t.pane_id = created.pane_id;
+        if record.kind == Kind::Tab {
+            // A tab thread always lives in its own Space: remember it, so a
+            // restart with the pane gone can reopen this one.
+            t.own_workspace = created.workspace_id.clone();
+        }
     })
 }
 
@@ -1334,6 +1344,29 @@ mod tests {
 
     fn agent(state: &str) -> Agent {
         Agent { pane_id: "w2:p1".into(), agent_status: state.into(), ..Agent::default() }
+    }
+
+    fn space(id: &str, label: &str) -> crate::herdr::Workspace {
+        crate::herdr::Workspace { workspace_id: id.into(), label: label.into(), ..crate::herdr::Workspace::default() }
+    }
+
+    #[test]
+    fn a_recorded_tab_space_is_only_reused_when_the_id_still_names_it() {
+        let t = Thread { kind: Kind::Tab, title: "Research".into(), own_workspace: "w3".into(), ..Thread::default() };
+        let all = [space("w3", "Research")];
+        assert_eq!(thread::recorded_own_space(&t, &all).map(|w| w.workspace_id.as_str()), Some("w3"));
+        // A reused id with another label, a home Space, a worktree Space and
+        // a disappeared id are all refused.
+        assert!(thread::recorded_own_space(&t, &[space("w3", "mine")]).is_none());
+        let home = space("w3", &format!("Research{}", crate::grouping::HOME_MARK));
+        assert!(thread::recorded_own_space(&t, &[home]).is_none());
+        let worktree = crate::herdr::Workspace { worktree: Some(crate::herdr::WorkspaceWorktree::default()), ..space("w3", "Research") };
+        assert!(thread::recorded_own_space(&t, &[worktree]).is_none());
+        assert!(thread::recorded_own_space(&t, &[space("w9", "Research")]).is_none());
+        // A record from before `own_workspace` existed falls back to its
+        // `workspace_id`.
+        let old = Thread { own_workspace: String::new(), workspace_id: "w3".into(), ..t.clone() };
+        assert_eq!(thread::recorded_own_space(&old, &all).map(|w| w.workspace_id.as_str()), Some("w3"));
     }
 
     #[test]

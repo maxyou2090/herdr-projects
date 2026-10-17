@@ -3,7 +3,7 @@
 //! one (a plain shell in the main checkout) when none is open. Once no open
 //! thread uses it, nothing runs in it and nobody looks at it, it is closed.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use crate::herdr::{Herdr, Workspace};
 use crate::paths::Ctx;
@@ -54,11 +54,20 @@ pub fn record(project: &Project, herdr: &Herdr) {
 /// Spaces safe to close: those `project`'s worktree threads recorded — herdr
 /// must still show them as the repository's primary Space with no worktree
 /// Space under it — plus orphan home Spaces, plain Spaces still carrying the
-/// project's home label that no open thread and no coordinator uses. None of
+/// project's home label that no open thread and no coordinator uses, plus a
+/// tab thread's own plain Space (recorded and titled after it). None of
 /// them may hold an agent, and every pane must be an idle shell. A focused
 /// Space or pane is kept unless `include_focused`.
 pub fn empty(ctx: &Ctx, project: &Project, herdr: &Herdr, include_focused: bool) -> Vec<Space> {
-    let mut recorded: Vec<(String, String)> = thread::list(project).into_iter().filter(|t| local_worktree(t) && !t.repo_workspace.is_empty()).map(|t| (t.repo_workspace, t.repo)).collect();
+    let threads = thread::list(project);
+    let mut recorded: Vec<(String, String)> = threads.iter().filter(|t| local_worktree(t) && !t.repo_workspace.is_empty()).map(|t| (t.repo_workspace.clone(), t.repo.clone())).collect();
+    // Tab threads' own Spaces: a plain Space named after the thread, which
+    // only its own tabs should work in.
+    let mut own: Vec<(String, String, String)> = threads
+        .iter()
+        .filter(|t| t.kind == Kind::Tab && !thread::own_space_id(t).is_empty())
+        .map(|t| (thread::own_space_id(t).to_string(), t.title.clone(), t.id.clone()))
+        .collect();
     let mut in_use = Vec::new();
     let mut coordinators = Vec::new();
     for slug in project::list_slugs(&ctx.root) {
@@ -76,14 +85,17 @@ pub fn empty(ctx: &Ctx, project: &Project, herdr: &Herdr, include_focused: bool)
         coordinators.extend(other.coordinator().map(|c| c.workspace_id));
     }
     recorded.retain(|(id, _)| !in_use.contains(id) && !coordinators.contains(id));
+    own.retain(|(id, _, _)| !in_use.contains(id) && !coordinators.contains(id));
     recorded.sort();
     recorded.dedup_by(|a, b| a.0 == b.0);
+    own.sort();
+    own.dedup_by(|a, b| a.0 == b.0);
     // A twin can only exist where a thread was placed outside the home:
     // without one, the cheap early return spares every project's tick three
     // lists it cannot need.
     let home_id = project.coordinator().map(|c| c.workspace_id).unwrap_or_default();
-    let twins = thread::list(project).iter().any(|t| t.kind != Kind::Worktree && !t.workspace_id.is_empty() && t.workspace_id != home_id);
-    if recorded.is_empty() && !twins {
+    let twins = threads.iter().any(|t| t.kind != Kind::Worktree && !t.workspace_id.is_empty() && t.workspace_id != home_id);
+    if recorded.is_empty() && own.is_empty() && !twins {
         return Vec::new();
     }
     let (Ok(workspaces), Ok(panes), Ok(agents)) = (herdr.workspace_list(), herdr.pane_list(), herdr.agent_list()) else {
@@ -129,6 +141,30 @@ pub fn empty(ctx: &Ctx, project: &Project, herdr: &Herdr, include_focused: bool)
             found.push(Space { id: w.workspace_id.clone(), label: w.label.clone() });
         }
     }
+    // Tab threads' own Spaces, once nothing uses them: a plain Space still
+    // carrying the thread's title (herdr reuses ids after a server restart,
+    // so the label and any panes are checked too). Their last tab is closed
+    // at resolve, which leaves the Space itself empty.
+    for (id, label, thread_id) in own {
+        let Some(space) = workspaces.iter().find(|w| w.workspace_id == id) else {
+            continue;
+        };
+        if space.worktree.is_some() || label.is_empty() || space.label != label || space.label.ends_with(crate::grouping::HOME_MARK) {
+            continue;
+        }
+        let own_panes: Vec<_> = panes.iter().filter(|p| p.workspace_id == id).collect();
+        let folder = project.dir().join("threads").join(&thread_id);
+        let in_folder = own_panes.iter().any(|p| !p.cwd.is_empty() && Path::new(&p.cwd).starts_with(&folder));
+        if own_panes.len() != space.pane_count
+            || agents.iter().any(|a| a.workspace_id == id)
+            || (!include_focused && (space.focused || own_panes.iter().any(|p| p.focused)))
+            || !own_panes.iter().all(|p| herdr.pane_idle_shell(&p.pane_id))
+            || (!own_panes.is_empty() && !in_folder)
+        {
+            continue;
+        }
+        found.push(Space { id, label: space.label.clone() });
+    }
     found
 }
 
@@ -138,10 +174,28 @@ pub fn close(herdr: &Herdr, space: &Space) -> Result<(), crate::herdr::HerdrErro
     herdr.call(&["workspace", "close", &space.id], crate::herdr::CALL_TIMEOUT).map(|_| ())
 }
 
-/// Forgets a Space on every thread of `project` that recorded it.
+/// Forgets a Space on every thread of `project` that recorded it. A tab
+/// thread's `workspace_id` names the same Space as its `own_workspace`, so
+/// a legacy record whose `own_workspace` was never written is forgotten too.
 fn forget(project: &Project, id: &str) {
-    for t in thread::list(project).into_iter().filter(|t| t.repo_workspace == id) {
-        let _ = thread::update(project, &t.id, |t| t.repo_workspace.clear());
+    for t in thread::list(project).into_iter().filter(|t| t.repo_workspace == id || t.own_workspace == id || (t.kind == Kind::Tab && t.workspace_id == id)) {
+        let repo = t.repo_workspace == id;
+        let own = t.own_workspace == id;
+        let tab = t.kind == Kind::Tab;
+        let _ = thread::update(project, &t.id, |t| {
+            if repo {
+                t.repo_workspace.clear();
+            }
+            if own {
+                t.own_workspace.clear();
+            }
+            // A legacy tab record has no `own_workspace`; its `workspace_id`
+            // names the same Space. Only the closed one is cleared: the tab
+            // may have moved elsewhere since.
+            if (own || tab) && t.workspace_id == id {
+                t.workspace_id.clear();
+            }
+        });
     }
 }
 
@@ -265,6 +319,41 @@ mod tests {
         let herdr = Herdr::new(f.world.env.herdr_bin(), f.project.coordinator().unwrap().socket, &f.world.runner);
         assert!(close_empty(&ctx, &f.project, &herdr).is_empty());
         f.world.runner.count("workspace close")
+    }
+
+    /// A project with one tab thread that recorded its own plain Space w8
+    /// (empty in herdr: its last pane is gone) and no other threads.
+    fn tab_fixture(status: Status, pane_count: usize, label: &str) -> Fixture {
+        let world = World::new();
+        let project = world.project("demo", "a.sock");
+        world.thread(&project, world.home.path(), |t| {
+            t.kind = Kind::Tab;
+            t.status = status;
+            t.title = "Research".into();
+            t.repo.clear();
+            t.worktree_path.clear();
+            t.workspace_id = "w8".into();
+            t.own_workspace = "w8".into();
+        });
+        *world.panes.borrow_mut() = format!("[{}]", world.coordinator_pane(&project));
+        let workspaces = Rc::new(RefCell::new(vec![
+            r#"{"workspace_id":"w1","label":"Demo","pane_count":1}"#.to_string(),
+            format!(r#"{{"workspace_id":"w8","label":"{label}","pane_count":{pane_count}}}"#),
+        ]));
+        let list = workspaces.clone();
+        world.runner.on_fn(|c| c.display().contains("workspace list"), move |_| Ok(ok(&format!(r#"{{"result":{{"workspaces":[{}]}}}}"#, list.borrow().join(",")))));
+        let busy = Rc::new(RefCell::new(Vec::<String>::new()));
+        let running = busy.clone();
+        world.runner.on_fn(
+            |c| c.display().contains("process-info"),
+            move |c| {
+                let pane = c.args.last().cloned().unwrap_or_default();
+                let group = if running.borrow().contains(&pane) { 200 } else { 100 };
+                Ok(ok(&format!(r#"{{"result":{{"process_info":{{"pane_id":"{pane}","shell_pid":100,"foreground_process_group_id":{group},"foreground_processes":[{{"pid":{group},"name":"zsh"}}]}}}}}}"#)))
+            },
+        );
+        world.runner.on("workspace close", ok(r#"{"result":{}}"#));
+        Fixture { world, project, repo: String::new(), workspaces, busy }
     }
 
     fn items(f: &Fixture) -> Vec<String> {
@@ -438,6 +527,67 @@ mod tests {
         assert_eq!(close(&f), 1);
         // Closing the primary forgot it on the thread.
         assert_eq!(thread::load(&f.project, "t-0001").unwrap().repo_workspace, "");
+    }
+
+    #[test]
+    fn a_resolved_tab_threads_empty_own_space_is_closed_once() {
+        let f = tab_fixture(Status::Resolved, 0, "Research");
+        assert_eq!(close(&f), 1);
+        let calls = f.world.runner.calls.borrow();
+        let closed = calls.iter().find(|c| c.display().contains("workspace close")).unwrap();
+        assert!(closed.args.ends_with(&["close".to_string(), "w8".to_string()]), "{}", closed.display());
+        drop(calls);
+        assert_eq!(items(&f), ["closed empty Space Research (w8)"]);
+        // Forgotten: the record no longer claims a Space herdr does not show.
+        assert_eq!(thread::load(&f.project, "t-0001").unwrap().own_workspace, "");
+        assert_eq!(close(&f), 1);
+    }
+
+    #[test]
+    fn a_legacy_tab_record_is_closed_by_its_workspace_id() {
+        let f = tab_fixture(Status::Resolved, 0, "Research");
+        thread::update(&f.project, "t-0001", |t| t.own_workspace.clear()).unwrap();
+        assert_eq!(close(&f), 1);
+        assert_eq!(thread::load(&f.project, "t-0001").unwrap().workspace_id, "");
+        assert_eq!(close(&f), 1);
+    }
+
+    #[test]
+    fn a_tab_threads_own_space_is_kept_while_the_thread_works_there() {
+        let f = tab_fixture(Status::Open, 1, "Research");
+        let folder = f.project.dir().join("threads/t-0001");
+        *f.world.panes.borrow_mut() = format!("[{},{}]", f.world.coordinator_pane(&f.project), pane_json("w8", "w8:t1", "w8:p1", &folder.to_string_lossy()));
+        assert_eq!(close(&f), 0);
+        assert_eq!(thread::load(&f.project, "t-0001").unwrap().own_workspace, "w8");
+        // Resolved: its last tab is gone from the records' eyes and the
+        // Space is reclaimed, while the home Space is never touched.
+        thread::update(&f.project, "t-0001", |t| {
+            t.status = Status::Resolved;
+            t.workspace_id.clear();
+        })
+        .unwrap();
+        assert_eq!(close(&f), 1);
+        let calls = f.world.runner.calls.borrow();
+        assert!(calls.iter().any(|c| c.args.ends_with(&["close".to_string(), "w8".to_string()])));
+        assert!(!calls.iter().any(|c| c.args.ends_with(&["close".to_string(), "w1".to_string()])), "the home Space is never closed");
+    }
+
+    #[test]
+    fn a_reused_id_or_a_pane_outside_the_folder_keeps_a_space() {
+        // Herdr reused w8 for something else: the label does not match.
+        let f = tab_fixture(Status::Resolved, 0, "mine");
+        assert_eq!(close(&f), 0);
+        // The label matches, but a live pane in it works elsewhere.
+        let f = tab_fixture(Status::Resolved, 1, "Research");
+        *f.world.panes.borrow_mut() = format!("[{},{}]", f.world.coordinator_pane(&f.project), pane_json("w8", "w8:t1", "w8:p1", "/tmp"));
+        assert_eq!(close(&f), 0);
+        // A busy pane anywhere in it keeps it too.
+        let folder = f.project.dir().join("threads/t-0001");
+        *f.world.panes.borrow_mut() = format!("[{},{}]", f.world.coordinator_pane(&f.project), pane_json("w8", "w8:t1", "w8:p1", &folder.to_string_lossy()));
+        f.busy.borrow_mut().push("w8:p1".into());
+        assert_eq!(close(&f), 0);
+        f.busy.borrow_mut().clear();
+        assert_eq!(close(&f), 1);
     }
 
     #[test]

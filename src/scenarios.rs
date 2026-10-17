@@ -2722,35 +2722,94 @@ fn open_makes_a_tab_outside_a_shell_pane_from_the_popup_with_tab_or_from_an_agen
 
 #[test]
 fn a_tab_thread_gets_a_workspace_of_its_own_and_a_restart_reuses_it() {
-    let h = Here::new(&[]);
-    h.runs.borrow_mut().push((0, format!("[{}]", h.child_agent("w5:p1", "", "sess-7"))));
-    h.open(true, false).unwrap();
-    let folder = h.project.dir().join("threads/t-0001");
-    h.world.runner.on("pane get", ok(r#"{"result":{"pane":{"cwd":""}}}"#));
-    h.world.runner.on("tab create", ok(r#"{"result":{"root_pane":{"workspace_id":"w3","tab_id":"w3:t2","pane_id":"w3:p2"}}}"#));
+    let world = World::new();
+    let project = world.project("demo", "a.sock");
+    let folder = std::fs::canonicalize(project.dir()).unwrap().join("threads/t-0001");
+    let folder_text = folder.to_string_lossy().into_owned();
+    world.runner.on("pane get", ok(r#"{"result":{"pane":{"cwd":""}}}"#));
+    // `workspace create` hands out a fresh Space each time: w3, then w7 once
+    // the first is gone (ids move when a server restarts).
+    let created = Rc::new(RefCell::new(0usize));
+    let counter = created.clone();
+    world.runner.on_fn(
+        |c| c.display().contains("workspace create"),
+        move |_| {
+            let n = {
+                let mut n = counter.borrow_mut();
+                *n += 1;
+                *n
+            };
+            let id = if n == 1 { "w3" } else { "w7" };
+            Ok(ok(&format!(r#"{{"result":{{"root_pane":{{"workspace_id":"{id}","tab_id":"{id}:t1","pane_id":"{id}:p1"}}}}}}"#)))
+        },
+    );
+    world.runner.on_fn(
+        |c| c.display().contains("tab create"),
+        |c| {
+            let at = c.args.iter().position(|a| a == "--workspace").expect("tab create carries --workspace");
+            let id = c.args[at + 1].clone();
+            Ok(ok(&format!(r#"{{"result":{{"root_pane":{{"workspace_id":"{id}","tab_id":"{id}:t2","pane_id":"{id}:p2"}}}}}}"#)))
+        },
+    );
+    world.runner.on("tab close", ok(r#"{"result":{}}"#));
+    world.runner.on("workspace close", ok(r#"{"result":{}}"#));
+    world.runner.on("du -sk", ok("4\t/x\n"));
+    world.runner.on("rsync", ok(""));
+    // Herdr's Spaces, changeable mid-test: the project's home w1 plus the
+    // thread's own Space once it is made.
+    let spaces: Rc<RefCell<Vec<String>>> = Rc::new(RefCell::new(vec![r#"{"workspace_id":"w1","label":"Demo","pane_count":1}"#.into()]));
+    let listed = spaces.clone();
+    world.runner.on_fn(|c| c.display().contains("workspace list"), move |_| {
+        Ok(ok(&format!(r#"{{"result":{{"workspaces":[{}]}}}}"#, listed.borrow().join(","))))
+    });
+    *world.panes.borrow_mut() = format!("[{}]", world.coordinator_pane(&project));
+    let ctx = world.ctx();
     let args = |title: &str| StartArgs { title: title.into(), repo: None, machine: None, profile: None, kind: Some(Kind::Tab), base: None, task: "Look.".into() };
-    let t = threads::start(&h.world.ctx(), "demo", args("Research")).unwrap();
+    let t = threads::start(&ctx, "demo", args("Research")).unwrap();
     // Its own Space, not a tab of the project's home: the coordinator keeps
     // its Space to itself.
-    assert_eq!(h.world.runner.count("workspace create"), 1);
-    assert_eq!(h.world.runner.count("tab create"), 0);
-    assert_eq!((t.workspace_id.as_str(), t.pane_id.as_str()), ("w3", "w3:p1"));
-    assert_eq!(h.world.runner.count("tab rename w3:t1 Research"), 1);
+    assert_eq!(world.runner.count("workspace create"), 1);
+    assert_eq!(world.runner.count("tab create"), 0);
+    assert_eq!((t.workspace_id.as_str(), t.own_workspace.as_str(), t.pane_id.as_str()), ("w3", "w3", "w3:p1"));
+    assert_eq!(world.runner.count("tab rename w3:t1 Research"), 1);
+    spaces.borrow_mut().push(r#"{"workspace_id":"w3","label":"Research","pane_count":0}"#.into());
 
-    // A restart whose pane sits in the project's home (a thread placed before
-    // it got a Space of its own) still opens a Space of its own.
-    let folder = std::fs::canonicalize(&folder).unwrap();
-    *h.world.panes.borrow_mut() = format!("[{},{}]", pane_json("w5", "w5:t1", "w5:p1", "/tmp"), pane_json("w5", "w5:t2", "w5:p2", &folder.to_string_lossy()));
-    threads::restart(&h.world.ctx(), "demo", &t.id, None).unwrap();
-    assert_eq!(h.world.runner.count("tab create --workspace w5"), 0);
-    assert_eq!(h.world.runner.count("workspace create"), 2);
+    // The pane is gone (a server restart moved the ids) but the Space is
+    // still open: the restart reuses it, never opens a second one.
+    threads::restart(&ctx, "demo", "t-0001", None).unwrap();
+    assert_eq!(world.runner.count("workspace create"), 1);
+    assert_eq!(world.runner.count("tab create --workspace w3"), 1);
+    assert_eq!(world.runner.count("tab create --workspace w1"), 0);
+    assert_eq!(thread::load(&project, "t-0001").unwrap().own_workspace, "w3");
 
-    // A restart that finds a pane working in the thread's own Space adds its
-    // tab there instead of making a third one.
-    *h.world.panes.borrow_mut() = format!("[{},{}]", pane_json("w5", "w5:t1", "w5:p1", "/tmp"), pane_json("w3", "w3:t9", "w3:p9", &folder.to_string_lossy()));
-    threads::restart(&h.world.ctx(), "demo", &t.id, None).unwrap();
-    assert_eq!(h.world.runner.count("tab create --workspace w3"), 1);
-    assert_eq!(h.world.runner.count("workspace create"), 2);
+    // A pane working in a Space names it even when the record does not (a
+    // thread placed before its Space was recorded): its tab is added there,
+    // never a second Space.
+    thread::update(&project, "t-0001", |t| {
+        t.own_workspace.clear();
+        t.workspace_id.clear();
+        t.pane_id = "w3:p1".into();
+    })
+    .unwrap();
+    *world.panes.borrow_mut() = format!("[{},{}]", world.coordinator_pane(&project), pane_json("w3", "w3:t9", "w3:p9", &folder_text));
+    threads::restart(&ctx, "demo", "t-0001", None).unwrap();
+    assert_eq!(world.runner.count("tab create --workspace w3"), 2);
+    assert_eq!(world.runner.count("workspace create"), 1);
+    assert_eq!(thread::load(&project, "t-0001").unwrap().own_workspace, "w3");
+
+    // The Space is gone from herdr: exactly one is made again.
+    spaces.borrow_mut().retain(|w| !w.contains(r#""w3""#));
+    *world.panes.borrow_mut() = format!("[{}]", world.coordinator_pane(&project));
+    threads::restart(&ctx, "demo", "t-0001", None).unwrap();
+    assert_eq!(world.runner.count("workspace create"), 2);
+    let t = thread::load(&project, "t-0001").unwrap();
+    assert_eq!((t.workspace_id.as_str(), t.own_workspace.as_str(), t.pane_id.as_str()), ("w7", "w7", "w7:p1"));
+
+    // Resolving closes the thread's own tab, never the project's Space.
+    *world.panes.borrow_mut() = format!("[{},{}]", world.coordinator_pane(&project), pane_json("w7", "w7:t1", "w7:p1", &folder_text));
+    threads::resolve(&ctx, "demo", "t-0001", &ResolveArgs::default()).unwrap();
+    assert_eq!(world.runner.count("tab close w7:t1"), 1);
+    assert_eq!(world.runner.count("workspace close"), 0);
 }
 
 #[test]
