@@ -45,7 +45,7 @@ pub fn prepare(repo: &Path, worktree: &Path) -> Result<()> {
             })?;
             let target = lexical_absolute(destination.parent().unwrap_or(&worktree), &target);
             if target == source {
-                return Ok(());
+                return exclude_shared_link(&primary);
             }
             bail!(
                 "conflicting worktree .agents link at {}; it must point directly to {}; broken or external links are not followed",
@@ -77,7 +77,64 @@ pub fn prepare(repo: &Path, worktree: &Path) -> Result<()> {
         }
         Err(error) => return Err(error.into()),
     }
-    Ok(())
+    exclude_shared_link(&primary)
+}
+
+/// The shared link carries no work of its own, but git counts it as untracked
+/// and both `git worktree remove` and herdr's dirty check then refuse a
+/// non-forced removal. Keep it in the repository's `info/exclude`, the same
+/// mechanism `.herdr-project/` uses. A linked worktree shares the common
+/// exclude file with its primary checkout, so the primary's own `.agents`
+/// becomes invisible to `git status` too; tracked `.agents` content is refused
+/// before this runs, so only local configuration can be hidden. The pattern is
+/// anchored to the root of each checkout the exclude applies to.
+fn exclude_shared_link(primary: &Path) -> Result<()> {
+    exclude_line(&primary.join(".git/info/exclude"), "/.agents")
+}
+
+/// Best effort for a worktree placed before the link was excluded: when its
+/// `.agents` is the link `prepare` makes, add the exclude before a non-forced
+/// removal runs. A link that is not ours, and a real directory, are left
+/// alone.
+pub fn exclude_shared_link_if_present(repo: &Path, worktree: &Path) -> Result<()> {
+    let Ok(primary) = primary_checkout(repo) else {
+        return Ok(());
+    };
+    let Ok(source) = fs::canonicalize(primary.join(".agents")) else {
+        return Ok(());
+    };
+    let destination = worktree.join(".agents");
+    let Ok(meta) = fs::symlink_metadata(&destination) else {
+        return Ok(());
+    };
+    if !meta.file_type().is_symlink() {
+        return Ok(());
+    }
+    let target = fs::read_link(&destination)?;
+    let target = lexical_absolute(destination.parent().unwrap_or(worktree), &target);
+    if target != source {
+        return Ok(());
+    }
+    exclude_shared_link(&primary)
+}
+
+/// Add one line to a git exclude file if it is not already listed, keeping
+/// the rest of the file.
+pub(crate) fn exclude_line(path: &Path, line: &str) -> Result<()> {
+    let current = fs::read_to_string(path).unwrap_or_default();
+    if current.lines().any(|existing| existing.trim() == line) {
+        return Ok(());
+    }
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).with_context(|| format!("could not create {}", parent.display()))?;
+    }
+    let mut text = current;
+    if !text.is_empty() && !text.ends_with('\n') {
+        text.push('\n');
+    }
+    text.push_str(line);
+    text.push('\n');
+    fs::write(path, text).with_context(|| format!("could not update {}", path.display()))
 }
 
 /// Inspect real directories only. Refusing all entries that are symlinks avoids
@@ -350,6 +407,54 @@ mod tests {
             "new Skill"
         );
         assert_eq!(fs::canonicalize(&link).unwrap(), source(&f));
+    }
+
+    fn materialize(repo: &Path) {
+        git(repo, &["reset", "--hard", "-q"]);
+    }
+
+    fn status(repo: &Path) -> String {
+        let output = git_output(repo, &["status", "--porcelain", "--untracked-files=all"]);
+        assert!(output.status.success(), "git status: {}", String::from_utf8_lossy(&output.stderr));
+        String::from_utf8_lossy(&output.stdout).into_owned()
+    }
+
+    #[test]
+    fn a_shared_link_never_counts_as_untracked_work() {
+        let f = fixture();
+        prepare(&f.worktree, &f.worktree).unwrap();
+        materialize(&f.worktree);
+        assert_eq!(status(&f.worktree), "", "the shared link must not make the worktree dirty");
+        // The primary checkout shares the exclude file, so its own .agents is
+        // hidden too: the documented trade-off of the common exclude.
+        assert_eq!(status(&f.primary), "");
+        // What herdr's and git's non-forced removal run.
+        git(&f.primary, &["worktree", "remove", f.worktree.to_str().unwrap()]);
+        assert!(!f.worktree.exists());
+    }
+
+    #[test]
+    fn a_link_placed_before_the_exclude_is_backfilled_once_and_foreign_links_are_left_alone() {
+        let f = fixture();
+        symlink(source(&f), f.worktree.join(".agents")).unwrap();
+        materialize(&f.worktree);
+        assert_eq!(status(&f.worktree), "?? .agents\n", "precondition: a bare shared link is untracked");
+        exclude_shared_link_if_present(&f.primary, &f.worktree).unwrap();
+        exclude_shared_link_if_present(&f.primary, &f.worktree).unwrap();
+        assert_eq!(status(&f.worktree), "");
+        assert_eq!(fs::read_link(f.worktree.join(".agents")).unwrap(), source(&f), "the link is only ignored, not touched");
+        let exclude = fs::read_to_string(f.primary.join(".git/info/exclude")).unwrap();
+        assert_eq!(exclude.matches("/.agents").count(), 1, "the entry is written once");
+
+        let f = fixture();
+        let external = f._tmp.path().join("external target");
+        fs::create_dir_all(&external).unwrap();
+        symlink(&external, f.worktree.join(".agents")).unwrap();
+        materialize(&f.worktree);
+        exclude_shared_link_if_present(&f.primary, &f.worktree).unwrap();
+        assert_eq!(status(&f.worktree), "?? .agents\n", "a link that is not ours stays visible to git");
+        assert_eq!(fs::read_link(f.worktree.join(".agents")).unwrap(), external);
+        assert!(!fs::read_to_string(f.primary.join(".git/info/exclude")).unwrap_or_default().contains("/.agents"));
     }
 
     #[test]

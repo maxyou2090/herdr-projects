@@ -428,19 +428,7 @@ pub fn exclude_from_git(runner: &dyn Runner, cwd: &str) -> Result<()> {
         return Ok(()); // not inside a git repository
     };
     let path = Path::new(cwd).join(path);
-    let current = std::fs::read_to_string(&path).unwrap_or_default();
-    if current.lines().any(|line| line.trim() == ".herdr-project/") {
-        return Ok(());
-    }
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    let mut text = current;
-    if !text.is_empty() && !text.ends_with('\n') {
-        text.push('\n');
-    }
-    text.push_str(".herdr-project/\n");
-    std::fs::write(&path, text).with_context(|| format!("could not update {}", path.display()))
+    crate::skills::exclude_line(&path, ".herdr-project/")
 }
 
 /// Step 5: hand the thread to the ticker's launch step.
@@ -1143,6 +1131,14 @@ pub fn remove_worktree(ctx: &Ctx, project: &Project, record: &Thread, view: Opti
         };
         return Ok(Removal::AlreadyGone(closed));
     }
+    // A worktree placed before the shared `.agents` link was excluded can
+    // still be all git sees as untracked. Clear that before either remover's
+    // non-forced run, including herdr's dirty check. Best effort: a link that
+    // is not ours is left alone, and the removal itself still reports what it
+    // finds.
+    if !record.is_remote() {
+        let _ = crate::skills::exclude_shared_link_if_present(Path::new(&record.repo), Path::new(&record.worktree_path));
+    }
     if let Some(view) = view {
         let (_, panes) = lists_for(view, record)?;
         if let Some(workspace) = own_workspace(record, &panes) {
@@ -1411,5 +1407,76 @@ mod tests {
         std::fs::create_dir_all(repo.path().join(".herdr-project/x")).unwrap();
         std::fs::write(repo.path().join(".herdr-project/x/report.md"), "r").unwrap();
         assert!(String::from_utf8_lossy(&run(&["status", "--porcelain"]).stdout).is_empty());
+    }
+
+    /// A real repo with a shared primary `.agents`, and a real worktree whose
+    /// `.agents` is the link the pre-exclude code wrote: an untracked file to
+    /// git, exactly the state `resolve` could not remove without `--force`.
+    fn worktree_with_a_bare_agents_link() -> (tempfile::TempDir, std::path::PathBuf, std::path::PathBuf) {
+        let home = tempfile::tempdir().unwrap();
+        let repo = home.path().join("repo");
+        let worktree = home.path().join("worktree");
+        let run = |cwd: &Path, args: &[&str]| {
+            let out = std::process::Command::new("git").arg("-C").arg(cwd).args(args).output().unwrap();
+            assert!(out.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&out.stderr));
+        };
+        std::fs::create_dir_all(&repo).unwrap();
+        run(&repo, &["init", "-q"]);
+        run(&repo, &["config", "user.email", "t@example.invalid"]);
+        run(&repo, &["config", "user.name", "Test"]);
+        std::fs::create_dir_all(repo.join(".agents/skills/sample")).unwrap();
+        std::fs::write(repo.join("README.md"), "base").unwrap();
+        run(&repo, &["add", "README.md"]);
+        run(&repo, &["commit", "-qm", "base"]);
+        run(&repo, &["worktree", "add", "--detach", worktree.to_str().unwrap()]);
+        std::os::unix::fs::symlink(std::fs::canonicalize(repo.join(".agents")).unwrap(), worktree.join(".agents")).unwrap();
+        (home, repo, worktree)
+    }
+
+    fn removal_ctx<'a>(home: &Path, env: &'a crate::paths::Env) -> Ctx<'a> {
+        Ctx { env, root: home.join("root"), config_dir: home.join("cfg"), runner: &crate::runner::RealRunner, detached_ticker: false }
+    }
+
+    fn record_of(repo: &Path, worktree: &Path) -> Thread {
+        Thread {
+            id: "t-0001".into(),
+            kind: Kind::Worktree,
+            status: Status::Open,
+            repo: repo.to_string_lossy().into_owned(),
+            worktree_path: worktree.to_string_lossy().into_owned(),
+            cwd: worktree.to_string_lossy().into_owned(),
+            ..Thread::default()
+        }
+    }
+
+    #[test]
+    fn a_worktree_whose_only_untracked_file_is_the_shared_agents_link_is_removed_non_forced() {
+        let (home, repo, worktree) = worktree_with_a_bare_agents_link();
+        let env = crate::paths::Env::for_test(home.path(), &[]);
+        let ctx = removal_ctx(home.path(), &env);
+        let project = crate::project::create(&ctx.root, "demo", "", vec![]).unwrap();
+
+        let removal = remove_worktree(&ctx, &project, &record_of(&repo, &worktree), None).unwrap();
+        assert!(matches!(removal, Removal::Removed));
+        assert!(!worktree.exists(), "the worktree must be gone, not kept for its own link");
+        let exclude = std::fs::read_to_string(repo.join(".git/info/exclude")).unwrap();
+        assert!(exclude.contains("/.agents"), "the legacy link was excluded before removal: {exclude}");
+    }
+
+    #[test]
+    fn real_untracked_work_still_keeps_the_worktree() {
+        let (home, repo, worktree) = worktree_with_a_bare_agents_link();
+        std::fs::write(worktree.join("unfinished.txt"), "not copied home").unwrap();
+        let env = crate::paths::Env::for_test(home.path(), &[]);
+        let ctx = removal_ctx(home.path(), &env);
+        let project = crate::project::create(&ctx.root, "demo", "", vec![]).unwrap();
+
+        assert!(remove_worktree(&ctx, &project, &record_of(&repo, &worktree), None).is_err());
+        assert!(worktree.exists(), "real work must keep the worktree");
+        assert_eq!(std::fs::read_to_string(worktree.join("unfinished.txt")).unwrap(), "not copied home");
+        let out = std::process::Command::new("git").arg("-C").arg(&worktree).args(["status", "--porcelain", "--untracked-files=all"]).output().unwrap();
+        let status = String::from_utf8_lossy(&out.stdout);
+        assert!(status.contains("?? unfinished.txt"), "{status}");
+        assert!(!status.contains(".agents"), "only the link is excluded: {status}");
     }
 }

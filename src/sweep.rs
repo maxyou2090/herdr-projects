@@ -7,7 +7,7 @@
 //! `--dry-run` lists; otherwise each is removed after a confirmation.
 //! Remote machines are left to `thread resolve`.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use anyhow::{Result, bail};
@@ -165,6 +165,9 @@ fn remove(ctx: &Ctx, project: &Project, orphan: &Orphan) -> Result<()> {
                     bail!("not everything in it could be copied home first");
                 }
             }
+            // The shared `.agents` link must not count as work for either
+            // non-forced removal, as in `threads::remove_worktree`.
+            let _ = crate::skills::exclude_shared_link_if_present(Path::new(repo), Path::new(path));
             if let (Some(workspace), Some(view)) = (workspace, threads::session_view(ctx, project)) {
                 return view.herdr.worktree_remove(workspace).map_err(|e| anyhow::anyhow!("{e}"));
             }
