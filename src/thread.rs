@@ -138,6 +138,10 @@ pub struct Thread {
     pub state_line: String,
     /// Resolved with `--keep-worktree`: `sweep` leaves the worktree alone.
     pub kept_worktree: bool,
+    /// The ticker backfilled this worktree's shared `.agents` link into the
+    /// repository's `info/exclude` (a thread placed before `prepare` wrote
+    /// it); checked once per thread, not every tick.
+    pub agents_excluded: bool,
     /// The agent's own last activity and percent (local threads).
     pub activity: String,
     pub percent: Option<u8>,

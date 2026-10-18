@@ -988,6 +988,18 @@ fn tick_slow(ctx: &Ctx, project: &Project, seen: &Seen, memory: &mut Memory) -> 
 
     // Local threads: copy home when the report changed, then launches.
     let local = open_threads(project, false);
+    // One-time backfill for worktrees placed before `skills::prepare` wrote the
+    // shared `.agents` link into `info/exclude`: without it a direct
+    // `herdr worktree remove` reads the link as untracked work and refuses
+    // (`dirty_worktree_requires_force`). Recorded, so each thread pays for
+    // this check once, not every tick.
+    for t in local.iter().filter(|t| t.status == thread::Status::Open && t.kind == thread::Kind::Worktree && !t.worktree_path.is_empty() && !t.agents_excluded) {
+        if crate::skills::exclude_shared_link_if_present(Path::new(&t.repo), Path::new(&t.worktree_path)).is_ok()
+            && let Err(error) = thread::update(project, &t.id, |t| t.agents_excluded = true)
+        {
+            errors.push(error.context(format!("{}: .agents exclude backfill", t.id)));
+        }
+    }
     for t in local.iter().filter(|t| t.status == thread::Status::Open) {
         if let Some(hash) = thread::local_report_hash(t)
             && hash != t.report_hash

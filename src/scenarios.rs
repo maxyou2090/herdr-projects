@@ -560,6 +560,45 @@ fn starting_for_more_than_five_minutes_becomes_failed() {
 }
 
 #[test]
+fn the_ticker_backfills_the_shared_agents_exclude_once_for_an_open_worktree_thread() {
+    use std::process::Command;
+
+    let world = World::new();
+    let project = world.project("demo", "a.sock");
+    let repo = world.home.path().join("repo");
+    let worktree = world.home.path().join("wt");
+    let git = |args: &[&str]| {
+        let output = Command::new("git").args(args).output().unwrap();
+        assert!(output.status.success(), "git {:?}: {}", args, String::from_utf8_lossy(&output.stderr));
+    };
+    std::fs::create_dir_all(&repo).unwrap();
+    git(&["init", "-q", repo.to_str().unwrap()]);
+    git(&["-C", repo.to_str().unwrap(), "config", "user.email", "fixture@example.invalid"]);
+    git(&["-C", repo.to_str().unwrap(), "config", "user.name", "Fixture"]);
+    std::fs::create_dir_all(repo.join(".agents/skills/sample")).unwrap();
+    std::fs::write(repo.join("README.md"), "base").unwrap();
+    git(&["-C", repo.to_str().unwrap(), "add", "README.md"]);
+    git(&["-C", repo.to_str().unwrap(), "commit", "-qm", "base"]);
+    git(&["-C", repo.to_str().unwrap(), "worktree", "add", "--detach", worktree.to_str().unwrap()]);
+    // The link as a thread placed before the exclude wrote it.
+    std::os::unix::fs::symlink(std::fs::canonicalize(repo.join(".agents")).unwrap(), worktree.join(".agents")).unwrap();
+    world.thread(&project, &worktree, |t| t.repo = repo.to_string_lossy().into_owned());
+    let exclude = repo.join(".git/info/exclude");
+    assert!(!std::fs::read_to_string(&exclude).unwrap().contains("/.agents"), "precondition: the old link is not excluded");
+
+    assert!(ticker::tick_project(&world.ctx(), &project).unwrap());
+    assert!(std::fs::read_to_string(&exclude).unwrap().contains("/.agents"), "the ticker must exclude the old link");
+    assert!(thread::load(&project, "t-0001").unwrap().agents_excluded, "the backfill is recorded so it runs once");
+
+    // The record stands in for the work: with the entry gone, no later tick
+    // writes it again.
+    let text: String = std::fs::read_to_string(&exclude).unwrap().lines().filter(|line| line.trim() != "/.agents").map(|line| format!("{line}\n")).collect();
+    std::fs::write(&exclude, text).unwrap();
+    assert!(ticker::tick_project(&world.ctx(), &project).unwrap());
+    assert!(!std::fs::read_to_string(&exclude).unwrap().contains("/.agents"), "the one-time backfill must not run again");
+}
+
+#[test]
 fn the_ticker_copies_a_changed_report_home_once() {
     let world = World::new();
     let project = world.project("demo", "a.sock");
