@@ -10,6 +10,7 @@ mod doctor;
 mod grouping;
 mod herdr;
 mod inbox;
+mod lanes;
 mod lifecycle;
 mod names;
 mod notify;

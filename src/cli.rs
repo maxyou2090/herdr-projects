@@ -9,7 +9,7 @@ use crate::paths::{self, Ctx, Env, SessionFlags};
 use crate::project::{self, Project, Status};
 use crate::runner::RealRunner;
 use crate::threads::{self, ResolveArgs, StartArgs};
-use crate::{actions, adopt, doctor, inbox, lifecycle, overview, routine, ticker};
+use crate::{actions, adopt, doctor, inbox, lanes, lifecycle, overview, routine, ticker};
 
 #[derive(Parser)]
 #[command(name = "herdr-projects", version = crate::VERSION, about = "Projects for herdr")]
@@ -120,6 +120,11 @@ enum Command {
     Inbox {
         #[command(subcommand)]
         command: InboxCommand,
+    },
+    /// Lanes: the project's lines of work and who coordinates each
+    Lane {
+        #[command(subcommand)]
+        command: LaneCommand,
     },
     /// Threads: the project's worker agents
     Thread {
@@ -301,6 +306,18 @@ enum InboxCommand {
         ids: Vec<String>,
         #[arg(long, conflicts_with = "ids")]
         all: bool,
+    },
+}
+
+#[derive(Subcommand)]
+enum LaneCommand {
+    /// Every lane with its status, default, last activity and the rule each
+    /// live pane matched (the same fact `context` prints on its
+    /// `Coordinators:` line)
+    List {
+        slug: String,
+        #[arg(long)]
+        json: bool,
     },
 }
 
@@ -700,6 +717,9 @@ pub fn run() -> Result<()> {
                 println!("{moved} item(s) moved to inbox/done");
                 Ok(())
             }
+        },
+        Command::Lane { command } => match command {
+            LaneCommand::List { slug, json } => lanes::lane_list(&ctx, &slug, json),
         },
         Command::Thread { command } => match command {
             ThreadCommand::Start { slug, title, repo, mut machine, mut profile, kind, base, task_file, from_task } => {

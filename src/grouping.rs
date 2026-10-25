@@ -223,12 +223,19 @@ pub fn report(herdr: &Herdr, kind: &str, id: &str, tokens: &Tokens) {
     }
 }
 
-/// Clears every token this module and the earlier layouts wrote.
+/// Clears every token this module and the earlier layouts wrote, plus the
+/// lane claim: a pane that is no longer the plugin's must not go on claiming
+/// a lane (`docs/lanes.md` §5.1).
 pub fn clear(herdr: &Herdr, kind: &str, id: &str) {
     if id.is_empty() {
         return;
     }
-    let all: Tokens = tokens().into_iter().chain(legacy()).map(|t| (t, None)).collect();
+    let all: Tokens = tokens()
+        .into_iter()
+        .chain(std::iter::once(crate::lanes::TOKEN.to_string()))
+        .chain(legacy())
+        .map(|t| (t, None))
+        .collect();
     report(herdr, kind, id, &all);
 }
 
