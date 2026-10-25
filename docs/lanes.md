@@ -399,6 +399,12 @@ So visibility is a standing output, not an event:
   `record`, `dir` or `none`. An `ambiguous` entry carries the reason and the
   command that fixes it — a coordinator reading its own digest must be able to
   hand the user a one-line fix, not the word "ambiguous".
+
+  A pane that resolves to a **closed** lane is marked `closed` and is not
+  treated as anyone's coordinator for nudging (§6.4), but it still appears on
+  this line: "a lane that is put away but whose pane is still running" is
+  exactly the state a person forgets about, and it should be visible rather than
+  discovered later as a stray agent.
 - **`hp lane list`** prints the same fact per lane and per live pane (the
   matched rule included), plus open lanes whose coordinator is missing entirely
   and closed lanes as `closed`.
@@ -473,8 +479,8 @@ Every lane command, with what it does. `hp` is the printed prefix
 | `hp lane list [--json]` | Every lane with the rule each live pane matched, thread and inbox counts, `last_active`, and `closed` lanes. | 列出所有 lane，含每个 live pane 命中的解析规则、线程数与 inbox 数、`last_active`，以及已 closed 的 lane。 |
 | `hp lane assign <lane> <pane>` | The explicit handover: point the lane (and its threads) at another coordinator pane. The **only** thing that moves ownership. | 显式接手：把该 lane 及其线程交给另一个协调器 pane。这是**唯一**会转移归属的命令。 |
 | `hp lane rename <lane> <label> [--name <name>]` | Change the display label, and optionally the CLI handle. The `id` never changes, so thread and inbox ownership never move. | 改显示名（可选改命令里的 handle）。`id` 不变，所以线程与 inbox 的归属不变。 |
-| `hp lane close <lane>` | Retire a lane: refused while any of its threads is `open`/`starting`; otherwise `status = closed`. A closed lane leaves `context`, the sidebar and nudging, and its record and id stay. | 收起来：该 lane 还有 open/starting 线程就拒绝并列出；全部 resolve 后 `status = closed`。closed 的 lane 不再出现在 context/侧栏/nudge 里，记录和 id 保留。 |
-| `hp lane open <lane>` | Undo a close: `status = open` again. Refused for a lane that is already open. | 恢复一个 closed 的 lane（如果它还有线程）。已是 open 的 lane 会拒绝。 |
+| `hp lane close <lane>` | Retire a lane: refused while any of its threads is `open`/`starting`; otherwise `status = closed`. A closed lane gets no `context` section, sidebar row or nudge, and its record and id stay. The coordinator process is left alone (§6.4). | 收起来：该 lane 还有 open/starting 线程就拒绝并列出；全部 resolve 后 `status = closed`。closed 的 lane 不再有 context 分区/侧栏行/nudge，记录和 id 保留；**不杀协调器进程**（§6.4）。 |
+| `hp lane open <lane>` | Undo a close: `status = open` again, and nothing else — no agent is started and no session is resumed. The output names the next step. | 恢复一个 closed 的 lane：只改 `status = open`，**不启动代理、不续 session**，输出会给出下一步。 |
 
 Ownership moves belong to the user. Neither `open`, nor `adopt`, nor the ticker
 ever rewrites `Thread.lane`:
@@ -492,8 +498,10 @@ close exists and `lane rm` does not.
 hp lane close <lane>
   - the lane has any open or starting thread  -> refuse, listing the live thread ids
   - all of its threads are resolved           -> status = closed, `closed` = now
-  - closed lane: absent from `context`, no sidebar row, no nudge, no items
+  - closed lane: no lane section in `context`, no sidebar row, no nudge, no items
+    (a still-running pane of it still shows on the `Coordinators:` line, §5.4)
   - the registry record, its id and its history stay; ids are never reused
+  - the coordinator process is not touched (see "Close does not stop the coordinator")
   - `hp lane list` shows it as closed; `hp lane open <lane>` reopens it
 ```
 
@@ -528,10 +536,79 @@ Details that decide the edge cases:
   construction, so it can never trigger it. Reopening a closed lane that somehow
   has live threads (a hand-edited registry) puts it straight back under §7's
   rules.
-- **Closing the default lane is allowed**, with one consequence to state in the
-  docs and in `lane close`'s prompt: the next `open` with no `--lane` picks
-  another open lane as default, and if none is open it reopens `c-1` rather than
-  creating a new one. A project always has a default lane.
+
+#### Close does not stop the coordinator, and open does not start one
+
+Same reason as decision 2: `close` answers "are the threads alive", so it does
+not also reach over and change process state. Both directions follow from that.
+
+**`hp lane close` does not kill the coordinator.** The pane may still be doing
+something else, or the user may simply want the line out of the way. After a
+close, if that pane is still alive it is still that lane's coordinator — the
+registry keeps its `pane_id` and `agent_session`, and rule 2 of §5.2 still
+resolves it. What changes is reachability: the lane has no section in `context`, no
+sidebar row and no nudging, so **it receives no new events**. Its pane still
+appears on `context`'s `Coordinators:` line, marked `closed` (§5.4) — the one
+place where "put away but still running" stays visible.
+
+The combination has to be stated plainly, because it looks contradictory:
+
+```text
+lane closed + its coordinator pane still alive
+  = a workspace that is put away but still running
+```
+
+That is a legitimate state, not a bug: the coordinator keeps whatever work it
+was mid-way through, and stops being woken with new inbox items. A user who
+wants it actually stopped closes the pane, or runs `hp thread stop` on a thread
+— closing a lane is not that command, and `lane close` says so in its output
+rather than silently killing a pane somebody is looking at.
+
+**`hp lane open` only flips `status = open`.** It starts no agent and resumes no
+session. Its output names the next step, because "open again" and "running" are
+not the same thing:
+
+```text
+lane `收藏` (c-2) is open again; its coordinator is not running.
+Start or resume one with `hp open law --lane c-2`.
+```
+
+When that lane's coordinator pane is in fact still alive (the combination
+above), the output says so instead and does **not** suggest `open` — suggesting
+it would start a second coordinator beside the one already running:
+
+```text
+lane `收藏` (c-2) is open again; its coordinator is already running in pane w1AB:p1.
+```
+
+**Which session a reopen resumes is `open`'s existing decision, not the lane's.**
+`lane open` records no "resume this" hint. `open` already decides: it resumes
+only when the new launch is not `--new`, the agent kind matches the recorded one
+and the profile matches the recorded profile (`src/coordinator.rs:371`-`:375`);
+otherwise it starts fresh. Lanes inherit exactly that rule — a second resume
+policy would be a second source of truth about a conversation.
+
+#### Default lane election
+
+Closing the default lane is allowed. A project always has a default lane, so one
+is elected when the current default closes:
+
+```text
+default lane election, when the current default is closed:
+  1. among open lanes, the one with the newest `last_active`
+  2. tie -> the lowest id (c-1 before c-2, creation order)
+  3. no open lane left -> reopen c-1 (a project always has a default lane)
+```
+
+- **Why `last_active`**: it is the only field that means "recently in use", and
+  that is the closest thing to "the line you are working on" — closer than
+  "declared first", which is only a file order. `c-1` wins ties only because a
+  stable, predictable id beats a coin flip.
+- **What the default lane is for, and what it is not.** It decides exactly two
+  things: where an `open` with no `--lane` goes, and who receives the orphan
+  reminder of §7. It does **not** own threads, does not gate what `context`
+  prints, and grants no privileges — a lane is not more or less a lane for being
+  the default. `lane list` marks it so nobody has to guess.
 
 ## 7. Orphans: a lane with no coordinator
 
@@ -548,8 +625,9 @@ The rule: **nothing is adopted automatically, and nothing is silently dropped.**
   thread (`src/ticker.rs:841`), and rules 1 and 2 resolve to no live pane.
 - It writes **one** inbox item, kind `lane` (a new kind next to `thread-state`,
   `session`, `space`, `routine`, `outage`; it renders through the existing
-  nudge path, `steps::nudge_text`, `src/steps.rs:442`), addressed to the default
-  lane:
+  nudge path, `steps::nudge_text`, `src/steps.rs:442`), addressed to the
+  **default lane** — that election is one of the two jobs the default lane has
+  (§6.4), and it is why a project with a closed default still needs one:
 
   ```text
   - 20261025T104200Z-lane-c-2-7 [lane] c-2: 12 open threads, no coordinator
@@ -681,8 +759,10 @@ the kind of loss nobody notices for a week.
   ambiguous one), then the lane's header (`lane c-1 · 抢修`), the lane's tasks,
   the lane's inbox, the threads of the lane — and a one-line summary of the
   other open lanes ("c-2 收藏: 12 open, 3 unhandled") so a coordinator can say
-  "that is the other line's" without reading it. **Closed lanes are absent from
-  all of it**, except for the "which lines exist" line in `lane list`.
+  "that is the other line's" without reading it. **Closed lanes get no section
+  of any of it** — no tasks, no inbox, no threads — but a still-running pane of
+  a closed lane stays on the `Coordinators:` line (marked `closed`, §5.4) and in
+  `lane list`.
   `context` also passes the lane to `inbox::mark_seen`.
   `skill/COORDINATOR.md` is the actual program here; it has to say all of this
   (§12).
@@ -812,7 +892,9 @@ cleanup at the end.
 4. **Open / adopt / assign / close.** `open --lane`, `--lane-name`,
    `hp lane adopt`, `hp lane assign`, `hp lane rename`, `hp lane close`,
    `hp lane open` (§6.4). Closing is a registry status change and a filter, not a
-   deletion, so it lands with the same commit that owns the registry.
+   deletion, so it lands with the same commit that owns the registry; so does the
+   default-lane election, because a closed default leaves the registry with no
+   default until one is chosen.
 5. **TASKS.md split + `hp task`.** The heading convention first (read-only,
    `context`/popup honour it), then the locked write commands (§8). Highest
    risk; no other commit in the same PR.
