@@ -672,8 +672,8 @@ the kind of loss nobody notices for a week.
   sidebar from live coordinators and recorded panes, so a closed lane's row
   simply disappears with its pane — nothing has to be added — but
   `spaces::empty` must not offer to close the home while an open lane still
-  lives in it (§ above), and `overview` / `needs-you` must filter on
-  `status == open` when they iterate lanes.
+  lives in it (the Home Space bullet above), and `overview` / `needs-you`
+  must filter on `status == open` when they iterate lanes.
 - **`hp context` must be lane-aware**, and its header carries the identity line
   from §5.4 on **every** run. It currently prints the whole digest
   (`src/coordinator.rs:588` `digest()`). After the change the first lines are
