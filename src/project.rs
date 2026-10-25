@@ -154,7 +154,10 @@ impl Default for Settings {
             goal: String::new(),
             coordinator_profile: "claude".into(),
             thread_profile: "claude".into(),
-            max_parallel_threads: 10,
+            // No cap by default (user, 2026-10-25): the validation ceiling of 1000 is
+            // "unlimited" for a person-driven queue, so a new project never blocks a start
+            // on a count. The setting stays, for a project that wants a real limit.
+            max_parallel_threads: 1000,
             auto_resolve_days: 7,
             // On by default (W15): the ticker prompts only a coordinator that
             // has been idle for a minute and whose input box is empty, because on herdr 0.9.1 a prompt
@@ -796,7 +799,7 @@ mod tests {
         assert_eq!(settings.name, "Demo");
         assert_eq!(settings.goal, "Ship \"it\"");
         assert_eq!(settings.coordinator_profile, "claude");
-        assert_eq!(settings.max_parallel_threads, 10);
+        assert_eq!(settings.max_parallel_threads, 1000);
         assert_eq!(settings.auto_resolve_days, 7);
         assert!(settings.nudge);
         assert!(project.dir().join(PR_FOLLOWUP).is_file());
