@@ -587,7 +587,35 @@ pub fn identity_line(view: &View) -> String {
     if !view.reachable {
         parts.push("session unreachable (no pane checked)".to_string());
     }
-    parts.append(&mut view.degraded());
+    // Only the lanes whose pane is not already on the line: a pane printed as
+    // `ambiguous` needs no second entry saying the same about its lane, and a
+    // pane that is simply gone is `lane list`'s orphan note, not a degraded one.
+    let statuses = view.lane_statuses();
+    for status in statuses.iter().filter(|s| !s.orphan && !s.shown) {
+        parts.push(format!(
+            "{} (degraded, lane {}{}: {}) — run `hp lane adopt {}` in it",
+            status.pane_id.clone().unwrap_or_default(),
+            status.lane_id,
+            if status.this_pane { ", this pane" } else { "" },
+            status.why,
+            status.lane_id,
+        ));
+    }
+    // And the reader itself, when it is a live agent Herdr lists and nothing
+    // above names it: no token, no record, not in the folder. `hp lane adopt`
+    // exists for the tab the user opened by hand (§6.2), so the line says the
+    // pane they are sitting in is not this project's coordinator — the one
+    // verdict a digest could never deliver before, because an unrecognized
+    // pane printed no entry at all. A pane outside Herdr, or one that is only a
+    // shell, is said nothing about.
+    let listed = view.agents.iter().any(|a| a.pane_id == view.this_pane);
+    // Only a status this line itself printed counts as naming the pane: an
+    // orphan lane leaves its pane unexplained, and that pane is the reader's.
+    let named = statuses.iter().any(|s| !s.orphan && s.pane_id.as_deref() == Some(view.this_pane.as_str()));
+    let shown = view.entries().iter().any(|e| e.starts_with(&format!("{} ", view.this_pane)));
+    if view.reachable && listed && !named && !shown {
+        parts.push(format!("this pane {} is no lane's coordinator (run `hp lane adopt <lane>` in it)", view.this_pane));
+    }
     parts.push(default_tail(&view.registry));
     format!("Coordinators: {}\n", parts.join(" · "))
 }
@@ -657,16 +685,19 @@ impl View {
             .collect()
     }
 
-    /// The incident this file's opening section describes, named while it is
-    /// still standing: a lane records the pane it ran in, that pane is alive,
-    /// and the pane resolves to **no lane at all** — its native session no
-    /// longer matches and its directory is outside the project home, so rules
-    /// 1, 2 and 3 all miss it. Under one record the project is then judged to
-    /// have no coordinator, nudges stop, and the *no coordinator* branch logs
-    /// nothing: `herdr-projects` lost a week that way. A lane whose recorded
-    /// pane is simply gone is not degraded — that is an orphan, and
-    /// [`View::list_text`] names it.
-    fn degraded(&self) -> Vec<String> {
+    /// The open lanes whose coordinator is **alive but not recognizable**,
+    /// named while the state stands. This is the incident this module exists
+    /// for: the lane records a pane, the pane is still listed, but its native
+    /// session no longer matches and its directory is outside the project home,
+    /// so rules 1, 2 and 3 all miss it. Under a single record the project is
+    /// then judged coordinator-less, nudges stop, and that branch logs nothing
+    /// at all — `herdr-projects` lost a week to exactly this, and a once-only
+    /// item could not have reported it because there was no transition.
+    ///
+    /// A lane whose recorded pane is *not* listed is not degraded: that is an
+    /// orphan, and [`LaneStatus::orphan`] says which is which so `lane list`
+    /// never tells a live pane it is gone.
+    fn lane_statuses(&self) -> Vec<LaneStatus> {
         if !self.reachable {
             return Vec::new();
         }
@@ -674,43 +705,65 @@ impl View {
         self.registry
             .lanes
             .iter()
-            .filter(|lane| lane.is_open() && !lane.pane_id.is_empty() && !lane.agent_session.is_empty())
+            .filter(|lane| lane.is_open())
             .filter(|lane| !sightings.iter().any(|s| s.resolution.lane_id() == Some(lane.id.as_str())))
-            .filter_map(|lane| {
+            .map(|lane| {
+                // Only a pane of *this* project: a neighbour's pane that reuses
+                // the id is not our coordinator.
                 let agent = self
                     .agents
                     .iter()
-                    .find(|a| a.pane_id == lane.pane_id && ours(a, &self.slug))?;
-                let session_gone = agent.session_id() != lane.agent_session;
-                let folder = crate::herdr::own_dir(&agent.cwd, &agent.foreground_cwd);
-                let drifted = folder != self.home;
+                    .find(|a| !lane.pane_id.is_empty() && a.pane_id == lane.pane_id && ours(a, &self.slug));
+                let Some(agent) = agent else {
+                    // No live pane at all for the lane: the orphan case.
+                    return LaneStatus {
+                        lane_id: lane.id.clone(),
+                        pane_id: (!lane.pane_id.is_empty()).then(|| lane.pane_id.clone()),
+                        why: if lane.pane_id.is_empty() {
+                            "no pane was ever recorded for it".to_string()
+                        } else {
+                            format!("its recorded pane {} is not listed", lane.pane_id)
+                        },
+                        this_pane: false,
+                        shown: false,
+                        orphan: true,
+                    };
+                };
+                // Why the rules missed it, in the order they missed it.
                 let mut why: Vec<String> = Vec::new();
-                if session_gone {
+                if !lane.agent_session.is_empty() && agent.session_id() != lane.agent_session {
                     why.push("its recorded session no longer matches".to_string());
                 }
-                if drifted {
+                let folder = crate::herdr::own_dir(&agent.cwd, &agent.foreground_cwd);
+                if folder != self.home {
                     why.push(format!("it works in {folder}, outside {}", self.home));
                 }
                 if why.is_empty() {
-                    return None;
+                    why.push("it is listed and claims no lane".to_string());
                 }
-                Some(format!(
-                    "{} (degraded, lane {}, {}{}) — run `hp lane adopt {}` in it",
-                    lane.pane_id,
-                    lane.id,
-                    why.join(" and "),
-                    if lane.pane_id == self.this_pane { ", this pane" } else { "" },
-                    lane.id
-                ))
+                // A pane the line already prints (ambiguous, or in the folder
+                // and unclaimed) needs no second entry about the same pane; it
+                // is not an orphan either — the process is running.
+                let shown = sightings.iter().any(|s| s.pane_id == agent.pane_id);
+                LaneStatus {
+                    lane_id: lane.id.clone(),
+                    pane_id: Some(lane.pane_id.clone()),
+                    why: why.join(" and "),
+                    this_pane: lane.pane_id == self.this_pane,
+                    shown,
+                    orphan: false,
+                }
             })
             .collect()
     }
 
-    /// `hp lane list`'s body: the identity line, one row per lane, and the
-    /// open lanes whose coordinator is missing entirely (§5.4).
+    /// `hp lane list`'s body: the identity line, one row per lane, and a note
+    /// for every open lane that no live pane claims (§5.4: "open lanes whose
+    /// coordinator is missing entirely").
     pub fn list_text(&self) -> String {
         let mut out = identity_line(self);
-        for row in views(&self.registry, &self.sightings()) {
+        let sightings = self.sightings();
+        for row in views(&self.registry, &sightings) {
             let panes: Vec<String> = row
                 .panes
                 .iter()
@@ -732,28 +785,52 @@ impl View {
             let _ = writeln!(out, "no lanes");
         }
         if self.reachable {
-            for lane in orphan_lanes(&self.registry, &self.sightings()) {
-                let _ = write!(out, "lane {} ({}) has no live coordinator", lane.id, lane.label);
-                if !lane.pane_id.is_empty() {
-                    let _ = write!(out, "; the pane it last ran in, {}, is gone", lane.pane_id);
+            // Only the lanes whose pane really is gone: a live-but-unrecognized
+            // pane is on the identity line already, and telling the user its
+            // coordinator "is gone" would be a lie that sends them to `open`,
+            // which starts a second coordinator beside the one running.
+            for status in self.lane_statuses().into_iter().filter(|s| s.orphan) {
+                let _ = write!(out, "lane {} ({}) has no live coordinator", status.lane_id, self.lane_label(&status.lane_id));
+                if let Some(pane) = status.pane_id {
+                    let _ = write!(out, "; the pane it last ran in, {pane}, is gone");
                 }
-                let _ = writeln!(out, " — start one with `open {} --lane {}`", self.slug, lane.id);
+                let _ = writeln!(out, " — start one with `open {} --lane {}`", self.slug, status.lane_id);
             }
         }
         out
     }
+
+    fn lane_label(&self, id: &str) -> String {
+        self.registry.get(id).map(|l| l.label.clone()).unwrap_or_default()
+    }
+
+    /// The open lanes whose coordinator is **gone**, as opposed to alive but
+    /// unrecognizable: the ids `lane list --json` flags `orphan`.
+    pub fn orphan_ids(&self) -> Vec<String> {
+        self.lane_statuses().into_iter().filter(|s| s.orphan).map(|s| s.lane_id).collect()
+    }
 }
 
-/// Open lanes that no live pane claims (§5.4: "`lane list` prints … open
-/// lanes whose coordinator is missing entirely").
-pub fn orphan_lanes<'a>(registry: &'a Registry, sightings: &[Sighting]) -> Vec<&'a Lane> {
-    registry
-        .lanes
-        .iter()
-        .filter(|lane| lane.is_open())
-        .filter(|lane| !sightings.iter().any(|s| s.resolution.lane_id() == Some(lane.id.as_str())))
-        .collect()
+/// One open lane that no pane claims, and why. `orphan` is the difference
+/// between "its coordinator is gone" and "its coordinator is sitting there
+/// unrecognizable": only the first may be told to start a new one.
+#[derive(Debug, Clone, PartialEq)]
+pub struct LaneStatus {
+    pub lane_id: String,
+    pub pane_id: Option<String>,
+    pub why: String,
+    pub this_pane: bool,
+    /// The pane is already printed on the line (ambiguous, or in the folder
+    /// and claimed by no lane), so no second entry about it is needed.
+    pub shown: bool,
+    /// No live pane at all for the lane: `lane list` says its coordinator is
+    /// gone and offers `open`. A lane whose pane runs unrecognized is not an
+    /// orphan, and telling the user to `open` would start a second coordinator
+    /// beside the one already running (§6.4).
+    pub orphan: bool,
 }
+
+
 
 fn default_tail(registry: &Registry) -> String {
     let default = registry.default_lane().map(|l| l.id.clone()).unwrap_or_default();
@@ -821,7 +898,7 @@ pub fn list_json(view: &View) -> serde_json::Value {
                     "profile": row.lane.profile,
                     "goal": row.lane.goal,
                     "pane_id": row.lane.pane_id,
-                    "orphan": row.lane.is_open() && row.panes.is_empty(),
+                    "orphan": view.orphan_ids().iter().any(|id| id == &row.lane.id),
                     "panes": row
                         .panes
                         .iter()
@@ -1463,7 +1540,7 @@ mod tests {
         // Read from that pane, the line names it and gives the fix.
         assert_eq!(
             identity_line(&view(&registry, vec![drifted.clone()], "w1D3:p1", true)),
-            "Coordinators: w1D3:p1 (degraded, lane c-1, its recorded session no longer matches and it works in /Users/maxyou, outside /r/demo, this pane) — run `hp lane adopt c-1` in it · default lane c-1\n"
+            "Coordinators: w1D3:p1 (degraded, lane c-1, this pane: its recorded session no longer matches and it works in /Users/maxyou, outside /r/demo) — run `hp lane adopt c-1` in it · default lane c-1\n"
         );
         // A pane that resolves is never also called degraded.
         let matched = identity_line(&view(&registry, vec![with_session("w1D3:p1", "/Users/maxyou", "old-session")], "w1D3:p1", true));
@@ -1471,7 +1548,76 @@ mod tests {
         // Another project's pane is not this project's degraded lane either.
         let mut theirs = with_session("w1D3:p1", "/Users/maxyou", "new-session");
         theirs.tokens.insert(crate::sidebar::PROJECT_TOKEN.into(), "other".into());
-        assert!(!identity_line(&view(&registry, vec![theirs], "w1D3:p1", true)).contains("identity degraded"));
+        let line = identity_line(&view(&registry, vec![theirs], "w1D3:p1", true));
+        assert!(!line.contains("degraded"), "{line}");
+        assert!(line.contains("this pane w1D3:p1 is no lane's coordinator"), "{line}");
+    }
+
+    #[test]
+    fn a_pane_is_named_once_however_many_lanes_point_at_it() {
+        // Found by running the real binary: a pane that is already on the line
+        // as `ambiguous` must not also appear as a second entry about its lane,
+        // or the reader counts two coordinators where one sits.
+        let registry = reg(
+            vec![lane_at("c-1", "fix", "w1D3:p1", "sess-1"), lane_at("c-2", "books", "w1AB:p1", "sess-old")],
+            "c-1",
+            3,
+        );
+        let line = identity_line(&view(
+            &registry,
+            vec![claiming("w1D3:p1", "/elsewhere", "c-1"), agent("w1AB:p1", HOME)],
+            "",
+            true,
+        ));
+        assert_eq!(
+            line,
+            "Coordinators: w1D3:p1 (token, lane c-1, other pane) · w1AB:p1 (ambiguous: no token, no record match, 2 open lanes share this folder — run `hp lane adopt <lane>` in it) · lanes c-1 c-2 of 2 (default c-1)\n",
+            "{line}"
+        );
+        assert_eq!(line.matches("w1AB:p1").count(), 1, "one entry per pane: {line}");
+    }
+
+    #[test]
+    fn a_lane_whose_pane_is_alive_is_never_called_gone() {
+        // Also found by running it: the orphan note used to say "the pane it
+        // last ran in is gone" about a pane that was listed and alive, and told
+        // the user to `open`, which starts a second coordinator beside the one
+        // already running (§6.4 says exactly that this must not be suggested).
+        let registry = reg(vec![lane_at("c-1", "default", "w1:p1", "sess-1")], "c-1", 2);
+        // The pane lives outside the folder with a new session: degraded, not
+        // gone, and `lane list` must not offer `open` for it.
+        let rendered = view(&registry, vec![with_session("w1:p1", "/elsewhere", "sess-2")], "", true);
+        let text = rendered.list_text();
+        assert!(text.contains("degraded"), "{text}");
+        assert!(!text.contains("has no live coordinator"), "{text}");
+        assert!(!text.contains("open demo --lane c-1"), "{text}");
+        assert_eq!(list_json(&rendered)[0]["orphan"], serde_json::json!(false));
+        // The same lane with its pane actually gone: then, and only then, the
+        // note appears.
+        let gone = view(&registry, vec![with_session("w9:p9", "/elsewhere", "sess-9")], "w9:p9", true);
+        let text = gone.list_text();
+        assert!(text.contains("lane c-1 (default) has no live coordinator; the pane it last ran in, w1:p1, is gone — start one with `open demo --lane c-1`"), "{text}");
+        assert_eq!(list_json(&gone)[0]["orphan"], serde_json::json!(true));
+        // Never started: no recorded pane, and no claim that one was lost.
+        let fresh = view(&reg(vec![lane("c-1", "default")], "c-1", 2), vec![], "", true);
+        assert!(fresh.list_text().contains("lane c-1 (default) has no live coordinator — start one with `open demo --lane c-1`"), "{}", fresh.list_text());
+    }
+
+    #[test]
+    fn an_unclaimed_lane_reports_its_status_without_renaming_its_pane() {
+        // A lane whose recorded pane is listed, in the folder, with the very
+        // session recorded — and yet another lane's token took it: the folder
+        // pane still needs explaining, and "nothing explains it" is a fact.
+        let registry = reg(vec![lane_at("c-1", "default", "w1:p1", "sess-1")], "c-1", 2);
+        let statuses = view(&registry, vec![with_session("w1:p1", HOME, "sess-1")], "", true).lane_statuses();
+        assert!(statuses.is_empty(), "the pane claimed it: {:?}", statuses);
+        // A second lane and an unrecorded folder pane: the pane is shown as
+        // ambiguous, the other lane is not orphaned by a pane it never had.
+        let two = reg(vec![lane_at("c-1", "default", "w1:p1", "sess-1"), lane("c-2", "books")], "c-1", 3);
+        let statuses = view(&two, vec![with_session("w1:p1", HOME, "sess-1")], "", true).lane_statuses();
+        assert_eq!(statuses.len(), 1);
+        assert!(statuses[0].orphan, "c-2 never had a pane: {}", statuses[0].why);
+        assert_eq!(statuses[0].pane_id, None);
     }
 
     #[test]
