@@ -133,6 +133,10 @@ pub fn pick(ctx: &Ctx) -> Result<String> {
 
 /// Threads grouped by state, in the one display order.
 pub fn render(project: &Project, rows: &[Row]) -> String {
+    // A closed lane leaves every view (§9): its rows — resolved ones included,
+    // since a close requires every thread resolved — are not printed. Without
+    // a registry `thread_visible` is always true, so nothing changes there.
+    let rows: Vec<&Row> = rows.iter().filter(|r| crate::lanes::thread_visible(project, &r.thread.lane)).collect();
     let mut out = String::new();
     let goal = project.read_project_md().map(|(s, _)| s.goal).unwrap_or_default();
     let _ = write!(out, "{} ({})", project.slug, project.status());
@@ -144,7 +148,7 @@ pub fn render(project: &Project, rows: &[Row]) -> String {
         let _ = writeln!(out, "\n  no threads yet");
     }
     for group in Group::DISPLAY_ORDER {
-        let members: Vec<&Row> = rows.iter().filter(|r| r.group == group).collect();
+        let members: Vec<&Row> = rows.iter().copied().filter(|r| r.group == group).collect();
         if members.is_empty() {
             continue;
         }
@@ -340,6 +344,45 @@ mod tests {
         assert_eq!(request["params"]["source"], "herdr-projects");
         assert_eq!(request["params"]["filter"], serde_json::json!({"op":"eq","field":{"token":"hp_project"},"value":"demo"}));
         assert_eq!(request["params"]["sort"], serde_json::json!([{"field":{"token":"hp_group"},"order":"asc"},{"field":{"token":"hp_rank"},"order":"asc"}]));
+    }
+
+    #[test]
+    fn a_closed_lane_leaves_the_overview_and_the_needs_you_groups() {
+        let world = World::new();
+        let project = world.project("demo", "a.sock");
+        crate::lanes::Registry {
+            lanes: vec![
+                crate::lanes::Lane { id: "c-1".into(), name: "fix".into(), label: "抢修".into(), ..Default::default() },
+                crate::lanes::Lane { id: "c-2".into(), name: "old".into(), label: "归档".into(), status: crate::lanes::Status::Closed, ..Default::default() },
+            ],
+            default: "c-1".into(),
+            next: 3,
+        }
+        .save(&project)
+        .unwrap();
+        world.thread(&project, world.home.path(), |t| {
+            t.status = thread::Status::Open;
+            t.lane = "c-2".into();
+            t.last_group = "waiting-on-you".into();
+        });
+        let rows = threads::rows(&world.ctx(), &project);
+        let text = render(&project, &rows);
+        assert!(!text.contains("t-0001"), "a closed lane's row is gone: {text}");
+        assert!(crate::sidebar::recorded_groups(&project).is_empty(), "and it is not counted as needing you");
+
+        // The zero-change anchor: the same record in a project with no
+        // registry still prints and still counts.
+        let plain = world.project("plain", "b.sock");
+        world.thread(&plain, world.home.path(), |t| {
+            t.status = thread::Status::Open;
+            t.last_group = "waiting-on-you".into();
+        });
+        let rows = threads::rows(&world.ctx(), &plain);
+        let text = render(&plain, &rows);
+        assert!(text.contains("t-0001"), "{text}");
+        assert_eq!(crate::sidebar::recorded_groups(&plain).len(), 1);
+        // `needs-you` sums `recorded_groups` for every project, so the check
+        // above is the filter that keeps a closed lane out of its count too.
     }
 
     #[test]

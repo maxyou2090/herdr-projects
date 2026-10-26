@@ -76,6 +76,9 @@ pub struct TaskRow {
     pub owner: String,
     pub thread: Option<String>,
     pub description: String,
+    /// The lane **id** the task's heading names, `None` when the list is
+    /// shared. `d`/`m`/`D` send the task to exactly this lane (§8, §9).
+    pub lane: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -108,18 +111,23 @@ pub fn parse_tasks(slug: &str, text: &str) -> Vec<TaskRow> {
     parse_tasks_for(slug, text, None, None)
 }
 
-/// The tasks section's rows for one reader: shared lists plus the reader
-/// lane's own lists, exactly like `hp context` (§8). The popup's interaction
-/// is unchanged in this commit; only the visible subset is.
+/// The tasks section's rows. Without a registry: every list as written. With
+/// one: shared lists plus **every open lane's** lists — the popup is the
+/// user's project-wide view (§8, §11), unlike `hp context`, which is read by
+/// one lane's coordinator and shows only that lane. `lane` scopes the rows to
+/// one reader's lane for callers that want it; `None` means every open lane.
+/// A closed lane's lists never appear (`docs/lanes.md` §8).
 pub fn parse_tasks_for(slug: &str, text: &str, registry: Option<&crate::lanes::Registry>, lane: Option<&str>) -> Vec<TaskRow> {
     crate::tasks::parse_with(text, registry)
         .into_iter()
-        .filter(|task| match (&task.lane, registry, lane) {
-            (None, _, _) => true,
-            (Some(id), Some(registry), Some(lane)) => id == lane && registry.get(id).is_some_and(|record| record.is_open()),
+        .filter(|task| match (&task.lane, registry) {
+            (None, _) => true,
+            (Some(id), Some(registry)) => {
+                registry.get(id).is_some_and(|record| record.is_open()) && lane.is_none_or(|reader| reader == id)
+            }
             _ => false,
         })
-        .map(|t| TaskRow { slug: slug.to_string(), list: t.list, title: t.title, owner: t.owner.to_string(), thread: t.thread, description: t.description })
+        .map(|t| TaskRow { slug: slug.to_string(), list: t.list, title: t.title, owner: t.owner.to_string(), thread: t.thread, description: t.description, lane: t.lane })
         .collect()
 }
 
@@ -286,6 +294,11 @@ fn group_color(group: Group) -> Option<Color> {
     }
 }
 
+/// A lane's human name: its label, or its handle when no label was given.
+fn lane_label(lane: &crate::lanes::Lane) -> String {
+    if lane.label.is_empty() { lane.name.clone() } else { lane.label.clone() }
+}
+
 /// A task's notes as a detail screen.
 fn task_detail(task: &TaskRow) -> Mode {
     let mut lines = vec![format!("{} · {}", task.list, if task.owner.is_empty() { "no owner" } else { &task.owner }), String::new()];
@@ -368,22 +381,39 @@ pub fn build(ctx: &Ctx, section: Section, scope: Option<&str>) -> Vec<Row> {
             for project in projects_in_scope(root, scope, false) {
                 let text = std::fs::read_to_string(project.dir().join("TASKS.md")).unwrap_or_default();
                 let registry = crate::lanes::Registry::load(&project);
-                let lane = registry.as_ref().map(|_| crate::lanes::lane_of_initiator(ctx, &project, &[])).map(|lane| {
-                    if lane.is_empty() {
-                        crate::lanes::default_lane_id(&project)
-                    } else {
-                        lane
-                    }
-                });
-                let tasks = match (registry.as_ref(), lane.as_deref()) {
-                    (Some(registry), Some(lane)) => parse_tasks_for(&project.slug, &text, Some(registry), Some(lane)),
-                    _ => parse_tasks(&project.slug, &text),
+                // The user's popup shows every open lane's tasks, not one
+                // reader's subset: that is the "tasks show their lane" split
+                // of §8/§11. `hp context` stays reader-scoped; this is the
+                // other kind of reader.
+                let tasks = match registry.as_ref() {
+                    Some(registry) => parse_tasks_for(&project.slug, &text, Some(registry), None),
+                    None => parse_tasks(&project.slug, &text),
                 };
-                let mut list = None;
+                // §8: the tasks section is one view with a lane column rather
+                // than a second view. With a registry each heading names its
+                // lane (or `shared`), so a row's lane is visible from its
+                // group; without one the headings stay exactly as before.
+                let mut list: Option<(Option<String>, String)> = None;
                 for task in tasks {
-                    if list.as_ref() != Some(&task.list) {
-                        list = Some(task.list.clone());
-                        rows.push(header(if scope.is_none() { format!("{} · {}", project.slug, task.list) } else { task.list.clone() }));
+                    let key = (task.lane.clone(), task.list.clone());
+                    if list.as_ref() != Some(&key) {
+                        list = Some(key);
+                        let lane_heading = match (registry.as_ref(), &task.lane) {
+                            (None, _) => None,
+                            (Some(registry), Some(id)) => {
+                                let label = registry.get(id).map(lane_label).unwrap_or_else(|| id.clone());
+                                let rest = task.list.split_once('/').map(|(_, rest)| rest.trim()).filter(|rest| !rest.is_empty()).unwrap_or(&task.list);
+                                Some(format!("{label} · {rest}"))
+                            }
+                            (Some(_), None) => Some(format!("shared · {}", task.list)),
+                        };
+                        let heading = match lane_heading {
+                            Some(lane) if scope.is_none() => format!("{} · {lane}", project.slug),
+                            Some(lane) => lane,
+                            None if scope.is_none() => format!("{} · {}", project.slug, task.list),
+                            None => task.list.clone(),
+                        };
+                        rows.push(header(heading));
                     }
                     let mut owner = if task.owner.is_empty() { String::new() } else { format!("  ({})", task.owner) };
                     if let Some(thread) = &task.thread {
@@ -597,6 +627,9 @@ enum Mode {
     Confirm { question: String, action: Vec<String>, lines: Vec<String> },
     Edit { label: String, buffer: String, action: Vec<String> },
     Pick { label: String, options: Vec<String>, selected: usize, action: Vec<String> },
+    /// A shared task's lane choice (`d`/`m`/`D`): the popup's plugin pane
+    /// resolves to no lane, so a person names the line explicitly.
+    Lane { question: String, slug: String, lanes: Vec<(String, String)>, selected: usize, text: String },
     /// Several choices at once: space toggles, ↵ runs `action` with the
     /// checked options appended (`--all` when the first, "every profile", is).
     Toggle { label: String, options: Vec<(String, bool)>, selected: usize, action: Vec<String> },
@@ -782,6 +815,28 @@ impl<'a> Popup<'a> {
                     Mode::List
                 }
                 _ => Mode::Pick { label, options, selected, action },
+            },
+            Mode::Lane { question, slug, lanes, mut selected, text } => match key.code {
+                KeyCode::Esc => {
+                    self.message = "cancelled".into();
+                    Mode::List
+                }
+                KeyCode::Up | KeyCode::Char('k') => {
+                    selected = selected.saturating_sub(1);
+                    Mode::Lane { question, slug, lanes, selected, text }
+                }
+                KeyCode::Down | KeyCode::Char('j') => {
+                    selected = (selected + 1).min(lanes.len().saturating_sub(1));
+                    Mode::Lane { question, slug, lanes, selected, text }
+                }
+                KeyCode::Enter => {
+                    if let Some((lane, _)) = lanes.get(selected) {
+                        let args = Self::prompt_args(&slug, lane);
+                        self.run(&args, Some(&text));
+                    }
+                    Mode::List
+                }
+                _ => Mode::Lane { question, slug, lanes, selected, text },
             },
             Mode::Toggle { label, mut options, mut selected, action } => match key.code {
                 KeyCode::Esc => {
@@ -1080,11 +1135,48 @@ impl<'a> Popup<'a> {
         self.run(&["coordinator".into(), "prompt".into(), slug.to_string(), "--text-file".into(), "-".into()], Some(&text));
     }
 
+    /// The command that sends a sentence to one lane's coordinator. The lane
+    /// is explicit, because the popup runs in a plugin pane: with several
+    /// open lanes no rule can tell whose context it is (§12 commit 6).
+    fn prompt_args(slug: &str, lane: &str) -> Vec<String> {
+        vec!["coordinator".into(), "prompt".into(), slug.to_string(), "--lane".into(), lane.to_string(), "--text-file".into(), "-".into()]
+    }
+
+    /// `d`/`m`/`D` on a task: the task's own lane when its heading names one,
+    /// else — for a shared task in a project with a registry — an explicit
+    /// lane choice. Neither the popup's plugin pane nor the default lane is
+    /// guessed: the popup can no longer merely refuse (§9).
+    fn task_says(&mut self, task: &TaskRow, verb: &str) {
+        let text = format!("(from the projects popup) {verb} the task \"{}\" in TASKS.md.", task.title);
+        if let Some(lane) = task.lane.clone() {
+            let args = Self::prompt_args(&task.slug, &lane);
+            self.run(&args, Some(&text));
+            return;
+        }
+        let registry = Project::load(&self.ctx.root, &task.slug).ok().and_then(|project| crate::lanes::Registry::load(&project));
+        let Some(registry) = registry else {
+            // No registry: today's behaviour, resolved from the calling pane.
+            self.coordinator_says(&task.slug, text);
+            return;
+        };
+        let open = registry.open_lanes();
+        match open.as_slice() {
+            [only] => {
+                let args = Self::prompt_args(&task.slug, &only.id);
+                self.run(&args, Some(&text));
+            }
+            [_, _, ..] => {
+                let lanes = open.iter().map(|lane| (lane.id.clone(), lane_label(lane))).collect();
+                self.mode = Mode::Lane { question: format!("Send \"{}\" to which lane?", task.title), slug: task.slug.clone(), lanes, selected: 0, text };
+            }
+            [] => self.message = format!("`{}` has no open lane to take this task", task.slug),
+        }
+    }
+
     fn task_key(&mut self, key: KeyEvent) {
         let Some(RowKind::Task(task)) = self.current().map(|r| r.kind.clone()) else {
             return;
         };
-        let sentence = |verb: &str| format!("(from the projects popup) {verb} the task \"{}\" in TASKS.md.", task.title);
         match key.code {
             KeyCode::Enter => match &task.thread {
                 Some(id) => {
@@ -1101,9 +1193,9 @@ impl<'a> Popup<'a> {
                 None => self.message = "this task has no thread yet; d delegates it".into(),
             },
             KeyCode::Char('i') => self.mode = task_detail(&task),
-            KeyCode::Char('d') => self.coordinator_says(&task.slug, sentence("Please delegate")),
-            KeyCode::Char('m') => self.coordinator_says(&task.slug, sentence("Please mark as done")),
-            KeyCode::Char('D') => self.coordinator_says(&task.slug, sentence("Please drop")),
+            KeyCode::Char('d') => self.task_says(&task, "Please delegate"),
+            KeyCode::Char('m') => self.task_says(&task, "Please mark as done"),
+            KeyCode::Char('D') => self.task_says(&task, "Please drop"),
             _ => {}
         }
     }
@@ -1341,6 +1433,19 @@ impl<'a> Popup<'a> {
                     }
                 }
             }
+            Mode::Lane { question, lanes, selected, .. } => {
+                queue!(out, cursor::MoveTo(0, body_top as u16), SetAttribute(Attribute::Bold), Print(fit(&format!(" {question}"), width)), SetAttribute(Attribute::Reset))?;
+                let start = selected.saturating_sub(body_height.saturating_sub(2));
+                for (i, (_, label)) in lanes.iter().enumerate().skip(start).take(body_height.saturating_sub(1)) {
+                    queue!(out, cursor::MoveTo(0, (body_top + 1 + i - start) as u16))?;
+                    let text = fit(&format!("  {label}"), width);
+                    if i == *selected {
+                        queue!(out, SetAttribute(Attribute::Reverse), Print(text), SetAttribute(Attribute::Reset))?;
+                    } else {
+                        queue!(out, Print(text))?;
+                    }
+                }
+            }
             Mode::Toggle { label, options, selected, .. } => {
                 queue!(out, cursor::MoveTo(0, body_top as u16), SetAttribute(Attribute::Bold), Print(fit(&format!(" {label}"), width)), SetAttribute(Attribute::Reset))?;
                 let start = selected.saturating_sub(body_height.saturating_sub(2));
@@ -1442,7 +1547,7 @@ impl<'a> Popup<'a> {
             Mode::Detail { .. } => "↑↓ scroll  esc back".into(),
             Mode::Confirm { question, .. } => question.clone(),
             Mode::Edit { label, buffer, .. } => format!("{label}: {buffer}▏  ↵ save  esc cancel"),
-            Mode::Pick { .. } => "↑↓ choose  ↵ ok  esc cancel".into(),
+            Mode::Pick { .. } | Mode::Lane { .. } => "↑↓ choose  ↵ ok  esc cancel".into(),
             Mode::Toggle { .. } => "↑↓ choose  space check  ↵ save  esc cancel".into(),
             Mode::Form { .. } => "↑↓/tab field  type to edit  ←→ choose  ↵ save  esc cancel".into(),
         };
@@ -1616,14 +1721,55 @@ mod tests {
         assert_eq!((tasks[3].list.as_str(), tasks[3].owner.as_str()), ("Later", ""));
     }
 
+    // This replaces commit 5's `..._only_the_readers_lane`: that assertion
+    // encoded the popup's intermediate state, when it had no lane view yet.
+    // Commit 6's design decision is that the popup is the **user's** view of
+    // the whole project, so it shows every open lane; `hp context` keeps the
+    // reader-lane filter. The coverage grows from one lane to three open plus
+    // one closed, so this is not a weakened assertion.
     #[test]
-    fn tasks_section_shows_shared_and_only_the_readers_lane() {
+    fn tasks_section_shows_shared_and_every_open_lanes_tasks() {
         let world = crate::scenarios::World::new();
         let project = world.project("demo", "a.sock");
         crate::lanes::Registry {
             lanes: vec![
                 crate::lanes::Lane { id: "c-1".into(), name: "fix".into(), label: "抢修".into(), ..Default::default() },
                 crate::lanes::Lane { id: "c-2".into(), name: "books".into(), label: "收藏".into(), ..Default::default() },
+                crate::lanes::Lane { id: "c-3".into(), name: "ops".into(), label: "巡检".into(), ..Default::default() },
+                crate::lanes::Lane { id: "c-4".into(), name: "old".into(), label: "归档".into(), status: crate::lanes::Status::Closed, ..Default::default() },
+            ],
+            default: "c-1".into(),
+            next: 5,
+        }
+        .save(&project)
+        .unwrap();
+        std::fs::write(
+            project.dir().join("TASKS.md"),
+            "# Tasks\n\n## Backlog\n- [ ] Shared task\n\n## 抢修/Backlog\n- [ ] Fix the leak\n\n## 收藏/Backlog\n- [ ] Sort the books\n\n## 巡检/Backlog\n- [ ] Check the fleet\n\n## 归档/Backlog\n- [ ] Old work\n",
+        )
+        .unwrap();
+        // The test process has no HERDR_PANE_ID; the popup no longer cares
+        // which lane it "is", because the user sees all of them.
+        let rows = build(&world.ctx(), Section::Tasks, Some("demo"));
+        let texts: Vec<&str> = rows.iter().map(|row| row.text.as_str()).collect();
+        for wanted in ["  Shared task", "  Fix the leak", "  Sort the books", "  Check the fleet"] {
+            assert!(texts.contains(&wanted), "{wanted:?} missing in {texts:?}");
+        }
+        assert!(!texts.iter().any(|text| text.contains("Old work")), "a closed lane's task stays out: {texts:?}");
+        let heads: Vec<&str> = rows.iter().filter(|row| row.header).map(|row| row.text.as_str()).collect();
+        assert_eq!(heads, ["shared · Backlog", "抢修 · Backlog", "收藏 · Backlog", "巡检 · Backlog"]);
+        assert!(!heads.iter().any(|head| head.contains("归档")), "{heads:?}");
+    }
+
+    #[test]
+    fn a_task_delegated_from_a_plugin_pane_names_its_lane_and_reaches_that_lane() {
+        let world = crate::scenarios::World::new();
+        let project = world.project("demo", "a.sock");
+        let dir = project.canonical_dir().to_string_lossy().into_owned();
+        crate::lanes::Registry {
+            lanes: vec![
+                crate::lanes::Lane { id: "c-1".into(), name: "fix".into(), label: "抢修".into(), pane_id: "w1:p1".into(), ..Default::default() },
+                crate::lanes::Lane { id: "c-2".into(), name: "books".into(), label: "收藏".into(), pane_id: "w2:p1".into(), ..Default::default() },
             ],
             default: "c-1".into(),
             next: 3,
@@ -1632,17 +1778,63 @@ mod tests {
         .unwrap();
         std::fs::write(
             project.dir().join("TASKS.md"),
-            "# Tasks\n\n## Backlog\n- [ ] Shared task\n\n## 抢修/Backlog\n- [ ] Fix the leak\n\n## 收藏/Backlog\n- [ ] Sort the books\n",
+            "# Tasks\n\n## Backlog\n- [ ] Shared task\n\n## 抢修/Backlog\n- [ ] Fix the leak\n",
         )
         .unwrap();
-        // The test process has no HERDR_PANE_ID, which reads as the default
-        // lane (c-1) — the same rule `hp context` uses outside Herdr.
-        let rows = build(&world.ctx(), Section::Tasks, Some("demo"));
-        let texts: Vec<&str> = rows.iter().map(|row| row.text.as_str()).collect();
-        assert!(texts.contains(&"  Shared task"), "{texts:?}");
-        assert!(texts.contains(&"  Fix the leak"), "{texts:?}");
-        assert!(!texts.iter().any(|text| text.contains("Sort the books")), "{texts:?}");
-        assert!(!texts.iter().any(|text| text.contains("收藏/Backlog")), "{texts:?}");
+        *world.agents.borrow_mut() = format!(
+            "[{},{}]",
+            crate::scenarios::agent_json_tokens("w1", "w1:p1", &dir, &[("hp_project", "demo"), ("hp_lane", "c-1")]),
+            crate::scenarios::agent_json_tokens("w2", "w2:p1", &dir, &[("hp_project", "demo"), ("hp_lane", "c-2")]),
+        );
+        *world.panes.borrow_mut() = format!("[{},{}]", crate::scenarios::pane_json("w1", "w1:t1", "w1:p1", &dir), crate::scenarios::pane_json("w2", "w2:t1", "w2:p1", &dir));
+        world.runner.on("agent prompt", crate::runner::fake::ok(r#"{"result":{}}"#));
+        // The popup runs every key as a CLI command: answer it and remember it.
+        world.runner.on_fn(
+            |cmd| cmd.display().contains("coordinator prompt"),
+            |_| Ok(crate::runner::fake::ok("sent")),
+        );
+        let ctx = world.ctx();
+        let mut popup = Popup::new(&ctx, Some("demo".into()), String::new());
+        popup.section = SECTIONS.iter().position(|s| *s == Section::Tasks).unwrap();
+        popup.reload();
+        let key = |popup: &mut Popup, code| popup.key(KeyEvent::new(code, KeyModifiers::NONE));
+
+        // §8: one tasks view with a lane section, not a second view. The
+        // reader is the default lane (the popup has no coordinator pane), so
+        // its lane's list and the shared list are shown, each named.
+        let heads: Vec<&str> = popup.rows.iter().filter(|r| r.header).map(|r| r.text.as_str()).collect();
+        assert!(heads.contains(&"shared · Backlog"), "{heads:?}");
+        assert!(heads.contains(&"抢修 · Backlog"), "{heads:?}");
+
+        // `d` on a lane-owned task goes straight to that lane, never to the
+        // default by guess.
+        popup.selected = popup.rows.iter().position(|r| matches!(&r.kind, RowKind::Task(t) if t.title == "Fix the leak")).unwrap();
+        key(&mut popup, KeyCode::Char('d'));
+        {
+            let calls = world.runner.calls.borrow();
+            let call = calls.iter().find(|c| c.display().contains("coordinator prompt")).expect("the popup ran the CLI");
+            assert!(call.args.ends_with(&["--lane".to_string(), "c-1".to_string(), "--text-file".to_string(), "-".to_string()]), "{}", call.display());
+        }
+
+        // A shared task has no lane of its own: `d` asks, and the answer is
+        // passed explicitly (the popup's plugin pane still resolves to none).
+        popup.selected = popup.rows.iter().position(|r| matches!(&r.kind, RowKind::Task(t) if t.title == "Shared task")).unwrap();
+        key(&mut popup, KeyCode::Char('d'));
+        assert!(matches!(&popup.mode, Mode::Lane { lanes, selected: 0, .. } if lanes.len() == 2 && lanes[1].0 == "c-2"));
+        key(&mut popup, KeyCode::Down);
+        key(&mut popup, KeyCode::Enter);
+        {
+            let calls = world.runner.calls.borrow();
+            let last = calls.iter().rev().find(|c| c.display().contains("coordinator prompt")).expect("the picker ran the CLI");
+            assert!(last.args.ends_with(&["--lane".to_string(), "c-2".to_string(), "--text-file".to_string(), "-".to_string()]), "{}", last.display());
+        }
+
+        // And the command those keys name really reaches the lane's pane.
+        crate::coordinator::prompt_to(&ctx, "demo", "Please delegate the task \"Fix the leak\" in TASKS.md.", Some("c-2")).unwrap();
+        let calls = world.runner.calls.borrow();
+        let sent: Vec<&crate::runner::Cmd> = calls.iter().filter(|c| c.display().contains("agent prompt")).collect();
+        assert_eq!(sent.len(), 1, "{:?}", sent.iter().map(|c| c.display()).collect::<Vec<_>>());
+        assert_eq!(sent[0].args[2], "w2:p1", "{}", sent[0].display());
     }
 
     #[test]

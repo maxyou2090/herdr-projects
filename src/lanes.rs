@@ -83,6 +83,93 @@ pub fn project_home(project: &Project) -> String {
         .unwrap_or_else(|| project.canonical_dir().to_string_lossy().into_owned())
 }
 
+/// The lane label a coordinator row shows after ` · `, or `None` when the row
+/// stays the project name. The gate is the **registry**, not the number of
+/// lanes (`docs/lanes.md` §9): a project that never wrote `lanes.json` keeps
+/// today's row byte for byte, while a project with lanes shows them even when
+/// it has only one and even when that one is the default — otherwise two lanes
+/// would be two identical rows again. A pane that resolved to no lane (an
+/// `Ambiguous` one) gets no label: inventing one would be a guess.
+pub fn display_label(project: &Project, lane_id: Option<&str>) -> Option<String> {
+    if !split_in_use(project) {
+        return None;
+    }
+    let lane_id = lane_id.filter(|id| !id.is_empty())?;
+    let registry = Registry::for_project(project);
+    registry.get(lane_id).map(|lane| if lane.label.is_empty() { lane.name.clone() } else { lane.label.clone() })
+}
+
+/// The lane's position for `grouping::coordinator_key` (`docs/lanes.md` §9):
+/// the default lane first, then the rest in registry order, which is
+/// declaration order. Panes break ties inside a lane.
+///
+/// `None` when the project has no registry, so the key keeps its two-part
+/// shape. With a registry, a pane that resolved to no lane (an `Ambiguous`
+/// one) ranks after every lane: it is shown, but never claims a lane.
+pub fn coordinator_rank(project: &Project, lane_id: &str) -> Option<usize> {
+    if !split_in_use(project) {
+        return None;
+    }
+    let registry = Registry::for_project(project);
+    let default = registry.default_lane().map(|lane| lane.id.as_str());
+    let mut order: Vec<&str> = default.into_iter().collect();
+    order.extend(registry.lanes.iter().map(|lane| lane.id.as_str()).filter(|id| Some(*id) != default));
+    Some(order.iter().position(|id| *id == lane_id).unwrap_or(order.len()))
+}
+
+/// Whether a thread's `lane` field belongs to an **open** lane, for the views
+/// that leave a closed lane out (`overview`, `needs-you`, the sidebar).
+/// Without a registry every thread is visible — the pre-lane answer — and an
+/// empty field is the default lane (§10).
+pub fn thread_visible(project: &Project, lane: &str) -> bool {
+    if !split_in_use(project) {
+        return true;
+    }
+    Registry::for_project(project).lane_of(lane).is_some_and(|lane| lane.is_open())
+}
+
+/// Whether a coordinator pane's lane may still have a sidebar row / be counted:
+/// every pane when there is no registry; with one, only panes whose lane is
+/// open. A pane with no lane is an `Ambiguous` one and stays visible — it is
+/// somebody, and `Coordinators:` says what to do about it.
+pub fn coordinator_visible(project: &Project, lane_id: &str) -> bool {
+    if !split_in_use(project) || lane_id.is_empty() {
+        return true;
+    }
+    Registry::for_project(project).get(lane_id).is_some_and(|lane| lane.is_open())
+}
+
+/// Every **open** lane's Space, for `spaces::empty`: a lane protects the Space
+/// its coordinator lives in, so the home is never offered for closing while a
+/// lane still runs there (`docs/lanes.md` §9). A closed lane protects nothing
+/// (§6.4).
+///
+/// The ticker's live view comes first because it is the only place a lane's own
+/// Space can differ from the shared record (every lane lives in the home by
+/// decision 1, but a later placement mode may not); the record is the fallback
+/// for a lane whose pane is gone. Without a registry this is exactly the one
+/// Space `Project::coordinator()` names today.
+pub fn open_spaces(project: &Project) -> Vec<String> {
+    if !split_in_use(project) {
+        return project.coordinator().map(|record| record.workspace_id).filter(|id| !id.is_empty()).into_iter().collect();
+    }
+    let registry = Registry::for_project(project);
+    let live = crate::coordinator::live(project);
+    let mut out: Vec<String> = Vec::new();
+    for lane in registry.open_lanes() {
+        let space = live
+            .iter()
+            .find(|pane| pane.lane == lane.id)
+            .map(|pane| pane.workspace_id.clone())
+            .filter(|id| !id.is_empty())
+            .unwrap_or_else(|| registry.coordinator_for(project, lane).workspace_id);
+        if !space.is_empty() && !out.contains(&space) {
+            out.push(space);
+        }
+    }
+    out
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Status {
     #[default]
@@ -1432,7 +1519,7 @@ pub fn lane_adopt(ctx: &Ctx, project: Option<&str>, handle: &str) -> Result<()> 
             updated: String::new(),
         }
     })?;
-    crate::sidebar::report_pane(&herdr, &pane, &crate::sidebar::coordinator_display(&project), &project.slug, crate::thread::Group::Idle, Some(&lane.id));
+    crate::sidebar::report_pane(&herdr, &pane, &crate::sidebar::coordinator_display(&project, Some(&lane.id)), &project.slug, crate::thread::Group::Idle, Some(&lane.id));
     let prefix = crate::coordinator::current_prefix(&ctx.root)?;
     println!("lane `{}` ({}) is coordinated by pane {pane}", lane.label, lane.id);
     println!("Commands: {prefix}");
@@ -1498,7 +1585,7 @@ pub fn lane_assign(ctx: &Ctx, project: &Project, handle: &str, pane: &str) -> Re
             record.last_active = now.clone();
         }
     })?;
-    crate::sidebar::report_pane(&session.herdr, pane, &crate::sidebar::coordinator_display(project), &project.slug, crate::thread::Group::Idle, Some(&lane.id));
+    crate::sidebar::report_pane(&session.herdr, pane, &crate::sidebar::coordinator_display(project, Some(&lane.id)), &project.slug, crate::thread::Group::Idle, Some(&lane.id));
     if !old_pane.is_empty() && old_pane != pane {
         // Clear only the lane claim: the old pane may still be a shell or an
         // agent the user is using for something else. It must not keep saying
@@ -2716,6 +2803,24 @@ mod tests {
         assert_eq!(routes(&project), [FALLBACK_ID]);
         reg(vec![lane("c-1", "default"), closed_lane("c-2")], "c-1", 3).save(&project).unwrap();
         assert_eq!(routes(&project), ["c-1"], "a closed lane takes no nudge");
+    }
+
+    #[test]
+    fn a_project_without_a_registry_keeps_every_lane_view_unchanged() {
+        // The umbrella anchor for the nine real projects (§12 commit 6): every
+        // path that commit 6 touched answers as the pre-lane binary did.
+        let world = crate::scenarios::World::new();
+        let project = world.project("demo", "a.sock");
+        assert!(!split_in_use(&project));
+        assert_eq!(display_label(&project, Some("c-1")), None);
+        assert_eq!(crate::sidebar::coordinator_display(&project, None), format!("Demo{}", crate::grouping::HEAD_MARK));
+        assert_eq!(coordinator_rank(&project, "c-1"), None);
+        assert_eq!(crate::grouping::coordinator_key("demo", coordinator_rank(&project, "c-1"), "w1:p1"), "demo!0!w1:p1");
+        assert!(thread_visible(&project, ""));
+        assert!(thread_visible(&project, "c-9"), "no lane table exists to hide a thread behind");
+        assert!(coordinator_visible(&project, ""));
+        assert!(coordinator_visible(&project, "c-1"));
+        assert_eq!(open_spaces(&project), ["w1"], "exactly the recorded coordinator Space");
     }
 
     #[test]
