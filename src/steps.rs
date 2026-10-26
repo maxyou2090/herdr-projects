@@ -64,8 +64,8 @@ pub struct State {
     /// Hashes of files a `config-error` item was already written for.
     pub config_errors: BTreeSet<String>,
     /// lane id -> hash of the set of unseen item ids last nudged in that lane.
-    /// Commit 2 still nudges the default lane only; commit 3 routes each lane
-    /// to its own entry. The old scalar shape is accepted on read (§4.4).
+    /// Every lane owns its entry (§4.4, §12 commit 3). The old scalar shape is
+    /// accepted on read (§4.4).
     #[serde(default, deserialize_with = "string_or_map")]
     pub nudged: BTreeMap<String, String>,
     /// lane id -> when that lane's aged reminder last went out.
@@ -84,15 +84,20 @@ pub struct State {
     pub box_pane: BTreeMap<String, String>,
     #[serde(default, deserialize_with = "string_or_map")]
     pub box_empty_since: BTreeMap<String, String>,
+    /// lane id -> the open-thread count the §7 orphan item was written for, so
+    /// an orphaned lane is announced once and once more at most when its count
+    /// changes. A project without a registry never writes a `lane` item, and
+    /// the old scalar file shape leaves this field out entirely.
+    pub lane_items: BTreeMap<String, usize>,
     pub session_item_written: bool,
     /// thread id -> the retry-failure line last reported from its pane.
     pub error_seen: BTreeMap<String, String>,
     /// thread id -> when the ticker first saw its pull request merged.
     pub merged_seen: BTreeMap<String, String>,
-    /// The default lane in force for this load. Not part of the file; the
-    /// per-lane maps are keyed by lane id, and the default lane is the one
-    /// `nudge` still reads and writes until commit 3. `State::default()` (a
-    /// test or a fresh ticker) falls back to [`crate::lanes::FALLBACK_ID`].
+    /// The default lane in force for this load. Not part of the file: the
+    /// per-lane maps are keyed by lane id, and an empty lane argument reads as
+    /// this one. `State::default()` (a test or a fresh ticker) falls back to
+    /// [`crate::lanes::FALLBACK_ID`].
     #[serde(skip)]
     pub default_lane: String,
 }
@@ -580,108 +585,119 @@ const WAITING_FOR_READ: &str = "items were announced and wait for the coordinato
 const NOT_AGED: &str = "shown items sit unhandled but none is old enough for a reminder";
 const REMINDED: &str = "a reminder went out recently; the next waits for its spacing";
 
-/// Step 6. A given set of unseen items is announced once. With `nudge =
-/// false` the user gets a herdr notification instead of a prompt in the
-/// coordinator. `coordinator_ready` is a coordinator idle long enough to be
-/// prompted (see `coordinator::nudge_target`); until one is, nothing is
-/// announced and nothing is spent, so a coordinator that appears or quiets
-/// down on a later tick still hears about the items. A prompt is typed only
-/// into an input box that has looked empty for `NUDGE_QUIET_SECS`, so it
-/// never merges with text someone is typing; until then the nudge waits for
-/// a later tick.
+/// Step 6, once per lane. A given set of unseen items is announced once, to
+/// that lane's coordinator only (§12 commit 3: each lane has its own seen set,
+/// delivered hash and input box, so one lane's announcement can never be spent
+/// on another's). With `nudge = false` the user gets a herdr notification
+/// instead of a prompt in the coordinator. `coordinator_ready` is that lane's
+/// coordinator, idle long enough to be prompted (see
+/// `coordinator::nudge_target`; an `Ambiguous` pane is never one); until there
+/// is one, nothing is announced and nothing is spent, so a coordinator that
+/// appears or quiets down on a later tick still hears about the items. A prompt
+/// is typed only into an input box that has looked empty for
+/// `NUDGE_QUIET_SECS`, so it never merges with text someone is typing; until
+/// then the nudge waits for a later tick.
 ///
 /// Items the coordinator was already shown (its `context` marks them seen)
 /// but never moved to `done` get one reminder once the oldest is
 /// `RE_NUDGE_AFTER_SECS` old, at most every `RE_NUDGE_EVERY_SECS`: an
 /// interrupted turn cannot strand them silently.
-pub fn nudge(project: &Project, state: &mut State, settings: &Settings, herdr: &Herdr, coordinator_ready: Option<&crate::coordinator::LivePane>, now: jiff::Timestamp) -> Result<NudgeOutcome> {
-    // Commit 2 keeps the old single nudge path: one set, the default lane's.
-    // Per-lane routing is commit 3.
-    let lane = crate::lanes::default_lane_id(project);
-    let seen = inbox::seen_in(project, &lane);
-    let unhandled = inbox::unhandled_in(project, &lane);
+pub fn nudge(project: &Project, state: &mut State, settings: &Settings, herdr: &Herdr, lane: &str, coordinator_ready: Option<&crate::coordinator::LivePane>, now: jiff::Timestamp) -> Result<NudgeOutcome> {
+    // Every lane has its own unseen set, seen set, delivered hash and input
+    // box (§4.4). Without a registry `lane` is the single synthesized default
+    // lane, so this is one run over the old files and the old slots.
+    let seen = inbox::seen_in(project, lane);
+    let unhandled = inbox::unhandled_in(project, lane);
     if unhandled.is_empty() {
-        forget_box(state);
+        forget_box(state, lane);
         return Ok(NudgeOutcome::Quiet);
     }
     let unseen: Vec<inbox::Item> = unhandled.iter().filter(|i| !seen.contains(&i.id)).cloned().collect();
     if unseen.is_empty() {
-        return aged_renudge(state, settings, herdr, coordinator_ready, &unhandled, now);
+        return aged_renudge(state, settings, herdr, lane, coordinator_ready, &unhandled, now);
     }
     let hash = hash_ids(&unseen.iter().map(|i| i.id.clone()).collect());
-    if hash == state.slot_value(&state.nudged) {
-        forget_box(state);
+    if state.slot_value(&state.nudged, lane) == hash {
+        forget_box(state, lane);
         return Ok(NudgeOutcome::Held(WAITING_FOR_READ));
     }
     // The user already got a specific notification per event; this step only
     // wakes a coordinator. Without one ready (or with `nudge = false`) the
     // one announcement is not spent: the items wait for a later tick.
     if !settings.nudge {
-        forget_box(state);
+        forget_box(state, lane);
         return Ok(NudgeOutcome::Quiet);
     }
     let Some(pane) = coordinator_ready else {
-        forget_box(state);
+        forget_box(state, lane);
         return Ok(NudgeOutcome::Held(NO_COORDINATOR)); // not idle long enough: try again on a later tick
     };
-    if !box_quiet(state, herdr, pane, now)? {
+    if !box_quiet(state, herdr, lane, pane, now)? {
         return Ok(NudgeOutcome::Held(BOX_NOT_QUIET));
     }
     // `agent_blocked` and other errors are returned, logged by the caller,
     // and the nudge is retried on a later tick.
     herdr.agent_prompt(&pane.pane_id, &nudge_text(&unseen))?;
-    let key = state.slot_key().to_string();
+    let key = state.key(lane).to_string();
     state.nudged.insert(key, hash);
-    forget_box(state);
+    forget_box(state, lane);
     Ok(NudgeOutcome::Delivered)
 }
 
 /// The aged reminder: every unhandled item has been shown to a coordinator
 /// that never finished with it.
-fn aged_renudge(state: &mut State, settings: &Settings, herdr: &Herdr, coordinator_ready: Option<&crate::coordinator::LivePane>, unhandled: &[inbox::Item], now: jiff::Timestamp) -> Result<NudgeOutcome> {
+fn aged_renudge(state: &mut State, settings: &Settings, herdr: &Herdr, lane: &str, coordinator_ready: Option<&crate::coordinator::LivePane>, unhandled: &[inbox::Item], now: jiff::Timestamp) -> Result<NudgeOutcome> {
     let quiet: Vec<inbox::Item> = unhandled.iter().filter(|i| RE_NUDGE_KINDS.contains(&i.kind.as_str())).cloned().collect();
     if quiet.is_empty() || !settings.nudge {
-        forget_box(state);
+        forget_box(state, lane);
         return Ok(NudgeOutcome::Quiet);
     }
     let oldest = quiet.iter().filter_map(|i| i.created.parse::<jiff::Timestamp>().ok()).min();
     let Some(oldest) = oldest else {
-        forget_box(state);
+        forget_box(state, lane);
         return Ok(NudgeOutcome::Quiet);
     };
     if now.as_second() - oldest.as_second() < RE_NUDGE_AFTER_SECS {
         return Ok(NudgeOutcome::Held(NOT_AGED));
     }
-    if state.slot_value(&state.renudged_at).parse::<jiff::Timestamp>().is_ok_and(|at| now.as_second() - at.as_second() < RE_NUDGE_EVERY_SECS) {
+    if state.slot_value(&state.renudged_at, lane).parse::<jiff::Timestamp>().is_ok_and(|at| now.as_second() - at.as_second() < RE_NUDGE_EVERY_SECS) {
         return Ok(NudgeOutcome::Held(REMINDED));
     }
     let Some(pane) = coordinator_ready else {
-        forget_box(state);
+        forget_box(state, lane);
         return Ok(NudgeOutcome::Held(NO_COORDINATOR));
     };
-    if !box_quiet(state, herdr, pane, now)? {
+    if !box_quiet(state, herdr, lane, pane, now)? {
         return Ok(NudgeOutcome::Held(BOX_NOT_QUIET));
     }
     herdr.agent_prompt(&pane.pane_id, &nudge_text(&quiet))?;
-    let key = state.slot_key().to_string();
+    let key = state.key(lane).to_string();
     state.renudged_at.insert(key, now.to_string());
-    forget_box(state);
+    forget_box(state, lane);
     Ok(NudgeOutcome::Delivered)
 }
 
 impl State {
-    /// The key `nudge` reads and writes in this commit: the default lane.
-    fn slot_key(&self) -> &str {
-        if self.default_lane.is_empty() { crate::lanes::FALLBACK_ID } else { &self.default_lane }
+    /// The slot key one lane's nudge state lives under: the lane id, with the
+    /// default lane's id standing in for an empty one (a caller that never
+    /// resolved a lane).
+    fn key<'a>(&'a self, lane: &'a str) -> &'a str {
+        if !lane.is_empty() {
+            lane
+        } else if self.default_lane.is_empty() {
+            crate::lanes::FALLBACK_ID
+        } else {
+            &self.default_lane
+        }
     }
 
-    fn slot_value<'a>(&self, slots: &'a BTreeMap<String, String>) -> &'a str {
-        slots.get(self.slot_key()).map(String::as_str).unwrap_or("")
+    fn slot_value<'a>(&self, slots: &'a BTreeMap<String, String>, lane: &str) -> &'a str {
+        slots.get(self.key(lane)).map(String::as_str).unwrap_or("")
     }
 }
 
-fn forget_box(state: &mut State) {
-    let key = state.slot_key().to_string();
+fn forget_box(state: &mut State, lane: &str) {
+    let key = state.key(lane).to_string();
     state.box_pane.remove(&key);
     state.box_empty_since.remove(&key);
 }
@@ -690,13 +706,13 @@ fn forget_box(state: &mut State) {
 /// earlier one at least `NUDGE_QUIET_SECS` before, with nothing typed seen in
 /// between. A box that holds text, or that the screen does not show, starts
 /// the wait over.
-fn box_quiet(state: &mut State, herdr: &Herdr, pane: &crate::coordinator::LivePane, now: jiff::Timestamp) -> Result<bool> {
+fn box_quiet(state: &mut State, herdr: &Herdr, lane: &str, pane: &crate::coordinator::LivePane, now: jiff::Timestamp) -> Result<bool> {
     let screen = herdr.agent_screen(&pane.pane_id).map_err(|error| anyhow::anyhow!("{error}"))?;
     if crate::prompt_box::check(&pane.agent, &screen) != crate::prompt_box::Draft::Empty {
-        forget_box(state);
+        forget_box(state, lane);
         return Ok(false);
     }
-    let key = state.slot_key().to_string();
+    let key = state.key(lane).to_string();
     let empty_since = state.box_empty_since.get(&key).cloned().unwrap_or_default();
     if state.box_pane.get(&key).map(String::as_str) != Some(pane.pane_id.as_str()) || empty_since.is_empty() {
         state.box_pane.insert(key.clone(), pane.pane_id.clone());
@@ -704,6 +720,39 @@ fn box_quiet(state: &mut State, herdr: &Herdr, pane: &crate::coordinator::LivePa
         return Ok(false);
     }
     Ok(thread::seconds_since(&empty_since, now) >= NUDGE_QUIET_SECS)
+}
+
+/// §7: one `lane` item per open lane that has live threads and **no live
+/// coordinator**, addressed to the default lane. The item is a report to the
+/// user, never an instruction to the receiving coordinator: ownership moves
+/// only on the user's word (`hp lane assign`), which is why its text says so.
+///
+/// Deduplicated on `(lane, open thread count)`: a lane that stays orphaned is
+/// announced once, and once more at most when its threads resolve. `orphans`
+/// comes from [`crate::lanes::orphan_lanes`], which excludes a lane whose pane
+/// is alive but unrecognized (§5.4's `degraded` case — there `open` would start
+/// a second coordinator beside it).
+pub fn write_lane_items(project: &Project, state: &mut State, orphans: &[(crate::lanes::Lane, usize)]) -> Result<()> {
+    if !crate::lanes::split_in_use(project) {
+        return Ok(());
+    }
+    // A lane that recovered forgets its announcement, so a later orphan spell
+    // is news again.
+    state.lane_items.retain(|id, _| orphans.iter().any(|(lane, _)| &lane.id == id));
+    let default_lane = crate::lanes::default_lane_id(project);
+    for (lane, count) in orphans {
+        if state.lane_items.get(&lane.id).copied() == Some(*count) {
+            continue;
+        }
+        let handle = if lane.name.is_empty() { &lane.id } else { &lane.name };
+        let summary = format!(
+            "Lane `{}` ({}) has {count} open threads and no live coordinator. Reopen it with `open {} --lane {handle}`, or move its threads with `lane assign {} <pane>`. Nothing moves until you say so.",
+            lane.label, lane.id, project.slug, lane.id
+        );
+        inbox::write_in(project, &default_lane, "lane", &lane.id, &format!("{count} open threads, no coordinator"), &summary, "")?;
+        state.lane_items.insert(lane.id.clone(), *count);
+    }
+    Ok(())
 }
 
 /// Step 2, every two minutes.
@@ -1123,7 +1172,7 @@ pub fn routines(ctx: &Ctx, project: &Project, state: &mut State, routine_command
 mod tests {
     use super::*;
     use crate::herdr::Herdr;
-    use crate::runner::fake::FakeRunner;
+    use crate::runner::fake::{FakeRunner, ok};
 
     fn at(text: &str) -> jiff::Timestamp {
         text.parse().unwrap()
@@ -1253,7 +1302,10 @@ mod tests {
         let settings = Settings::default();
         let now = at("2026-10-08T14:10:00Z");
         // No coordinator: with nothing aged there is no delivery attempt at all.
-        assert_eq!(nudge(&project, &mut state, &settings, &herdr, None, now).unwrap(), NudgeOutcome::Held(NOT_AGED));
+        assert_eq!(
+            nudge(&project, &mut state, &settings, &herdr, crate::lanes::FALLBACK_ID, None, now).unwrap(),
+            NudgeOutcome::Held(NOT_AGED)
+        );
         assert!(state.nudged.is_empty());
         assert!(state.renudged_at.is_empty());
     }
@@ -1268,11 +1320,124 @@ mod tests {
         let mut state = State::default();
         let settings = Settings::default();
         let now = at("2026-10-08T14:10:00Z");
-        assert_eq!(nudge(&project, &mut state, &settings, &herdr, None, now).unwrap(), NudgeOutcome::Held(NO_COORDINATOR));
+        assert_eq!(
+            nudge(&project, &mut state, &settings, &herdr, crate::lanes::FALLBACK_ID, None, now).unwrap(),
+            NudgeOutcome::Held(NO_COORDINATOR)
+        );
         assert!(state.renudged_at.is_empty(), "a held reminder is not spent");
         // A recent reminder spaces the next one out, coordinator or not.
         state.renudged_at.insert(crate::lanes::FALLBACK_ID.into(), "2026-10-08T14:05:00Z".into());
-        assert_eq!(nudge(&project, &mut state, &settings, &herdr, None, now).unwrap(), NudgeOutcome::Held(REMINDED));
+        assert_eq!(
+            nudge(&project, &mut state, &settings, &herdr, crate::lanes::FALLBACK_ID, None, now).unwrap(),
+            NudgeOutcome::Held(REMINDED)
+        );
+    }
+
+    fn two_lane_project() -> (tempfile::TempDir, Project) {
+        let root = tempfile::tempdir().unwrap();
+        let project = project::create(root.path(), "demo", "", vec![]).unwrap();
+        crate::lanes::Registry::ensure_written(&project).unwrap();
+        let mut registry = crate::lanes::Registry::load(&project).unwrap();
+        registry.create("books", "收藏");
+        registry.save(&project).unwrap();
+        (root, project)
+    }
+
+    /// A Claude input box with nothing typed, as `prompt_box::check` reads it.
+    fn empty_claude_box() -> String {
+        let rule = "─".repeat(40);
+        format!("{rule}\n❯\u{a0}\n{rule}\n")
+    }
+
+    fn idle_coordinator(lane: &str, pane: &str) -> crate::coordinator::LivePane {
+        crate::coordinator::LivePane {
+            pane_id: pane.into(),
+            lane: lane.into(),
+            agent: "claude".into(),
+            agent_status: "idle".into(),
+            pair_since: "2026-10-08T13:00:00Z".into(),
+            ..Default::default()
+        }
+    }
+
+    /// §12 commit 3: two lanes, two coordinators, two items — each lane's
+    /// announcement goes to its own pane and is spent on its own hash. Sharing
+    /// either slot is how one lane's nudge would silence the other's.
+    #[test]
+    fn each_lane_is_nudged_and_spent_on_its_own() {
+        let (_root, project) = two_lane_project();
+        inbox::write_in(&project, "c-1", "thread-state", "t-0001", "idle", "lane one", "").unwrap();
+        inbox::write_in(&project, "c-2", "thread-state", "t-0002", "idle", "lane two", "").unwrap();
+        let runner = FakeRunner::new();
+        runner.on("agent read", ok(&empty_claude_box()));
+        runner.on("agent prompt", ok(r#"{"result":{}}"#));
+        let herdr = Herdr::new("herdr", "sock", &runner);
+        let settings = Settings::default();
+        let now = at("2026-10-08T14:10:00Z");
+        let mut state = State::default();
+        let (a, b) = (idle_coordinator("c-1", "w1:p1"), idle_coordinator("c-2", "w2:p1"));
+
+        // Each lane's box is seen empty for the first time, in its own slot.
+        assert_eq!(nudge(&project, &mut state, &settings, &herdr, "c-1", Some(&a), now).unwrap(), NudgeOutcome::Held(BOX_NOT_QUIET));
+        assert_eq!(nudge(&project, &mut state, &settings, &herdr, "c-2", Some(&b), now).unwrap(), NudgeOutcome::Held(BOX_NOT_QUIET));
+        assert_eq!(state.box_pane["c-1"], "w1:p1");
+        assert_eq!(state.box_pane["c-2"], "w2:p1");
+        assert_eq!(runner.count("agent prompt"), 0);
+
+        // Once both boxes have looked empty long enough, each item goes to its
+        // own lane's pane and only that lane's hash is spent.
+        for lane in ["c-1", "c-2"] {
+            state.box_empty_since.insert(lane.into(), "2026-10-08T14:00:00Z".into());
+        }
+        assert_eq!(nudge(&project, &mut state, &settings, &herdr, "c-1", Some(&a), now).unwrap(), NudgeOutcome::Delivered);
+        assert!(state.nudged.contains_key("c-1"));
+        assert!(!state.nudged.contains_key("c-2"), "lane c-1's delivery must not spend c-2's: {:?}", state.nudged);
+        assert_eq!(nudge(&project, &mut state, &settings, &herdr, "c-2", Some(&b), now).unwrap(), NudgeOutcome::Delivered);
+        assert!(state.nudged.contains_key("c-2"));
+
+        let sent: Vec<(String, String)> = runner
+            .calls
+            .borrow()
+            .iter()
+            .filter(|c| c.display().contains("agent prompt"))
+            .map(|c| (c.args[2].clone(), c.args[3].clone()))
+            .collect();
+        assert_eq!(
+            sent,
+            [("w1:p1".to_string(), "[hp inbox] t-0001 idle".to_string()), ("w2:p1".to_string(), "[hp inbox] t-0002 idle".to_string())]
+        );
+    }
+
+    /// §7: the orphan reminder, deduplicated on `(lane, open thread count)`.
+    #[test]
+    fn an_orphaned_lane_is_announced_once_per_thread_count_to_the_default_lane() {
+        let (_root, project) = two_lane_project();
+        let c2 = crate::lanes::Registry::load(&project).unwrap().get("c-2").cloned().unwrap();
+        let mut state = State::default();
+        write_lane_items(&project, &mut state, &[(c2.clone(), 2)]).unwrap();
+        let items = inbox::unhandled(&project);
+        assert_eq!(items.len(), 1, "{items:?}");
+        assert_eq!((items[0].kind.as_str(), items[0].subject.as_str(), items[0].event.as_str()), ("lane", "c-2", "2 open threads, no coordinator"));
+        assert_eq!(items[0].lane, "c-1", "addressed to the default lane");
+        assert_eq!(
+            items[0].summary,
+            "Lane `收藏` (c-2) has 2 open threads and no live coordinator. Reopen it with `open demo --lane books`, or move its threads with `lane assign c-2 <pane>`. Nothing moves until you say so."
+        );
+        // The same state is not announced again.
+        write_lane_items(&project, &mut state, &[(c2.clone(), 2)]).unwrap();
+        assert_eq!(inbox::unhandled(&project).len(), 1);
+        // Threads resolved: the count changed, so exactly one more item.
+        write_lane_items(&project, &mut state, &[(c2.clone(), 1)]).unwrap();
+        assert_eq!(inbox::unhandled(&project).len(), 2);
+        write_lane_items(&project, &mut state, &[(c2, 1)]).unwrap();
+        assert_eq!(inbox::unhandled(&project).len(), 2);
+        // A project without a registry never writes such an item (§7).
+        let root = tempfile::tempdir().unwrap();
+        let plain = project::create(root.path(), "plain", "", vec![]).unwrap();
+        let mut state = State::default();
+        write_lane_items(&plain, &mut state, &[(crate::lanes::Lane { id: "c-9".into(), ..Default::default() }, 3)]).unwrap();
+        assert!(inbox::unhandled(&plain).is_empty());
+        assert!(state.lane_items.is_empty());
     }
 
     #[test]
