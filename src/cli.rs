@@ -127,6 +127,11 @@ enum Command {
         #[command(subcommand)]
         command: InboxCommand,
     },
+    /// TASKS.md: add, move or tick a task without touching any other byte
+    Task {
+        #[command(subcommand)]
+        command: TaskCommand,
+    },
     /// Lanes: the project's lines of work and who coordinates each
     Lane {
         #[command(subcommand)]
@@ -301,6 +306,35 @@ enum Command {
         #[command(subcommand)]
         command: TickerCommand,
     },
+}
+
+#[derive(Subcommand)]
+enum TaskCommand {
+    /// Append a task to a list (creates the list and, when needed, the file skeleton)
+    Add {
+        slug: String,
+        /// The list: a shared `## <list>` heading, or with --lane the part after `<lane>/`
+        list: String,
+        title: String,
+        /// The owner, in TASKS.md's existing syntax: me, PROFILE, @MACHINE or PROFILE@MACHINE
+        #[arg(long, value_name = "OWNER")]
+        owner: Option<String>,
+        /// Write into this lane's list (`## <label>/<list>`) instead of the shared one
+        #[arg(long, value_name = "LANE")]
+        lane: Option<String>,
+        /// Indented notes under the task line (a literal \n starts another line)
+        #[arg(long, value_name = "TEXT")]
+        notes: Option<String>,
+    },
+    /// Move a uniquely titled task line and its notes to another list
+    Move {
+        slug: String,
+        title: String,
+        /// The target list: a shared `## <list>` heading or `<lane>/<list>` for your own lane
+        list: String,
+    },
+    /// Tick a task's checkbox (`- [ ]` -> `- [x]`); the line stays
+    Done { slug: String, title: String },
 }
 
 #[derive(Subcommand)]
@@ -685,6 +719,17 @@ pub fn apply_profile_args(ctx: &Ctx, args: &[String]) -> Result<String> {
     crate::profiles::apply(&ctx.config_dir, &change)
 }
 
+/// The lane `hp task move` / `hp task done` run as, for the cross-lane guard.
+/// A project without a registry has no lanes, so there is nothing to guard; a
+/// pane that resolves to no lane reads as the default lane (§10).
+fn task_caller_lane(ctx: &Ctx, project: &Project) -> Option<String> {
+    if !lanes::split_in_use(project) {
+        return None;
+    }
+    let lane = lanes::lane_of_initiator(ctx, project, &[]);
+    Some(if lane.is_empty() { lanes::default_lane_id(project) } else { lane })
+}
+
 pub fn run() -> Result<()> {
     let cli = Cli::parse();
     let env = Env::from_process()?;
@@ -769,6 +814,26 @@ pub fn run() -> Result<()> {
                 Ok(())
             }
         },
+        Command::Task { command } => match command {
+            TaskCommand::Add { slug, list, title, owner, lane, notes } => {
+                let project = Project::load(&ctx.root, &slug)?;
+                let options = crate::tasks::AddOptions { owner: owner.as_deref(), lane: lane.as_deref(), notes: notes.as_deref() };
+                println!("{}", crate::tasks::add(&project, &list, &title, &options)?);
+                Ok(())
+            }
+            TaskCommand::Move { slug, title, list } => {
+                let project = Project::load(&ctx.root, &slug)?;
+                let lane = task_caller_lane(&ctx, &project);
+                println!("{}", crate::tasks::move_task(&project, &title, &list, lane.as_deref())?);
+                Ok(())
+            }
+            TaskCommand::Done { slug, title } => {
+                let project = Project::load(&ctx.root, &slug)?;
+                let lane = task_caller_lane(&ctx, &project);
+                println!("{}", crate::tasks::done(&project, &title, lane.as_deref())?);
+                Ok(())
+            }
+        },
         Command::Lane { command } => match command {
             LaneCommand::List { slug, json } => lanes::lane_list(&ctx, &slug, json),
             LaneCommand::Adopt { lane, project } => lanes::lane_adopt(&ctx, project.as_deref(), &lane),
@@ -796,13 +861,21 @@ pub fn run() -> Result<()> {
                     // The task's owner picks the profile and machine.
                     let project = Project::load(&ctx.root, &slug)?;
                     let tasks_md = crate::tasks::read(&project.dir());
-                    let found = crate::tasks::find(&tasks_md, &from)?;
+                    let registry = lanes::Registry::load(&project);
+                    let lane = task_caller_lane(&ctx, &project);
+                    let found = crate::tasks::find_in(&tasks_md, &from, registry.as_ref(), lane.as_deref())?;
                     let config = crate::profiles::load(&ctx.config_dir)?;
                     if found.owner.is_person(|p| config.get(p).is_some()) {
                         bail!("\"{}\" belongs to {}, a person; people's tasks are never delegated. Change its owner in TASKS.md first if the user asks", found.title, found.owner);
                     }
                     (profile, machine) = crate::tasks::launch_for(&found, profile, machine)?;
-                    task = crate::tasks::delegated(&tasks_md, &from, &task)?;
+                    task = if registry.is_some() {
+                        crate::tasks::delegated_from(&found, &task)
+                    } else {
+                        // The pre-lane path, byte for byte: `find` is exactly
+                        // what this command used before lanes existed.
+                        crate::tasks::delegated(&tasks_md, &from, &task)?
+                    };
                 }
                 let kind = kind.as_deref().map(crate::thread::Kind::parse).transpose()?;
                 let thread = threads::start(&ctx, &slug, StartArgs { title, repo, machine, profile, kind, base, task })?;

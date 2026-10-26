@@ -4122,6 +4122,44 @@ fn two_lanes_each_read_only_their_own_threads_and_inbox_items() {
 }
 
 #[test]
+fn two_lanes_read_only_their_own_task_lists_and_a_closed_lane_stays_in_the_file() {
+    let world = World::new();
+    let project = world.project("demo", "a.sock");
+    let dir = project.canonical_dir().to_string_lossy().into_owned();
+    crate::lanes::Registry {
+        lanes: vec![
+            crate::lanes::Lane { id: "c-1".into(), name: "fix".into(), label: "抢修".into(), ..Default::default() },
+            crate::lanes::Lane { id: "c-2".into(), name: "books".into(), label: "收藏".into(), ..Default::default() },
+            crate::lanes::Lane { id: "c-3".into(), name: "old".into(), label: "归档".into(), status: crate::lanes::Status::Closed, ..Default::default() },
+        ],
+        default: "c-1".into(),
+        next: 4,
+    }
+    .save(&project)
+    .unwrap();
+    let tasks = "# Tasks\n\n## Backlog\n- [ ] Shared task\n\n## 抢修/Backlog\n- [ ] Fix the leak\n\n## 收藏/Backlog\n- [ ] Sort the books\n\n## 归档/Backlog\n- [ ] Old archived task\n";
+    std::fs::write(project.dir().join("TASKS.md"), tasks).unwrap();
+    *world.agents.borrow_mut() = format!(
+        "[{},{}]",
+        agent_json_tokens("w1", "w1:p1", &dir, &[("hp_project", "demo"), ("hp_lane", "c-1")]),
+        agent_json_tokens("w2", "w2:p1", &dir, &[("hp_project", "demo"), ("hp_lane", "c-2")]),
+    );
+    let digest_in = |pane: &str| {
+        let env = crate::paths::Env::for_test(world.home.path(), &[("HERDR_PANE_ID", pane), ("HERDR_SOCKET_PATH", &project.coordinator().unwrap().socket)]);
+        let ctx = Ctx { env: &env, root: world.root.clone(), config_dir: world.home.path().join("cfg"), runner: &world.runner, detached_ticker: false };
+        coordinator::digest(&ctx, &project, "hp").unwrap().0
+    };
+    let one = digest_in("w1:p1");
+    assert!(one.contains("- [ ] Shared task") && one.contains("- [ ] Fix the leak"), "{one}");
+    assert!(!one.contains("Sort the books") && !one.contains("Old archived task"), "c-1 must not read c-2's or the closed lane's tasks: {one}");
+    assert!(!one.contains("## 收藏/Backlog") && !one.contains("## 归档/Backlog"), "{one}");
+    let two = digest_in("w2:p1");
+    assert!(two.contains("- [ ] Shared task") && two.contains("- [ ] Sort the books"), "{two}");
+    assert!(!two.contains("Fix the leak") && !two.contains("Old archived task"), "c-2 must not read c-1's or the closed lane's tasks: {two}");
+    assert_eq!(std::fs::read_to_string(project.dir().join("TASKS.md")).unwrap(), tasks, "closed-lane headings and tasks stay in the file");
+}
+
+#[test]
 fn a_single_lane_project_reads_the_same_digest_with_and_without_a_registry_and_with_content() {
     let world = World::new();
     let project = world.project("demo", "a.sock");
@@ -4465,6 +4503,29 @@ fn a_single_lane_registry_keeps_the_popups_prompt_working_from_a_pane_that_is_no
     let ctx = Ctx { env: &env, root: world.root.clone(), config_dir: world.home.path().join("cfg"), runner: &world.runner, detached_ticker: false };
     coordinator::prompt(&ctx, "demo", "Please mark as done").unwrap();
     assert_eq!(prompts(&world), [("w1:p1".to_string(), "Please mark as done".to_string())]);
+}
+
+#[test]
+fn the_popups_task_keys_refuse_loudly_from_a_plugin_pane_in_a_multi_lane_project() {
+    // The popup's d/m/D keys run `coordinator prompt` from a plugin pane,
+    // which is nobody's coordinator. With several open lanes there is no
+    // honest lane to send to, so the action must say so instead of landing
+    // in the default lane's context.
+    let world = World::new();
+    let project = world.project("demo", "a.sock");
+    let dir = project.canonical_dir().to_string_lossy().into_owned();
+    two_lane_registry(&project);
+    *world.agents.borrow_mut() = format!(
+        "[{},{}]",
+        agent_json_tokens("w1", "w1:p1", &dir, &[("hp_project", "demo"), ("hp_lane", "c-1")]),
+        agent_json_tokens("w2", "w2:p1", &dir, &[("hp_project", "demo"), ("hp_lane", "c-2")]),
+    );
+    world.runner.on("agent prompt", ok(r#"{"result":{}}"#));
+    let env = Env::for_test(world.home.path(), &[("HERDR_PANE_ID", "w9:p9")]);
+    let ctx = Ctx { env: &env, root: world.root.clone(), config_dir: world.home.path().join("cfg"), runner: &world.runner, detached_ticker: false };
+    let error = coordinator::prompt(&ctx, "demo", "(from the projects popup) Please mark as done the task \"Fix the leak\" in TASKS.md.").unwrap_err().to_string();
+    assert!(error.contains("has 2 open lanes and this pane resolves to none of them"), "{error}");
+    assert!(prompts(&world).is_empty(), "nothing may be sent to either lane");
 }
 
 #[test]

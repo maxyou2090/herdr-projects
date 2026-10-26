@@ -859,7 +859,13 @@ fn digest_for(ctx: &Ctx, project: &Project, prefix: &str) -> Result<(String, Vec
     let _ = writeln!(out, "{}", memory.trim());
 
     let _ = writeln!(out, "\n## Tasks (TASKS.md)");
-    let tasks = crate::tasks::compact(&crate::tasks::read(&project.dir()));
+    let task_text = crate::tasks::read(&project.dir());
+    let tasks = match &scope {
+        // §8: shared lists plus only this lane's lists. A project without a
+        // registry has `scope == None` and keeps the old whole-file digest.
+        Some(scope) => crate::tasks::compact_for(&task_text, &identity_view.registry, &scope.lane),
+        None => crate::tasks::compact(&task_text),
+    };
     let _ = writeln!(out, "{}", if tasks.trim().is_empty() { "(none)" } else { tasks.trim() });
 
     let rows = crate::threads::rows_with_view(project, view.as_ref());
