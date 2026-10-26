@@ -43,33 +43,33 @@ coordinators". The concrete version, which is what actually breaks, is this:
 **A project can only remember one coordinator, so an event can be delivered to
 the wrong one.** Concretely:
 
-1. `Project::coordinator()` (`src/project.rs:410`) reads
+1. `Project::coordinator()` (`src/project.rs`) reads
    `.state/coordinator.json` — one file, one record. `update_coordinator()`
-   (`src/project.rs:416`) is a read-modify-write of that same file.
+   (same file) is a read-modify-write of that same file.
 2. `open` writes that record with `*c = Coordinator { ... }`
-   (`src/coordinator.rs:377`) — a whole-record replacement, not an append. A
-   second `open` (including `open --new`) overwrites the first coordinator's
-   record. The first coordinator keeps running but is no longer the one written
-   down.
-3. `.state/coordinators.json` (`LivePane` at `src/coordinator.rs:129`,
-   `discover()` at `src/coordinator.rs:148`) looks like a registry but is only a
-   cache: the ticker rebuilds every entry every tick, and the file is worthless
-   after a Herdr server restart or while the ticker is stopped.
-4. `is_coordinator()` (`src/coordinator.rs:60`) decides who is a coordinator with
+   (`coordinator::open`, `src/coordinator.rs`) — a whole-record replacement, not
+   an append. A second `open` (including `open --new`) overwrites the first
+   coordinator's record. The first coordinator keeps running but is no longer
+   the one written down.
+3. `.state/coordinators.json` (`LivePane` and `discover()` in
+   `src/coordinator.rs`) looks like a registry but is only a cache: the ticker
+   rebuilds every entry every tick, and the file is worthless after a Herdr
+   server restart or while the ticker is stopped.
+4. `is_coordinator()` (`src/coordinator.rs`) decides who is a coordinator with
    `agent.works_in(&record.cwd) || session_matches(record, agent)`. `works_in`
-   (`src/herdr.rs:247`) compares `own_dir(cwd, foreground_cwd)` (`src/herdr.rs:263`)
-   to the recorded directory.
+   (`src/herdr.rs`) compares `own_dir(cwd, foreground_cwd)` (same file) to the
+   recorded directory.
 5. Therefore, when two agents work in the same project home, `works_in` is true
    for **both**, and every "find the coordinator" site picks
    `max_by_key(state_change_seq)` — "whichever was most recently active". See
-   `found()` (`src/coordinator.rs:110`) and the `running` branch of `open`
-   (`src/coordinator.rs:295`). The record gets replaced by whichever coordinator
-   spoke last, and the next inbox event goes to whoever that is.
+   `found()` (`src/coordinator.rs`) and the `running` branch of `open`
+   (same file). The record gets replaced by whichever coordinator spoke last,
+   and the next inbox event goes to whoever that is.
 6. The directory test is already failing in production. In the `law` project
    today, the record says `cwd = /Users/maxyou/.herdr-projects/law`, but the
    coordinator pane `w1AR:p1` has `own_dir = /Users/maxyou`. `works_in` returns
    **false**; the pane is still recognised only because `session_matches`
-   (`src/coordinator.rs:67`, pane id **and** native session id) catches it. The
+   (`src/coordinator.rs`, pane id **and** native session id) catches it. The
    primary test is dead and the fallback is carrying the system.
 
 Point 6 is the reason this document does not simply "key the record by pane id"
@@ -200,37 +200,37 @@ default lane (§10).
   ticker. They are not the identity.
 - The file is written only under `project.lock()`, with the same
   `read_json`/`write_json`/`write_atomic` helpers the rest of the state uses
-  (`src/project.rs:430`, `:435`).
+  (all three in `src/project.rs`).
 
 ### 4.2 `Thread.lane`
 
-Add `lane: String` to `Thread` (`src/thread.rs:66`) — the lane **id**, not its
-name, so renaming a lane never touches 168 thread files. Empty on every record
-written before this change; empty reads as the default lane (§10). Serialised
-with `#[serde(default)]` like the rest of the struct, so old `threads/<id>.toml`
-files keep loading and no rewrite pass is needed.
+Add `lane: String` to `Thread` (`src/thread.rs`, `struct Thread`) — the lane
+**id**, not its name, so renaming a lane never touches 168 thread files. Empty
+on every record written before this change; empty reads as the default lane
+(§10). Serialised with `#[serde(default)]` like the rest of the struct, so old
+`threads/<id>.toml` files keep loading and no rewrite pass is needed.
 
 ### 4.3 `inbox::Item.lane`
 
-Add `lane: String` to `inbox::Item` (`src/inbox.rs:13`). Every writer
-(`inbox::write`, `src/inbox.rs:55`) sets it: the ticker knows the thread's lane
+Add `lane: String` to `inbox::Item` (`src/inbox.rs`, `struct Item`). Every
+writer (`inbox::write`, same file) sets it: the ticker knows the thread's lane
 from its record, so all thread, PR, stuck and session items inherit it. Items
 with an empty lane are the default lane's.
 
 Seen-state becomes per lane:
 
 - `.state/inbox-seen.json` → `.state/inbox-seen/<lane>.json`
-  (`inbox::seen` at `src/inbox.rs:116`, `mark_seen` at `src/inbox.rs:121`).
+  (`inbox::seen` and `inbox::mark_seen` in `src/inbox.rs`).
   Its `live` filter (`unhandled()`) is filtered by the same lane, so one lane's
   `context` cannot mark another lane's items read.
-- `inbox::done` (`src/inbox.rs:148`) stays global on purpose: handling an item
+- `inbox::done` (`src/inbox.rs`) stays global on purpose: handling an item
   is handling it, whoever does it.
 
 ### 4.4 `steps::State` per lane
 
-`State` (`src/steps.rs:56`) holds one `nudged` hash (`:67`), one `renudged_at`
-(`:69`) and one `box_pane` (`:79`) — i.e. one deliver-once opportunity and one
-"which input box did I last type into" per project. Two coordinators would
+`State` (`src/steps.rs`, `struct State`) holds one `nudged` hash, one
+`renudged_at` and one `box_pane` field — i.e. one deliver-once opportunity and
+one "which input box did I last type into" per project. Two coordinators would
 share, and burn, each other's. Make them maps keyed by lane id:
 
 ```rust
@@ -239,8 +239,8 @@ pub renudged_at: BTreeMap<String, String>, // lane id -> timestamp
 pub box_pane: BTreeMap<String, String>,    // lane id -> pane id
 ```
 
-`box_empty_since` follows `box_pane`. `nudge()` (`src/steps.rs:501`) and
-`aged_renudge()` (`src/steps.rs:541`) take a lane, compute the unseen set for
+`box_empty_since` follows `box_pane`. `nudge()` and `aged_renudge()`
+(both in `src/steps.rs`) take a lane, compute the unseen set for
 that lane, and touch only that lane's entries. The "nothing is spent without a
 delivery" rule from the 2026-10-07 incident stays exactly as it is; it is now
 per lane, which also fixes the case where lane A has no coordinator and lane B
@@ -270,9 +270,9 @@ So identity is **declared**, not inferred.
 ### 5.1 The self-report: an `hp_lane` pane token
 
 Herdr lets a pane carry tokens, and the plugin already uses that channel.
-`sidebar::report_pane()` (`src/sidebar.rs:88`) calls
+`sidebar::report_pane()` (`src/sidebar.rs`) calls
 `herdr pane report-metadata <pane> --source herdr-projects --token k=v` with a
-TTL of `TOKEN_TTL_MS = 300_000` (`src/sidebar.rs:16`). Live panes show it:
+TTL of `TOKEN_TTL_MS = 300_000` (same file). Live panes show it:
 
 ```json
 "tokens": {"hp_group": "law!0!w1AR:p1", "hp_project": "law", "hp_rank": "5"}
@@ -280,7 +280,7 @@ TTL of `TOKEN_TTL_MS = 300_000` (`src/sidebar.rs:16`). Live panes show it:
 
 Adding one token — `hp_lane=c-1` — is enough for a coordinator to say which lane
 it is. `herdr pane report-metadata --token NAME=VALUE --ttl-ms N` is the same
-mechanism (`--source` is the plugin's fixed id, `src/herdr.rs:564`); the token
+mechanism (`--source` is `herdr::SOURCE`, `src/herdr.rs`); the token
 also expired the same way, so a stopped ticker or a dead pane leaves no stale
 claim behind after the TTL.
 
@@ -292,13 +292,16 @@ Semantics, spelled out, because two places now write pane metadata:
   degrades to rule 2, never to a wrong lane.
 - **The ticker refreshes the token every tick** for panes it resolves to a lane
   (alongside the existing `hp_group`/`hp_rank`/`hp_sub` writes in
-  `grouping::apply`, `src/grouping.rs:238`, which already re-sends a card every
-  `TOKEN_TTL_MS / 3`, `src/grouping.rs:194`). So the token's TTL is a liveness
-  lease, not a lease on ownership.
+  `grouping::apply`, `src/grouping.rs`, which already re-sends a card every
+  `TOKEN_TTL_MS / 3`, same file). So the token's TTL is a liveness lease, not a
+  lease on ownership. **Until commit 3 the ticker still refreshes only the panes
+  its single record matches**, so in a project with several lanes a second
+  lane's token expires after its TTL (five minutes) and that pane falls back to
+  rules 2-5; a single-lane project is unaffected.
 - **`hp_lane` never clears `hp_group`**: `sidebar::report_pane` sends
-  `--clear-token` for `OLD_TOKENS` (`src/sidebar.rs:18`), and `hp_lane` must not
-  join that list; `sidebar::clear_pane` (`src/sidebar.rs:105`) and
-  `grouping::clear` (`src/grouping.rs:227`) must clear it.
+  `--clear-token` for `OLD_TOKENS` (`src/sidebar.rs`), and `hp_lane` must not
+  join that list; `sidebar::clear_pane` (same file) and
+  `grouping::clear` (`src/grouping.rs`) must clear it.
 - The token value is the lane **id**, so a rename cannot make a token lie.
 - **A lane id is unique inside one project, not across projects.** Every
   project's first lane is `c-1`, and one Herdr session holds panes of several
@@ -340,7 +343,7 @@ Each rule and why it sits where it does:
 - **Rule 2 second** because a token can be missing (server restart, TTL while the
   ticker was down, `open` started a moment ago). The pair `(pane_id,
   agent_session)` is already the fallback that rescues the `law` coordinator
-  today (`session_matches`, `src/coordinator.rs:67`); the native session id is
+  today (`session_matches`, `src/coordinator.rs`); the native session id is
   what stops a **recycled** pane id from counting, and it is exactly what a
   restarted `open` re-records.
 - **Rule 3** is the old behaviour, kept for projects that have one lane, so
@@ -348,8 +351,8 @@ Each rule and why it sits where it does:
 - **Rule 4 is a refusal, and that is the point.** "Works in the project home" is
   true for every coordinator, so with two lanes it carries no information. Today
   the code resolves that ambiguity with `max_by_key(state_change_seq)`
-  (`src/coordinator.rs:110`, `:182`, `:295`, `:569`) and silently picks one; that
-  is exactly how events reach the wrong lane. The new rule: refuse the
+  (`src/coordinator.rs`, in `found`, `open`, `prompt` and `digest`) and silently
+  picks one; that is exactly how events reach the wrong lane. The new rule: refuse the
   classification, print which panes are ambiguous, and ask for
   `hp lane adopt <lane>` (run in that pane, §6.2) or `hp lane assign <lane>
   <pane>`. **An error the user can fix beats a guess that silently misfiles
@@ -455,21 +458,29 @@ So visibility is a standing output, not an event:
   both are rendered from one `View`, so the two cannot drift apart — and its
   rows name each lane's panes as `pane(rule)` (`-` when a lane has none).
   `--json` adds `goal`, `profile`, `pane_id` and an `orphan` flag per lane, set
-  from the same `degraded`/`orphan` decision the text uses.
+  from the same `degraded`/`orphan` decision the text uses. Per-lane thread and
+  inbox counts belong to the same command and are **not printed yet** — they
+  arrive with commit 2, when `Thread.lane` and `inbox::Item.lane` start being
+  written (counting them now would print a constant 0).
 - **The `nudge`/`prompt`/`place_tab` paths still refuse** on `Ambiguous` (§5.2
   rule 4), and a refused nudge is logged by the ticker as a held reason
-  (`nudge_held`, `src/ticker.rs:907`, `:915`, logged when it changes at
-  `:321`-`:328`) — which is what the ticker log showed was missing in the
+  (`nudge_held`, `src/ticker.rs`, logged when it changes in `tick_project`) —
+  which is what the ticker log showed was missing in the
   incident above: the failure there was a *no coordinator* verdict, and that
-  branch logs nothing at all.
+  branch logs nothing at all. The refusal itself lands with commit 3: until
+  then the nudge path still asks the old single-record `is_coordinator`, so an
+  ambiguous pane is not yet a held reason either.
 - **The ticker also writes one inbox item of kind `lane` per ambiguous pane,
   once**, so a project whose inspector you are not looking at still says
   something. That item is the least reliable of the three (it fires once, and
   its deduplication key is the state, not the tick) and is explicitly **not**
-  the only source of visibility — the `context` line is.
+  the only source of visibility — the `context` line is. **This item lands with
+  commit 3**; today the only standing visibility is the `context` line and
+  `lane list`.
 - **`hp doctor`** reports an ambiguous pane the same way it reports a broken
   `AGENTS.md` prefix, so a periodic `doctor` cycle surfaces it too (it already
-  walks every project, `src/doctor.rs:286`).
+  walks every project, in `src/doctor.rs`). **That report lands with commit 7**;
+  until then `doctor` says nothing about lanes.
 
 This costs one line per turn and is the cheapest thing in the design that would
 have caught a week-long silent stall.
@@ -489,7 +500,8 @@ The CLI keeps its shape: `hp` below is the printed prefix
   coordinator for it — a new tab in the project's home Space when the default
   lane's home Space exists, else the current workspace-creation path.
 - `--lane <name>` that exists and has a live coordinator: focus that pane (the
-  existing "running" branch, `src/coordinator.rs:296`, but scoped to the lane).
+  existing "running" branch of `open` in `src/coordinator.rs`, but scoped to the
+  lane).
   `--new` starts another instance for the same lane — allowed, but the lane still
   has one record; the last one to speak wins rule 2, and rule 1 keeps the other
   one honest.
@@ -503,14 +515,14 @@ means: "the pane I am running in is a coordinator of lane `<name>`".
 
 - Reads the current pane (`HERDR_PANE_ID`), the session (`HERDR_SOCKET_PATH`) and
   the agent's native session id from `herdr agent list`, exactly like the
-  existing adoption paths: `src/adopt.rs:19` `adoptable_agent()` (which already
+  existing adoption paths: `adoptable_agent()` in `src/adopt.rs` (which already
   refuses a pane that is another project's coordinator, a thread, or not an
-  agent) and `src/coordinator.rs:474` `adopt_here()`.
+  agent) and `adopt_here()` in `src/coordinator.rs`.
 - Refuses when the pane already claims another lane (use `lane assign` to move
   it, and say so), when the agent does not work in the project home (that is a
   thread, `hp thread adopt` is the right command), and when the pane is a plugin
   pane (`HERDR_PLUGIN_STATE_DIR` set — the popup must never become a
-  coordinator, the same guard as `here_pane`, `src/coordinator.rs:211`).
+  coordinator, the same guard as `here_pane`, in `src/coordinator.rs`).
 - On success: writes the lane's `pane_id`/`agent_session`, writes `hp_lane` into
   the pane immediately, and prints the prefix. If the project has exactly one
   lane and none of its rules fire, `adopt` also sets it as the default lane.
@@ -524,7 +536,7 @@ Every lane command, with what it does. `hp` is the printed prefix
 | --- | --- | --- |
 | `hp open <slug> --lane <name> [--lane-name <label>] [--profile P] [--new]` | Open or focus that lane's coordinator. A missing lane is created; an existing live one is focused. No `--lane`: the default lane, today's behaviour. | 打开或聚焦该 lane 的协调器：不存在就创建，存在且活着就聚焦。不传 `--lane` 就是默认 lane，即现有行为。 |
 | `hp lane adopt <lane>` | Claim **the current pane** as lane `<lane>`'s coordinator (reads `HERDR_PANE_ID`, `HERDR_SOCKET_PATH` and the agent session). For a tab the user started by hand. | 把**当前 pane** 认领为 lane 的协调器（读 `HERDR_PANE_ID`、`HERDR_SOCKET_PATH` 和 agent session），用于用户手动开 tab 起 agent。 |
-| `hp lane list [--json]` | Every lane with the rule each live pane matched, thread and inbox counts, `last_active`, and `closed` lanes. | 列出所有 lane，含每个 live pane 命中的解析规则、线程数与 inbox 数、`last_active`，以及已 closed 的 lane。 |
+| `hp lane list [--json]` | Every lane with the rule each live pane matched, thread and inbox counts, `last_active`, and `closed` lanes. **The counts come with commit 2; today's `lane list` prints neither** (every `Thread.lane` is still empty, so an implementation could only count 0, and a field that is always 0 misleads more than it says). | 列出所有 lane，含每个 live pane 命中的解析规则、线程数与 inbox 数、`last_active`，以及已 closed 的 lane。**线程数与 inbox 数随提交 2 提供；当前 `lane list` 不打印这两项**（现在所有 `Thread.lane` 都是空串，实现只能数出 0，印一个恒为 0 的字段比不印更误导）。 |
 | `hp lane assign <lane> <pane>` | The explicit handover: point the lane (and its threads) at another coordinator pane. The **only** thing that moves ownership. | 显式接手：把该 lane 及其线程交给另一个协调器 pane。这是**唯一**会转移归属的命令。 |
 | `hp lane rename <lane> <label> [--name <name>]` | Change the display label, and optionally the CLI handle. The `id` never changes, so thread and inbox ownership never move. | 改显示名（可选改命令里的 handle）。`id` 不变，所以线程与 inbox 的归属不变。 |
 | `hp lane close <lane>` | Retire a lane: refused while any of its threads is `open`/`starting`; otherwise `status = closed`. A closed lane gets no `context` section, sidebar row or nudge, and its record and id stay. The coordinator process is left alone (§6.4). | 收起来：该 lane 还有 open/starting 线程就拒绝并列出；全部 resolve 后 `status = closed`。closed 的 lane 不再有 context 分区/侧栏行/nudge，记录和 id 保留；**不杀协调器进程**（§6.4）。 |
@@ -557,7 +569,7 @@ Details that decide the edge cases:
 
 - **"Alive" means `Open` or `Starting`**, for local and remote threads alike —
   the same predicate the ticker already uses for "open threads"
-  (`open_threads`, `src/ticker.rs:841`, which filters
+  (`open_threads`, `src/ticker.rs`, which filters
   `Status::Open | Status::Starting`). A lane with zero threads closes
   immediately: an empty lane is the easiest thing to close and the easiest to
   reopen.
@@ -632,9 +644,10 @@ lane `收藏` (c-2) is open again; its coordinator is already running in pane w1
 **Which session a reopen resumes is `open`'s existing decision, not the lane's.**
 `lane open` records no "resume this" hint. `open` already decides: it resumes
 only when the new launch is not `--new`, the agent kind matches the recorded one
-and the profile matches the recorded profile (`src/coordinator.rs:371`-`:375`);
-otherwise it starts fresh. Lanes inherit exactly that rule — a second resume
-policy would be a second source of truth about a conversation.
+and the profile matches the recorded profile (the resume filter in
+`coordinator::open`, `src/coordinator.rs`); otherwise it starts fresh. Lanes
+inherit exactly that rule — a second resume policy would be a second source of
+truth about a conversation.
 
 #### Default lane election
 
@@ -670,10 +683,11 @@ The rule: **nothing is adopted automatically, and nothing is silently dropped.**
   where decisions 4 and 9 meet. `hp lane close` refuses while a thread is alive,
   so "closed but orphans exist" is not a state the model can reach.
 - The ticker detects it: an **open** lane has at least one `Open` or `Starting`
-  thread (`src/ticker.rs:841`), and rules 1 and 2 resolve to no live pane.
+  thread (`open_threads`, `src/ticker.rs`), and rules 1 and 2 resolve to no live
+  pane.
 - It writes **one** inbox item, kind `lane` (a new kind next to `thread-state`,
   `session`, `space`, `routine`, `outage`; it renders through the existing
-  nudge path, `steps::nudge_text`, `src/steps.rs:442`), addressed to the
+  nudge path, `steps::nudge_text`, `src/steps.rs`), addressed to the
   **default lane** — that election is one of the two jobs the default lane has
   (§6.4), and it is why a project with a closed default still needs one:
 
@@ -706,9 +720,9 @@ prevent.
 ## 8. TASKS.md split
 
 `TASKS.md` is a single file with `## <list>` headings; `tasks::parse()`
-(`src/tasks.rs:126`) already builds `Task.list` from the heading, `tasks::compact`
-(`src/tasks.rs:185`) folds bodies for `context`, and the popup groups by list
-(`popup::parse_tasks`, `src/popup.rs:107`). **No file split is needed or wanted.**
+(`tasks::parse`, `src/tasks.rs`) already builds `Task.list` from the heading,
+`tasks::compact` (same file) folds bodies for `context`, and the popup groups by
+list (`popup::parse_tasks`, `src/popup.rs`). **No file split is needed or wanted.**
 
 The split is a naming convention:
 
@@ -740,10 +754,11 @@ The split is a naming convention:
 
 ### The write path is the risky part
 
-`src/tasks.rs:1` says it plainly: *"The coordinator is the only writer; this
-module only reads it."* Today the coordinator edits the file with its own tools,
-and the only thing keeping two writers apart is `project.lock()`
-(`src/project.rs:352`), which no text edit takes.
+The module comment at the top of `src/tasks.rs` says it plainly: *"The
+coordinator is the only writer; this module only reads it."* Today the
+coordinator edits the file with its own tools, and the only thing keeping two
+writers apart is `project.lock()`
+(`Project::lock`, `src/project.rs`), which no text edit takes.
 
 With several coordinators that becomes a real race: two agents rewriting one
 file, one of them losing the other's section, and no record of it.
@@ -760,7 +775,7 @@ hp task done <slug> "<title>"        # ticks the box; keeps the line
 Each is one `project.lock()`-protected read-modify-write of `TASKS.md` that
 preserves every other section byte-for-byte. The skill then says "never edit
 `TASKS.md` directly; use `hp task`", and the popup's existing "send a sentence
-to the coordinator" actions (`src/popup.rs:1064`) keep working unchanged.
+to the coordinator" actions in `src/popup.rs` keep working unchanged.
 
 Until `hp task` exists, lanes must not be rolled out with more than one
 coordinator writing tasks: a lost task section is silent data loss, and it is
@@ -768,33 +783,33 @@ the kind of loss nobody notices for a week.
 
 ## 9. Sidebar, grouping, lifecycle
 
-- **Display name.** `sidebar::coordinator_display()` (`src/sidebar.rs:80`)
+- **Display name.** `sidebar::coordinator_display()` (`src/sidebar.rs`)
   returns `"<project name>␣"` + `HEAD_MARK` for every coordinator, so two
   coordinators are two identical rows. It becomes `"<project> · <lane label>"` +
   `HEAD_MARK`. With one lane the row stays exactly as it is today (no
   `· <lane>` for the default lane in a single-lane project; a project with lanes
   always shows them, including the default, so the rows are distinguishable).
-- **Sort key.** `grouping::coordinator_key()` (`src/grouping.rs:76`) is
+- **Sort key.** `grouping::coordinator_key()` (`src/grouping.rs`) is
   `"<slug>!0!<pane>"`, i.e. coordinator order is pane order.
   It becomes `"<slug>!0!<lane-rank>!<pane>"` so coordinators sort by lane
   declaration order (default first) and panes break ties inside a lane. `!0!`
-  stays, so the `plan()` owner map (`src/grouping.rs:100`) and the `!0!`/`!1!`
+  stays, so the `plan()` owner map (same file) and the `!0!`/`!1!`
   split between coordinator and thread keys need no change. `lane-rank` must be
   fixed-width (`{rank:02}`): the keys are sorted as plain strings, and `10`
   sorts before `2` otherwise.
-- **Home Space.** `ProjectPart.home` (`src/grouping.rs:62`) stays one Space:
+- **Home Space.** `ProjectPart.home` (`src/grouping.rs`) stays one Space:
   every lane's coordinator lives in the project home by decision 1. `part()`
-  (`src/ticker.rs:533`) already collects coordinators' `workspace_id`s, so a lane
-  opened in another Space (a `--kind`-style escape hatch later) still shows.
-  `spaces::empty` (`src/spaces.rs:61`) must exclude **every** lane's
+  (`part`, `src/ticker.rs`) already collects coordinators' `workspace_id`s, so a
+  lane opened in another Space (a `--kind`-style escape hatch later) still shows.
+  `spaces::empty` (`src/spaces.rs`) must exclude **every** lane's
   `workspace_id` from its "orphan home" sweep, not just `coordinator().workspace_id`
-  (`src/spaces.rs:96`, `:85`), otherwise it will offer to close the Space of a
+  (same file), otherwise it will offer to close the Space of a
   live lane.
-- **Lifecycle.** `lifecycle::close_workspaces()` (`src/lifecycle.rs:40`) closes
+- **Lifecycle.** `lifecycle::close_workspaces()` (`src/lifecycle.rs`) closes
   `coordinator().workspace_id`; it must iterate the lanes
-  (`alive_panes`, `src/lifecycle.rs:12`, likewise). `archive` must not leave a
+  (`alive_panes`, same file, likewise). `archive` must not leave a
   lane's coordinator behind; `delete` is unchanged (whole project).
-- **Closed lanes leave the views.** `part()` (`src/ticker.rs:533`) builds the
+- **Closed lanes leave the views.** `part()` (`src/ticker.rs`) builds the
   sidebar from live coordinators and recorded panes, so a closed lane's row
   simply disappears with its pane — nothing has to be added — but
   `spaces::empty` must not offer to close the home while an open lane still
@@ -802,7 +817,7 @@ the kind of loss nobody notices for a week.
   must filter on `status == open` when they iterate lanes.
 - **`hp context` must be lane-aware**, and its header carries the identity line
   from §5.4 on **every** run. It currently prints the whole digest
-  (`src/coordinator.rs:588` `digest()`). After the change the first lines are
+  (`digest()`, `src/coordinator.rs`). After the change the first lines are
   `Coordinators: …` (which rule each live pane matched, and the fix for an
   ambiguous one), then the lane's header (`lane c-1 · 抢修`), the lane's tasks,
   the lane's inbox, the threads of the lane — and a one-line summary of the
@@ -820,7 +835,7 @@ the kind of loss nobody notices for a week.
 - **Empty `lane` = default lane.** On every read path: `Thread.lane`,
   `inbox::Item.lane`, the task heading's missing prefix.
 - **Old `coordinator.json` is the default lane's view.** `Project::coordinator()`
-  (`src/project.rs:410`) keeps returning `Option<Coordinator>`; it becomes "the
+  (`src/project.rs`) keeps returning `Option<Coordinator>`; it becomes "the
   default lane's record". So do its 63 call sites in `src/` — they keep working
   for single-lane projects without a rewrite, which is what makes the rollout
   incremental (§12, the commit plan).
@@ -833,7 +848,7 @@ the kind of loss nobody notices for a week.
   `needs-you`, `overview`, `archive`, `rename`, `doctor` all keep their
   behaviour for single-lane projects.
 - **`rename <slug> <new-slug>`** keeps working: it rewrites `coordinator.json`
-  paths (`src/rename.rs:271`) and moves the folder. It only has to iterate the
+  paths (`src/rename.rs`) and moves the folder. It only has to iterate the
   lanes where it iterates one record: reopen each lane's coordinator in the new
   folder, re-report the `hp_lane` tokens, and rename the home Space once.
 - **Downgrade.** A file written by a lane-aware binary still loads in an old
@@ -847,15 +862,15 @@ the kind of loss nobody notices for a week.
 
 Explicitly out of scope for plan B:
 
-- **Memory partitioning (plan C).** Today `thread::brief_for`
-  (`src/thread.rs:480`) inlines the whole `MEMORY.md` plus every `memory/*.md`
-  into every brief, capped at `MEMORY_CAP_CHARS = 32_000`
-  (`src/thread.rs:17`, the cap is applied at `:449`). `law` is at 14 KB of
-  `MEMORY.md` and 29 memory files, so a lane-specific memory split (e.g.
-  `memory/<lane>/` or a `lane:` tag on each file) is where this goes next —
-  including the "not inlined because over the cap" line at `src/thread.rs:458`,
+- **Memory partitioning (plan C).** Today `thread::brief_for` (`src/thread.rs`)
+  inlines the whole `MEMORY.md` plus every `memory/*.md` into every brief, capped
+  at `MEMORY_CAP_CHARS = 32_000` (`src/thread.rs`; the cap is applied inside
+  `brief_for`). `law` is at 14 KB of `MEMORY.md` and 29 memory files, so a
+  lane-specific memory split (e.g. `memory/<lane>/` or a `lane:` tag on each
+  file) is where this goes next —
+  including the "not inlined because over the cap" line in `brief_for` (`src/thread.rs`),
   which two lanes will hit faster than one. Not designed here.
-- **Routines per lane.** `routine::Routine` (`src/routine.rs:138`) has no lane
+- **Routines per lane.** `routine::Routine` (`src/routine.rs`) has no lane
   field; every routine fires for the project. A `pr-followup` for one lane's
   threads is a reasonable want; it is a separate change (routine state
   `States`, `routine::load_all`, the `pr` trigger's thread filter).
@@ -933,10 +948,9 @@ cleanup at the end.
    stall, and it is worth having before any lane exists at all.
 2. **Ownership.** `Thread.lane` and `inbox.lane` writer and readers, `steps::State`
    per lane, `inbox::seen`/`mark_seen` per lane, `context` lane-scoped.
-3. **Routing.** `nudge_target()` (`src/coordinator.rs:177`) returns one target
-   *per lane*; `nudge()` runs once per lane; `prompt()` (`src/coordinator.rs:556`)
-   resolves by lane; `discover()` (`src/coordinator.rs:148`) stores the lane in
-   `LivePane`.
+3. **Routing.** `nudge_target()` (`src/coordinator.rs`) returns one target
+   *per lane*; `nudge()` runs once per lane; `prompt()` (same file) resolves by
+   lane; `discover()` (same file) stores the lane in `LivePane`.
 4. **Open / adopt / assign / close.** `open --lane`, `--lane-name`,
    `hp lane adopt`, `hp lane assign`, `hp lane rename`, `hp lane close`,
    `hp lane open` (§6.4). Closing is a registry status change and a filter, not a
@@ -960,24 +974,26 @@ reviewed as if it were the only change in the release.
 ## Appendix: the decision points
 
 Every place that today answers "which coordinator?" and what it must become.
-Line numbers checked on this commit; `rg` the function name if they drift.
+The Where column names **symbols, not line numbers**: a line number here was
+correct only for the commit this document was written on, and every commit of
+the lane series moves them. `rg` the symbol to find it.
 
 | Where | Today | Under lanes |
 | --- | --- | --- |
-| `src/coordinator.rs:177` `nudge_target()` | newest idle pane across all `LivePane`s | group by lane, pick one per lane |
-| `src/coordinator.rs:556` `prompt()` | `max_by_key(state_change_seq)` (`:569`) to one pane | resolve the target's lane first, then match |
-| `src/inbox.rs:121` `mark_seen()` (called from `context`, `src/coordinator.rs:582`) | one global seen set (`:116`) | one seen set per lane |
-| `src/steps.rs:56` `State` (`nudged` `:67`, `box_pane` `:79`) | one scalar each | one entry per lane |
-| `src/threads.rs:323` `place_tab()` | `project.coordinator()`'s home Space (`:324`) | the initiating lane's coordinator's Space |
-| `src/threads.rs:913` `called_from_coordinator()` | compares one record's socket/workspace/tab/pane | compares against any lane's record, else lane A's `thread resolve` re-adds the item to lane B |
-| `src/lifecycle.rs:40` `close_workspaces()` | closes `coordinator().workspace_id` (`:48`, `:64`) | iterate all lanes |
-| `src/coordinator.rs:60` `is_coordinator()` / `:67` `session_matches()` | dir (`works_in`) or one record's session | the §5.2 resolver |
-| `src/coordinator.rs:108` `found()` / `:148` `discover()` | "the most recently active agent in the folder" (`:110`) | record the lane the resolver returns; rule 4 writes a note instead |
-| `src/coordinator.rs:295` `open` reuse | newest of the `running` set | the target lane's live pane only |
-| `src/coordinator.rs:377` `open` record write | `*c = Coordinator{…}` replaces the record | write that lane's entry in `lanes.json` |
-| `src/spaces.rs:61` `empty()` | excludes `coordinator().workspace_id` (`:85`, `:96`) | excludes every lane's Space |
-| `src/sidebar.rs:80` `coordinator_display()` | project name for every coordinator | `<project> · <lane>` |
-| `src/grouping.rs:76` `coordinator_key()` | `<slug>!0!<pane>` | `<slug>!0!<lane-rank>!<pane>` |
-| `src/coordinator.rs:588` `digest()` (via `context`, `:576`) | prints state, never says who the coordinator is | first line is the §5.4 `Coordinators:` line, every turn |
-| `src/ticker.rs:901` `coordinator_missing` | a missing coordinator only feeds `session_lost` (`:902`-`904`); nothing is logged or written | an ambiguous pane is logged as a held reason and written as one `lane` item |
-| `src/ticker.rs:841` `open_threads()` | `Open \| Starting` per project | the same predicate per lane, and the basis of `lane close`'s refusal and of §7's orphan test |
+| `coordinator::nudge_target()` (`src/coordinator.rs`) | newest idle pane across all `LivePane`s | group by lane, pick one per lane |
+| `coordinator::prompt()` (`src/coordinator.rs`) | `max_by_key(state_change_seq)` to one pane | resolve the target's lane first, then match |
+| `inbox::mark_seen()` (`src/inbox.rs`), called from `coordinator::context` | one global seen set | one seen set per lane |
+| `steps::State` (`src/steps.rs`): `nudged`, `box_pane` | one scalar each | one entry per lane |
+| `threads::place_tab()` (`src/threads.rs`) | the home Space of the record `Project::coordinator()` returns | the initiating lane's coordinator's Space |
+| `threads::called_from_coordinator()` (`src/threads.rs`) | compares one record's socket/workspace/tab/pane | compares against any lane's record, else lane A's `thread resolve` re-adds the item to lane B |
+| `lifecycle::close_workspaces()` (`src/lifecycle.rs`) | closes `coordinator().workspace_id` | iterate all lanes |
+| `coordinator::is_coordinator()` / `session_matches()` (`src/coordinator.rs`) | dir (`works_in`) or one record's session | the §5.2 resolver |
+| `coordinator::found()` / `discover()` (`src/coordinator.rs`) | "the most recently active agent in the folder" | record the lane the resolver returns; rule 4 writes a note instead |
+| `coordinator::open()`'s reuse branch (`src/coordinator.rs`) | newest of the `running` set | the target lane's live pane only |
+| `coordinator::open()`'s record write (`src/coordinator.rs`) | `*c = Coordinator{…}` replaces the record | write that lane's entry in `lanes.json` |
+| `spaces::empty()` (`src/spaces.rs`) | excludes `coordinator().workspace_id` | excludes every lane's Space |
+| `sidebar::coordinator_display()` (`src/sidebar.rs`) | project name for every coordinator | `<project> · <lane>` |
+| `grouping::coordinator_key()` (`src/grouping.rs`) | `<slug>!0!<pane>` | `<slug>!0!<lane-rank>!<pane>` |
+| `coordinator::digest()` (`src/coordinator.rs`), reached through `coordinator::context()` | prints state, never says who the coordinator is | first line is the §5.4 `Coordinators:` line, every turn |
+| `tick_cheap()`'s `coordinator_missing` (`src/ticker.rs`) | a missing coordinator only feeds `session_lost`; nothing is logged or written | an ambiguous pane is logged as a held reason and written as one `lane` item |
+| `ticker::open_threads()` (`src/ticker.rs`) | `Open \| Starting` per project | the same predicate per lane, and the basis of `lane close`'s refusal and of §7's orphan test |
