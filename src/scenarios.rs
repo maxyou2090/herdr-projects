@@ -3989,10 +3989,14 @@ fn two_claimed_lanes_both_print_and_a_neighbouring_project_is_left_out() {
 }
 
 #[test]
-fn a_drifted_lane_keeps_its_token_from_the_registry_and_the_other_lane_is_left_unclaimed() {
+fn a_drifted_lane_keeps_its_token_from_the_registry_and_each_lane_claims_its_own() {
     // The shape of the incident: a coordinator whose shell sits in another
     // folder. The ticker re-reads the registry every tick, so the pane keeps
     // saying which lane it is even after its folder and its token both went.
+    // Since commit 3 it does so for **every** lane, not only the one the
+    // shared `coordinator.json` names: that gap (§5.1, "until commit 3 the
+    // ticker still refreshes only the panes its single record matches") is
+    // what let a second lane's claim expire after its TTL.
     let world = World::new();
     let project = world.project("demo", "a.sock");
     crate::lanes::Registry {
@@ -4034,10 +4038,11 @@ fn a_drifted_lane_keeps_its_token_from_the_registry_and_the_other_lane_is_left_u
     // The default lane's pane keeps claiming c-1 from the registry although its
     // folder and its own token are gone.
     assert!(reports.iter().any(|t| t.contains("pane report-metadata w1:p1") && t.contains("hp_lane=c-1")), "{reports:?}");
-    // And the other lane's pane is never handed a claim it has not earned:
-    // `discover` is still the single-record test (commit 3 makes it per lane),
-    // so it either gets no report or one with no lane token.
-    assert!(!reports.iter().any(|t| t.contains("pane report-metadata w2:p1") && t.contains("hp_lane")), "no token lies: {reports:?}");
+    // And the other lane's drifted pane is discovered by rule 2 and claims
+    // **its own** lane: the claim is earned from the registry's recorded pane
+    // and session, not invented (before commit 3 this pane got none at all).
+    assert!(reports.iter().any(|t| t.contains("pane report-metadata w2:p1") && t.contains("hp_lane=c-2")), "{reports:?}");
+    assert!(!reports.iter().any(|t| t.contains("pane report-metadata w2:p1") && t.contains("hp_lane=c-1")), "no token crosses lanes: {reports:?}");
     // The resolver itself is per lane and independent of `discover`: both
     // drifted panes read back their own lanes, and neither is ambiguous.
     let (line, _) = digest_parts(&world, &project);
@@ -4151,4 +4156,335 @@ fn thread_start_writes_the_initiating_coordinators_lane_and_restart_does_not_rec
     registry.save(&project).unwrap();
     let restarted = threads::restart(&ctx, "demo", &t.id, None).unwrap();
     assert_eq!(restarted.lane, "c-2", "a restart never recomputes ownership");
+}
+
+// ---------------------------------------------------------------- lanes, commit 3
+
+/// Two open lanes, each recording its own coordinator pane and session — the
+/// shape `open --lane` leaves behind.
+fn two_lane_registry(project: &Project) -> crate::lanes::Registry {
+    let registry = crate::lanes::Registry {
+        lanes: vec![
+            crate::lanes::Lane {
+                id: "c-1".into(),
+                name: "fix".into(),
+                label: "抢修".into(),
+                pane_id: "w1:p1".into(),
+                agent_session: "sess-1".into(),
+                ..Default::default()
+            },
+            crate::lanes::Lane {
+                id: "c-2".into(),
+                name: "books".into(),
+                label: "收藏".into(),
+                pane_id: "w2:p1".into(),
+                agent_session: "sess-2".into(),
+                ..Default::default()
+            },
+        ],
+        default: "c-1".into(),
+        next: 3,
+    };
+    registry.save(project).unwrap();
+    registry
+}
+
+/// Backdates every lane's input-box watch, so the quiet guard lets the next
+/// tick nudge — the per-lane sibling of `box_empty_for_a_while`.
+fn lanes_box_empty_for_a_while(project: &Project, lanes: &[&str]) {
+    let mut state = crate::steps::load_state(project);
+    for lane in lanes {
+        assert!(state.box_empty_since.contains_key(*lane), "lane {lane} was not seen empty yet: {:?}", state.box_empty_since);
+        state.box_empty_since.insert((*lane).to_string(), "2026-01-01T00:00:00Z".into());
+    }
+    crate::steps::save_state(project, &state).unwrap();
+}
+
+/// `(pane, text)` of every `agent prompt` the fake herdr was given.
+fn prompts(world: &World) -> Vec<(String, String)> {
+    world
+        .runner
+        .calls
+        .borrow()
+        .iter()
+        .filter(|c| c.display().contains("agent prompt"))
+        .map(|c| (c.args[2].clone(), c.args[3].clone()))
+        .collect()
+}
+
+#[test]
+fn each_lanes_items_are_nudged_only_to_its_own_coordinator() {
+    let world = World::new();
+    let project = world.project("demo", "a.sock");
+    let dir = project.canonical_dir().to_string_lossy().into_owned();
+    two_lane_registry(&project);
+    inbox::write_in(&project, "c-1", "thread-state", "t-0001", "idle", "lane one", "").unwrap();
+    inbox::write_in(&project, "c-2", "thread-state", "t-0002", "idle", "lane two", "").unwrap();
+    *world.agents.borrow_mut() = format!(
+        "[{},{}]",
+        agent_json_tokens("w1", "w1:p1", &dir, &[("hp_project", "demo"), ("hp_lane", "c-1")]),
+        agent_json_tokens("w2", "w2:p1", &dir, &[("hp_project", "demo"), ("hp_lane", "c-2")]),
+    );
+    *world.panes.borrow_mut() = format!("[{},{}]", pane_json("w1", "w1:t1", "w1:p1", &dir), pane_json("w2", "w2:t1", "w2:p1", &dir));
+    world.runner.on("agent prompt", ok(r#"{"result":{}}"#));
+    let ctx = world.ctx();
+    let mut memory = Memory::new(&ctx);
+
+    // Tick 1 discovers both coordinators; the idle guard holds the nudge.
+    ticker::tick_project_with(&ctx, &project, &mut memory).unwrap();
+    assert!(prompts(&world).is_empty());
+    idle_for_a_minute(&project);
+    // Tick 2 sees each lane's box empty for the first time.
+    ticker::tick_project_with(&ctx, &project, &mut memory).unwrap();
+    assert!(prompts(&world).is_empty(), "each lane waits for its own box");
+    lanes_box_empty_for_a_while(&project, &["c-1", "c-2"]);
+    // Tick 3 delivers each lane's own item to its own pane, and to no other.
+    ticker::tick_project_with(&ctx, &project, &mut memory).unwrap();
+    assert_eq!(
+        prompts(&world),
+        [
+            ("w1:p1".to_string(), "[hp inbox] t-0001 idle".to_string()),
+            ("w2:p1".to_string(), "[hp inbox] t-0002 idle".to_string())
+        ]
+    );
+    // Both hashes are spent, each under its own lane, so neither lane repeats.
+    let state = crate::steps::load_state(&project);
+    assert!(state.nudged.contains_key("c-1") && state.nudged.contains_key("c-2"), "{:?}", state.nudged);
+    ticker::tick_project_with(&ctx, &project, &mut memory).unwrap();
+    assert_eq!(prompts(&world).len(), 2);
+}
+
+#[test]
+fn a_lane_with_live_threads_and_no_coordinator_is_announced_to_the_default_lane_once() {
+    let world = World::new();
+    let project = world.project("demo", "a.sock");
+    let dir = project.canonical_dir().to_string_lossy().into_owned();
+    let mut registry = two_lane_registry(&project);
+    // c-2's coordinator is gone: its recorded pane is not listed at all.
+    registry.lanes[1].pane_id = "w9:p9".into();
+    registry.save(&project).unwrap();
+    for title in ["books one", "books two"] {
+        thread::allocate(&project, |t| {
+            t.title = title.into();
+            t.status = Status::Open;
+            t.lane = "c-2".into();
+        })
+        .unwrap();
+    }
+    *world.agents.borrow_mut() = format!("[{}]", agent_json_tokens("w1", "w1:p1", &dir, &[("hp_project", "demo"), ("hp_lane", "c-1")]));
+    *world.panes.borrow_mut() = format!("[{}]", pane_json("w1", "w1:t1", "w1:p1", &dir));
+    let ctx = world.ctx();
+    let mut memory = Memory::new(&ctx);
+
+    ticker::tick_project_with(&ctx, &project, &mut memory).unwrap();
+    let items = items_of(&project, "lane");
+    assert_eq!(items.len(), 1, "{items:?}");
+    assert_eq!((items[0].subject.as_str(), items[0].event.as_str()), ("c-2", "2 open threads, no coordinator"));
+    assert_eq!(items[0].lane, "c-1", "addressed to the default lane");
+    assert_eq!(
+        items[0].summary,
+        "Lane `收藏` (c-2) has 2 open threads and no live coordinator. Reopen it with `open demo --lane books`, or move its threads with `lane assign c-2 <pane>`. Nothing moves until you say so."
+    );
+
+    // The same state is not announced again, tick after tick.
+    ticker::tick_project_with(&ctx, &project, &mut memory).unwrap();
+    assert_eq!(items_of(&project, "lane").len(), 1);
+    // A thread resolves: the count changed, so exactly one more announcement.
+    let open: Vec<String> = thread::list(&project).into_iter().filter(|t| t.status == Status::Open).map(|t| t.id).collect();
+    thread::update(&project, &open[0], |t| t.status = Status::Resolved).unwrap();
+    ticker::tick_project_with(&ctx, &project, &mut memory).unwrap();
+    assert_eq!(items_of(&project, "lane").len(), 2);
+    assert_eq!(items_of(&project, "lane")[1].event, "1 open threads, no coordinator");
+    ticker::tick_project_with(&ctx, &project, &mut memory).unwrap();
+    assert_eq!(items_of(&project, "lane").len(), 2);
+}
+
+#[test]
+fn a_closed_lane_with_live_threads_is_never_reported_as_an_orphan() {
+    let world = World::new();
+    let project = world.project("demo", "a.sock");
+    let dir = project.canonical_dir().to_string_lossy().into_owned();
+    let mut registry = two_lane_registry(&project);
+    registry.lanes[1].status = crate::lanes::Status::Closed;
+    registry.lanes[1].pane_id = "w9:p9".into();
+    registry.save(&project).unwrap();
+    thread::allocate(&project, |t| {
+        t.title = "left over".into();
+        t.status = Status::Open;
+        t.lane = "c-2".into();
+    })
+    .unwrap();
+    *world.agents.borrow_mut() = format!("[{}]", agent_json_tokens("w1", "w1:p1", &dir, &[("hp_project", "demo"), ("hp_lane", "c-1")]));
+    *world.panes.borrow_mut() = format!("[{}]", pane_json("w1", "w1:t1", "w1:p1", &dir));
+    let ctx = world.ctx();
+    let mut memory = Memory::new(&ctx);
+    ticker::tick_project_with(&ctx, &project, &mut memory).unwrap();
+    assert!(items_of(&project, "lane").is_empty(), "a closed lane is never an orphan (§6.4, §7)");
+    // And it is not nudgeable either: no lane item means no announcement.
+    assert!(prompts(&world).is_empty());
+    let state = crate::steps::load_state(&project);
+    assert!(state.lane_items.is_empty());
+}
+
+#[test]
+fn a_project_without_a_registry_still_nudges_once_to_the_newest_idle_coordinator() {
+    // The zero-change anchor for the nine real projects: two agents in the
+    // folder (the old rule accepts both), one item, one nudge — to the newest
+    // — and a `coordinators.json` / `ticker.json` shaped exactly as before.
+    let world = World::new();
+    let project = world.project("demo", "a.sock");
+    let dir = project.canonical_dir().to_string_lossy().into_owned();
+    let with_seq = |pane: &str, seq: u64| {
+        format!(
+            r#"{{"pane_id":"{pane}","tab_id":"w1:t1","workspace_id":"w1","cwd":"{dir}","name":"hp-{pane}","agent":"claude","agent_status":"idle","state_change_seq":{seq}}}"#
+        )
+    };
+    *world.agents.borrow_mut() = format!("[{},{}]", with_seq("w1:p1", 3), with_seq("w2:p1", 9));
+    *world.panes.borrow_mut() = format!("[{},{}]", pane_json("w1", "w1:t1", "w1:p1", &dir), pane_json("w2", "w2:t1", "w2:p1", &dir));
+    inbox::write(&project, "thread-state", "t-0001", "idle", "an item", "").unwrap();
+    world.runner.on("agent prompt", ok(r#"{"result":{}}"#));
+    let ctx = world.ctx();
+    let mut memory = Memory::new(&ctx);
+    ticker::tick_project_with(&ctx, &project, &mut memory).unwrap();
+    idle_for_a_minute(&project);
+    ticker::tick_project_with(&ctx, &project, &mut memory).unwrap();
+    box_empty_for_a_while(&project);
+    ticker::tick_project_with(&ctx, &project, &mut memory).unwrap();
+    assert_eq!(
+        prompts(&world),
+        [("w2:p1".to_string(), "[hp inbox] t-0001 idle".to_string())],
+        "one nudge, to the most recently changed coordinator, as before lanes"
+    );
+    // The two state files keep their pre-lane shape: no lane field, no map.
+    let live = std::fs::read_to_string(project.state_dir().join("coordinators.json")).unwrap();
+    assert!(!live.contains("lane"), "{live}");
+    let ticker_state = std::fs::read_to_string(project.state_dir().join("ticker.json")).unwrap();
+    assert!(ticker_state.contains(r#""nudged": ""#), "the scalar nudge slot is unchanged: {ticker_state}");
+    assert!(!ticker_state.contains(r#""nudged": {"#), "{ticker_state}");
+    assert!(!ticker_state.contains("lane_items"), "{ticker_state}");
+}
+
+#[test]
+fn the_ticker_logs_why_a_lane_was_not_nudged_naming_the_lane_and_project() {
+    // §12 commit 3, deliverable 8: the "no coordinator" verdict — the branch
+    // the 2026-10-18 stall sat in for a week — is written down, per lane.
+    let world = World::new();
+    let project = world.project("demo", "a.sock");
+    let dir = project.canonical_dir().to_string_lossy().into_owned();
+    two_lane_registry(&project);
+    // One item in the lane whose coordinator is gone; c-1 is alive and quiet.
+    inbox::write_in(&project, "c-2", "thread-state", "t-0002", "idle", "lane two", "").unwrap();
+    *world.agents.borrow_mut() = format!("[{}]", agent_json_tokens("w1", "w1:p1", &dir, &[("hp_project", "demo"), ("hp_lane", "c-1")]));
+    *world.panes.borrow_mut() = format!("[{}]", pane_json("w1", "w1:t1", "w1:p1", &dir));
+    let ctx = world.ctx();
+    let mut memory = Memory::new(&ctx);
+    let path = world.home.path().join("ticker.log");
+    ticker::tick(&ctx, &ticker::Log::at(path.clone()), &mut memory);
+    let text = std::fs::read_to_string(&path).unwrap();
+    assert!(
+        text.contains("demo: nudge held: c-2: items wait but no coordinator is idle long enough"),
+        "the log names the project, the lane and the reason: {text}"
+    );
+    // Written once per reason, not once per tick.
+    ticker::tick(&ctx, &ticker::Log::at(path.clone()), &mut memory);
+    let text = std::fs::read_to_string(&path).unwrap();
+    assert_eq!(text.matches("nudge held").count(), 1, "{text}");
+}
+
+#[test]
+fn a_prompt_goes_to_the_callers_own_lane_and_never_to_an_ambiguous_pane() {
+    let world = World::new();
+    let project = world.project("demo", "a.sock");
+    let dir = project.canonical_dir().to_string_lossy().into_owned();
+    two_lane_registry(&project);
+    *world.agents.borrow_mut() = format!(
+        "[{},{}]",
+        agent_json_tokens("w1", "w1:p1", &dir, &[("hp_project", "demo"), ("hp_lane", "c-1")]),
+        agent_json_tokens("w2", "w2:p1", &dir, &[("hp_project", "demo"), ("hp_lane", "c-2")]),
+    );
+    world.runner.on("agent prompt", ok(r#"{"result":{}}"#));
+    let prompt_as = |agents: &str, pane: &str, text: &str| -> anyhow::Result<()> {
+        *world.agents.borrow_mut() = agents.to_string();
+        let env = Env::for_test(world.home.path(), &[("HERDR_PANE_ID", pane)]);
+        let ctx = Ctx { env: &env, root: world.root.clone(), config_dir: world.home.path().join("cfg"), runner: &world.runner, detached_ticker: false };
+        coordinator::prompt(&ctx, "demo", text)
+    };
+    let two = format!(
+        "[{},{}]",
+        agent_json_tokens("w1", "w1:p1", &dir, &[("hp_project", "demo"), ("hp_lane", "c-1")]),
+        agent_json_tokens("w2", "w2:p1", &dir, &[("hp_project", "demo"), ("hp_lane", "c-2")]),
+    );
+    prompt_as(&two, "w2:p1", "Sort the books.").unwrap();
+    assert_eq!(prompts(&world), [("w2:p1".to_string(), "Sort the books.".to_string())], "the caller's lane, not the newest pane");
+
+    // A pane in the folder that no lane claims is ambiguous: refused, with the
+    // reason and the command that fixes it — never guessed.
+    let ambiguous = format!(
+        "[{},{},{}]",
+        agent_json_tokens("w1", "w1:p1", &dir, &[("hp_project", "demo"), ("hp_lane", "c-1")]),
+        agent_json_tokens("w2", "w2:p1", &dir, &[("hp_project", "demo"), ("hp_lane", "c-2")]),
+        agent_json("w3", "w3:t1", "w3:p1", &dir, "hp-demo-third", "idle"),
+    );
+    let error = prompt_as(&ambiguous, "w3:p1", "Which lane?").unwrap_err().to_string();
+    assert!(error.contains("2 open lanes share this folder"), "{error}");
+    assert_eq!(prompts(&world).len(), 1, "the ambiguous pane got nothing");
+
+    // The caller's own lane with no pane that can take a prompt names the lane.
+    let blocked = format!(
+        "[{},{}]",
+        agent_json_tokens("w1", "w1:p1", &dir, &[("hp_project", "demo"), ("hp_lane", "c-1")]),
+        r#"{"pane_id":"w2:p1","tab_id":"w2:t1","workspace_id":"w2","cwd":"/elsewhere","agent":"claude","agent_status":"blocked","tokens":{"hp_project":"demo","hp_lane":"c-2"}}"#,
+    );
+    let error = prompt_as(&blocked, "w2:p1", "Please retry.").unwrap_err().to_string();
+    assert!(error.contains("lane c-2 of `demo` has no coordinator that can take a prompt"), "{error}");
+    assert_eq!(prompts(&world).len(), 1);
+}
+
+#[test]
+fn a_single_lane_registry_keeps_the_popups_prompt_working_from_a_pane_that_is_nobody() {
+    // The popup's task keys run `coordinator prompt` from a plugin pane, which
+    // is no lane's coordinator. One open lane is the only honest answer, so
+    // the single-lane behaviour is unchanged (§6.4 rule 3, §12 commit 3).
+    let world = World::new();
+    let project = world.project("demo", "a.sock");
+    let dir = project.canonical_dir().to_string_lossy().into_owned();
+    crate::lanes::Registry::ensure_written(&project).unwrap();
+    *world.agents.borrow_mut() = format!("[{}]", agent_json("w1", "w1:t1", "w1:p1", &dir, "hp-demo-coordinator", "idle"));
+    world.runner.on("agent prompt", ok(r#"{"result":{}}"#));
+    let env = Env::for_test(world.home.path(), &[("HERDR_PANE_ID", "w9:p9")]);
+    let ctx = Ctx { env: &env, root: world.root.clone(), config_dir: world.home.path().join("cfg"), runner: &world.runner, detached_ticker: false };
+    coordinator::prompt(&ctx, "demo", "Please mark as done").unwrap();
+    assert_eq!(prompts(&world), [("w1:p1".to_string(), "Please mark as done".to_string())]);
+}
+
+#[test]
+fn an_ambiguous_pane_keeps_the_project_alive_but_receives_nothing() {
+    // §5.2 rule 4: a pane no rule can place counts as *somebody* — the project
+    // is not coordinator-less, so its routines keep firing — and is given
+    // nothing: no lane, no nudge.
+    let world = World::new();
+    let project = world.project("demo", "a.sock");
+    let dir = project.canonical_dir().to_string_lossy().into_owned();
+    two_lane_registry(&project);
+    std::fs::create_dir_all(project.dir().join("routines")).unwrap();
+    std::fs::write(project.dir().join("routines").join("sweep.md"), "+++\nschedule = \"every 1m\"\n+++\nGo.\n").unwrap();
+    let mut state = crate::steps::load_state(&project);
+    state.routines.entry("sweep".into()).or_default().last_run = "2026-01-01T00:00:00Z".into();
+    crate::steps::save_state(&project, &state).unwrap();
+    inbox::write_in(&project, "c-1", "thread-state", "t-0001", "idle", "lane one", "").unwrap();
+    // One pane in the project folder, no token and no record in either lane.
+    *world.agents.borrow_mut() = format!("[{}]", agent_json("w9", "w9:t1", "w9:p1", &dir, "hp-demo-lost", "idle"));
+    *world.panes.borrow_mut() = format!("[{}]", pane_json("w9", "w9:t1", "w9:p1", &dir));
+    let ctx = world.ctx();
+    let mut memory = Memory::new(&ctx);
+    ticker::tick_project_with(&ctx, &project, &mut memory).unwrap();
+
+    // Nothing was sent to the ambiguous pane, and no lane was invented for it.
+    assert!(prompts(&world).is_empty(), "an ambiguous pane is never nudged: {:?}", prompts(&world));
+    let live = crate::coordinator::live(&project);
+    assert_eq!(live.len(), 1, "{live:?}");
+    assert_eq!(live[0].lane, "", "and it is assigned no lane");
+    // But it is somebody: a prompt-only routine still fires.
+    let routines = items_of(&project, "routine");
+    assert_eq!(routines.len(), 1, "the project is not coordinator-less: {routines:?}");
 }

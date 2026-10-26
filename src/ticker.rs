@@ -206,6 +206,13 @@ pub struct Log {
 }
 
 impl Log {
+    /// A log at `path`. The ticker's own log is `.ticker.log` under the root;
+    /// tests point one at a temporary file to read what was written.
+    #[cfg_attr(not(test), allow(dead_code))] // the ticker itself only ever logs to `.ticker.log`
+    pub fn at(path: PathBuf) -> Log {
+        Log { path }
+    }
+
     pub fn line(&self, text: &str) {
         let Ok(mut file) = File::options().create(true).append(true).open(&self.path) else {
             return;
@@ -318,7 +325,8 @@ pub fn tick(ctx: &Ctx, log: &Log, memory: &mut Memory) -> bool {
         }
         match tick_cheap(ctx, &project, &mut sessions) {
             Ok(Some(seen)) => {
-                match (&seen.nudge_held, memory.nudge_held.get(&slug)) {
+                let held = (!seen.nudge_held.is_empty()).then(|| held_text(&seen.nudge_held));
+                match (&held, memory.nudge_held.get(&slug)) {
                     (Some(held), previous) if previous.map(String::as_str) != Some(held.as_str()) => {
                         log.line(&format!("{slug}: nudge held: {held}"));
                         memory.nudge_held.insert(slug.clone(), held.clone());
@@ -594,9 +602,17 @@ pub struct Seen {
     /// The session answered, the project has at least two recorded local
     /// panes, and every one of them is missing: herdr was restarted.
     session_lost: bool,
-    /// Why a nudge had items to send but sent nothing this tick, for the
-    /// ticker's log.
-    nudge_held: Option<String>,
+    /// lane id -> why that lane had items to send but sent nothing this tick,
+    /// for the ticker's log. Every lane is named, so a silent "no coordinator"
+    /// verdict on one lane cannot hide behind another lane's delivery (§12
+    /// commit 3, the shape of the 2026-10-18 stall).
+    nudge_held: std::collections::BTreeMap<String, String>,
+}
+
+/// The `nudge held` line's tail: every lane that could not deliver, with its
+/// reason. One line per project, because a project's state is one state.
+fn held_text(held: &std::collections::BTreeMap<String, String>) -> String {
+    held.iter().map(|(lane, why)| format!("{lane}: {why}")).collect::<Vec<_>>().join("; ")
 }
 
 /// Both passes for one project; `Ok(false)` when its session is unreachable.
@@ -868,7 +884,7 @@ fn tick_cheap(ctx: &Ctx, project: &Project, sessions: &mut Sessions) -> Result<O
     // launched or primed here; `open` starts them and AGENTS.md primes them.
     let previous = coordinator::live(project);
     let now_text = project::now();
-    let coordinators = coordinator::discover(&record, &previous, &agents, &now_text);
+    let coordinators = coordinator::discover(project, &record, &previous, &agents, &now_text);
     if coordinators != previous {
         coordinator::save_live(project, &coordinators)?;
     }
@@ -889,7 +905,9 @@ fn tick_cheap(ctx: &Ctx, project: &Project, sessions: &mut Sessions) -> Result<O
         let (group, _) = coordinator::row_state(c, report.as_ref());
         // The lane claim, refreshed every tick from the registry, so a pane
         // whose shell drifted keeps saying which lane it is (§5.1, risk (b)).
-        let lane = crate::lanes::token_for_pane(project, &c.pane_id);
+        // A pane the resolver could not place keeps no claim at all: rule 4
+        // never assigns an `Ambiguous` pane a lane.
+        let lane = (!c.lane.is_empty()).then(|| c.lane.clone());
         crate::sidebar::report_pane(&herdr, &c.pane_id, &crate::sidebar::coordinator_display(project), slug, group, lane.as_deref());
     }
 
@@ -906,18 +924,30 @@ fn tick_cheap(ctx: &Ctx, project: &Project, sessions: &mut Sessions) -> Result<O
     let recorded_panes = pass.recorded_panes + coordinator_recorded;
     let missing_panes = pass.missing_panes + coordinator_missing;
 
-    // Nudge (or notify) about inbox items `context` has not shown yet.
-    let mut nudge_held = None;
+    // Nudge (or notify) about inbox items `context` has not shown yet, once
+    // per lane: each lane's coordinator hears only its own lane's items, and
+    // one lane's announcement is never spent on another's (§4.4, §12 commit
+    // 3). Without a registry there is exactly one lane, so this is the single
+    // nudge run it always was.
+    let mut nudge_held: std::collections::BTreeMap<String, String> = Default::default();
     if let Ok((settings, _)) = project.read_project_md() {
         let mut state = steps::load_state(project);
         let before = state.clone();
         let now = jiff::Timestamp::now();
-        let target = coordinator::nudge_target(&coordinators, now);
-        match steps::nudge(project, &mut state, &settings, &herdr, target, now) {
-            Ok(steps::NudgeOutcome::Delivered) | Ok(steps::NudgeOutcome::Quiet) => {}
-            Ok(steps::NudgeOutcome::Held(why)) => nudge_held = Some(why.to_string()),
-            Err(error) => {
-                first_error = first_error.or(Some(error.context("nudge")));
+        let targets = coordinator::nudge_target(project, &coordinators, now);
+        for lane in crate::lanes::routes(project) {
+            // A lane with no idle coordinator gets no target, which is a held
+            // reason rather than a delivery — an `Ambiguous` pane never has a
+            // lane here, so it is never nudged.
+            let target = targets.get(&lane).copied();
+            match steps::nudge(project, &mut state, &settings, &herdr, &lane, target, now) {
+                Ok(steps::NudgeOutcome::Delivered) | Ok(steps::NudgeOutcome::Quiet) => {}
+                Ok(steps::NudgeOutcome::Held(why)) => {
+                    nudge_held.insert(lane, why.to_string());
+                }
+                Err(error) => {
+                    first_error = first_error.or(Some(error.context(format!("nudge {lane}"))));
+                }
             }
         }
         if state != before {
@@ -1050,6 +1080,10 @@ fn tick_slow(ctx: &Ctx, project: &Project, seen: &Seen, memory: &mut Memory) -> 
     errors.extend(steps::write_thread_items(project, &mut state, &transitions, seen.session_lost, &copy_notes, &notifier).err());
     errors.extend(steps::write_stuck_items(project, &mut state, &seen.stuck, &notifier).err());
     errors.extend(steps::write_idle_notes(project, &mut state, now).err());
+    // §7: an open lane with live threads and no live coordinator gets one
+    // `lane` item, addressed to the default lane, deduplicated on its thread
+    // count. A project without a registry has no lane that can be orphaned.
+    errors.extend(steps::write_lane_items(project, &mut state, &crate::lanes::orphan_lanes(project, &seen.agents)).err());
     errors.extend(steps::pull_requests(ctx, project, &mut state, memory, now));
     errors.extend(steps::resolve_merged(ctx, project, &mut state, now));
     errors.extend(routine_pass(ctx, project, &mut state, seen.coordinator));

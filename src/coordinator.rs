@@ -5,6 +5,7 @@
 //! runs in, or in a tab of the project's workspace; the ticker discovers every
 //! such agent.
 
+use std::collections::BTreeMap;
 use std::fmt::Write as _;
 use std::path::Path;
 use std::time::Duration;
@@ -137,6 +138,16 @@ pub struct LivePane {
     /// When the ticker first observed the current `(agent_status, state_change_seq)` pair.
     pub pair_since: String,
     pub agent_session: String,
+    /// The lane this pane resolved to (`docs/lanes.md` §12 commit 3), empty
+    /// when it resolved to none — an `Ambiguous` pane, or any pane of a project
+    /// that has no `lanes.json` at all. Empty is therefore both "the default
+    /// lane" and "unknown", which is why routing never groups on it: a lane
+    /// with no id is never a nudge target (rule 4 of §5.2).
+    ///
+    /// Skipped when empty, so a pre-lane project's `coordinators.json` keeps
+    /// exactly the shape it had, and an older binary reads a newer file fine.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub lane: String,
 }
 
 pub fn live(project: &Project) -> Vec<LivePane> {
@@ -144,24 +155,41 @@ pub fn live(project: &Project) -> Vec<LivePane> {
 }
 
 /// The coordinators among `agents`, carrying `pair_since` over from the last
-/// observation when the pair is unchanged. Written under the lock by the caller.
-pub fn discover(record: &Coordinator, previous: &[LivePane], agents: &[Agent], now: &str) -> Vec<LivePane> {
+/// observation when the pair is unchanged, plus the lane each one resolved to
+/// (§12 commit 3). Written under the lock by the caller.
+///
+/// With a lane registry the resolver decides (`lanes::classify_all`), not the one
+/// shared record: a second lane's coordinator is discovered — and its `hp_lane`
+/// token re-reported every tick — although `coordinator.json` never names it.
+/// An `Ambiguous` pane is kept with **no lane**: it is evidence that somebody
+/// is there (so the project is never judged coordinator-less) but it is never
+/// nudged, prompted or given a lane.
+///
+/// Without a registry the old single-record test is the only rule, and no lane
+/// is written at all, so a pre-lane project's `coordinators.json` stays byte
+/// for byte what it was (§10).
+pub fn discover(project: &Project, record: &Coordinator, previous: &[LivePane], agents: &[Agent], now: &str) -> Vec<LivePane> {
+    let split = crate::lanes::split_in_use(project);
+    let resolutions = crate::lanes::classify_all(project, record, agents);
     agents
         .iter()
-        .filter(|a| is_coordinator(record, a))
-        .map(|a| {
-            let same = previous.iter().find(|p| p.pane_id == a.pane_id && p.agent_status == a.agent_status && p.state_change_seq == a.state_change_seq);
-            LivePane {
-                pane_id: a.pane_id.clone(),
-                tab_id: a.tab_id.clone(),
-                workspace_id: a.workspace_id.clone(),
-                name: a.name.clone(),
-                agent: a.agent.clone(),
-                agent_status: a.agent_status.clone(),
-                state_change_seq: a.state_change_seq,
-                pair_since: same.map(|p| p.pair_since.clone()).unwrap_or_else(|| now.to_string()),
-                agent_session: a.session_id().to_string(),
-            }
+        .zip(resolutions)
+        .filter_map(|(a, resolution)| {
+            resolution.counts_as_coordinator().then(|| {
+                let same = previous.iter().find(|p| p.pane_id == a.pane_id && p.agent_status == a.agent_status && p.state_change_seq == a.state_change_seq);
+                LivePane {
+                    pane_id: a.pane_id.clone(),
+                    tab_id: a.tab_id.clone(),
+                    workspace_id: a.workspace_id.clone(),
+                    name: a.name.clone(),
+                    agent: a.agent.clone(),
+                    agent_status: a.agent_status.clone(),
+                    state_change_seq: a.state_change_seq,
+                    pair_since: same.map(|p| p.pair_since.clone()).unwrap_or_else(|| now.to_string()),
+                    agent_session: a.session_id().to_string(),
+                    lane: if split { resolution.lane_id().unwrap_or("").to_string() } else { String::new() },
+                }
+            })
         })
         .collect()
 }
@@ -171,15 +199,35 @@ pub fn save_live(project: &Project, panes: &[LivePane]) -> Result<()> {
     project::write_json(&project.state_dir().join("coordinators.json"), &panes.to_vec())
 }
 
-/// The coordinator a nudge goes to: idle for at least `NUDGE_IDLE_SECS`
-/// (`done` counts as idle), the one whose pair changed most recently when
-/// several qualify. `None` when no coordinator is that idle.
-pub fn nudge_target(panes: &[LivePane], now: jiff::Timestamp) -> Option<&LivePane> {
-    panes
-        .iter()
-        .filter(|p| crate::herdr::ready_state(&p.agent_status))
-        .filter(|p| crate::thread::seconds_since(&p.pair_since, now) >= NUDGE_IDLE_SECS)
-        .max_by_key(|p| p.state_change_seq)
+/// The nudge target of every lane (§12 commit 3): one pane per lane, the one
+/// whose `(agent_status, state_change_seq)` pair changed most recently among
+/// those idle for at least `NUDGE_IDLE_SECS` (`done` counts as idle). Keyed by
+/// lane id, so the ticker can name the lane it asks about, and inside one lane
+/// the rule is exactly the old one.
+///
+/// A project without a registry has a single lane and a single answer — the
+/// same pane as before, and an empty map when no coordinator is that idle. A
+/// project with a registry groups by the lane `discover` resolved; a pane with
+/// no lane (an `Ambiguous` one) is never a target, so rule 4 of §5.2 holds on
+/// the hot path: send nothing rather than to the wrong lane.
+pub fn nudge_target<'a>(project: &Project, panes: &'a [LivePane], now: jiff::Timestamp) -> BTreeMap<String, &'a LivePane> {
+    let idle = |p: &&LivePane| crate::herdr::ready_state(&p.agent_status) && crate::thread::seconds_since(&p.pair_since, now) >= NUDGE_IDLE_SECS;
+    let mut out: BTreeMap<String, &'a LivePane> = BTreeMap::new();
+    if !crate::lanes::split_in_use(project) {
+        if let Some(pane) = panes.iter().filter(idle).max_by_key(|p| p.state_change_seq) {
+            out.insert(crate::lanes::default_lane_id(project), pane);
+        }
+        return out;
+    }
+    for pane in panes.iter().filter(idle).filter(|p| !p.lane.is_empty()) {
+        match out.get(pane.lane.as_str()) {
+            Some(best) if best.state_change_seq > pane.state_change_seq => {}
+            _ => {
+                out.insert(pane.lane.clone(), pane);
+            }
+        }
+    }
+    out
 }
 
 /// The profile a coordinator record ran: before profiles, the built-in of
@@ -557,6 +605,12 @@ fn name_tab(herdr: &Herdr, tab_id: &str) {
 
 /// `coordinator prompt`: a sentence to a coordinator (the popup's task keys
 /// use it; the coordinator stays the only writer of TASKS.md).
+///
+/// With a lane registry the sentence goes to the caller's **own** lane (§12
+/// commit 3): the pane this command runs in resolves through §5.2, and only that
+/// lane's panes are candidates. An `Ambiguous` pane is never picked, and a
+/// caller that resolves to no lane is refused when several lanes could be
+/// meant, naming `hp lane list` — never guessed.
 pub fn prompt(ctx: &Ctx, slug: &str, text: &str) -> Result<()> {
     let project = Project::load(&ctx.root, slug)?;
     let text = text.trim();
@@ -565,16 +619,65 @@ pub fn prompt(ctx: &Ctx, slug: &str, text: &str) -> Result<()> {
     }
     let view = crate::threads::session_view(ctx, &project).with_context(|| format!("the herdr session of `{slug}` is not reachable; run `open {slug}` first"))?;
     let record = project.coordinator().unwrap_or_default();
-    let target = view
-        .agents
-        .iter()
-        .filter(|a| is_coordinator(&record, a))
-        .filter(|a| a.agent_status != "blocked" && a.agent_status != "unknown")
-        .max_by_key(|a| a.state_change_seq)
-        .with_context(|| format!("no coordinator of `{slug}` can take a prompt right now; `open {slug}` starts one"))?;
+    let ready = |a: &&Agent| a.agent_status != "blocked" && a.agent_status != "unknown";
+    let (target, missing) = match prompt_lane(ctx, &project, &record, &view.agents)? {
+        // No registry: today's pick, over every pane the one record matches.
+        None => (
+            view.agents.iter().filter(|a| is_coordinator(&record, a)).filter(ready).max_by_key(|a| a.state_change_seq),
+            format!("no coordinator of `{slug}` can take a prompt right now; `open {slug}` starts one"),
+        ),
+        // A registry: only this lane's resolved panes, so one lane's sentence
+        // can never land in another lane's context.
+        Some(lane) => {
+            let registry = crate::lanes::Registry::for_project(&project);
+            let home = crate::lanes::project_home(&project);
+            let target = view
+                .agents
+                .iter()
+                .filter(|a| crate::lanes::resolve(&registry, a, &home, &project.slug).lane_id() == Some(lane.as_str()))
+                .filter(ready)
+                .max_by_key(|a| a.state_change_seq);
+            (
+                target,
+                format!("lane {lane} of `{slug}` has no coordinator that can take a prompt right now; `hp lane list {slug}` shows its lanes and panes"),
+            )
+        }
+    };
+    let target = target.with_context(|| missing)?;
     view.herdr.agent_prompt(&target.pane_id, text).map_err(|e| anyhow::anyhow!("{e}"))?;
     println!("sent to the coordinator in pane {} (agent was {})", target.pane_id, target.agent_status);
     Ok(())
+}
+
+/// The lane a prompt goes to (§5.2, §12 commit 3): the caller's own, resolved
+/// from `HERDR_PANE_ID` through the same five rules.
+///
+/// `Ok(None)` means "no lane routing at all": a project without a registry keeps
+/// the old single-record pick. A caller that resolves to **no** lane — the popup
+/// runs in a plugin pane, which is nobody's coordinator — goes to the default
+/// lane when the project has exactly one open lane, the same way rule 3 falls
+/// back to it for a single-lane project. With several lanes there is nothing
+/// honest to guess, so it refuses and names `hp lane list`.
+fn prompt_lane(ctx: &Ctx, project: &Project, record: &Coordinator, agents: &[Agent]) -> Result<Option<String>> {
+    use crate::lanes::LaneResolution as Answer;
+    if !crate::lanes::split_in_use(project) {
+        return Ok(None);
+    }
+    let slug = &project.slug;
+    let registry = crate::lanes::Registry::for_project(project);
+    let this = ctx.env.var("HERDR_PANE_ID").unwrap_or_default();
+    let caller = agents.iter().find(|a| !this.is_empty() && a.pane_id == this && crate::lanes::ours(a, slug));
+    match caller.map(|a| crate::lanes::classify(project, record, a)) {
+        Some(Answer::Known { lane, .. }) => Ok(Some(lane)),
+        Some(Answer::Ambiguous { reason }) => bail!("this pane is no lane's coordinator of `{slug}`: {reason}; `hp lane list {slug}` shows the lanes"),
+        _ => match registry.open_lanes().as_slice() {
+            [only] => Ok(Some(only.id.clone())),
+            open => bail!(
+                "`{slug}` has {} open lanes and this pane resolves to none of them; `hp lane list {slug}` shows them",
+                open.len()
+            ),
+        },
+    }
 }
 
 pub fn context(ctx: &Ctx, slug: &str, peek: bool) -> Result<()> {
@@ -748,6 +851,41 @@ mod tests {
         }
     }
 
+    fn project() -> (tempfile::TempDir, Project) {
+        let root = tempfile::tempdir().unwrap();
+        let project = crate::project::create(root.path(), "demo", "", vec![]).unwrap();
+        (root, project)
+    }
+
+    /// A registry with two open lanes, each recording its own pane and native
+    /// session — the shape `open --lane` will leave behind (§12 commit 4).
+    fn two_lanes(project: &Project) -> crate::lanes::Registry {
+        let registry = crate::lanes::Registry {
+            lanes: vec![
+                crate::lanes::Lane {
+                    id: "c-1".into(),
+                    name: "fix".into(),
+                    label: "抢修".into(),
+                    pane_id: "w1:p1".into(),
+                    agent_session: "sess-1".into(),
+                    ..Default::default()
+                },
+                crate::lanes::Lane {
+                    id: "c-2".into(),
+                    name: "books".into(),
+                    label: "收藏".into(),
+                    pane_id: "w2:p1".into(),
+                    agent_session: "sess-2".into(),
+                    ..Default::default()
+                },
+            ],
+            default: "c-1".into(),
+            next: 3,
+        };
+        registry.save(project).unwrap();
+        registry
+    }
+
     #[test]
     fn a_coordinator_is_any_agent_in_the_project_folder() {
         let record = Coordinator { cwd: "/r/demo".into(), workspace_id: "w1".into(), ..Coordinator::default() };
@@ -849,18 +987,70 @@ mod tests {
 
     #[test]
     fn discovery_keeps_pair_since_while_the_pair_is_unchanged() {
-        let record = Coordinator { cwd: "/r/demo".into(), ..Coordinator::default() };
-        let first = discover(&record, &[], &[agent("w1:p1", "/r/demo", "idle", 5), agent("w2:p1", "/other", "idle", 1)], "2026-09-23T10:00:00Z");
+        let (_root, project) = project();
+        let record = Coordinator { cwd: project.canonical_dir().to_string_lossy().into_owned(), ..Coordinator::default() };
+        let dir = record.cwd.clone();
+        let first = discover(&project, &record, &[], &[agent("w1:p1", &dir, "idle", 5), agent("w2:p1", "/other", "idle", 1)], "2026-09-23T10:00:00Z");
         assert_eq!(first.len(), 1);
         assert_eq!(first[0].pair_since, "2026-09-23T10:00:00Z");
-        let same = discover(&record, &first, &[agent("w1:p1", "/r/demo", "idle", 5)], "2026-09-23T10:01:00Z");
+        // A project without a registry writes no lane, so its
+        // `coordinators.json` keeps exactly the shape it had.
+        assert_eq!(first[0].lane, "");
+        let same = discover(&project, &record, &first, &[agent("w1:p1", &dir, "idle", 5)], "2026-09-23T10:01:00Z");
         assert_eq!(same[0].pair_since, "2026-09-23T10:00:00Z");
-        let changed = discover(&record, &first, &[agent("w1:p1", "/r/demo", "working", 6)], "2026-09-23T10:02:00Z");
+        let changed = discover(&project, &record, &first, &[agent("w1:p1", &dir, "working", 6)], "2026-09-23T10:02:00Z");
         assert_eq!(changed[0].pair_since, "2026-09-23T10:02:00Z");
     }
 
     #[test]
+    fn discovery_with_a_registry_finds_a_second_lane_the_shared_record_never_names() {
+        let (_root, project) = project();
+        two_lanes(&project);
+        // Both shells drifted out of the project folder; only rule 2 (recorded
+        // pane + native session) can find them, and the shared record names
+        // one of them at most.
+        let record = Coordinator { cwd: "".into(), pane_id: "w1:p1".into(), agent_session: "sess-1".into(), ..Coordinator::default() };
+        let drifted = |pane: &str, session: &str| Agent {
+            agent_session: Some(crate::herdr::AgentSession { value: session.into() }),
+            ..agent(pane, "/elsewhere", "idle", 1)
+        };
+        let found = discover(&project, &record, &[], &[drifted("w1:p1", "sess-1"), drifted("w2:p1", "sess-2")], "2026-09-23T10:00:00Z");
+        assert_eq!(found.len(), 2, "the second lane's coordinator is discovered too: {found:?}");
+        assert_eq!((found[0].pane_id.as_str(), found[0].lane.as_str()), ("w1:p1", "c-1"));
+        assert_eq!((found[1].pane_id.as_str(), found[1].lane.as_str()), ("w2:p1", "c-2"));
+        // The old single-record test would have kept only the first.
+        assert!(!is_coordinator(&record, &drifted("w2:p1", "sess-2")));
+    }
+
+    #[test]
+    fn discovery_keeps_an_ambiguous_pane_as_a_coordinator_with_no_lane() {
+        let (_root, project) = project();
+        two_lanes(&project);
+        let record = Coordinator::default();
+        let dir = project.canonical_dir().to_string_lossy().into_owned();
+        // Two open lanes share the folder and nothing says which: rule 4.
+        let found = discover(&project, &record, &[], &[agent("w9:p9", &dir, "idle", 1)], "2026-09-23T10:00:00Z");
+        assert_eq!(found.len(), 1, "an ambiguous pane is somebody, so it is kept");
+        assert_eq!(found[0].lane, "", "and it is assigned no lane");
+    }
+
+    #[test]
+    fn a_live_pane_reads_an_old_record_and_writes_no_lane_when_it_has_none() {
+        let old = r#"{"pane_id":"w1:p1","agent_status":"idle","pair_since":"2026-09-23T10:00:00Z"}"#;
+        let pane: LivePane = serde_json::from_str(old).unwrap();
+        assert_eq!(pane.lane, "");
+        assert_eq!(pane.pair_since, "2026-09-23T10:00:00Z");
+        // Serializing a lane-less pane leaves the old shape alone.
+        assert!(!serde_json::to_string(&pane).unwrap().contains("lane"));
+        let with = LivePane { lane: "c-2".into(), ..pane };
+        let text = serde_json::to_string(&with).unwrap();
+        assert!(text.contains(r#""lane":"c-2""#), "{text}");
+        assert_eq!(serde_json::from_str::<LivePane>(&text).unwrap(), with);
+    }
+
+    #[test]
     fn nudge_goes_to_the_most_recently_changed_coordinator_idle_for_a_minute() {
+        let (_root, project) = project();
         let now: jiff::Timestamp = "2026-09-23T10:02:00Z".parse().unwrap();
         let pane = |id: &str, status: &str, seq: u64, since: &str| LivePane { pane_id: id.into(), agent_status: status.into(), state_change_seq: seq, pair_since: since.into(), ..LivePane::default() };
         let panes = vec![
@@ -869,7 +1059,41 @@ mod tests {
             pane("w1:p3", "idle", 9, "2026-09-23T10:01:30Z"),
             pane("w1:p4", "working", 12, "2026-09-23T09:00:00Z"),
         ];
-        assert_eq!(nudge_target(&panes, now).unwrap().pane_id, "w1:p2");
-        assert!(nudge_target(&panes[2..], now).is_none());
+        let targets = nudge_target(&project, &panes, now);
+        assert_eq!(targets.len(), 1, "one lane, one target: {targets:?}");
+        assert_eq!(targets["c-1"].pane_id, "w1:p2");
+        assert!(nudge_target(&project, &panes[2..], now).is_empty());
+    }
+
+    #[test]
+    fn nudge_target_is_one_pane_per_lane_and_none_at_all_when_every_lane_is_busy() {
+        let (_root, project) = project();
+        two_lanes(&project);
+        let now: jiff::Timestamp = "2026-09-23T10:02:00Z".parse().unwrap();
+        let pane = |id: &str, lane: &str, status: &str, seq: u64| LivePane {
+            pane_id: id.into(),
+            lane: lane.into(),
+            agent_status: status.into(),
+            state_change_seq: seq,
+            pair_since: "2026-09-23T10:00:00Z".into(),
+            ..LivePane::default()
+        };
+        // Each lane has an idle pane: each gets one, the most recently changed
+        // inside the lane.
+        let panes = vec![pane("w1:p1", "c-1", "idle", 3), pane("w1:p2", "c-1", "idle", 5), pane("w2:p1", "c-2", "idle", 4)];
+        let targets = nudge_target(&project, &panes, now);
+        assert_eq!(targets.len(), 2, "{targets:?}");
+        assert_eq!(targets["c-1"].pane_id, "w1:p2");
+        assert_eq!(targets["c-2"].pane_id, "w2:p1");
+        // One lane busy: the other lane's target is unaffected.
+        let busy = vec![pane("w1:p1", "c-1", "working", 3), pane("w2:p1", "c-2", "idle", 4)];
+        let targets = nudge_target(&project, &busy, now);
+        assert_eq!(targets.keys().collect::<Vec<_>>(), ["c-2"], "{targets:?}");
+        // Both busy: nothing at all.
+        let all_busy = vec![pane("w1:p1", "c-1", "working", 3), pane("w2:p1", "c-2", "working", 4)];
+        assert!(nudge_target(&project, &all_busy, now).is_empty());
+        // An `Ambiguous` pane has no lane and is never a target, however idle.
+        let ambiguous = vec![pane("w9:p9", "", "idle", 99)];
+        assert!(nudge_target(&project, &ambiguous, now).is_empty(), "no lane, no nudge");
     }
 }

@@ -257,7 +257,6 @@ impl Registry {
     /// The lane a `lane` field means: the id it names when it names one, else
     /// the default lane. An empty field is the default lane, so records
     /// written before lanes existed need no migration (§10).
-    #[cfg_attr(not(test), allow(dead_code))] // the readers land with routing (commit 3)
     pub fn lane_of(&self, field: &str) -> Option<&Lane> {
         if field.is_empty() {
             self.default_lane()
@@ -433,7 +432,7 @@ impl LaneResolution {
         self == &LaneResolution::None
     }
 
-    #[cfg_attr(not(test), allow(dead_code))] // the ticker's held reason (commit 3)
+    #[cfg_attr(not(test), allow(dead_code))] // kept for tests of the ticker's held reason
     pub fn is_ambiguous(&self) -> bool {
         matches!(self, LaneResolution::Ambiguous { .. })
     }
@@ -459,7 +458,6 @@ impl LaneResolution {
     /// routines and nudges never stall in silence. It is never *given*
     /// anything: routing asks for [`LaneResolution::lane_id`] and refuses on
     /// the ambiguous answer. This is what makes the refusal safe.
-    #[cfg_attr(not(test), allow(dead_code))] // `is_coordinator` (commit 3)
     pub fn counts_as_coordinator(&self) -> bool {
         !self.is_none()
     }
@@ -562,6 +560,103 @@ pub fn resolve_in_project(project: &Project, agent: &Agent) -> LaneResolution {
     resolve(&registry, agent, &project_home(project), &project.slug)
 }
 
+/// The three-valued identity answer the ticker's hot path uses (`docs/lanes.md`
+/// §5.2 rule 4, §12 commit 3).
+///
+/// A project **without** `lanes.json` is classified by the old single record
+/// ([`crate::coordinator::is_coordinator`]) and nothing else: that is the
+/// zero-change promise of §10, and it is why the gate is [`split_in_use`] and
+/// not a second opinion about lanes. Its one lane is the synthesized default
+/// lane, whose id answers for every pane the old record matched.
+///
+/// A project **with** a registry goes through [`resolve`], so a second lane's
+/// pane is discovered (and its `hp_lane` token refreshed) even though the
+/// shared `coordinator.json` never names it. The `rule` word of a `Known`
+/// answer is only meaningful for the registry path: nothing on the old path
+/// displays it.
+///
+/// `Ambiguous` counts as a coordinator for liveness and is never a
+/// destination: `nudge` and `prompt` ask for a lane id, which it does not
+/// have.
+pub fn classify(project: &Project, record: &Coordinator, agent: &Agent) -> LaneResolution {
+    classify_all(project, record, std::slice::from_ref(agent)).pop().unwrap_or(LaneResolution::None)
+}
+
+/// [`classify`] for a whole agent list, with the registry read **once** — the
+/// ticker's `discover` asks about every agent in the session every tick, and a
+/// per-pane file read on that path is exactly the kind of cost this commit must
+/// not add. The answers keep the agents' order.
+pub fn classify_all(project: &Project, record: &Coordinator, agents: &[Agent]) -> Vec<LaneResolution> {
+    if !split_in_use(project) {
+        let lane = default_lane_id(project);
+        return agents
+            .iter()
+            .map(|agent| {
+                if crate::coordinator::is_coordinator(record, agent) {
+                    LaneResolution::Known { lane: lane.clone(), rule: Rule::Dir }
+                } else {
+                    LaneResolution::None
+                }
+            })
+            .collect();
+    }
+    let registry = Registry::for_project(project);
+    let home = project_home(project);
+    agents
+        .iter()
+        .map(|agent| resolve(&registry, agent, &home, &project.slug))
+        .collect()
+}
+
+/// The lanes one tick routes to (`docs/lanes.md` §4.4, §12 commit 3): every
+/// **open** lane of the registry, so a closed lane takes no nudge (§6.4), and
+/// without a registry the single synthesized default lane — the one nudge run
+/// today's ticker makes.
+pub fn routes(project: &Project) -> Vec<String> {
+    if !split_in_use(project) {
+        return vec![default_lane_id(project)];
+    }
+    Registry::for_project(project).open_lanes().iter().map(|lane| lane.id.clone()).collect()
+}
+
+/// §7's orphans: the open lanes that still have live threads and whose live
+/// panes no rule resolves to them at all, with the number of `Open`/`Starting`
+/// threads each holds. Empty without a registry: a project that never used
+/// lanes has no lane to be orphaned.
+///
+/// A lane whose recorded pane is **alive but unrecognized** is deliberately not
+/// included — that is §5.4's `degraded` case, which the `Coordinators:` line
+/// reports every turn; its fix is `hp lane adopt`, never `hp open`, because
+/// `open` would start a second coordinator beside the running one (§6.4).
+pub fn orphan_lanes(project: &Project, agents: &[Agent]) -> Vec<(Lane, usize)> {
+    if !split_in_use(project) {
+        return Vec::new();
+    }
+    let registry = Registry::for_project(project);
+    let view = View {
+        registry: registry.clone(),
+        agents: agents.to_vec(),
+        home: project_home(project),
+        slug: project.slug.clone(),
+        this_pane: String::new(),
+        reachable: true,
+        counts: BTreeMap::new(),
+    };
+    let threads = crate::thread::list(project);
+    view.orphan_ids()
+        .into_iter()
+        .filter_map(|id| {
+            let lane = registry.get(&id)?.clone();
+            let count = threads
+                .iter()
+                .filter(|t| matches!(t.status, crate::thread::Status::Open | crate::thread::Status::Starting))
+                .filter(|t| registry.lane_of(&t.lane).map(|l| l.id.as_str()) == Some(lane.id.as_str()))
+                .count();
+            (count > 0).then_some((lane, count))
+        })
+        .collect()
+}
+
 /// The lane a **new** thread record inherits: the lane the pane that ran
 /// `thread start` / `thread adopt` belongs to (`docs/lanes.md` §4.2). Only a
 /// `Known` answer writes a lane id; an ambiguous pane, an unknown pane and no
@@ -643,10 +738,11 @@ pub fn reader_scope(project: &Project, view: &View) -> Option<Scope> {
 /// what keeps commit 1 free of behaviour change. `None` when the pane cannot be
 /// tied to exactly one lane — a token must never lie (§5.1).
 ///
-/// `pane_id` is a pane already known to be a coordinator: the callers take it
-/// from `open`'s record and from `coordinator::discover`. With one open lane
-/// any coordinator pane claims that lane (the folder rule, and the common
-/// case); with several, only the lane whose recorded pane it is claims it.
+/// `pane_id` is a pane already known to be a coordinator: the caller takes it
+/// from `open`'s record (the ticker has the lane its resolver found, in
+/// `LivePane.lane`, and writes that instead). With one open lane any
+/// coordinator pane claims that lane (the folder rule, and the common case);
+/// with several, only the lane whose recorded pane it is claims it.
 pub fn token_for_pane(project: &Project, pane_id: &str) -> Option<String> {
     if pane_id.is_empty() {
         return None;
@@ -2044,5 +2140,89 @@ mod tests {
         crate::sidebar::report_pane(&herdr, "w2:p1", "t-0001 · Task", "demo", crate::thread::Group::Working, None);
         let third = reports(&runner);
         assert!(!third[2].contains(TOKEN), "{}", third[2]);
+    }
+
+    // -------------------------------------------------- routing (commit 3)
+
+    #[test]
+    fn classify_keeps_the_old_single_record_for_a_project_without_a_registry() {
+        let (_world, project) = temp_project("demo");
+        let mut record = crate::project::Coordinator { cwd: project.canonical_dir().to_string_lossy().into_owned(), ..Default::default() };
+        let home = record.cwd.clone();
+        assert_eq!(
+            classify(&project, &record, &agent("w1:p1", &home)),
+            LaneResolution::Known {
+                lane: FALLBACK_ID.into(),
+                rule: Rule::Dir
+            }
+        );
+        assert!(classify(&project, &record, &agent("w1:p1", "/elsewhere")).is_none());
+        // The recorded pane counts from anywhere while its session matches,
+        // exactly like `is_coordinator`.
+        record.pane_id = "w2:p1".into();
+        record.agent_session = "sess-2".into();
+        assert_eq!(classify(&project, &record, &with_session("w2:p1", "/elsewhere", "sess-2")).lane_id(), Some(FALLBACK_ID));
+    }
+
+    #[test]
+    fn classify_uses_the_resolver_once_a_registry_exists() {
+        let (_world, project) = temp_project("demo");
+        reg(vec![lane("c-1", "default"), lane("c-2", "books")], "c-1", 3).save(&project).unwrap();
+        let home = project.canonical_dir().to_string_lossy().into_owned();
+        // Two open lanes and a pane in the folder: a refusal, not a guess.
+        assert!(classify(&project, &crate::project::Coordinator::default(), &agent("w1:p1", &home)).is_ambiguous());
+        // A token picks its lane.
+        assert_eq!(
+            classify(&project, &crate::project::Coordinator::default(), &claiming("w1:p1", "/elsewhere", "c-2")).lane_id(),
+            Some("c-2")
+        );
+    }
+
+    #[test]
+    fn routes_are_the_open_lanes_and_the_one_default_lane_without_a_registry() {
+        let (_world, project) = temp_project("demo");
+        assert_eq!(routes(&project), [FALLBACK_ID]);
+        reg(vec![lane("c-1", "default"), closed_lane("c-2")], "c-1", 3).save(&project).unwrap();
+        assert_eq!(routes(&project), ["c-1"], "a closed lane takes no nudge");
+    }
+
+    #[test]
+    fn an_orphan_lane_has_live_threads_and_no_live_pane_but_a_degraded_one_is_not_an_orphan() {
+        let (_world, project) = temp_project("demo");
+        reg(vec![lane_at("c-1", "default", "w1:p1", "sess-1"), lane_at("c-2", "books", "w2:p1", "sess-2")], "c-1", 3)
+            .save(&project)
+            .unwrap();
+        for lane in ["c-1", "c-2"] {
+            crate::thread::allocate(&project, |t| {
+                t.title = lane.into();
+                t.status = crate::thread::Status::Open;
+                t.lane = lane.into();
+            })
+            .unwrap();
+        }
+        // Both coordinators are alive: no orphan at all.
+        let alive = vec![with_session("w1:p1", "/elsewhere", "sess-1"), with_session("w2:p1", "/elsewhere", "sess-2")];
+        assert!(orphan_lanes(&project, &alive).is_empty());
+        // c-2's pane is gone, c-1's is there: only c-2 is an orphan, with its
+        // open thread count.
+        let found = orphan_lanes(&project, &[with_session("w1:p1", "/elsewhere", "sess-1")]);
+        assert_eq!(found.len(), 1);
+        assert_eq!((found[0].0.id.as_str(), found[0].1), ("c-2", 1));
+        // c-2's pane is alive but no rule matches it (§5.4's degraded case):
+        // not an orphan, because `open` would start a second coordinator
+        // beside it.
+        let degraded = with_session("w2:p1", "/elsewhere", "other-session");
+        assert!(orphan_lanes(&project, &[with_session("w1:p1", "/elsewhere", "sess-1"), degraded]).is_empty());
+        // A lane with no live thread is not an orphan either, however gone its
+        // coordinator is.
+        let threads: Vec<String> = crate::thread::list(&project).into_iter().map(|t| t.id).collect();
+        for id in &threads {
+            crate::thread::update(&project, id, |t| t.status = crate::thread::Status::Resolved).unwrap();
+        }
+        assert!(orphan_lanes(&project, &[]).is_empty());
+        // Without a registry there is no lane to orphan.
+        let (_world2, plain) = temp_project("plain");
+        crate::thread::allocate(&plain, |t| t.status = crate::thread::Status::Open).unwrap();
+        assert!(orphan_lanes(&plain, &[]).is_empty());
     }
 }
