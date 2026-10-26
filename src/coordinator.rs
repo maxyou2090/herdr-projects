@@ -236,6 +236,7 @@ fn recorded_profile(record: &Coordinator) -> &str {
     if record.profile.is_empty() { &record.agent } else { &record.profile }
 }
 
+#[derive(Debug, Clone, Default)]
 pub struct OpenOptions {
     pub session: SessionFlags,
     pub rebind: bool,
@@ -251,6 +252,12 @@ pub struct OpenOptions {
     /// rather than an agent's shell or the ticker: a paused project is then
     /// resumed, not only noted.
     pub person: bool,
+    /// `--lane`: the lane to open or focus (§6.1). `None` is today's default
+    /// lane, byte for byte.
+    pub lane: Option<String>,
+    /// `--lane-name`: the label a newly created lane gets; ignored for an
+    /// existing lane. Without it the handle is the label.
+    pub lane_name: Option<String>,
 }
 
 /// The pane `open` runs in, when the coordinator can start right there: the
@@ -262,6 +269,54 @@ fn here_pane(ctx: &Ctx, options: &OpenOptions, socket: &str, agents: &[Agent]) -
     }
     let pane = ctx.env.var("HERDR_PANE_ID")?;
     (!agents.iter().any(|a| a.pane_id == pane)).then(|| pane.to_string())
+}
+
+/// The agent kind a recorded coordinator ran. With lanes, `coordinator.json`
+/// may be a view written by another lane, but a lane's profile still names the
+/// harness it launches; a record from before profiles has only `agent`.
+fn recorded_kind(config: &crate::profiles::Config, record: &Coordinator) -> String {
+    if record.profile.is_empty() {
+        record.agent.clone()
+    } else {
+        config.get(&record.profile).map(|profile| profile.agent().to_string()).unwrap_or_else(|| record.agent.clone())
+    }
+}
+
+/// The lane `open` acts on: the one `--lane` names (created on the spot when it
+/// does not exist), else the registry's default lane. The registry is written
+/// first when the project has none (`Registry::ensure_written`, §10), because
+/// from this commit on `open` is the command that gives a project lanes.
+fn open_target(project: &Project, options: &OpenOptions) -> Result<(crate::lanes::Registry, crate::lanes::Lane)> {
+    crate::lanes::Registry::ensure_written(project)?;
+    let registry = crate::lanes::Registry::load(project)
+        .with_context(|| format!("could not read {}", crate::lanes::registry_path(project).display()))?;
+    let Some(handle) = options.lane.as_deref() else {
+        let lane = registry.default_lane().cloned().with_context(|| format!("`{}` has no default lane", project.slug))?;
+        return Ok((registry, lane));
+    };
+    if handle.trim().is_empty() {
+        bail!("--lane may not be empty");
+    }
+    if let Some(lane) = registry.find(handle).cloned() {
+        if !lane.is_open() {
+            bail!("lane `{}` ({}) is closed; reopen it with `lane open {}` first", lane.label, lane.id, lane.id);
+        }
+        return Ok((registry, lane));
+    }
+    crate::profiles::validate_name(handle)?;
+    let label = options.lane_name.as_deref().filter(|label| !label.trim().is_empty()).unwrap_or(handle).to_string();
+    let _lock = project.lock()?;
+    let mut registry = crate::lanes::Registry::load(project).with_context(|| format!("could not read {}", crate::lanes::registry_path(project).display()))?;
+    // Another process may have created it between the read and the lock.
+    let lane = match registry.find(handle) {
+        Some(lane) => lane.clone(),
+        None => {
+            let id = registry.create(handle, &label).id.clone();
+            registry.save(project)?;
+            registry.get(&id).cloned().expect("just created")
+        }
+    };
+    Ok((registry, lane))
 }
 
 pub fn open(ctx: &Ctx, slug: &str, options: &OpenOptions) -> Result<()> {
@@ -291,7 +346,11 @@ pub fn open(ctx: &Ctx, slug: &str, options: &OpenOptions) -> Result<()> {
     // widen powers.
     let config = crate::profiles::load(&ctx.config_dir)?;
     let safety = project.safety(&ctx.config_dir)?;
-    let profile = crate::profiles::resolve(&config, &safety, &settings, Role::Coordinator, options.profile.as_deref(), slug)?;
+    // The lane is resolved before the profile: an existing lane carries its
+    // own default profile (§4.1), and `--lane` must be able to create one.
+    let (lane_registry, target_lane) = open_target(&project, options)?;
+    let lane_profile = options.lane.as_ref().and_then(|_| Some(target_lane.profile.clone()).filter(|profile| !profile.is_empty()));
+    let profile = crate::profiles::resolve(&config, &safety, &settings, Role::Coordinator, options.profile.as_deref().or(lane_profile.as_deref()), slug)?;
     let kind = profile.agent().to_string();
     let session = paths::resolve_session(&options.session, ctx.env, ctx.runner)?;
     let socket = session.socket.to_string_lossy().into_owned();
@@ -299,8 +358,14 @@ pub fn open(ctx: &Ctx, slug: &str, options: &OpenOptions) -> Result<()> {
     // The priming files are what make an agent in this folder the coordinator.
     project::write_priming(&project, &prefix)?;
 
-    // A project belongs to the session it was opened in.
-    let mut previous = project.coordinator();
+    // A project belongs to the session it was opened in. For a concrete lane
+    // the instance fields come from that lane, not from `Project::coordinator()`
+    // (which is the default lane's view).
+    let mut previous = if lane_registry.is_default(&target_lane.id) {
+        project.coordinator()
+    } else {
+        Some(lane_registry.coordinator_for(&project, &target_lane))
+    };
     if let Some(record) = &previous
         && !record.socket.is_empty()
         && record.socket != socket
@@ -335,10 +400,18 @@ pub fn open(ctx: &Ctx, slug: &str, options: &OpenOptions) -> Result<()> {
     // With an explicit profile, only the recorded coordinator is reused, and
     // only when it runs that profile: choosing another profile in the popup
     // starts one beside the others.
+    let lane_filter = options.lane.as_ref().map(|_| target_lane.id.clone());
     let running: Vec<&Agent> = agents
         .iter()
         .filter(|a| a.works_in(&cwd))
         .filter(|a| options.profile.is_none() || previous.as_ref().is_some_and(|r| r.pane_id == a.pane_id && recorded_profile(r) == profile.name))
+        // §6.1: the running branch is scoped to the requested lane. A pane
+        // with the same folder but another lane's token never gets focused by
+        // `open --lane`; an ambiguous pane names no lane and never matches.
+        .filter(|a| match &lane_filter {
+            Some(id) => crate::lanes::resolve(&lane_registry, a, &crate::lanes::project_home(&project), slug).lane_id() == Some(id.as_str()),
+            None => true,
+        })
         .collect();
     if let Some(agent) = running.iter().max_by_key(|a| a.state_change_seq)
         && !options.new
@@ -365,6 +438,7 @@ pub fn open(ctx: &Ctx, slug: &str, options: &OpenOptions) -> Result<()> {
                 c.agent_session = agent.session_id().to_string();
             }
         })?;
+        crate::lanes::sync_instance(&project, &target_lane.id, &record.pane_id, &record.agent_session, &record.profile, &project::now())?;
         report_tokens(&herdr, &project, &record.pane_id);
         ticker::start(ctx)?;
         println!("coordinator is running in pane {} ({} more: pass --new to start another)", record.pane_id, running.len() - 1);
@@ -418,7 +492,7 @@ pub fn open(ctx: &Ctx, slug: &str, options: &OpenOptions) -> Result<()> {
     // running: the new agent starts fresh and never inherits its session id.
     let resume = previous
         .as_ref()
-        .filter(|r| !options.new && r.agent == kind && recorded_profile(r) == profile.name && !r.agent_session.is_empty())
+        .filter(|r| !options.new && recorded_kind(&config, r) == kind && recorded_profile(r) == profile.name && !r.agent_session.is_empty())
         .and_then(|r| crate::agents::resume_args(&kind, &r.agent_session))
         .unwrap_or_default();
     let record = project.update_coordinator(|c| {
@@ -437,6 +511,7 @@ pub fn open(ctx: &Ctx, slug: &str, options: &OpenOptions) -> Result<()> {
             updated: String::new(),
         }
     })?;
+    crate::lanes::sync_instance(&project, &target_lane.id, &record.pane_id, &record.agent_session, &record.profile, &project::now())?;
 
     let legacy = crate::profiles::legacy_agent(&config, &settings, Role::Coordinator);
     let base_args = crate::profiles::expand_home(&crate::profiles::launch_args(&profile, &safety.coordinator_agent_args, &legacy), &ctx.env.home);
@@ -446,7 +521,7 @@ pub fn open(ctx: &Ctx, slug: &str, options: &OpenOptions) -> Result<()> {
     if here.is_some() {
         report_tokens(&herdr, &project, &record.pane_id);
         ticker::start(ctx)?;
-        return run_here(ctx, &herdr, &project, &record, &args, &base_args, &prefix);
+        return run_here(ctx, &herdr, &project, HereRun { record: &record, lane_id: Some(&target_lane.id), args: &args, base_args: &base_args, prefix: &prefix });
     }
     let mut started = start_when_shell_ready(&herdr, &name, &kind, &record.pane_id, &args);
     if let Err(error) = &started
@@ -460,11 +535,12 @@ pub fn open(ctx: &Ctx, slug: &str, options: &OpenOptions) -> Result<()> {
     match started {
         Ok(agent) => {
             let session_id = agent.session_id().to_string();
-            project.update_coordinator(|c| {
-                if !session_id.is_empty() {
-                    c.agent_session = session_id;
-                }
-            })?;
+            if !session_id.is_empty() {
+                project.update_coordinator(|c| {
+                    c.agent_session = session_id.clone();
+                })?;
+                crate::lanes::sync_instance(&project, &target_lane.id, &record.pane_id, &session_id, &record.profile, &project::now())?;
+            }
             if resume.is_empty() {
                 println!("started {kind} as {name}; it reads AGENTS.md and primes itself");
             } else {
@@ -487,39 +563,50 @@ pub fn open(ctx: &Ctx, slug: &str, options: &OpenOptions) -> Result<()> {
 /// returns when it exits: the pane is back at the user's shell. While it
 /// starts, the agent Herdr detects in the pane gets its name and its session
 /// is recorded. Nothing is printed while the agent owns the terminal.
-fn run_here(ctx: &Ctx, herdr: &Herdr, project: &Project, record: &Coordinator, args: &[String], base_args: &[String], prefix: &str) -> Result<()> {
+fn run_here(ctx: &Ctx, herdr: &Herdr, project: &Project, run: HereRun<'_>) -> Result<()> {
+    let record = run.record;
     let kind = &record.agent;
-    let resuming = args.len() > base_args.len();
+    let resuming = run.args.len() > run.base_args.len();
     if resuming {
         println!("starting {kind} as {} in this pane, resuming session {}; quit it to return to this shell", record.agent_name, record.agent_session);
     } else {
         println!("starting {kind} as {} in this pane; it reads AGENTS.md and primes itself. Quit it to return to this shell", record.agent_name);
     }
-    println!("Commands: {prefix}");
-    let run = |args: &[String]| -> Result<(Option<i32>, bool)> {
+    println!("Commands: {}", run.prefix);
+    let launch = |args: &[String]| -> Result<(Option<i32>, bool)> {
         let cmd = crate::runner::Cmd::new(crate::profiles::executable(kind), Duration::ZERO).args(args.iter().cloned()).cwd(&record.cwd).env("PWD", &record.cwd);
         let deadline = std::time::Instant::now() + Duration::from_secs(60);
         let mut detected = false;
         let code = ctx.runner.run_foreground(&cmd, &mut || {
-            detected = detected || adopt_here(herdr, project, record);
+            detected = detected || adopt_here(herdr, project, record, run.lane_id);
             detected || std::time::Instant::now() >= deadline
         })?;
         Ok((code, detected))
     };
-    let (code, detected) = run(args)?;
+    let (code, detected) = launch(run.args)?;
     if resuming && !detected && code != Some(0) {
         // The recorded session may be gone: start fresh once.
         println!("resuming session {} failed; starting a fresh {kind}", record.agent_session);
         project.update_coordinator(|c| c.agent_session.clear())?;
-        run(base_args)?;
+        launch(run.base_args)?;
     }
     println!("{kind} exited; this pane is back at your shell");
     Ok(())
 }
 
+/// Everything `run_here` needs besides the project and the pane: the record
+/// being launched, its lane, the launch arguments and the printed prefix.
+struct HereRun<'a> {
+    record: &'a Coordinator,
+    lane_id: Option<&'a str>,
+    args: &'a [String],
+    base_args: &'a [String],
+    prefix: &'a str,
+}
+
 /// Names the agent Herdr detects in the recorded pane and records its
 /// session. False until the agent shows up; errors count as not yet.
-fn adopt_here(herdr: &Herdr, project: &Project, record: &Coordinator) -> bool {
+fn adopt_here(herdr: &Herdr, project: &Project, record: &Coordinator, lane_id: Option<&str>) -> bool {
     let Ok(agents) = herdr.agent_list() else {
         return false;
     };
@@ -532,9 +619,14 @@ fn adopt_here(herdr: &Herdr, project: &Project, record: &Coordinator) -> bool {
     let session_id = agent.session_id().to_string();
     let _ = project.update_coordinator(|c| {
         if !session_id.is_empty() {
-            c.agent_session = session_id;
+            c.agent_session = session_id.clone();
         }
     });
+    if let Some(lane_id) = lane_id
+        && !session_id.is_empty()
+    {
+        let _ = crate::lanes::sync_instance(project, lane_id, &agent.pane_id, &session_id, &record.profile, &project::now());
+    }
     true
 }
 

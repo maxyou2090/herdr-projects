@@ -22,7 +22,7 @@ use std::collections::BTreeMap;
 use std::fmt::Write as _;
 use std::path::PathBuf;
 
-use anyhow::Result;
+use anyhow::{Context as _, Result, bail};
 use serde::{Deserialize, Serialize};
 
 use crate::herdr::Agent;
@@ -195,7 +195,7 @@ impl Registry {
     /// synthesized **in memory** from `coordinator.json` (§10). The read path
     /// writes nothing — a ticker, a `context` or a `lane list` must not create
     /// state nobody asked for. [`Registry::ensure_written`] is the write path,
-    /// and no command calls it until `open` learns about lanes.
+    /// called by `open` (and by an explicit `lane adopt`).
     pub fn for_project(project: &Project) -> Registry {
         Registry::load(project).unwrap_or_else(|| Registry::synthesized(project))
     }
@@ -229,8 +229,8 @@ impl Registry {
     }
 
     /// Writes the synthesized registry once, under the project lock. Returns
-    /// whether it wrote. Nothing calls this yet: creating the file belongs to
-    /// `open` (commit 4), and a read must never be the thing that creates it.
+    /// whether it wrote. `open` calls this before it acts on a lane; a read
+    /// must never be the thing that creates the file.
     #[cfg_attr(not(test), allow(dead_code))]
     pub fn ensure_written(project: &Project) -> Result<bool> {
         if exists(project) {
@@ -244,6 +244,53 @@ impl Registry {
         }
         registry.save(project)?;
         Ok(true)
+    }
+
+    /// Read-modify-write of the registry under the project lock, for the
+    /// commands that own a lane (`open --lane`, `lane adopt`, ...). Returns
+    /// `None` when the project has no registry: creating one is `open`'s job
+    /// (or `lane adopt`'s explicit `ensure_written`), never a read path's.
+    pub fn update<F>(project: &Project, change: F) -> Result<Option<Registry>>
+    where
+        F: FnOnce(&mut Registry),
+    {
+        if !exists(project) {
+            return Ok(None);
+        }
+        let _lock = project.lock()?;
+        let Some(mut registry) = Registry::load(project) else {
+            return Ok(None);
+        };
+        change(&mut registry);
+        registry.save(project)?;
+        Ok(Some(registry))
+    }
+
+    /// Elects the default lane of §6.4 over the currently open lanes: newest
+    /// `last_active`, ties by lowest id, and when no lane is open, `c-1` is
+    /// reopened. Returns the id that is now the default.
+    pub fn elect_default(&mut self, project: &Project) -> String {
+        if let Some(lane) = self.open_lanes().into_iter().max_by(|a, b| a.last_active.cmp(&b.last_active).then_with(|| b.id.cmp(&a.id))) {
+            self.default = lane.id.clone();
+            return self.default.clone();
+        }
+        if let Some(lane) = self.lanes.iter_mut().find(|lane| lane.id == FALLBACK_ID) {
+            lane.status = Status::Open;
+            self.default = lane.id.clone();
+            return self.default.clone();
+        }
+        let lane = Lane {
+            id: FALLBACK_ID.to_string(),
+            name: DEFAULT_NAME.to_string(),
+            label: project_label(project),
+            status: Status::Open,
+            created: project::now(),
+            ..Lane::default()
+        };
+        self.default = lane.id.clone();
+        self.lanes.insert(0, lane);
+        self.next = self.next.max(2);
+        self.default.clone()
     }
 
     pub fn get(&self, id: &str) -> Option<&Lane> {
@@ -1165,6 +1212,491 @@ pub fn lane_list(ctx: &Ctx, slug: &str, json: bool) -> Result<()> {
     }
     print!("{}", view.list_text());
     Ok(())
+}
+
+// ---------------------------------------------------------------- commands
+
+/// The registry a lane command needs. A project that never ran `open` has no
+/// lane registry and no lane to act on; say what creates one.
+fn require_registry(project: &Project) -> Result<Registry> {
+    Registry::load(project).with_context(|| format!("`{}` has no lanes yet; run `open {} --lane <name>` first", project.slug, project.slug))
+}
+
+/// The lane a `hp lane ...` command names, with a message that lists the
+/// existing handles instead of guessing.
+fn require_lane(registry: &Registry, handle: &str) -> Result<Lane> {
+    registry.find(handle).cloned().with_context(|| {
+        let handles: Vec<String> = registry.lanes.iter().map(|lane| if lane.name.is_empty() { lane.id.clone() } else { lane.name.clone() }).collect();
+        let shown = if handles.is_empty() { "none".to_string() } else { handles.join(", ") };
+        format!("no lane `{handle}`; lanes: {shown}")
+    })
+}
+
+/// The project a lane command means: `--project`, else the current Herdr
+/// workspace's project, else the only project whose registry has that handle.
+/// Lane ids repeat across projects (`c-1` everywhere), so silence is never
+/// allowed to pick one.
+pub fn project_for_command(ctx: &Ctx, handle: &str, explicit: Option<&str>) -> Result<Project> {
+    if let Some(slug) = explicit {
+        return Project::load(&ctx.root, slug);
+    }
+    if let Some(slug) = crate::overview::resolve_slug_quiet(ctx)
+        && let Ok(project) = Project::load(&ctx.root, &slug)
+    {
+        return Ok(project);
+    }
+    let mut found: Vec<Project> = Vec::new();
+    for slug in crate::project::list_slugs(&ctx.root) {
+        let Ok(project) = Project::load(&ctx.root, &slug) else {
+            continue;
+        };
+        if let Some(registry) = Registry::load(&project)
+            && registry.find(handle).is_some()
+        {
+            found.push(project);
+        }
+    }
+    match found.len() {
+        1 => Ok(found.remove(0)),
+        0 => bail!("no project has a lane `{handle}`; run `open <project> --lane {handle}` first"),
+        _ => bail!(
+            "several projects have a lane `{handle}` ({}); pass --project <slug>",
+            found.iter().map(|project| project.slug.as_str()).collect::<Vec<_>>().join(", ")
+        ),
+    }
+}
+
+/// Record the instance a lane just ran in (`pane_id`, `agent_session`,
+/// `last_active`, and the profile it was launched with). Read-modify-write
+/// under the project lock, never a whole-file overwrite from a stale copy.
+pub fn sync_instance(project: &Project, lane_id: &str, pane_id: &str, agent_session: &str, profile: &str, last_active: &str) -> Result<()> {
+    Registry::update(project, |registry| {
+        if let Some(lane) = registry.lanes.iter_mut().find(|lane| lane.id == lane_id) {
+            lane.pane_id = pane_id.to_string();
+            // A new instance with no session yet must clear the previous one,
+            // exactly as `coordinator.json` is replaced: otherwise `--new`
+            // would inherit a retired coordinator's session id.
+            lane.agent_session = agent_session.to_string();
+            if !profile.is_empty() {
+                lane.profile = profile.to_string();
+            }
+            if !last_active.is_empty() {
+                lane.last_active = last_active.to_string();
+            }
+        }
+    })?;
+    Ok(())
+}
+
+/// The ticker's refresh of §4.1's instance hints: for every open lane whose
+/// `Known` pane this tick, one read-modify-write of `lanes.json` under the
+/// project lock. `pane` is taken from the same resolver that wrote
+/// `LivePane.lane`, and when `--new` left several instances of one lane, the
+/// one with the highest `state_change_seq` is the record rule 2 should match
+/// next ("the last one to speak wins"). The write is skipped when nothing
+/// changed.
+pub fn refresh_instances(project: &Project, panes: &[crate::coordinator::LivePane], now: &str) -> Result<bool> {
+    if !split_in_use(project) {
+        return Ok(false);
+    }
+    let _lock = project.lock()?;
+    let Some(mut registry) = Registry::load(project) else {
+        return Ok(false);
+    };
+    let before = registry.clone();
+    let mut newest: BTreeMap<&str, &crate::coordinator::LivePane> = BTreeMap::new();
+    for pane in panes.iter().filter(|pane| !pane.lane.is_empty()) {
+        match newest.get(pane.lane.as_str()) {
+            Some(best) if best.state_change_seq > pane.state_change_seq => {}
+            _ => {
+                newest.insert(pane.lane.as_str(), pane);
+            }
+        }
+    }
+    for (lane_id, pane) in newest {
+        let Some(lane) = registry.lanes.iter_mut().find(|lane| lane.id == lane_id && lane.is_open()) else {
+            continue;
+        };
+        lane.pane_id = pane.pane_id.clone();
+        if !pane.agent_session.is_empty() {
+            lane.agent_session = pane.agent_session.clone();
+        }
+        lane.last_active = now.to_string();
+    }
+    if registry == before {
+        return Ok(false);
+    }
+    registry.save(project)?;
+    Ok(true)
+}
+
+/// Every `Ambiguous` pane in this tick, with the resolver's reason. Empty
+/// without a registry: a pre-lane project has no lane ambiguity to report.
+pub fn ambiguous_panes(project: &Project, record: &Coordinator, agents: &[Agent]) -> Vec<(String, String)> {
+    if !split_in_use(project) {
+        return Vec::new();
+    }
+    classify_all(project, record, agents)
+        .into_iter()
+        .zip(agents)
+        .filter_map(|(resolution, agent)| match resolution {
+            LaneResolution::Ambiguous { reason } => Some((agent.pane_id.clone(), reason)),
+            _ => None,
+        })
+        .collect()
+}
+
+/// `hp lane adopt <name>` (§6.2): the current pane becomes lane `<name>`'s
+/// coordinator. The pane is read from `HERDR_PANE_ID` / `HERDR_SOCKET_PATH`,
+/// run through `adopt::adoptable_agent` (which rejects another project's
+/// coordinator, a thread, or a pane with no agent), and must work in the
+/// project home — a thread-like pane belongs to `hp thread adopt`.
+pub fn lane_adopt(ctx: &Ctx, project: Option<&str>, handle: &str) -> Result<()> {
+    if ctx.env.var("HERDR_PLUGIN_STATE_DIR").is_some() {
+        bail!("a plugin popup pane can never become a coordinator; run `hp lane adopt {handle}` from the pane that should coordinate the lane");
+    }
+    let pane = ctx.env.var("HERDR_PANE_ID").context("HERDR_PANE_ID is not set; `lane adopt` must run in the pane it adopts")?.to_string();
+    let socket = ctx.env.var("HERDR_SOCKET_PATH").context("HERDR_SOCKET_PATH is not set; `lane adopt` must run inside Herdr")?.to_string();
+    let project = match project {
+        Some(slug) => Project::load(&ctx.root, slug)?,
+        None => project_for_pane(ctx, &socket, &pane)?,
+    };
+    let herdr = crate::herdr::Herdr::new(ctx.env.herdr_bin(), &socket, ctx.runner);
+    let home = project_home(&project);
+    let canonical = project.canonical_dir().to_string_lossy().into_owned();
+    // Check the directory before the adoption path's "already thread" refusal,
+    // so a thread pane always gets the command that belongs to it.
+    let listed = herdr.agent_list().map_err(|error| anyhow::anyhow!("the herdr session at {socket} is not reachable: {error}"))?;
+    let early = listed.iter().find(|agent| agent.pane_id == pane).with_context(|| format!("no agent is detected in pane {pane} of the session at {socket}"))?;
+    let dir = crate::herdr::own_dir(&early.cwd, &early.foreground_cwd);
+    if !early.works_in(&home) && !early.works_in(&canonical) {
+        bail!(
+            "pane {pane} works in {dir}, not in the project home {home}; a lane's coordinator works in the project home — if this is a thread, run `hp thread adopt {} --pane {pane} --title <title>`",
+            project.slug
+        );
+    }
+    // Reuses the adoption path's refusals: another project's coordinator, an
+    // existing thread, no agent in the pane. This project's own old-record
+    // classification is exempt — that is exactly what `lane adopt` replaces.
+    let agent = crate::adopt::adoptable_agent_except(ctx, &herdr, &socket, &pane, Some(&project.slug))?;
+    if !exists(&project) {
+        Registry::ensure_written(&project)?;
+    }
+    let registry = require_registry(&project)?;
+    let lane = require_lane(&registry, handle)?;
+    if let LaneResolution::Known { lane: claimed, .. } = resolve(&registry, &agent, &home, &project.slug)
+        && claimed != lane.id
+    {
+        let other = registry.get(&claimed).map(|lane| format!("`{}` ({})", lane.label, lane.id)).unwrap_or_else(|| claimed.clone());
+        bail!("pane {pane} already belongs to lane {other}; use `hp lane assign {claimed} {pane}` to move it");
+    }
+    let one_lane = registry.lanes.len() == 1;
+    let taken: Vec<String> = herdr
+        .agent_list()
+        .map_err(|error| anyhow::anyhow!("the herdr session at {socket} is not reachable: {error}"))?
+        .into_iter()
+        .map(|agent| agent.name)
+        .collect();
+    let agent_name = if agent.name.is_empty() { crate::names::free_coordinator(&project.slug, &taken) } else { agent.name.clone() };
+    if agent.name != agent_name
+        && let Err(error) = herdr.agent_rename(&pane, &agent_name)
+    {
+        eprintln!("could not rename pane {pane} to `{agent_name}` ({error})");
+    }
+    let session_id = agent.session_id().to_string();
+    let now = project::now();
+    Registry::update(&project, |registry| {
+        if let Some(record) = registry.lanes.iter_mut().find(|record| record.id == lane.id) {
+            record.pane_id = pane.clone();
+            record.agent_session = session_id.clone();
+            record.last_active = now.clone();
+        }
+        if one_lane {
+            registry.default = lane.id.clone();
+        }
+    })?;
+    // The single-record view follows too, so an older binary and every
+    // `Project::coordinator()` caller keep reading the same pane.
+    project.update_coordinator(|record| {
+        *record = Coordinator {
+            socket: socket.clone(),
+            session: ctx.env.var("HERDR_SESSION").unwrap_or("").to_string(),
+            workspace_id: agent.workspace_id.clone(),
+            tab_id: agent.tab_id.clone(),
+            pane_id: pane.clone(),
+            agent_name: agent_name.clone(),
+            cwd: home.clone(),
+            agent: agent.agent.clone(),
+            profile: lane.profile.clone(),
+            agent_session: session_id.clone(),
+            updated: String::new(),
+        }
+    })?;
+    crate::sidebar::report_pane(&herdr, &pane, &crate::sidebar::coordinator_display(&project), &project.slug, crate::thread::Group::Idle, Some(&lane.id));
+    let prefix = crate::coordinator::current_prefix(&ctx.root)?;
+    println!("lane `{}` ({}) is coordinated by pane {pane}", lane.label, lane.id);
+    println!("Commands: {prefix}");
+    Ok(())
+}
+
+/// The project a pane's own directory belongs to: the exact project home, not
+/// a worktree or `threads/<id>/` below it. Several matches are a configuration
+/// error worth reporting, not a coin flip.
+fn project_for_pane(ctx: &Ctx, socket: &str, pane: &str) -> Result<Project> {
+    // Read the pane's own directory before the adoption checks so the project
+    // can be chosen from it; `adoptable_agent_except` lists the agents again
+    // for its own refusals.
+    let herdr = crate::herdr::Herdr::new(ctx.env.herdr_bin(), socket, ctx.runner);
+    let agents = herdr.agent_list().map_err(|error| anyhow::anyhow!("the herdr session at {socket} is not reachable: {error}"))?;
+    let agent = agents.iter().find(|agent| agent.pane_id == pane).with_context(|| format!("no agent is detected in pane {pane} of the session at {socket}"))?;
+    let dir = crate::herdr::own_dir(&agent.cwd, &agent.foreground_cwd).to_string();
+    let mut found: Vec<Project> = Vec::new();
+    for slug in crate::project::list_slugs(&ctx.root) {
+        let Ok(project) = Project::load(&ctx.root, &slug) else {
+            continue;
+        };
+        let canonical = project.canonical_dir().to_string_lossy().into_owned();
+        if dir == canonical || dir == project_home(&project) {
+            found.push(project);
+        }
+    }
+    match found.len() {
+        1 => Ok(found.remove(0)),
+        0 => bail!("pane {pane} works in {dir}, which is not a project home; if it is a thread, use `hp thread adopt <slug> --pane {pane} --title <title>`"),
+        _ => bail!("pane {pane} works in {dir}, which is the home of several projects: {}; pass --project <slug>", found.iter().map(|project| project.slug.as_str()).collect::<Vec<_>>().join(", ")),
+    }
+}
+
+/// `hp lane assign <lane> <pane>` (§6.3, decision 5): the explicit handover.
+/// It moves the lane's recorded instance, not its threads: every `Thread.lane`
+/// stays exactly where it was, and because threads point at the lane id, they
+/// follow the lane to its new pane without a record being rewritten.
+pub fn lane_assign(ctx: &Ctx, project: &Project, handle: &str, pane: &str) -> Result<()> {
+    let registry = require_registry(project)?;
+    let lane = require_lane(&registry, handle)?;
+    let session = crate::threads::session_view(ctx, project).with_context(|| format!("the herdr session of `{}` is not reachable; run `open {}` first", project.slug, project.slug))?;
+    let agent = session.agents.iter().find(|agent| agent.pane_id == pane).cloned().with_context(|| format!("no live agent in pane {pane} of the session at {}", session.socket))?;
+    if !ours(&agent, &project.slug) {
+        let owner = agent.tokens.get(crate::sidebar::PROJECT_TOKEN).map(String::as_str).unwrap_or("");
+        bail!("pane {pane} belongs to another project (`{owner}`), not `{}`", project.slug);
+    }
+    match resolve(&registry, &agent, &project_home(project), &project.slug) {
+        LaneResolution::Ambiguous { reason } => bail!("pane {pane} is ambiguous: {reason}; run `hp lane adopt {handle}` in that pane first"),
+        LaneResolution::Known { lane: claimed, .. } if claimed != lane.id => {
+            let other = registry.get(&claimed).map(|lane| format!("`{}` ({})", lane.label, lane.id)).unwrap_or(claimed);
+            bail!("pane {pane} is already the coordinator of lane {other}; `lane assign` moves one lane at a time — assign that lane first, or pick another pane");
+        }
+        _ => {}
+    }
+    let old_pane = lane.pane_id.clone();
+    let session_id = agent.session_id().to_string();
+    let now = project::now();
+    Registry::update(project, |registry| {
+        if let Some(record) = registry.lanes.iter_mut().find(|record| record.id == lane.id) {
+            record.pane_id = pane.to_string();
+            record.agent_session = session_id.clone();
+            record.last_active = now.clone();
+        }
+    })?;
+    crate::sidebar::report_pane(&session.herdr, pane, &crate::sidebar::coordinator_display(project), &project.slug, crate::thread::Group::Idle, Some(&lane.id));
+    if !old_pane.is_empty() && old_pane != pane {
+        // Clear only the lane claim: the old pane may still be a shell or an
+        // agent the user is using for something else. It must not keep saying
+        // it is this lane's coordinator.
+        if let Err(error) = session.herdr.call(
+            &["pane", "report-metadata", old_pane.as_str(), "--source", crate::herdr::SOURCE, "--clear-token", TOKEN],
+            crate::herdr::CALL_TIMEOUT,
+        ) {
+            println!("could not clear `{TOKEN}` on old pane {old_pane}: {error}");
+        }
+    }
+    // If the moved lane is the default, the single-file view must follow it.
+    if registry.is_default(&lane.id) {
+        let agent_name = agent.name.clone();
+        let session_id = agent.session_id().to_string();
+        project.update_coordinator(|record| {
+            record.pane_id = pane.to_string();
+            record.agent_name = agent_name;
+            record.agent_session = session_id;
+            if !agent.agent.is_empty() {
+                record.agent = agent.agent.clone();
+            }
+        })?;
+    }
+    let following: Vec<String> = crate::thread::list(project)
+        .into_iter()
+        .filter(|thread| registry.lane_of(&thread.lane).map(|record| record.id.as_str()) == Some(lane.id.as_str()))
+        .map(|thread| thread.id)
+        .collect();
+    println!("lane `{}` ({}) is now coordinated from pane {pane}", lane.label, lane.id);
+    if following.is_empty() {
+        println!("threads following the lane: none");
+    } else {
+        println!("threads following the lane ({}): {}", following.len(), following.join(" "));
+    }
+    if old_pane.is_empty() {
+        println!("the lane had no recorded pane before");
+    } else if old_pane == pane {
+        println!("the lane already pointed at pane {pane}");
+    } else if session.agents.iter().any(|agent| agent.pane_id == old_pane) {
+        println!("old pane {old_pane} is still running; its `{TOKEN}` claim was cleared");
+    } else {
+        println!("old pane {old_pane} is gone");
+    }
+    Ok(())
+}
+
+/// `hp lane rename <lane> <label> [--name <name>]` (§4.1, §6.3). Only the
+/// display label (and, with `--name`, the CLI handle) changes. The id never
+/// does, so every `Thread.lane`, inbox item and `hp_lane` token keeps naming
+/// the same lane.
+pub fn lane_rename(ctx: &Ctx, project: &Project, handle: &str, label: &str, name: Option<&str>) -> Result<()> {
+    let _ = ctx;
+    if label.trim().is_empty() {
+        bail!("the label may not be empty");
+    }
+    if let Some(name) = name {
+        crate::profiles::validate_name(name)?;
+    }
+    let _lock = project.lock()?;
+    let mut registry = require_registry(project)?;
+    let index = registry
+        .lanes
+        .iter()
+        .position(|lane| lane.id == handle || lane.name == handle || lane.label == handle)
+        .with_context(|| format!("no lane `{handle}`"))?;
+    let id = registry.lanes[index].id.clone();
+    let old_label = registry.lanes[index].label.clone();
+    let old_name = registry.lanes[index].name.clone();
+    if let Some(new) = name
+        && new != old_name
+        && registry.lanes.iter().any(|lane| lane.id != id && lane.name == new)
+    {
+        bail!("another lane already uses the name `{new}`");
+    }
+    if let Some(new) = name {
+        registry.lanes[index].name = new.to_string();
+    }
+    registry.lanes[index].label = label.to_string();
+    registry.save(project)?;
+    println!("lane {id}: label `{old_label}` -> `{label}`{}", match name {
+        Some(new) if new != old_name => format!(", name `{old_name}` -> `{new}`"),
+        _ => String::new(),
+    });
+    println!("id {id} is unchanged, so threads and inbox items keep pointing at it");
+    Ok(())
+}
+
+/// The pane a lane's coordinator is actually running in, if it is: a pane the
+/// resolver names for the lane, or the lane's recorded pane when its native
+/// session still matches (the §5.4 `degraded` case: alive but unrecognized).
+fn running_pane_for(view: &View, lane: &Lane) -> Option<String> {
+    if let Some(sighting) = view.sightings().iter().find(|sighting| sighting.resolution.lane_id() == Some(lane.id.as_str())) {
+        return Some(sighting.pane_id.clone());
+    }
+    if lane.pane_id.is_empty() {
+        return None;
+    }
+    view.agents
+        .iter()
+        .find(|agent| {
+            agent.pane_id == lane.pane_id
+                && ours(agent, &view.slug)
+                && (lane.agent_session.is_empty() || agent.session_id() == lane.agent_session)
+        })
+        .map(|agent| agent.pane_id.clone())
+}
+
+/// `hp lane close <lane>` (§6.4): refused while any thread of the lane is
+/// `Open` or `Starting` (the ticker's own `open_threads` predicate), otherwise
+/// a pure registry status change. The coordinator process is never touched.
+pub fn lane_close(ctx: &Ctx, project: &Project, handle: &str) -> Result<()> {
+    let _lock = project.lock()?;
+    let mut registry = require_registry(project)?;
+    let lane = require_lane(&registry, handle)?;
+    let index = registry.lanes.iter().position(|record| record.id == lane.id).expect("require_lane found it");
+    let mut open = crate::ticker::open_threads(project, false);
+    open.extend(crate::ticker::open_threads(project, true));
+    let blockers: Vec<String> = open
+        .iter()
+        .filter(|thread| registry.lane_of(&thread.lane).map(|record| record.id.as_str()) == Some(lane.id.as_str()))
+        .map(|thread| thread.id.clone())
+        .collect();
+    if !blockers.is_empty() {
+        bail!(
+            "lane `{}` ({}) still has {} open threads: {}\nresolve them first (`hp thread resolve {} {}`), then run `hp lane close {}`",
+            lane.label,
+            lane.id,
+            blockers.len(),
+            blockers.join(", "),
+            project.slug,
+            blockers[0],
+            lane.id
+        );
+    }
+    registry.lanes[index].status = Status::Closed;
+    registry.lanes[index].closed = project::now();
+    let mut elected = None;
+    if registry.default.is_empty() || registry.default == lane.id {
+        elected = Some(registry.elect_default(project));
+    }
+    registry.save(project)?;
+    let closed = registry.get(&lane.id).cloned().unwrap_or_else(|| lane.clone());
+    drop(_lock);
+    let session = crate::threads::session_view(ctx, project);
+    let view = View::with_session(ctx, project, session.as_ref());
+    let running = running_pane_for(&view, &closed).is_some();
+    print!("lane `{}` ({}) is closed; its coordinator process was not touched", closed.label, closed.id);
+    if running {
+        println!(" — it is still running in pane {}, and stays on the `Coordinators:` line marked closed", closed.pane_id);
+    } else if !closed.pane_id.is_empty() {
+        println!("; pane {} is no longer running", closed.pane_id);
+    } else {
+        println!();
+    }
+    if let Some(id) = elected {
+        let label = registry.get(&id).map(|lane| lane.label.clone()).unwrap_or_default();
+        if id == FALLBACK_ID && registry.lanes.iter().filter(|lane| lane.is_open()).count() == 1 {
+            println!("no lane was left open, so {id} was reopened as the default lane");
+        } else {
+            println!("default lane is now `{label}` ({id})");
+        }
+    }
+    Ok(())
+}
+
+/// `hp lane open <lane>` (§6.4): flips `status` back to open and nothing more.
+/// It starts no agent and resumes no session; the output names the next step,
+/// or says the old pane is still alive so `open` is not run beside it.
+pub fn lane_open(ctx: &Ctx, project: &Project, handle: &str) -> Result<()> {
+    let _lock = project.lock()?;
+    let mut registry = require_registry(project)?;
+    let lane = require_lane(&registry, handle)?;
+    let index = registry.lanes.iter().position(|record| record.id == lane.id).expect("require_lane found it");
+    let was_open = registry.lanes[index].is_open();
+    registry.lanes[index].status = Status::Open;
+    registry.save(project)?;
+    let lane = registry.lanes[index].clone();
+    drop(_lock);
+    let session = crate::threads::session_view(ctx, project);
+    let view = View::with_session(ctx, project, session.as_ref());
+    let running = running_pane_for(&view, &lane);
+    print!("{}", lane_open_message(&lane, running.as_deref(), was_open, &project.slug));
+    Ok(())
+}
+
+/// The two output branches of §6.4. `open` must not be suggested while the
+/// old coordinator pane is alive: that would start a second coordinator beside
+/// the one already running.
+pub fn lane_open_message(lane: &Lane, running: Option<&str>, was_open: bool, slug: &str) -> String {
+    let state = if was_open { "is already open" } else { "is open again" };
+    match running {
+        Some(pane) => format!("lane `{}` ({}) {state}; its coordinator is already running in pane {pane}.\n", lane.label, lane.id),
+        None => format!(
+            "lane `{}` ({}) {state}; its coordinator is not running.\nStart or resume one with `open {slug} --lane {}`.\n",
+            lane.label, lane.id, lane.id
+        ),
+    }
 }
 
 #[cfg(test)]

@@ -863,12 +863,12 @@ fn thread_start_and_open_refuse_profiles_off_the_allow_list() {
         let args = StartArgs { title: "x".into(), repo: None, machine: None, profile: Some(bad.into()), kind: Some(Kind::Tab), base: None, task: "t".into() };
         let error = threads::start(&world.ctx(), "demo", args).unwrap_err().to_string();
         assert!(error.contains("not allowed for threads") || error.contains("no profile `nope`"), "{error}");
-        let options = coordinator::OpenOptions { session: Default::default(), rebind: false, profile: Some(bad.into()), new: true, here: false, person: false };
+        let options = coordinator::OpenOptions { session: Default::default(), rebind: false, profile: Some(bad.into()), new: true, here: false, person: false, lane: None, lane_name: None };
         let error = coordinator::open(&world.ctx(), "demo", &options).unwrap_err().to_string();
         assert!(error.contains("not allowed for the coordinator") || error.contains("no profile `nope`"), "{error}");
     }
     // `luna` is allowed for threads, not for the coordinator.
-    let options = coordinator::OpenOptions { session: Default::default(), rebind: false, profile: Some("luna".into()), new: true, here: false, person: false };
+    let options = coordinator::OpenOptions { session: Default::default(), rebind: false, profile: Some("luna".into()), new: true, here: false, person: false, lane: None, lane_name: None };
     assert!(coordinator::open(&world.ctx(), "demo", &options).unwrap_err().to_string().contains("allowed: claude"));
     assert!(threads::restart(&world.ctx(), "demo", "t-0001", Some("deep")).is_err());
     assert!(thread::list(&project).is_empty());
@@ -2222,6 +2222,8 @@ fn open_alive(world: &World, project: &Project) -> anyhow::Result<()> {
         new: false,
         here: false,
         person: false,
+        lane: None,
+        lane_name: None,
     };
     crate::coordinator::open(&world.ctx(), &project.slug, &options)
 }
@@ -2274,6 +2276,8 @@ fn a_persons_open_resumes_a_paused_project_an_agents_open_only_notes_it() {
         new: false,
         here: false,
         person: true,
+        lane: None,
+        lane_name: None,
     };
     crate::coordinator::open(&world.ctx(), "demo", &options).unwrap();
     assert_eq!(project.status(), crate::project::Status::Active);
@@ -2316,6 +2320,8 @@ fn open_starts_a_coordinator_without_a_priming_prompt_then_focuses_it_and_resume
         new,
         here: false,
         person: false,
+        lane: None,
+        lane_name: None,
     };
     let ctx = world.ctx();
 
@@ -2380,6 +2386,8 @@ fn open_new_starts_a_fresh_coordinator_beside_a_live_one_without_its_session() {
         new,
         here: false,
         person: false,
+        lane: None,
+        lane_name: None,
     };
     let ctx = world.ctx();
     crate::coordinator::open(&ctx, "demo", &options(false)).unwrap();
@@ -2601,6 +2609,8 @@ impl Here {
             new,
             here,
             person: false,
+            lane: None,
+            lane_name: None,
         };
         crate::coordinator::open(&Ctx { env, ..self.world.ctx() }, "demo", &options)
     }
@@ -4487,4 +4497,394 @@ fn an_ambiguous_pane_keeps_the_project_alive_but_receives_nothing() {
     // But it is somebody: a prompt-only routine still fires.
     let routines = items_of(&project, "routine");
     assert_eq!(routines.len(), 1, "the project is not coordinator-less: {routines:?}");
+}
+
+// ---------------------------------------------------------------- lanes, commit 4
+
+#[test]
+fn first_open_writes_one_default_lane_and_keeps_a_single_lane_project_equivalent() {
+    // The risky half of commit 4: `open` now creates `lanes.json` on a project
+    // that had none. A single-lane project must read, nudge and persist exactly
+    // the same state before and after that file exists.
+    let world = World::new();
+    let project = world.project("demo", "a.sock");
+    let dir = project.canonical_dir().to_string_lossy().into_owned();
+    set_front_matter(&project, "nudge = true");
+    *world.agents.borrow_mut() = format!("[{}]", agent_json_session("w1", "w1:p1", &dir, "sess-7"));
+    *world.panes.borrow_mut() = format!("[{}]", world.coordinator_pane(&project));
+    world.runner.on("agent prompt", ok(r#"{"result":{}}"#));
+    inbox::write(&project, "thread-state", "t-0001", "idle", "an item", "").unwrap();
+    let ctx = world.ctx();
+    let mut memory = Memory::new(&ctx);
+
+    let digest_before = digest_parts(&world, &project);
+    // One nudge reaches the only coordinator before the registry exists.
+    ticker::tick_project_with(&ctx, &project, &mut memory).unwrap();
+    idle_for_a_minute(&project);
+    ticker::tick_project_with(&ctx, &project, &mut memory).unwrap();
+    box_empty_for_a_while(&project);
+    ticker::tick_project_with(&ctx, &project, &mut memory).unwrap();
+    assert_eq!(nudges(&world), ["[hp inbox] t-0001 idle"]);
+    let record_before = project.coordinator().unwrap();
+    let state_before = crate::steps::load_state(&project);
+    let ticker_before = std::fs::read_to_string(project.state_dir().join("ticker.json")).unwrap();
+    assert!(ticker_before.contains(r#""nudged": ""#), "the pre-lane file keeps its scalar shape: {ticker_before}");
+    assert!(!project.state_dir().join(crate::lanes::REGISTRY_FILE).exists(), "no registry yet");
+
+    // The first open writes the synthesized default lane from coordinator.json.
+    open_alive(&world, &project).unwrap();
+    let registry = crate::lanes::Registry::load(&project).expect("first open wrote lanes.json");
+    assert_eq!((registry.lanes.len(), registry.default.as_str(), registry.next), (1, "c-1", 2));
+    let lane = &registry.lanes[0];
+    assert_eq!((lane.name.as_str(), lane.pane_id.as_str(), lane.status.as_str()), ("default", "w1:p1", "open"));
+    assert_eq!(lane.agent_session, "sess-7", "ensure_written copies the recorded native session");
+
+    // Every read a single-lane project makes is byte-for-byte the same.
+    assert_eq!(digest_before, digest_parts(&world, &project), "digest must not change");
+    let record_after = project.coordinator().unwrap();
+    assert_eq!(record_after.pane_id, record_before.pane_id);
+    assert_eq!(record_after.agent_session, record_before.agent_session);
+    assert_eq!(record_after.cwd, record_before.cwd);
+    assert_eq!(record_after.agent, record_before.agent);
+
+    // The nudge already delivered is not delivered again, and the loaded
+    // ticker state is the same map the scalar file meant.
+    ticker::tick_project_with(&ctx, &project, &mut memory).unwrap();
+    assert_eq!(nudges(&world).len(), 1, "the same item is not nudged twice");
+    let state_after = crate::steps::load_state(&project);
+    assert_eq!(state_after.nudged, state_before.nudged);
+    assert_eq!(state_after.renudged_at, state_before.renudged_at);
+    assert_eq!(state_after.box_pane, state_before.box_pane);
+    assert_eq!(state_after.box_empty_since, state_before.box_empty_since);
+    assert_eq!(state_after.ambiguous_items, state_before.ambiguous_items);
+}
+
+#[test]
+fn open_lane_creates_the_lane_in_the_home_tab_and_writes_its_instance_and_token() {
+    let world = World::new();
+    let project = world.project("demo", "a.sock");
+    let dir = project.canonical_dir().to_string_lossy().into_owned();
+    *world.agents.borrow_mut() = format!("[{}]", agent_json("w1", "w1:t1", "w1:p1", &dir, "hp-demo-coordinator", "idle"));
+    *world.panes.borrow_mut() = format!("[{}]", world.coordinator_pane(&project));
+    world.runner.on("workspace get", ok(r#"{"result":{"workspace":{"label":"Demo⠀"}}}"#));
+    world.runner.on("tab rename", ok(r#"{"result":{}}"#));
+    world.runner.on("tab create", ok(r#"{"result":{"root_pane":{"workspace_id":"w1","tab_id":"w1:t2","pane_id":"w1:p2"}}}"#));
+    world.runner.on("agent start", ok(r#"{"result":{"agent":{"pane_id":"w1:p2","tab_id":"w1:t2","workspace_id":"w1","name":"hpc-demo","agent":"claude","agent_status":"idle","agent_session":{"value":"sess-books"}}}}"#));
+    let ctx = world.ctx();
+    let options = crate::coordinator::OpenOptions {
+        session: crate::paths::SessionFlags { session: None, socket: Some(world.home.path().join("a.sock")) },
+        rebind: false,
+        profile: None,
+        new: false,
+        here: false,
+        person: false,
+        lane: Some("books".into()),
+        lane_name: Some("收藏".into()),
+    };
+    coordinator::open(&ctx, "demo", &options).unwrap();
+
+    let registry = crate::lanes::Registry::load(&project).unwrap();
+    assert_eq!(registry.lanes.len(), 2);
+    let books = registry.get("c-2").expect("created as c-2");
+    assert_eq!((books.name.as_str(), books.label.as_str()), ("books", "收藏"));
+    assert_eq!((books.pane_id.as_str(), books.agent_session.as_str()), ("w1:p2", "sess-books"));
+    assert_eq!(registry.get("c-1").unwrap().pane_id, "w1:p1", "the default lane is untouched");
+    // A new tab in the existing home Space, not a new Space.
+    assert_eq!(world.runner.count("tab create"), 1);
+    assert_eq!(world.runner.count("workspace create"), 0);
+    let calls = world.runner.calls.borrow();
+    let report = calls.iter().find(|c| c.display().contains("report-metadata w1:p2")).unwrap();
+    assert!(report.args.contains(&"hp_lane=c-2".to_string()), "{}", report.display());
+    drop(calls);
+    assert_eq!(project.coordinator().unwrap().pane_id, "w1:p1", "the default-lane view still sees c-1");
+
+    // The same lane is live: a second open focuses it, scoped to that lane only.
+    *world.agents.borrow_mut() = format!(
+        "[{},{}]",
+        agent_json_tokens("w1", "w1:p1", &dir, &[("hp_project", "demo"), ("hp_lane", "c-1")]),
+        agent_json_tokens("w2", "w2:p1", &dir, &[("hp_project", "demo"), ("hp_lane", "c-2")])
+    );
+    world.runner.on("agent focus", ok(r#"{"result":{}}"#));
+    coordinator::open(&ctx, "demo", &options).unwrap();
+    assert_eq!(world.runner.count("agent focus w2:p1"), 1);
+    assert_eq!(world.runner.count("agent start"), 1, "no second coordinator");
+    assert_eq!(
+        crate::lanes::Registry::load(&project).unwrap().get("c-2").unwrap().pane_id,
+        "w2:p1",
+        "the focused instance is recorded"
+    );
+
+    // A closed lane cannot be opened implicitly.
+    let mut registry = crate::lanes::Registry::load(&project).unwrap();
+    registry.lanes[1].status = crate::lanes::Status::Closed;
+    registry.save(&project).unwrap();
+    let error = coordinator::open(&ctx, "demo", &options).unwrap_err().to_string();
+    assert!(error.contains("is closed") && error.contains("lane open c-2"), "{error}");
+}
+
+#[test]
+fn lane_adopt_refuses_the_three_cases_and_claims_the_current_pane_on_success() {
+    let world = World::new();
+    let project = world.project("demo", "a.sock");
+    let dir = project.canonical_dir().to_string_lossy().into_owned();
+    two_lane_registry(&project);
+    let socket = project.coordinator().unwrap().socket;
+
+    // Already another lane: point at `lane assign`, never steal it.
+    *world.agents.borrow_mut() = format!("[{}]", agent_json_tokens("w1", "w1:p1", &dir, &[("hp_project", "demo"), ("hp_lane", "c-1")]));
+    let env = Env::for_test(world.home.path(), &[("HERDR_PANE_ID", "w1:p1"), ("HERDR_SOCKET_PATH", &socket)]);
+    let ctx = Ctx { env: &env, root: world.root.clone(), config_dir: world.home.path().join("cfg"), runner: &world.runner, detached_ticker: false };
+    let error = crate::lanes::lane_adopt(&ctx, Some("demo"), "books").unwrap_err().to_string();
+    assert!(error.contains("already belongs to lane") && error.contains("lane assign c-1 w1:p1"), "{error}");
+
+    // A thread-like working directory points at `thread adopt`.
+    let thread_dir = format!("{dir}/threads/t-0001");
+    *world.agents.borrow_mut() = format!("[{}]", agent_json("w5", "w5:t1", "w5:p1", &thread_dir, "worker", "idle"));
+    let env = Env::for_test(world.home.path(), &[("HERDR_PANE_ID", "w5:p1"), ("HERDR_SOCKET_PATH", &socket)]);
+    let ctx = Ctx { env: &env, root: world.root.clone(), config_dir: world.home.path().join("cfg"), runner: &world.runner, detached_ticker: false };
+    let error = crate::lanes::lane_adopt(&ctx, Some("demo"), "books").unwrap_err().to_string();
+    assert!(error.contains("hp thread adopt demo"), "{error}");
+
+    // A plugin popup pane can never become a coordinator.
+    let env = Env::for_test(world.home.path(), &[("HERDR_PANE_ID", "w5:p1"), ("HERDR_SOCKET_PATH", &socket), ("HERDR_PLUGIN_STATE_DIR", "/tmp/plugin")]);
+    let ctx = Ctx { env: &env, root: world.root.clone(), config_dir: world.home.path().join("cfg"), runner: &world.runner, detached_ticker: false };
+    let error = crate::lanes::lane_adopt(&ctx, Some("demo"), "books").unwrap_err().to_string();
+    assert!(error.contains("plugin popup"), "{error}");
+
+    // Success: a hand-started agent in the project home claims c-2.
+    *world.agents.borrow_mut() = format!("[{}]", agent_json("w5", "w5:t1", "w5:p1", &dir, "hand-agent", "idle"));
+    let env = Env::for_test(world.home.path(), &[("HERDR_PANE_ID", "w5:p1"), ("HERDR_SOCKET_PATH", &socket)]);
+    let ctx = Ctx { env: &env, root: world.root.clone(), config_dir: world.home.path().join("cfg"), runner: &world.runner, detached_ticker: false };
+    crate::lanes::lane_adopt(&ctx, Some("demo"), "books").unwrap();
+    let registry = crate::lanes::Registry::load(&project).unwrap();
+    assert_eq!(registry.get("c-2").unwrap().pane_id, "w5:p1");
+    let calls = world.runner.calls.borrow();
+    let report = calls.iter().find(|c| c.display().contains("report-metadata w5:p1")).unwrap();
+    assert!(report.args.contains(&"hp_lane=c-2".to_string()), "{}", report.display());
+}
+
+#[test]
+fn lane_assign_moves_the_notification_target_and_never_rewrites_thread_lane_fields() {
+    let world = World::new();
+    let project = world.project("demo", "a.sock");
+    let dir = project.canonical_dir().to_string_lossy().into_owned();
+    two_lane_registry(&project);
+    thread::allocate(&project, |t| {
+        t.title = "one".into();
+        t.status = Status::Open;
+        t.lane = "c-1".into();
+    })
+    .unwrap();
+    let before: Vec<(String, String)> = thread::list(&project).into_iter().map(|t| (t.id, t.lane)).collect();
+    *world.agents.borrow_mut() = format!("[{}]", agent_json_tokens("w1", "w1:p1", &dir, &[("hp_project", "demo"), ("hp_lane", "c-1")]));
+    *world.panes.borrow_mut() = format!("[{}]", world.coordinator_pane(&project));
+    let ctx = world.ctx();
+
+    // An agent inside the shared folder with no token is ambiguous: refuse.
+    *world.agents.borrow_mut() = format!("[{}]", agent_json("w3", "w3:t1", "w3:p1", &dir, "third", "idle"));
+    let error = crate::lanes::lane_assign(&ctx, &project, "fix", "w3:p1").unwrap_err().to_string();
+    assert!(error.contains("ambiguous"), "{error}");
+
+    // Another lane's coordinator is refused with the lane it belongs to.
+    *world.agents.borrow_mut() = format!("[{}]", agent_json_tokens("w2", "w2:p1", &dir, &[("hp_project", "demo"), ("hp_lane", "c-2")]));
+    let error = crate::lanes::lane_assign(&ctx, &project, "fix", "w2:p1").unwrap_err().to_string();
+    assert!(error.contains("already the coordinator of lane") && error.contains("c-2"), "{error}");
+
+    // The explicit handover: a live agent elsewhere becomes c-1's coordinator.
+    let elsewhere = world.home.path().join("elsewhere");
+    std::fs::create_dir(&elsewhere).unwrap();
+    let elsewhere = elsewhere.to_string_lossy().into_owned();
+    *world.agents.borrow_mut() = format!("[{}]", agent_json_session("w3", "w3:p1", &elsewhere, "sess-new"));
+    crate::lanes::lane_assign(&ctx, &project, "fix", "w3:p1").unwrap();
+    assert_eq!(thread::list(&project).into_iter().map(|t| (t.id, t.lane)).collect::<Vec<_>>(), before, "threads never move");
+    let registry = crate::lanes::Registry::load(&project).unwrap();
+    assert_eq!(registry.get("c-1").unwrap().pane_id, "w3:p1");
+    assert_eq!(registry.get("c-1").unwrap().agent_session, "sess-new");
+    let calls = world.runner.calls.borrow();
+    let report = calls.iter().find(|c| c.display().contains("report-metadata w3:p1")).unwrap();
+    assert!(report.args.contains(&"hp_lane=c-1".to_string()), "{}", report.display());
+    let cleared = calls.iter().find(|c| c.display().contains("report-metadata w1:p1")).unwrap();
+    assert!(cleared.args.contains(&"--clear-token".to_string()) && cleared.args.contains(&"hp_lane".to_string()), "{}", cleared.display());
+    drop(calls);
+
+    // The lane's inbox item now reaches the new pane, not the old one.
+    *world.agents.borrow_mut() = format!("[{}]", agent_json_tokens("w3", "w3:p1", &elsewhere, &[("hp_project", "demo"), ("hp_lane", "c-1")]));
+    *world.panes.borrow_mut() = "[]".into();
+    world.runner.on("agent prompt", ok(r#"{"result":{}}"#));
+    inbox::write_in(&project, "c-1", "thread-state", "t-0001", "idle", "lane one", "").unwrap();
+    let mut memory = Memory::new(&ctx);
+    ticker::tick_project_with(&ctx, &project, &mut memory).unwrap();
+    idle_for_a_minute(&project);
+    ticker::tick_project_with(&ctx, &project, &mut memory).unwrap();
+    box_empty_for_a_while(&project);
+    ticker::tick_project_with(&ctx, &project, &mut memory).unwrap();
+    assert_eq!(prompts(&world), [("w3:p1".to_string(), "[hp inbox] t-0001 idle".to_string())]);
+}
+
+#[test]
+fn lane_rename_changes_label_and_handle_but_keeps_the_id_and_ownership() {
+    let world = World::new();
+    let project = world.project("demo", "a.sock");
+    two_lane_registry(&project);
+    thread::allocate(&project, |t| {
+        t.title = "books".into();
+        t.lane = "c-2".into();
+    })
+    .unwrap();
+    let item = inbox::write_in(&project, "c-2", "thread-state", "t-0001", "idle", "books item", "").unwrap();
+    crate::lanes::lane_rename(&world.ctx(), &project, "books", "书单", Some("volumes")).unwrap();
+    let registry = crate::lanes::Registry::load(&project).unwrap();
+    let lane = registry.get("c-2").unwrap();
+    assert_eq!((lane.id.as_str(), lane.name.as_str(), lane.label.as_str()), ("c-2", "volumes", "书单"));
+    assert_eq!(thread::load(&project, "t-0001").unwrap().lane, "c-2");
+    let items = inbox::unhandled_in(&project, "c-2");
+    assert_eq!(items.len(), 1);
+    assert_eq!(items[0].id, item);
+    // The handle is unique; renaming onto an existing one is refused.
+    let error = crate::lanes::lane_rename(&world.ctx(), &project, "volumes", "x", Some("fix")).unwrap_err().to_string();
+    assert!(error.contains("already uses the name `fix`"), "{error}");
+}
+
+#[test]
+fn lane_close_refuses_open_threads_then_closes_without_killing_the_coordinator() {
+    let world = World::new();
+    let project = world.project("demo", "a.sock");
+    let dir = project.canonical_dir().to_string_lossy().into_owned();
+    let mut registry = two_lane_registry(&project);
+    registry.lanes[1].last_active = "2026-02-01T00:00:00Z".into();
+    registry.save(&project).unwrap();
+    thread::allocate(&project, |t| {
+        t.title = "book one".into();
+        t.status = Status::Open;
+        t.lane = "c-2".into();
+    })
+    .unwrap();
+    let ctx = world.ctx();
+    let error = crate::lanes::lane_close(&ctx, &project, "books").unwrap_err().to_string();
+    assert!(error.contains("lane `收藏` (c-2) still has 1 open threads: t-0001"), "{error}");
+    assert!(error.contains("hp thread resolve demo t-0001"), "{error}");
+    thread::update(&project, "t-0001", |t| t.status = Status::Resolved).unwrap();
+
+    // The pane is still alive and keeps its token; close must not touch it.
+    *world.agents.borrow_mut() = format!("[{}]", agent_json_tokens("w2", "w2:p1", &dir, &[("hp_project", "demo"), ("hp_lane", "c-2")]));
+    *world.panes.borrow_mut() = format!("[{}]", pane_json("w2", "w2:t1", "w2:p1", &dir));
+    crate::lanes::lane_close(&ctx, &project, "books").unwrap();
+    let registry = crate::lanes::Registry::load(&project).unwrap();
+    let closed = registry.get("c-2").unwrap();
+    assert_eq!(closed.status, crate::lanes::Status::Closed);
+    assert!(!closed.closed.is_empty());
+    assert_eq!(world.runner.count("agent stop"), 0);
+    assert_eq!(world.runner.count("pane close"), 0);
+    // A closed lane's living pane still appears on the Coordinators line, marked closed.
+    let session = threads::session_view(&ctx, &project);
+    let view = crate::lanes::View::with_session(&ctx, &project, session.as_ref());
+    let line = crate::lanes::identity_line(&view);
+    assert!(line.contains("lane c-2, closed"), "{line}");
+    assert!(view.list_text().contains("\tclosed\t"), "{}", view.list_text());
+    // `lane open` flips only the status; the pane was never touched.
+    crate::lanes::lane_open(&ctx, &project, "books").unwrap();
+    assert_eq!(crate::lanes::Registry::load(&project).unwrap().get("c-2").unwrap().status, crate::lanes::Status::Open);
+    assert_eq!(world.runner.count("agent stop") + world.runner.count("agent start"), 0);
+}
+
+#[test]
+fn closing_the_default_lane_elects_the_newest_open_lane_and_all_closed_reopens_c_1() {
+    let world = World::new();
+    let project = world.project("demo", "a.sock");
+    let mut registry = two_lane_registry(&project);
+    registry.lanes[0].last_active = "2026-01-01T00:00:00Z".into();
+    registry.lanes[1].last_active = "2026-02-01T00:00:00Z".into();
+    registry.save(&project).unwrap();
+    let ctx = world.ctx();
+    crate::lanes::lane_close(&ctx, &project, "fix").unwrap();
+    let registry = crate::lanes::Registry::load(&project).unwrap();
+    assert_eq!(registry.default, "c-2", "the newest last_active wins");
+    crate::lanes::lane_close(&ctx, &project, "books").unwrap();
+    let registry = crate::lanes::Registry::load(&project).unwrap();
+    assert_eq!((registry.default.as_str(), registry.get("c-1").unwrap().status), ("c-1", crate::lanes::Status::Open), "no open lane left reopens c-1");
+}
+
+#[test]
+fn lane_open_reports_the_two_branches_and_never_suggests_a_second_coordinator() {
+    let lane = |id: &str, label: &str| crate::lanes::Lane { id: id.into(), label: label.into(), ..Default::default() };
+    let not_running = crate::lanes::lane_open_message(&lane("c-2", "收藏"), None, false, "law");
+    assert_eq!(
+        not_running,
+        "lane `收藏` (c-2) is open again; its coordinator is not running.\nStart or resume one with `open law --lane c-2`.\n"
+    );
+    let running = crate::lanes::lane_open_message(&lane("c-2", "收藏"), Some("w1AB:p1"), false, "law");
+    assert_eq!(running, "lane `收藏` (c-2) is open again; its coordinator is already running in pane w1AB:p1.\n");
+    assert!(!running.contains("Start or resume"), "{running}");
+}
+
+#[test]
+fn an_ambiguous_pane_writes_one_lane_item_with_a_runnable_adopt_command() {
+    let world = World::new();
+    let project = world.project("demo", "a.sock");
+    let dir = project.canonical_dir().to_string_lossy().into_owned();
+    two_lane_registry(&project);
+    *world.agents.borrow_mut() = format!("[{}]", agent_json("w9", "w9:t1", "w9:p1", &dir, "hp-demo-lost", "idle"));
+    *world.panes.borrow_mut() = format!("[{}]", pane_json("w9", "w9:t1", "w9:p1", &dir));
+    let ctx = world.ctx();
+    let mut memory = Memory::new(&ctx);
+    ticker::tick_project_with(&ctx, &project, &mut memory).unwrap();
+    let items = items_of(&project, "lane");
+    assert_eq!(items.len(), 1, "{items:?}");
+    assert_eq!((items[0].kind.as_str(), items[0].subject.as_str()), ("lane", "w9:p1"));
+    assert_eq!(items[0].event, "ambiguous coordinator");
+    assert!(items[0].summary.contains("hp lane adopt fix"), "{}", items[0].summary);
+    assert!(items[0].summary.contains("Nothing is assigned"), "{}", items[0].summary);
+    // Same pane, same state: no second item on the next tick.
+    ticker::tick_project_with(&ctx, &project, &mut memory).unwrap();
+    assert_eq!(items_of(&project, "lane").len(), 1);
+}
+
+#[test]
+fn the_ticker_refreshes_every_open_lanes_instance_without_losing_another_lane() {
+    let world = World::new();
+    let project = world.project("demo", "a.sock");
+    let dir = project.canonical_dir().to_string_lossy().into_owned();
+    let mut registry = two_lane_registry(&project);
+    registry.lanes[0].goal = "keep one".into();
+    registry.lanes[1].goal = "keep two".into();
+    registry.lanes[1].pane_id = "w9:p9".into();
+    registry.lanes[1].agent_session = "stale".into();
+    registry.save(&project).unwrap();
+    let agent = |workspace: &str, pane: &str, session: &str, lane: &str| {
+        format!(
+            r#"{{"pane_id":"{pane}","tab_id":"{workspace}:t1","workspace_id":"{workspace}","cwd":"{dir}","name":"hp-{pane}","agent":"claude","agent_status":"idle","agent_session":{{"value":"{session}"}},"tokens":{{"hp_project":"demo","hp_lane":"{lane}"}}}}"#
+        )
+    };
+    *world.agents.borrow_mut() = format!("[{},{}]", agent("w1", "w1:p1", "sess-1", "c-1"), agent("w2", "w2:p1", "sess-2", "c-2"));
+    *world.panes.borrow_mut() = format!("[{},{}]", pane_json("w1", "w1:t1", "w1:p1", &dir), pane_json("w2", "w2:t1", "w2:p1", &dir));
+    let ctx = world.ctx();
+    let mut memory = Memory::new(&ctx);
+    ticker::tick_project_with(&ctx, &project, &mut memory).unwrap();
+    let registry = crate::lanes::Registry::load(&project).unwrap();
+    assert_eq!(registry.lanes.len(), 2);
+    let one = registry.get("c-1").unwrap();
+    assert_eq!((one.pane_id.as_str(), one.agent_session.as_str()), ("w1:p1", "sess-1"));
+    assert!(!one.last_active.is_empty());
+    assert_eq!(one.goal, "keep one");
+    let two = registry.get("c-2").unwrap();
+    assert_eq!((two.pane_id.as_str(), two.agent_session.as_str()), ("w2:p1", "sess-2"), "a stale hint is replaced");
+    assert!(!two.last_active.is_empty());
+    assert_eq!(two.goal, "keep two", "a read-modify-write never drops another lane's fields");
+}
+
+#[test]
+fn lane_adopt_with_one_lane_makes_that_lane_the_default() {
+    let world = World::new();
+    let project = world.project("demo", "a.sock");
+    let dir = project.canonical_dir().to_string_lossy().into_owned();
+    crate::lanes::Registry::ensure_written(&project).unwrap();
+    let mut registry = crate::lanes::Registry::load(&project).unwrap();
+    registry.default.clear();
+    registry.save(&project).unwrap();
+    *world.agents.borrow_mut() = format!("[{}]", agent_json("w5", "w5:t1", "w5:p1", &dir, "hand-agent", "idle"));
+    let socket = project.coordinator().unwrap().socket;
+    let env = Env::for_test(world.home.path(), &[("HERDR_PANE_ID", "w5:p1"), ("HERDR_SOCKET_PATH", &socket)]);
+    let ctx = Ctx { env: &env, root: world.root.clone(), config_dir: world.home.path().join("cfg"), runner: &world.runner, detached_ticker: false };
+    crate::lanes::lane_adopt(&ctx, Some("demo"), "default").unwrap();
+    assert_eq!(crate::lanes::Registry::load(&project).unwrap().default, "c-1");
 }

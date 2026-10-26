@@ -607,6 +607,9 @@ pub struct Seen {
     /// verdict on one lane cannot hide behind another lane's delivery (§12
     /// commit 3, the shape of the 2026-10-18 stall).
     nudge_held: std::collections::BTreeMap<String, String>,
+    /// Every `Ambiguous` pane this tick with the resolver's reason, for the
+    /// once-per-state `lane` item of §5.4.
+    ambiguous: Vec<(String, String)>,
 }
 
 /// The `nudge held` line's tail: every lane that could not deliver, with its
@@ -854,7 +857,7 @@ fn launch_pass(ctx: &Ctx, project: &Project, herdr: &Herdr, threads: &[thread::T
     }
 }
 
-fn open_threads(project: &Project, remote: bool) -> Vec<thread::Thread> {
+pub(crate) fn open_threads(project: &Project, remote: bool) -> Vec<thread::Thread> {
     thread::list(project)
         .into_iter()
         .filter(|t| t.is_remote() == remote && matches!(t.status, thread::Status::Open | thread::Status::Starting))
@@ -888,6 +891,12 @@ fn tick_cheap(ctx: &Ctx, project: &Project, sessions: &mut Sessions) -> Result<O
     if coordinators != previous {
         coordinator::save_live(project, &coordinators)?;
     }
+    // §4.1 rule 2's hint: every open lane whose coordinator this tick resolved
+    // gets its pane, native session and `last_active` refreshed, under the
+    // project lock and as a read-modify-write so another lane's concurrent
+    // update is never dropped.
+    crate::lanes::refresh_instances(project, &coordinators, &now_text)?;
+    let ambiguous = crate::lanes::ambiguous_panes(project, &record, &agents);
     // The primary pane's native session id, for a later resume by `open`.
     if let Some(primary) = coordinators.iter().find(|c| c.pane_id == record.pane_id)
         && !primary.agent_session.is_empty()
@@ -966,6 +975,7 @@ fn tick_cheap(ctx: &Ctx, project: &Project, sessions: &mut Sessions) -> Result<O
             coordinator: !coordinators.is_empty(),
             session_lost: recorded_panes >= 2 && missing_panes == recorded_panes,
             nudge_held,
+            ambiguous,
         })),
     }
 }
@@ -1084,6 +1094,9 @@ fn tick_slow(ctx: &Ctx, project: &Project, seen: &Seen, memory: &mut Memory) -> 
     // `lane` item, addressed to the default lane, deduplicated on its thread
     // count. A project without a registry has no lane that can be orphaned.
     errors.extend(steps::write_lane_items(project, &mut state, &crate::lanes::orphan_lanes(project, &seen.agents)).err());
+    // §5.4: every `Ambiguous` pane gets one `lane` item, so a project whose
+    // inspector is not open still reports the refusal somewhere visible.
+    errors.extend(steps::write_ambiguous_lane_items(project, &mut state, &seen.ambiguous).err());
     errors.extend(steps::pull_requests(ctx, project, &mut state, memory, now));
     errors.extend(steps::resolve_merged(ctx, project, &mut state, now));
     errors.extend(routine_pass(ctx, project, &mut state, seen.coordinator));

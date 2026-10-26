@@ -89,6 +89,11 @@ pub struct State {
     /// changes. A project without a registry never writes a `lane` item, and
     /// the old scalar file shape leaves this field out entirely.
     pub lane_items: BTreeMap<String, usize>,
+    /// pane id -> the `Ambiguous` reason the §5.4 per-pane `lane` item was
+    /// written for. The dedup key is pane + state, so the same standing
+    /// ambiguity is written once and a changed reason is news again.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub ambiguous_items: BTreeMap<String, String>,
     pub session_item_written: bool,
     /// thread id -> the retry-failure line last reported from its pane.
     pub error_seen: BTreeMap<String, String>,
@@ -751,6 +756,39 @@ pub fn write_lane_items(project: &Project, state: &mut State, orphans: &[(crate:
         );
         inbox::write_in(project, &default_lane, "lane", &lane.id, &format!("{count} open threads, no coordinator"), &summary, "")?;
         state.lane_items.insert(lane.id.clone(), *count);
+    }
+    Ok(())
+}
+
+/// §5.4's per-pane visibility item: one `lane` item for every `Ambiguous`
+/// pane, deduplicated on `(pane id, reason)`. It complements — never replaces —
+/// the standing `Coordinators:` line: a project the user is not looking at
+/// still says, in its default lane's inbox, that a pane could not be placed
+/// and which command fixes it. `ambiguous` comes from `lanes::ambiguous_panes`,
+/// so a project without a registry never produces one.
+pub fn write_ambiguous_lane_items(project: &Project, state: &mut State, ambiguous: &[(String, String)]) -> Result<()> {
+    if !crate::lanes::split_in_use(project) {
+        return Ok(());
+    }
+    // Forget panes that are no longer ambiguous, so a later spell is news
+    // again instead of being suppressed forever.
+    state.ambiguous_items.retain(|pane, _| ambiguous.iter().any(|(current, _)| current == pane));
+    let registry = crate::lanes::Registry::for_project(project);
+    let example = registry
+        .open_lanes()
+        .first()
+        .map(|lane| if lane.name.is_empty() { lane.id.clone() } else { lane.name.clone() })
+        .unwrap_or_else(|| crate::lanes::DEFAULT_NAME.to_string());
+    let default_lane = crate::lanes::default_lane_id(project);
+    for (pane, reason) in ambiguous {
+        if state.ambiguous_items.get(pane) == Some(reason) {
+            continue;
+        }
+        let summary = format!(
+            "Pane {pane} could be a coordinator but cannot be tied to one lane: {reason}. Run `hp lane adopt {example}` in that pane (or `hp lane adopt <lane>` for the lane it serves). Nothing is assigned until you say so."
+        );
+        inbox::write_in(project, &default_lane, "lane", pane, "ambiguous coordinator", &summary, "")?;
+        state.ambiguous_items.insert(pane.clone(), reason.clone());
     }
     Ok(())
 }

@@ -17,6 +17,15 @@ const DEFAULT_TASK: &str = "Continue the work you were already doing in this pan
 /// The refusals shared by `thread adopt` and `adopt-workspace`, checked before
 /// anything is created. Returns the agent herdr detects in the pane.
 pub fn adoptable_agent(ctx: &Ctx, herdr: &Herdr, socket: &str, pane: &str) -> Result<Agent> {
+    adoptable_agent_except(ctx, herdr, socket, pane, None)
+}
+
+/// The same checks, with one project exempted from the "already a coordinator"
+/// refusal. `hp lane adopt` passes its own project: a pane in the project home
+/// matches the old single-record test by definition, and that is exactly the
+/// pane the command exists to claim. Threads and other projects' coordinators
+/// are still refused.
+pub fn adoptable_agent_except(ctx: &Ctx, herdr: &Herdr, socket: &str, pane: &str, own: Option<&str>) -> Result<Agent> {
     let agents = herdr.agent_list().map_err(|e| anyhow::anyhow!("the herdr session at {socket} is not reachable: {e}"))?;
     let agent = agents
         .into_iter()
@@ -34,7 +43,7 @@ pub fn adoptable_agent(ctx: &Ctx, herdr: &Herdr, socket: &str, pane: &str) -> Re
         if record.socket != socket {
             continue;
         }
-        if coordinator::is_coordinator(&record, &agent) {
+        if own != Some(slug.as_str()) && coordinator::is_coordinator(&record, &agent) {
             bail!("pane {pane} is a coordinator of `{slug}` (its working directory is the project folder)");
         }
         if let Some(t) = thread::list(&other).iter().find(|t| !t.is_remote() && t.status != Status::Resolved && t.pane_id == pane && thread::agent_matches(t, &agent)) {
@@ -170,7 +179,7 @@ pub fn adopt_workspace(ctx: &Ctx, args: &AdoptWorkspace) -> Result<()> {
     crate::profiles::write_project_defaults(&project, &config.new_project_default(crate::profiles::Role::Thread), &config.new_project_default(crate::profiles::Role::Coordinator))?;
     project::write_priming(&project, &coordinator::current_prefix(&ctx.root)?)?;
     println!("created `{}` at {}", project.slug, project.dir().display());
-    coordinator::open(ctx, &project.slug, &coordinator::OpenOptions { session: SessionFlags { session: None, socket: Some(session.socket.clone()) }, rebind: false, profile: None, new: false, here: false, person: true })?;
+    coordinator::open(ctx, &project.slug, &coordinator::OpenOptions { session: SessionFlags { session: None, socket: Some(session.socket.clone()) }, rebind: false, profile: None, new: false, here: false, person: true, lane: None, lane_name: None })?;
     let adopted = adopt(ctx, &project.slug, &args.pane, &args.name, None)?;
     println!("adopted pane {} as thread {} of `{}`", args.pane, adopted.id, project.slug);
     Ok(())
