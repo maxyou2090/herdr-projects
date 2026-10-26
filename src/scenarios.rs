@@ -2410,6 +2410,123 @@ fn open_new_starts_a_fresh_coordinator_beside_a_live_one_without_its_session() {
 }
 
 #[test]
+fn open_focuses_a_coordinator_whose_shell_left_the_project_home() {
+    let world = World::new();
+    let project = world.project("demo", "a.sock");
+    let dir = project.canonical_dir().to_string_lossy().into_owned();
+    // Where a drifted shell sits: the home directory, never the project folder.
+    let elsewhere = world.home.path().to_string_lossy().into_owned();
+    assert!(!crate::lanes::exists(&project), "a pre-lane project: no registry yet");
+    project.update_coordinator(|c| c.agent_session = "sess-7".into()).unwrap();
+    world.runner.on("agent focus", ok(r#"{"result":{}}"#));
+    world.runner.on("workspace get w4", ok(r#"{"result":{"workspace":{"label":"Elsewhere\u2800"}}}"#));
+    world.runner.on("workspace rename", ok(r#"{"result":{}}"#));
+    let ctx = world.ctx();
+
+    // Rule 2: the recorded pane id and native session id, and nothing else.
+    // `works_in` looks at the folder and says no; the record says yes. While
+    // `open` asked the folder, this started a second agent resuming the very
+    // session the running one had, and made a second Space beside the home.
+    *world.agents.borrow_mut() = format!("[{}]", agent_json_session("w1", "w1:p1", &elsewhere, "sess-7"));
+    coordinator::open(&ctx, "demo", &open_options(&world, None)).unwrap();
+    assert_eq!(world.runner.count("agent focus w1:p1"), 1);
+    assert_eq!(world.runner.count("agent start"), 0, "no second agent on the recorded session");
+    assert_eq!(world.runner.count("workspace create"), 0, "no second Space");
+    assert_eq!(world.runner.count("tab create"), 0);
+    // The first open is what gives a pre-lane project its registry; the record
+    // keeps the pane, the folder and the session it had.
+    assert!(crate::lanes::exists(&project));
+    let record = project.coordinator().unwrap();
+    assert_eq!((record.pane_id.as_str(), record.agent_session.as_str(), record.cwd.as_str()), ("w1:p1", "sess-7", dir.as_str()));
+
+    // Rule 1: the `hp_lane` token, with no session in the record to fall back
+    // on, in a Space the record does not name. The label follows the Space the
+    // coordinator really is in, not the stale recorded one.
+    *world.agents.borrow_mut() = format!("[{}]", agent_json_tokens("w4", "w4:p1", &elsewhere, &[("hp_project", "demo"), ("hp_lane", "c-1")]));
+    coordinator::open(&ctx, "demo", &open_options(&world, None)).unwrap();
+    assert_eq!(world.runner.count("agent focus w4:p1"), 1);
+    assert_eq!(world.runner.count("agent start"), 0, "a token is enough on its own");
+    assert_eq!(world.runner.count("workspace create") + world.runner.count("tab create"), 0);
+    let calls = world.runner.calls.borrow();
+    let rename = calls.iter().find(|c| c.display().contains("workspace rename")).unwrap();
+    assert!(rename.args.ends_with(&["w4".to_string(), "Demo\u{2800}".to_string()]), "{}", rename.display());
+    drop(calls);
+    let record = project.coordinator().unwrap();
+    assert_eq!((record.workspace_id.as_str(), record.pane_id.as_str()), ("w4", "w4:p1"), "the record follows the pane");
+}
+
+#[test]
+fn open_adds_the_coordinator_tab_to_the_home_space_whose_shell_left_the_project() {
+    let world = World::new();
+    let project = world.project("demo", "a.sock");
+    let dir = project.canonical_dir().to_string_lossy().into_owned();
+    let elsewhere = world.home.path().to_string_lossy().into_owned();
+    // The recorded home Space is still there, and so is its pane — but that
+    // shell sits outside the project folder (the coordinator `cd`-ed away and
+    // quit) and no agent runs in it. The old folder test therefore found no
+    // home Space and made a second one under the same label.
+    *world.panes.borrow_mut() = format!("[{},{}]", pane_json("w1", "w1:t1", "w1:p1", &elsewhere), pane_json("w1", "w1:t9", "w1:p9", &elsewhere));
+    world.runner.on("workspace get", ok(r#"{"result":{"workspace":{"label":"Demo\u2800"}}}"#));
+    world.runner.on("tab create", ok(r#"{"result":{"root_pane":{"workspace_id":"w1","tab_id":"w1:t2","pane_id":"w1:p2"}}}"#));
+    world.runner.on("agent start", ok(r#"{"result":{"agent":{"pane_id":"w1:p2","tab_id":"w1:t2","workspace_id":"w1","name":"hpc-demo","agent":"claude","agent_status":"idle"}}}"#));
+    let ctx = world.ctx();
+    coordinator::open(&ctx, "demo", &open_options(&world, None)).unwrap();
+    assert_eq!(world.runner.count("workspace create"), 0, "the home Space still exists: no second one");
+    assert_eq!(world.runner.count("tab create"), 1);
+    let calls = world.runner.calls.borrow();
+    let tab = calls.iter().find(|c| c.display().contains("tab create")).unwrap();
+    assert!(tab.args.windows(2).any(|pair| pair == ["--workspace", "w1"]), "{}", tab.display());
+    assert!(tab.args.windows(2).any(|pair| pair == ["--cwd", dir.as_str()]), "the tab still starts in the project folder: {}", tab.display());
+    drop(calls);
+    let record = project.coordinator().unwrap();
+    assert_eq!((record.workspace_id.as_str(), record.pane_id.as_str()), ("w1", "w1:p2"));
+
+    // The same when the home Space has no pane at all: `workspace list` is
+    // what says it is still open, and the tab goes there, not into a new Space.
+    *world.panes.borrow_mut() = "[]".into();
+    world.runner.on("workspace list", ok(r#"{"result":{"workspaces":[{"workspace_id":"w1","label":"Demo\u2800","pane_count":0}]}}"#));
+    coordinator::open(&ctx, "demo", &open_options(&world, None)).unwrap();
+    assert_eq!(world.runner.count("workspace create"), 0);
+    assert_eq!(world.runner.count("tab create"), 2);
+}
+
+#[test]
+fn a_pre_lane_project_keeps_the_two_old_open_paths() {
+    // Focus: an agent working in the project folder, no token and no session.
+    let world = World::new();
+    let project = world.project("demo", "a.sock");
+    let dir = project.canonical_dir().to_string_lossy().into_owned();
+    assert!(!crate::lanes::exists(&project), "a pre-lane project");
+    *world.agents.borrow_mut() = format!("[{}]", agent_json("w1", "w1:t1", "w1:p1", &dir, "hpc-demo", "idle"));
+    world.runner.on("agent focus", ok(r#"{"result":{}}"#));
+    coordinator::open(&world.ctx(), "demo", &open_options(&world, None)).unwrap();
+    assert_eq!(world.runner.count("agent focus w1:p1"), 1);
+    assert_eq!(world.runner.count("agent start"), 0);
+    assert_eq!(world.runner.count("workspace create") + world.runner.count("tab create"), 0);
+    assert_eq!(project.coordinator().unwrap().pane_id, "w1:p1");
+
+    // Start: nothing runs and the recorded Space is not in the session, so the
+    // old path makes one — same commands, same tab name, same record.
+    *world.agents.borrow_mut() = "[]".into();
+    let fresh = world.project("fresh", "b.sock");
+    assert!(!crate::lanes::exists(&fresh), "a pre-lane project");
+    world.runner.on("workspace create", ok(r#"{"result":{"root_pane":{"workspace_id":"w3","tab_id":"w3:t1","pane_id":"w3:p1"}}}"#));
+    world.runner.on("tab rename", ok(r#"{"result":{}}"#));
+    world.runner.on("agent start", ok(r#"{"result":{"agent":{"pane_id":"w3:p1","tab_id":"w3:t1","workspace_id":"w3","name":"hpc-fresh","agent":"claude","agent_status":"idle","agent_session":{"value":"sess-fresh"}}}}"#));
+    let options = crate::coordinator::OpenOptions {
+        session: crate::paths::SessionFlags { session: None, socket: Some(world.home.path().join("b.sock")) },
+        ..open_options(&world, None)
+    };
+    coordinator::open(&world.ctx(), "fresh", &options).unwrap();
+    assert_eq!(world.runner.count("workspace create"), 1);
+    assert_eq!(world.runner.count("tab create"), 0);
+    assert_eq!(world.runner.count("agent start"), 1);
+    assert_eq!(labels_of(&world.runner, "workspace create"), ["Fresh\u{2800}"], "the home label, unchanged");
+    let record = fresh.coordinator().unwrap();
+    assert_eq!((record.workspace_id.as_str(), record.tab_id.as_str(), record.pane_id.as_str(), record.agent_session.as_str()), ("w3", "w3:t1", "w3:p1", "sess-fresh"));
+}
+
+#[test]
 fn a_tab_thread_with_a_repo_gets_its_brief_seconds_after_its_agent_is_ready() {
     let world = World::new();
     let project = world.project("demo", "a.sock");

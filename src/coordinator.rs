@@ -39,6 +39,22 @@ pub fn current_prefix(root: &Path) -> Result<String> {
     Ok(command_prefix(&binary, root))
 }
 
+/// The project's home Space, while this session still has it: the recorded
+/// one when any pane of it is listed, or when `workspace list` still names it
+/// (an empty Space has no pane to be seen by). A fresh coordinator tab goes
+/// there even when the recorded pane's shell has left the project folder — a
+/// coordinator runs commands wherever, and demanding a pane in the folder made
+/// `open` create a second, same-named Space beside the real one. `None` means
+/// the Space is gone (the user closed it); then a new one is made.
+fn home_space(herdr: &Herdr, record: Option<&Coordinator>, panes: &[Pane]) -> Option<String> {
+    let id = record.map(|record| record.workspace_id.clone()).filter(|id| !id.is_empty())?;
+    if panes.iter().any(|pane| pane.workspace_id == id) {
+        return Some(id);
+    }
+    let listed = herdr.workspace_list().ok()?;
+    listed.iter().any(|space| space.workspace_id == id).then_some(id)
+}
+
 /// True when `pane` is the pane the record describes: same workspace, tab and
 /// working directory (see `herdr::own_dir`). Ids are only unique within one
 /// server, so callers only ever compare panes listed through the project's
@@ -492,25 +508,33 @@ pub fn open(ctx: &Ctx, slug: &str, options: &OpenOptions) -> Result<()> {
     // With an explicit profile, only the recorded coordinator is reused, and
     // only when it runs that profile: choosing another profile in the popup
     // starts one beside the others.
-    let lane_filter = options.lane.as_ref().map(|_| target_lane.id.clone());
+    //
+    // Who is a coordinator is `lanes::classify_all` (§5.2), not the folder. A
+    // coordinator's shell may sit anywhere: the recorded one works in
+    // `/Users/maxyou` while the project home is `~/.herdr-projects/x`, and the
+    // old `works_in` test then reported "nobody is running" and started a
+    // second agent resuming the first one's session (§1.6). A pane counts when
+    // it resolves to the lane being opened: its `hp_lane` token (rule 1), the
+    // recorded pane+session (rule 2), or — for a project without a registry,
+    // where this is exactly the old `is_coordinator` — the project folder
+    // (rule 3). `Ambiguous` names no lane and is never focused (§5.2 rule 4),
+    // and another lane's coordinator is not this lane's: focusing it would
+    // write its pane into this lane's instance.
+    let recorded = previous.clone().unwrap_or_default();
+    let identity = crate::lanes::classify_all(&project, &recorded, &agents);
     let running: Vec<&Agent> = agents
         .iter()
-        .filter(|a| a.works_in(&cwd))
-        .filter(|a| options.profile.is_none() || previous.as_ref().is_some_and(|r| r.pane_id == a.pane_id && recorded_profile(r) == profile.name))
-        // §6.1: the running branch is scoped to the requested lane. A pane
-        // with the same folder but another lane's token never gets focused by
-        // `open --lane`; an ambiguous pane names no lane and never matches.
-        .filter(|a| match &lane_filter {
-            Some(id) => crate::lanes::resolve(&lane_registry, a, &crate::lanes::project_home(&project), slug).lane_id() == Some(id.as_str()),
-            None => true,
-        })
+        .zip(&identity)
+        .filter(|(_, resolution)| resolution.lane_id() == Some(target_lane.id.as_str()))
+        .filter(|(a, _)| options.profile.is_none() || previous.as_ref().is_some_and(|r| r.pane_id == a.pane_id && recorded_profile(r) == profile.name))
+        .map(|(a, _)| a)
         .collect();
     if let Some(agent) = running.iter().max_by_key(|a| a.state_change_seq)
         && !options.new
     {
-        if let Some(record) = &previous {
-            sync_label(&herdr, &record.workspace_id, &label);
-        }
+        // The Space the coordinator is really in: the record may name a stale
+        // one, and this is the Space the record is rewritten to just below.
+        sync_label(&herdr, &agent.workspace_id, &label);
         let _ = herdr.agent_focus(&agent.pane_id);
         let session_name = session.name.clone().unwrap_or_default();
         let record = project.update_coordinator(|c| {
@@ -558,11 +582,7 @@ pub fn open(ctx: &Ctx, slug: &str, options: &OpenOptions) -> Result<()> {
         name_tab(&herdr, &record.tab_id);
         (record.workspace_id.clone(), record.tab_id.clone(), record.pane_id.clone())
     } else {
-        let workspace = previous
-            .as_ref()
-            .map(|record| record.workspace_id.clone())
-            .filter(|id| panes.iter().any(|p| &p.workspace_id == id && Path::new(&p.cwd).starts_with(&dir)));
-        let created = match workspace {
+        let created = match home_space(&herdr, previous.as_ref(), &panes) {
             Some(id) => {
                 sync_label(&herdr, &id, &label);
                 herdr.tab_create(&id, &dir, "coordinator", true)?
