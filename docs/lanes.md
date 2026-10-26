@@ -1,8 +1,10 @@
 # Lanes: several coordinators in one project
 
-> Design document. Nothing here is implemented: the code today has exactly one
-> coordinator record per project and no notion of a lane. Every line reference
-> was checked against the commit this document was written on.
+> This is a design document for a feature that is partly built: commit 1 of §12
+> exists (the registry, the five identity rules, the `Coordinators:` line and
+> `lane list`), and §3.5 says exactly what is and is not in the binary today.
+> Code is cited by symbol (`module::symbol()`, `src/file.rs`), never by line
+> number, because every commit of this series moves them.
 
 A **lane** is one line of work inside one project. Each lane has its own
 coordinator instance, its own slice of the task list and its own inbox. The
@@ -520,6 +522,8 @@ The CLI keeps its shape: `hp` below is the printed prefix
 
 ### 6.1 `hp open <slug> --lane <name> [--lane-name <label>]`
 
+*Not built yet: this section is commit 4 (§12).*
+
 - No `--lane`: the default lane, exactly today's behaviour (`--new`, `--profile`,
   `--tab`, `--rebind`, `--session` unchanged). Projects that never use lanes see
   no difference at all.
@@ -566,13 +570,13 @@ Of these, only `lane list` exists today (§3.5); the rest arrive with commit 4.
 
 | Command | Effect | 作用 |
 | --- | --- | --- |
-| `hp open <slug> --lane <name> [--lane-name <label>] [--profile P] [--new]` | Open or focus that lane's coordinator. A missing lane is created; an existing live one is focused. No `--lane`: the default lane, today's behaviour. | 打开或聚焦该 lane 的协调器：不存在就创建，存在且活着就聚焦。不传 `--lane` 就是默认 lane，即现有行为。 |
+| `hp open <slug> --lane <name> [--lane-name <label>] [--profile P] [--new]` | Open or focus that lane's coordinator. A missing lane is created; an existing live one is focused. No `--lane`: the default lane, today's behaviour. — not built yet (commit 4) | 打开或聚焦该 lane 的协调器：不存在就创建，存在且活着就聚焦。不传 `--lane` 就是默认 lane，即现有行为。 |
 | `hp lane adopt <lane>` | Claim **the current pane** as lane `<lane>`'s coordinator (reads `HERDR_PANE_ID`, `HERDR_SOCKET_PATH` and the agent session). For a tab the user started by hand. — not built yet (commit 4) | 把**当前 pane** 认领为 lane 的协调器（读 `HERDR_PANE_ID`、`HERDR_SOCKET_PATH` 和 agent session），用于用户手动开 tab 起 agent。 |
 | `hp lane list [--json]` | Every lane with the rule each live pane matched, thread and inbox counts, `last_active`, and `closed` lanes. **The counts come with commit 2; today's `lane list` prints neither** (every `Thread.lane` is still empty, so an implementation could only count 0, and a field that is always 0 misleads more than it says). | 列出所有 lane，含每个 live pane 命中的解析规则、线程数与 inbox 数、`last_active`，以及已 closed 的 lane。**线程数与 inbox 数随提交 2 提供；当前 `lane list` 不打印这两项**（现在所有 `Thread.lane` 都是空串，实现只能数出 0，印一个恒为 0 的字段比不印更误导）。 |
 | `hp lane assign <lane> <pane>` | The explicit handover: point the lane (and its threads) at another coordinator pane. The **only** thing that moves ownership. — not built yet (commit 4) | 显式接手：把该 lane 及其线程交给另一个协调器 pane。这是**唯一**会转移归属的命令。 |
-| `hp lane rename <lane> <label> [--name <name>]` | Change the display label, and optionally the CLI handle. The `id` never changes, so thread and inbox ownership never move. | 改显示名（可选改命令里的 handle）。`id` 不变，所以线程与 inbox 的归属不变。 |
-| `hp lane close <lane>` | Retire a lane: refused while any of its threads is `open`/`starting`; otherwise `status = closed`. A closed lane gets no `context` section, sidebar row or nudge, and its record and id stay. The coordinator process is left alone (§6.4). | 收起来：该 lane 还有 open/starting 线程就拒绝并列出；全部 resolve 后 `status = closed`。closed 的 lane 不再有 context 分区/侧栏行/nudge，记录和 id 保留；**不杀协调器进程**（§6.4）。 |
-| `hp lane open <lane>` | Undo a close: `status = open` again, and nothing else — no agent is started and no session is resumed. The output names the next step. | 恢复一个 closed 的 lane：只改 `status = open`，**不启动代理、不续 session**，输出会给出下一步。 |
+| `hp lane rename <lane> <label> [--name <name>]` | Change the display label, and optionally the CLI handle. The `id` never changes, so thread and inbox ownership never move. — not built yet (commit 4) | 改显示名（可选改命令里的 handle）。`id` 不变，所以线程与 inbox 的归属不变。 |
+| `hp lane close <lane>` | Retire a lane: refused while any of its threads is `open`/`starting`; otherwise `status = closed`. A closed lane gets no `context` section, sidebar row or nudge, and its record and id stay. The coordinator process is left alone (§6.4). — not built yet (commit 4) | 收起来：该 lane 还有 open/starting 线程就拒绝并列出；全部 resolve 后 `status = closed`。closed 的 lane 不再有 context 分区/侧栏行/nudge，记录和 id 保留；**不杀协调器进程**（§6.4）。 |
+| `hp lane open <lane>` | Undo a close: `status = open` again, and nothing else — no agent is started and no session is resumed. The output names the next step. — not built yet (commit 4) | 恢复一个 closed 的 lane：只改 `status = open`，**不启动代理、不续 session**，输出会给出下一步。 |
 
 Ownership moves belong to the user. Neither `open`, nor `adopt`, nor the ticker
 ever rewrites `Thread.lane`:
