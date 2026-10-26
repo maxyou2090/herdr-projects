@@ -283,10 +283,13 @@ fn recorded_kind(config: &crate::profiles::Config, record: &Coordinator) -> Stri
 }
 
 /// The lane `open` acts on: the one `--lane` names (created on the spot when it
-/// does not exist), else the registry's default lane. The registry is written
-/// first when the project has none (`Registry::ensure_written`, §10), because
-/// from this commit on `open` is the command that gives a project lanes.
-fn open_target(project: &Project, options: &OpenOptions) -> Result<(crate::lanes::Registry, crate::lanes::Lane)> {
+/// does not exist, or picked for it when the flag has no value), else the
+/// registry's default lane. The registry is written first when the project has
+/// none (`Registry::ensure_written`, §10), because from this commit on `open` is
+/// the command that gives a project lanes. `agents` is the session's live pane
+/// list: an empty `--lane` needs it to tell a lane whose coordinator is gone
+/// from one that is running.
+fn open_target(project: &Project, options: &OpenOptions, agents: &[Agent]) -> Result<(crate::lanes::Registry, crate::lanes::Lane)> {
     crate::lanes::Registry::ensure_written(project)?;
     let registry = crate::lanes::Registry::load(project)
         .with_context(|| format!("could not read {}", crate::lanes::registry_path(project).display()))?;
@@ -294,8 +297,9 @@ fn open_target(project: &Project, options: &OpenOptions) -> Result<(crate::lanes
         let lane = registry.default_lane().cloned().with_context(|| format!("`{}` has no default lane", project.slug))?;
         return Ok((registry, lane));
     };
+    // A bare `--lane` picks the line itself: reopen a free one, else make one.
     if handle.trim().is_empty() {
-        bail!("--lane may not be empty");
+        return auto_lane(project, options, agents);
     }
     if let Some(lane) = registry.find(handle).cloned() {
         if !lane.is_open() {
@@ -317,6 +321,92 @@ fn open_target(project: &Project, options: &OpenOptions) -> Result<(crate::lanes
         }
     };
     Ok((registry, lane))
+}
+
+/// `--lane` with no name: reopen a line that is free, or make one.
+///
+/// 1. The **default lane**, when it has no live coordinator. The everyday loop
+///    is "open it, close the tab, open it again", and the tasks and threads are
+///    filed under the default lane: a fresh `coordinator2` beside them would
+///    leave the new coordinator blind to all of it.
+/// 2. Else the lowest-numbered automatic lane (`coordinator<N>`) that has no
+///    live coordinator: a lane can be closed but never deleted, so "a new one
+///    every time" would fill `lane list` forever.
+/// 3. Else a new lane: the smallest N from 2 that no lane uses as its `name` or
+///    its `label`, so a lane the user named by hand is never shadowed. Both name
+///    and label are that handle (unless `--lane-name` says otherwise).
+///
+/// Under the project lock, like every other registry write.
+fn auto_lane(project: &Project, options: &OpenOptions, agents: &[Agent]) -> Result<(crate::lanes::Registry, crate::lanes::Lane)> {
+    let _lock = project.lock()?;
+    let mut registry = crate::lanes::Registry::load(project)
+        .with_context(|| format!("could not read {}", crate::lanes::registry_path(project).display()))?;
+    if let Some(lane) = reusable_lane(&registry, project, agents).cloned() {
+        return Ok((registry, lane));
+    }
+    let handle = free_lane_handle(&registry);
+    let label = options.lane_name.as_deref().filter(|label| !label.trim().is_empty()).unwrap_or(&handle).to_string();
+    let id = registry.create(&handle, &label).id.clone();
+    registry.save(project)?;
+    let lane = registry.get(&id).cloned().expect("just created");
+    Ok((registry, lane))
+}
+
+/// The lane a bare `--lane` reopens instead of making one (see [`auto_lane`] for
+/// the order). "No live coordinator" is `resolve` (§5.2) — the same answer the
+/// running branch uses, so the two never disagree. A closed lane is never
+/// reused: closing is the user's decision, and `lane open` is how it is undone.
+/// A name the user chose is never automatic, so it never matches step 2.
+fn reusable_lane<'a>(registry: &'a crate::lanes::Registry, project: &Project, agents: &[Agent]) -> Option<&'a crate::lanes::Lane> {
+    let home = crate::lanes::project_home(project);
+    let live: Vec<String> = agents
+        .iter()
+        .filter_map(|agent| crate::lanes::resolve(registry, agent, &home, &project.slug).lane_id().map(str::to_string))
+        .collect();
+    // 1. The default line: where the tasks and threads live.
+    if let Some(lane) = registry.get(&registry.default)
+        && free_for_reuse(lane, &live)
+    {
+        return Some(lane);
+    }
+    // 2. The lowest-numbered automatic line nobody is running.
+    registry
+        .lanes
+        .iter()
+        .filter(|lane| free_for_reuse(lane, &live))
+        .filter_map(|lane| auto_lane_number(&lane.name).map(|n| (n, lane)))
+        .min_by_key(|(n, _)| *n)
+        .map(|(_, lane)| lane)
+}
+
+/// Open, and no live pane resolves to it: the two conditions of a lane a bare
+/// `--lane` may take over.
+fn free_for_reuse(lane: &crate::lanes::Lane, live: &[String]) -> bool {
+    lane.is_open() && !live.iter().any(|id| id == &lane.id)
+}
+
+/// The N of an automatic handle (`coordinator<N>`), or `None` for a name the
+/// user chose: digits only, so `coordinator`, `coordinator2x` and `fixbug`
+/// never count as automatic.
+fn auto_lane_number(name: &str) -> Option<u32> {
+    let digits = name.strip_prefix("coordinator")?;
+    if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    digits.parse().ok()
+}
+
+/// The handle a bare `--lane` takes: the smallest `coordinator<N>`, N from 2,
+/// that no lane uses as its name or its label.
+fn free_lane_handle(registry: &crate::lanes::Registry) -> String {
+    let mut n = 2u32;
+    loop {
+        let handle = format!("coordinator{n}");
+        if !registry.lanes.iter().any(|lane| lane.name == handle || lane.label == handle) {
+            return handle;
+        }
+        n = n.saturating_add(1);
+    }
 }
 
 pub fn open(ctx: &Ctx, slug: &str, options: &OpenOptions) -> Result<()> {
@@ -346,14 +436,19 @@ pub fn open(ctx: &Ctx, slug: &str, options: &OpenOptions) -> Result<()> {
     // widen powers.
     let config = crate::profiles::load(&ctx.config_dir)?;
     let safety = project.safety(&ctx.config_dir)?;
+    // The session is read before the lane: a bare `--lane` reuses a lane whose
+    // coordinator is gone, which needs the live panes. An unreachable session is
+    // still reported below, after the session-ownership check.
+    let session = paths::resolve_session(&options.session, ctx.env, ctx.runner)?;
+    let socket = session.socket.to_string_lossy().into_owned();
+    let herdr = Herdr::new(ctx.env.herdr_bin(), &session.socket, ctx.runner);
+    let listed = herdr.agent_list();
     // The lane is resolved before the profile: an existing lane carries its
     // own default profile (§4.1), and `--lane` must be able to create one.
-    let (lane_registry, target_lane) = open_target(&project, options)?;
+    let (lane_registry, target_lane) = open_target(&project, options, listed.as_deref().unwrap_or_default())?;
     let lane_profile = options.lane.as_ref().and_then(|_| Some(target_lane.profile.clone()).filter(|profile| !profile.is_empty()));
     let profile = crate::profiles::resolve(&config, &safety, &settings, Role::Coordinator, options.profile.as_deref().or(lane_profile.as_deref()), slug)?;
     let kind = profile.agent().to_string();
-    let session = paths::resolve_session(&options.session, ctx.env, ctx.runner)?;
-    let socket = session.socket.to_string_lossy().into_owned();
     let prefix = current_prefix(&ctx.root)?;
     // The priming files are what make an agent in this folder the coordinator.
     project::write_priming(&project, &prefix)?;
@@ -386,10 +481,7 @@ pub fn open(ctx: &Ctx, slug: &str, options: &OpenOptions) -> Result<()> {
         previous = None;
     }
 
-    let herdr = Herdr::new(ctx.env.herdr_bin(), &session.socket, ctx.runner);
-    let agents = herdr
-        .agent_list()
-        .with_context(|| format!("the herdr session at {socket} is not reachable"))?;
+    let agents = listed.with_context(|| format!("the herdr session at {socket} is not reachable"))?;
     let label = crate::project::home_label(&settings.name, slug);
     // Canonical, because herdr reports a pane's physical working directory and
     // the identity check compares against it.

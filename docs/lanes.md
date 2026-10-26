@@ -527,6 +527,12 @@ The CLI keeps its shape: `hp` below is the printed prefix
 - No `--lane`: the default lane, exactly today's behaviour (`--new`, `--profile`,
   `--tab`, `--rebind`, `--session` unchanged). Projects that never use lanes see
   no difference at all.
+- `--lane` with no value picks the line itself: **the default lane** when it has
+  no live coordinator (close the tab, run it again, and you are back on the line
+  your tasks and threads are filed under), else the lowest `coordinator<N>` lane
+  that is open and idle, else the next new one — the smallest N from 2 that no
+  lane uses as its name or its label. A closed lane is never reopened this way
+  (`lane open` is), and a handle the user chose is never automatic.
 - `--lane <name>` that does not exist: create it (`c-<next>`), with
   `--lane-name` as its label if given, else the name as the label. Then open a
   coordinator for it — a new tab in the project's home Space when the default

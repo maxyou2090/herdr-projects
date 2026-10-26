@@ -77,8 +77,11 @@ enum Command {
         /// Move the project to this session when its recorded socket no longer exists
         #[arg(long)]
         rebind: bool,
-        /// Open or focus this lane's coordinator (default: the default lane)
-        #[arg(long, value_name = "NAME")]
+        /// Open or focus this lane's coordinator (default: the default lane).
+        /// Without a name (`--lane`) it reopens the default lane when that is
+        /// idle, else the lowest idle `coordinator<N>` lane, and only when every
+        /// one of them is running does it create the next one
+        #[arg(long, value_name = "NAME", num_args = 0..=1, default_missing_value = "")]
         lane: Option<String>,
         /// The display label when --lane creates a new lane (default: the name)
         #[arg(long, value_name = "LABEL", requires = "lane")]
