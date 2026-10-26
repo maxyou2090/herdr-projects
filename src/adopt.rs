@@ -66,6 +66,15 @@ pub fn adopt(ctx: &Ctx, slug: &str, pane: &str, title: &str, task: Option<String
     let branch = git(&["rev-parse", "--abbrev-ref", "HEAD"]).filter(|b| b != "HEAD").unwrap_or_default();
     let origin = git(&["remote", "get-url", "origin"]).unwrap_or_default();
 
+    // Same ownership rule as `thread start`: the record is created with the
+    // initiating coordinator's lane and nothing later rewrites it (§4.2). A
+    // pre-lane project asks Herdr for nothing extra and writes no lane.
+    let lane = if crate::lanes::split_in_use(&project) {
+        let agents = herdr.agent_list().unwrap_or_default();
+        crate::lanes::lane_of_initiator(ctx, &project, &agents)
+    } else {
+        String::new()
+    };
     let created = thread::allocate(&project, |t| {
         t.title = title.trim().to_string();
         t.kind = Kind::Adopted;
@@ -79,6 +88,7 @@ pub fn adopt(ctx: &Ctx, slug: &str, pane: &str, title: &str, task: Option<String
         t.workspace_id = agent.workspace_id.clone();
         t.tab_id = agent.tab_id.clone();
         t.pane_id = agent.pane_id.clone();
+        t.lane = lane;
     })?;
     let id = created.id.clone();
     let task = task.filter(|t| !t.trim().is_empty()).unwrap_or_else(|| DEFAULT_TASK.to_string());
@@ -170,7 +180,7 @@ pub fn adopt_workspace(ctx: &Ctx, args: &AdoptWorkspace) -> Result<()> {
 mod tests {
     use super::*;
     use crate::runner::fake::{fail, ok};
-    use crate::scenarios::{World, agent_json};
+    use crate::scenarios::{World, agent_json, agent_json_tokens};
 
     fn world_with_agent(state: &str, name: &str) -> (World, Project, String) {
         let world = World::new();
@@ -223,6 +233,26 @@ mod tests {
         assert!(!thread::load(&project, "t-0001").unwrap().prompt_pending);
         // The ticker never tries to start an agent in an adopted pane it found busy.
         assert_eq!(world.runner.count("agent start"), 0);
+    }
+
+    #[test]
+    fn an_adopted_thread_inherits_the_initiating_coordinators_lane() {
+        let (world, project, cwd) = world_with_agent("idle", "my-agent");
+        crate::lanes::Registry::ensure_written(&project).unwrap();
+        let mut registry = crate::lanes::Registry::load(&project).unwrap();
+        registry.create("books", "收藏");
+        registry.save(&project).unwrap();
+        let dir = project.canonical_dir().to_string_lossy().into_owned();
+        *world.agents.borrow_mut() = format!(
+            "[{},{}]",
+            agent_json("w5", "w5:t1", "w5:p1", &cwd, "my-agent", "idle"),
+            agent_json_tokens("w1", "w1:p1", &dir, &[("hp_project", "demo"), ("hp_lane", "c-2")]),
+        );
+        let socket = project.coordinator().unwrap().socket;
+        let env = crate::paths::Env::for_test(world.home.path(), &[("HERDR_PANE_ID", "w1:p1"), ("HERDR_SOCKET_PATH", &socket)]);
+        let ctx = Ctx { env: &env, root: world.root.clone(), config_dir: world.home.path().join("cfg"), runner: &world.runner, detached_ticker: false };
+        let t = adopt(&ctx, "demo", "w5:p1", "Adopted work", Some("Do it.".into())).unwrap();
+        assert_eq!(t.lane, "c-2");
     }
 
     #[test]

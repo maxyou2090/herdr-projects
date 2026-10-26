@@ -54,6 +54,25 @@ pub fn exists(project: &Project) -> bool {
     registry_path(project).is_file()
 }
 
+/// Whether lane-aware code may split this project into lanes. This is the
+/// single switch behind the compatibility promise (§10): a project with no
+/// `lanes.json` keeps today's single-file, single-value paths byte for byte,
+/// and only a project that really has a registry is sharded. Callers must use
+/// this instead of repeating `exists()` at every decision point.
+pub fn split_in_use(project: &Project) -> bool {
+    exists(project)
+}
+
+/// The id an empty `lane` field means: the project's default lane (§10).
+/// Without a registry this is the synthesized `c-1`, which is what every
+/// pre-lane record already means.
+pub fn default_lane_id(project: &Project) -> String {
+    Registry::for_project(project)
+        .default_lane()
+        .map(|lane| lane.id.clone())
+        .unwrap_or_else(|| FALLBACK_ID.to_string())
+}
+
 /// The project home as an identity question sees it: the folder
 /// `coordinator.json` records (the canonical path `open` wrote), else the
 /// canonical folder. The same string the old `works_in` test compared against.
@@ -538,10 +557,85 @@ pub fn resolve(registry: &Registry, agent: &Agent, project_home: &str, slug: &st
 
 /// Resolve a pane against its project: the registry on disk when there is one,
 /// else the synthesized single-lane view (§10). Read-only.
-#[cfg_attr(not(test), allow(dead_code))] // `prompt`, `place_tab`, `nudge` (commit 3)
 pub fn resolve_in_project(project: &Project, agent: &Agent) -> LaneResolution {
     let registry = Registry::for_project(project);
     resolve(&registry, agent, &project_home(project), &project.slug)
+}
+
+/// The lane a **new** thread record inherits: the lane the pane that ran
+/// `thread start` / `thread adopt` belongs to (`docs/lanes.md` §4.2). Only a
+/// `Known` answer writes a lane id; an ambiguous pane, an unknown pane and no
+/// pane at all all write the empty string, which reads as the default lane.
+/// `agents` is the whole agent list of the session `HERDR_PANE_ID` lives in —
+/// the caller already has it from `threads::session_view` / `adopt`.
+pub fn lane_of_initiator(ctx: &Ctx, project: &Project, agents: &[Agent]) -> String {
+    // A project that never used lanes keeps writing no lane at all: its new
+    // records read as the default lane by being empty (§10), and nothing about
+    // its files changes.
+    if !split_in_use(project) {
+        return String::new();
+    }
+    let Some(pane) = ctx.env.var("HERDR_PANE_ID").filter(|pane| !pane.is_empty()) else {
+        return String::new();
+    };
+    // `HERDR_SOCKET_PATH` is the session the pane belongs to; read the agent
+    // list there rather than trusting a view from another session. A command
+    // run outside Herdr has no socket and keeps the caller's `agents`.
+    let listed: Vec<Agent>;
+    let agents: &[Agent] = match ctx.env.var("HERDR_SOCKET_PATH") {
+        Some(socket) => {
+            listed = crate::herdr::Herdr::new(ctx.env.herdr_bin(), socket, ctx.runner).agent_list().unwrap_or_default();
+            &listed
+        }
+        None => agents,
+    };
+    let Some(agent) = agents.iter().find(|agent| agent.pane_id == pane && ours(agent, &project.slug)) else {
+        return String::new();
+    };
+    match resolve_in_project(project, agent) {
+        LaneResolution::Known { lane, .. } => lane,
+        LaneResolution::Ambiguous { .. } | LaneResolution::None => String::new(),
+    }
+}
+
+/// The lane a `context` is being read from — `HERDR_PANE_ID` resolved through
+/// §5.2, else the default lane — plus the lane an empty `lane` field means.
+/// `None` only when the project has no `lanes.json`: then nothing may be split
+/// (the zero-change promise for pre-lane projects).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Scope {
+    pub lane: String,
+    pub default_lane: String,
+}
+
+impl Scope {
+    /// Whether a record's `lane` field belongs to this reader's lane. An
+    /// empty field is the default lane (§10), never a third lane.
+    pub fn admits(&self, field: &str) -> bool {
+        if field.is_empty() { self.lane == self.default_lane } else { field == self.lane }
+    }
+}
+
+/// The scope of one `context` turn, from the session view the digest already
+/// read. A pane that resolves to no lane (ambiguous, unknown, outside Herdr)
+/// reads the default lane, as §8 specifies.
+pub fn reader_scope(project: &Project, view: &View) -> Option<Scope> {
+    if !split_in_use(project) {
+        return None;
+    }
+    let default_lane = view
+        .registry
+        .default_lane()
+        .map(|lane| lane.id.clone())
+        .unwrap_or_else(|| FALLBACK_ID.to_string());
+    let lane = view
+        .agents
+        .iter()
+        .find(|agent| agent.pane_id == view.this_pane && ours(agent, &view.slug))
+        .map(|agent| resolve(&view.registry, agent, &view.home, &view.slug))
+        .and_then(|resolution| resolution.lane_id().map(str::to_string))
+        .unwrap_or_else(|| default_lane.clone());
+    Some(Scope { lane, default_lane })
 }
 
 /// The lane id to write as a pane's `hp_lane` token, from the registry on disk
@@ -620,6 +714,34 @@ pub fn identity_line(view: &View) -> String {
     format!("Coordinators: {}\n", parts.join(" · "))
 }
 
+/// The per-lane counts `hp lane list` prints (§6.3). A thread with an empty
+/// `lane` counts for the default lane; an item with an empty lane likewise
+/// (§10). Without a registry the synthesized single lane counts everything,
+/// which is the same fact the old single-file view had.
+fn lane_counts(project: &Project) -> BTreeMap<String, LaneCounts> {
+    let registry = Registry::for_project(project);
+    let default_lane = registry
+        .default_lane()
+        .map(|lane| lane.id.clone())
+        .unwrap_or_else(|| FALLBACK_ID.to_string());
+    let mut counts: BTreeMap<String, LaneCounts> =
+        registry.lanes.iter().map(|lane| (lane.id.clone(), LaneCounts::default())).collect();
+    let effective = |field: &str| -> String {
+        if field.is_empty() { default_lane.clone() } else { field.to_string() }
+    };
+    for thread in crate::thread::list(project) {
+        if let Some(count) = counts.get_mut(&effective(&thread.lane)) {
+            count.threads += 1;
+        }
+    }
+    for item in crate::inbox::unhandled(project) {
+        if let Some(count) = counts.get_mut(&effective(&item.lane)) {
+            count.inbox += 1;
+        }
+    }
+    counts
+}
+
 /// One look at a project's live session. The two places §5.4 requires to say
 /// the same thing — `hp context`'s identity line and `hp lane list` — render
 /// from this one value, so they cannot drift apart. Reading it writes nothing:
@@ -634,6 +756,19 @@ pub struct View {
     /// False when Herdr could not be asked at all. A line is printed either
     /// way: "nothing printed" is how the week-long stall hid.
     pub reachable: bool,
+    /// Per-lane `(threads, unhandled inbox items)`, filled only by
+    /// [`View::with_counts`] so the identity line pays no file reads. An empty
+    /// map keeps the old row shape (the literal-only tests rely on that).
+    pub counts: BTreeMap<String, LaneCounts>,
+}
+
+/// The two counts §6.3 promises per lane: every thread record that names the
+/// lane (resolved ones included — a closed lane keeps its history), and the
+/// unhandled inbox items addressed to it.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct LaneCounts {
+    pub threads: usize,
+    pub inbox: usize,
 }
 
 impl View {
@@ -654,7 +789,15 @@ impl View {
             slug: project.slug.clone(),
             this_pane: ctx.env.var("HERDR_PANE_ID").unwrap_or("").to_string(),
             reachable: session.is_some(),
+            counts: BTreeMap::new(),
         }
+    }
+
+    /// Fills the per-lane counts for `hp lane list` (§6.3). One registry read
+    /// and two directory walks; `context` never calls this.
+    pub fn with_counts(mut self, project: &Project) -> View {
+        self.counts = lane_counts(project);
+        self
     }
 
     pub fn sightings(&self) -> Vec<Sighting> {
@@ -769,9 +912,13 @@ impl View {
                 .iter()
                 .map(|(pane, rule)| format!("{pane}({rule})"))
                 .collect();
+            let counts = match self.counts.get(&row.lane.id) {
+                Some(counts) => format!("\tthreads={}\tinbox={}", counts.threads, counts.inbox),
+                None => String::new(),
+            };
             let _ = writeln!(
                 out,
-                "{}\t{}\t{}\t{}\t{}\tlast_active={}\tpanes={}",
+                "{}\t{}\t{}\t{}\t{}\tlast_active={}\tpanes={}{}",
                 row.lane.id,
                 if row.is_default { "default" } else { "" },
                 row.lane.status.as_str(),
@@ -779,6 +926,7 @@ impl View {
                 row.lane.label,
                 if row.lane.last_active.is_empty() { "-" } else { &row.lane.last_active },
                 if panes.is_empty() { "-".to_string() } else { panes.join(" ") },
+                counts,
             );
         }
         if self.registry.lanes.is_empty() {
@@ -898,6 +1046,8 @@ pub fn list_json(view: &View) -> serde_json::Value {
                     "profile": row.lane.profile,
                     "goal": row.lane.goal,
                     "pane_id": row.lane.pane_id,
+                    "threads": view.counts.get(&row.lane.id).map(|counts| counts.threads).unwrap_or(0),
+                    "inbox": view.counts.get(&row.lane.id).map(|counts| counts.inbox).unwrap_or(0),
                     "orphan": view.orphan_ids().iter().any(|id| id == &row.lane.id),
                     "panes": row
                         .panes
@@ -912,7 +1062,7 @@ pub fn list_json(view: &View) -> serde_json::Value {
 
 pub fn lane_list(ctx: &Ctx, slug: &str, json: bool) -> Result<()> {
     let project = Project::load(&ctx.root, slug)?;
-    let view = View::load(ctx, &project);
+    let view = View::load(ctx, &project).with_counts(&project);
     if json {
         println!("{}", serde_json::to_string_pretty(&list_json(&view))?);
         return Ok(());
@@ -1012,6 +1162,7 @@ mod tests {
             slug: "demo".into(),
             this_pane: this_pane.into(),
             reachable,
+            counts: BTreeMap::new(),
         }
     }
 
@@ -1177,6 +1328,39 @@ mod tests {
         let line = identity_line(&view(&two, vec![agent("w1:p1", HOME)], "w1:p1", true));
         assert!(!line.contains("dir"), "{line}");
         assert!(line.contains("ambiguous: no token, no record match, 2 open lanes"), "{line}");
+    }
+
+    // ------------------------------------------------------ ownership input
+
+    #[test]
+    fn a_new_thread_inherits_the_lane_of_the_pane_that_started_it() {
+        let (world, project) = temp_project("demo");
+        let mut registry = Registry::synthesized(&project);
+        registry.create("books", "收藏");
+        registry.save(&project).unwrap();
+        let mut worker = agent("w2:p1", "/elsewhere");
+        worker.tokens.insert(TOKEN.into(), "c-2".into());
+        let runner = crate::runner::fake::FakeRunner::new();
+        let with_pane = |pane: &str| {
+            let env = crate::paths::Env::for_test(world.path(), &[("HERDR_PANE_ID", pane)]);
+            Ctx {
+                env: Box::leak(Box::new(env)) as &crate::paths::Env,
+                root: world.path().join("root"),
+                config_dir: world.path().join("cfg"),
+                runner: &runner,
+                detached_ticker: false,
+            }
+        };
+        // A known token names the lane.
+        assert_eq!(lane_of_initiator(&with_pane("w2:p1"), &project, &[worker.clone()]), "c-2");
+        // No `HERDR_PANE_ID`: the default lane.
+        assert_eq!(lane_of_initiator(&with_pane(""), &project, &[worker.clone()]), "");
+        // A pane the session does not list: the default lane.
+        assert_eq!(lane_of_initiator(&with_pane("w9:p9"), &project, &[worker]), "");
+        // Ambiguous (two open lanes, pane in the folder, no token): empty,
+        // never a guess.
+        let folder_pane = agent("w3:p1", HOME);
+        assert_eq!(lane_of_initiator(&with_pane("w3:p1"), &project, &[folder_pane]), "");
     }
 
     // ---------------------------------------------------------- the store
@@ -1678,6 +1862,45 @@ mod tests {
     }
 
     #[test]
+    fn lane_list_counts_threads_and_unhandled_items_for_each_lane() {
+        let (_world, project) = temp_project("demo");
+        let mut registry = Registry::synthesized(&project);
+        registry.create("books", "收藏");
+        registry.save(&project).unwrap();
+        crate::thread::allocate(&project, |t| {
+            t.title = "one".into();
+            t.lane = "c-2".into();
+            t.status = crate::thread::Status::Resolved;
+        })
+        .unwrap();
+        crate::thread::allocate(&project, |t| {
+            t.title = "two".into();
+            t.lane = "c-2".into();
+        })
+        .unwrap();
+        crate::inbox::write_in(&project, "c-2", "thread-state", "t-0001", "idle", "s", "").unwrap();
+        crate::inbox::write_in(&project, "c-1", "thread-state", "t-0002", "idle", "s", "").unwrap();
+        let counts = lane_counts(&project);
+        assert_eq!(counts["c-1"], LaneCounts { threads: 0, inbox: 1 });
+        assert_eq!(counts["c-2"], LaneCounts { threads: 2, inbox: 1 }, "resolved threads keep their lane's history");
+        let rendered = View {
+            registry,
+            agents: vec![],
+            home: HOME.into(),
+            slug: "demo".into(),
+            this_pane: "".into(),
+            reachable: true,
+            counts,
+        };
+        let text = rendered.list_text();
+        assert!(text.contains("c-1\tdefault\topen\tdefault\tDemo\tlast_active=-\tpanes=-\tthreads=0\tinbox=1"), "{text}");
+        assert!(text.contains("c-2\t\topen\tbooks\t收藏\tlast_active=-\tpanes=-\tthreads=2\tinbox=1"), "{text}");
+        let json = list_json(&rendered);
+        assert_eq!(json[1]["threads"], 2);
+        assert_eq!(json[1]["inbox"], 1);
+    }
+
+    #[test]
     fn lane_list_prints_the_identity_line_and_one_row_per_lane() {
         let registry = reg(
             vec![
@@ -1698,6 +1921,7 @@ mod tests {
             slug: "demo".into(),
             this_pane: "w1D3:p1".into(),
             reachable: true,
+            counts: BTreeMap::new(),
         };
         let text = rendered.list_text();
         let lines: Vec<&str> = text.lines().collect();
