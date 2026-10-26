@@ -4683,6 +4683,233 @@ fn open_lane_creates_the_lane_in_the_home_tab_and_writes_its_instance_and_token(
     assert!(error.contains("is closed") && error.contains("lane open c-2"), "{error}");
 }
 
+// ---------------------------------------------------- a bare `--lane` names one
+
+/// `open` options naming `lane` (`Some("")` is the flag with no value).
+fn open_options(world: &World, lane: Option<&str>) -> crate::coordinator::OpenOptions {
+    crate::coordinator::OpenOptions {
+        session: crate::paths::SessionFlags { session: None, socket: Some(world.home.path().join("a.sock")) },
+        rebind: false,
+        profile: None,
+        new: false,
+        here: false,
+        person: false,
+        lane: lane.map(str::to_string),
+        lane_name: None,
+    }
+}
+
+/// The `--label` of every recorded command whose display line contains
+/// `needle`: `tab create` and `workspace create` are given theirs that way.
+fn labels_of(runner: &FakeRunner, needle: &str) -> Vec<String> {
+    runner
+        .calls
+        .borrow()
+        .iter()
+        .filter(|cmd| cmd.display().contains(needle))
+        .filter_map(|cmd| cmd.args.iter().position(|arg| arg == "--label").map(|at| cmd.args[at + 1].clone()))
+        .collect()
+}
+
+/// A world where `open` puts its coordinator in a new tab of the home Space: a
+/// second tab is already there at a shell prompt, so the recorded pane is not
+/// reused. Every `tab create` is answered with a fresh tab.
+fn new_tab_world() -> (World, Project) {
+    let world = World::new();
+    let project = world.project("demo", "a.sock");
+    let dir = project.canonical_dir().to_string_lossy().into_owned();
+    *world.panes.borrow_mut() = format!("[{}]", pane_json("w1", "w1:t9", "w1:p9", &dir));
+    world.runner.on("workspace get", ok(r#"{"result":{"workspace":{"label":"Demo⠀"}}}"#));
+    let next = Rc::new(RefCell::new(2usize));
+    let counter = next.clone();
+    world.runner.on_fn(
+        |cmd| cmd.display().contains("tab create"),
+        move |_| {
+            let n = {
+                let mut counter = counter.borrow_mut();
+                let n = *counter;
+                *counter += 1;
+                n
+            };
+            Ok(ok(&format!(r#"{{"result":{{"root_pane":{{"workspace_id":"w1","tab_id":"w1:t{n}","pane_id":"w1:p{n}"}}}}}}"#)))
+        },
+    );
+    world.runner.on("agent start", ok(r#"{"result":{"agent":{"pane_id":"w1:p2","tab_id":"w1:t2","workspace_id":"w1","name":"hpc-demo","agent":"claude","agent_status":"idle"}}}"#));
+    world.runner.on("agent focus", ok(r#"{"result":{}}"#));
+    (world, project)
+}
+
+fn lane_registry(project: &Project, lanes: Vec<crate::lanes::Lane>, next: u32) {
+    crate::lanes::Registry { lanes, default: "c-1".into(), next }.save(project).unwrap();
+}
+
+fn lane_of(project: &Project, id: &str) -> crate::lanes::Lane {
+    crate::lanes::Registry::load(project).unwrap().get(id).cloned().unwrap_or_else(|| panic!("no lane {id}"))
+}
+
+#[test]
+fn open_without_a_lane_creates_no_lane_and_keeps_the_tab_name() {
+    let (world, project) = new_tab_world();
+    coordinator::open(&world.ctx(), "demo", &open_options(&world, None)).unwrap();
+    assert_eq!(crate::lanes::Registry::load(&project).unwrap().lanes.len(), 1, "only the synthesized default lane");
+    assert_eq!(labels_of(&world.runner, "tab create"), ["coordinator"], "the tab name is unchanged");
+}
+
+#[test]
+fn a_named_lane_is_created_with_that_name_and_label() {
+    let (world, project) = new_tab_world();
+    coordinator::open(&world.ctx(), "demo", &open_options(&world, Some("fixbug"))).unwrap();
+    let lane = lane_of(&project, "c-2");
+    assert_eq!((lane.name.as_str(), lane.label.as_str()), ("fixbug", "fixbug"));
+    // The tab is not named after the lane: it stays `coordinator`.
+    assert_eq!(labels_of(&world.runner, "tab create"), ["coordinator"]);
+}
+
+#[test]
+fn a_bare_lane_comes_back_to_the_default_lane_after_its_tab_is_closed() {
+    let (world, project) = new_tab_world();
+    // Nothing is running: the bare flag reopens the default lane (`c-1`), where
+    // the tasks and threads are filed, instead of making `coordinator2` blind
+    // to all of it. This is the everyday "close the tab, run it again".
+    coordinator::open(&world.ctx(), "demo", &open_options(&world, Some(""))).unwrap();
+    assert_eq!(crate::lanes::Registry::load(&project).unwrap().lanes.len(), 1, "no lane was made");
+    assert_eq!(project.coordinator().unwrap().pane_id, "w1:p2", "the default lane got the coordinator");
+    assert_eq!(lane_of(&project, "c-1").pane_id, "w1:p2");
+    assert_eq!(labels_of(&world.runner, "tab create"), ["coordinator"], "the tab is still `coordinator`");
+}
+
+#[test]
+fn a_bare_lane_makes_coordinator_two_while_the_default_lane_runs() {
+    let (world, project) = new_tab_world();
+    let dir = project.canonical_dir().to_string_lossy().into_owned();
+    // The default lane's coordinator is running: the bare flag makes the first
+    // automatic line beside it.
+    *world.agents.borrow_mut() = format!("[{}]", agent_json_tokens("w1", "w1:p1", &dir, &[("hp_project", "demo"), ("hp_lane", "c-1")]));
+    let ctx = world.ctx();
+    coordinator::open(&ctx, "demo", &open_options(&world, Some(""))).unwrap();
+    let lane = lane_of(&project, "c-2");
+    assert_eq!((lane.name.as_str(), lane.label.as_str()), ("coordinator2", "coordinator2"));
+    assert_eq!(labels_of(&world.runner, "tab create"), ["coordinator"], "the tab name never follows the lane");
+
+    // Naming the automatic handle focuses that line: no lane and no tab is made.
+    *world.agents.borrow_mut() = format!(
+        "[{},{}]",
+        agent_json_tokens("w1", "w1:p1", &dir, &[("hp_project", "demo"), ("hp_lane", "c-1")]),
+        agent_json_tokens("w4", "w4:p1", &dir, &[("hp_project", "demo"), ("hp_lane", "c-2")])
+    );
+    coordinator::open(&ctx, "demo", &open_options(&world, Some("coordinator2"))).unwrap();
+    assert_eq!(world.runner.count("agent focus w4:p1"), 1);
+    assert_eq!(world.runner.count("tab create"), 1, "no tab was made");
+    assert_eq!(crate::lanes::Registry::load(&project).unwrap().lanes.len(), 2, "no lane was made");
+}
+
+#[test]
+fn a_bare_lane_reuses_the_automatic_lane_whose_coordinator_is_gone() {
+    let (world, project) = new_tab_world();
+    let dir = project.canonical_dir().to_string_lossy().into_owned();
+    let ctx = world.ctx();
+    let live = |lanes: &[&str]| {
+        let panes: Vec<String> = lanes
+            .iter()
+            .enumerate()
+            .map(|(n, lane)| agent_json_tokens(&format!("w{}", 4 + n), &format!("w{}:p1", 4 + n), &dir, &[("hp_project", "demo"), ("hp_lane", lane)]))
+            .collect();
+        format!("[{}]", panes.join(","))
+    };
+
+    // Only the default lane runs: the bare flag makes coordinator2.
+    *world.agents.borrow_mut() = live(&["c-1"]);
+    coordinator::open(&ctx, "demo", &open_options(&world, Some(""))).unwrap();
+    assert_eq!(lane_of(&project, "c-2").pane_id, "w1:p2");
+
+    // Both automatic lines are running too: the only free line is a new one.
+    *world.agents.borrow_mut() = live(&["c-1", "c-2"]);
+    coordinator::open(&ctx, "demo", &open_options(&world, Some(""))).unwrap();
+    assert_eq!(lane_of(&project, "c-3").pane_id, "w1:p3");
+    assert_eq!(crate::lanes::Registry::load(&project).unwrap().lanes.len(), 3);
+
+    // coordinator2's tab is closed and the default lane still runs: the bare
+    // flag reopens coordinator2 — never `coordinator4`, and adds no lane, so
+    // open/close cycles cannot grow the lane list.
+    *world.agents.borrow_mut() = live(&["c-1"]);
+    coordinator::open(&ctx, "demo", &open_options(&world, Some(""))).unwrap();
+    assert_eq!(crate::lanes::Registry::load(&project).unwrap().lanes.len(), 3, "no lane was added");
+    assert_eq!(lane_of(&project, "c-2").pane_id, "w1:p4", "coordinator2 was reopened");
+    assert_eq!(lane_of(&project, "c-3").pane_id, "w1:p3", "coordinator3 was left alone");
+    assert_eq!(world.runner.count("tab create"), 3);
+}
+
+#[test]
+fn a_bare_lane_does_not_reuse_a_closed_lane_or_its_handle() {
+    let (world, project) = new_tab_world();
+    let dir = project.canonical_dir().to_string_lossy().into_owned();
+    // Two lanes the user closed — closed is never reopened behind their back —
+    // one holding the handle `coordinator2`, the other only the *label*
+    // `coordinator3`: the automatic name must be neither, so it is
+    // `coordinator4`.
+    lane_registry(
+        &project,
+        vec![
+            crate::lanes::Lane { id: "c-1".into(), name: "default".into(), label: "Demo⠀".into(), ..Default::default() },
+            crate::lanes::Lane { id: "c-2".into(), name: "coordinator2".into(), label: "抢修".into(), status: crate::lanes::Status::Closed, ..Default::default() },
+            crate::lanes::Lane { id: "c-3".into(), name: "hand".into(), label: "coordinator3".into(), status: crate::lanes::Status::Closed, ..Default::default() },
+        ],
+        4,
+    );
+    // The default lane is running, so it is no reuse candidate either.
+    *world.agents.borrow_mut() = format!("[{}]", agent_json_tokens("w1", "w1:p1", &dir, &[("hp_project", "demo"), ("hp_lane", "c-1")]));
+
+    coordinator::open(&world.ctx(), "demo", &open_options(&world, Some(""))).unwrap();
+    let lane = lane_of(&project, "c-4");
+    assert_eq!((lane.name.as_str(), lane.label.as_str()), ("coordinator4", "coordinator4"));
+    assert_eq!(lane_of(&project, "c-2").status, crate::lanes::Status::Closed, "the closed lane was not reopened");
+    assert_eq!(lane_of(&project, "c-2").pane_id, "");
+    assert_eq!(lane_of(&project, "c-3").status, crate::lanes::Status::Closed);
+}
+
+#[test]
+fn a_bare_lane_never_reuses_a_lane_the_user_named() {
+    let (world, project) = new_tab_world();
+    let dir = project.canonical_dir().to_string_lossy().into_owned();
+    // An open lane with no live coordinator, but the user named it `fixbug`:
+    // only `coordinator<N>` is automatic. The default lane runs, so the free
+    // line is a new `coordinator2`.
+    lane_registry(
+        &project,
+        vec![
+            crate::lanes::Lane { id: "c-1".into(), name: "default".into(), label: "Demo⠀".into(), ..Default::default() },
+            crate::lanes::Lane { id: "c-2".into(), name: "fixbug".into(), label: "fixbug".into(), ..Default::default() },
+        ],
+        3,
+    );
+    *world.agents.borrow_mut() = format!("[{}]", agent_json_tokens("w1", "w1:p1", &dir, &[("hp_project", "demo"), ("hp_lane", "c-1")]));
+
+    coordinator::open(&world.ctx(), "demo", &open_options(&world, Some(""))).unwrap();
+    let lane = lane_of(&project, "c-3");
+    assert_eq!((lane.name.as_str(), lane.label.as_str()), ("coordinator2", "coordinator2"));
+    assert_eq!(lane_of(&project, "c-2").pane_id, "", "the user's lane was not taken over");
+}
+
+#[test]
+fn a_bare_lane_skips_a_closed_default_lane() {
+    let (world, project) = new_tab_world();
+    // The user put the default lane away, and coordinator2 is free: the bare
+    // flag reopens coordinator2 and never flips `c-1` back open on its own.
+    lane_registry(
+        &project,
+        vec![
+            crate::lanes::Lane { id: "c-1".into(), name: "default".into(), label: "Demo⠀".into(), status: crate::lanes::Status::Closed, ..Default::default() },
+            crate::lanes::Lane { id: "c-2".into(), name: "coordinator2".into(), label: "coordinator2".into(), ..Default::default() },
+        ],
+        3,
+    );
+
+    coordinator::open(&world.ctx(), "demo", &open_options(&world, Some(""))).unwrap();
+    assert_eq!(lane_of(&project, "c-2").pane_id, "w1:p2", "coordinator2 was reopened");
+    assert_eq!(lane_of(&project, "c-1").status, crate::lanes::Status::Closed, "the closed default lane stays closed");
+    assert_eq!(crate::lanes::Registry::load(&project).unwrap().lanes.len(), 2, "no lane was made");
+}
+
 #[test]
 fn lane_adopt_refuses_the_three_cases_and_claims_the_current_pane_on_success() {
     let world = World::new();
