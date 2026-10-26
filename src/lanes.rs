@@ -1069,8 +1069,9 @@ impl View {
     ///
     /// A lane whose recorded pane is *not* listed is not degraded: that is an
     /// orphan, and [`LaneStatus::orphan`] says which is which so `lane list`
-    /// never tells a live pane it is gone.
-    fn lane_statuses(&self) -> Vec<LaneStatus> {
+    /// never tells a live pane it is gone. `doctor` also reads this list, which
+    /// is why it is public.
+    pub fn lane_statuses(&self) -> Vec<LaneStatus> {
         if !self.reachable {
             return Vec::new();
         }

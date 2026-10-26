@@ -5,7 +5,7 @@
 
 <h3 align="center">Run a whole project across your coding agents without handing each one its task or keeping track of who is doing what</h3>
 
-<p align="center">Herdr Projects lets you run a larger piece of work in <a href="https://herdr.dev">Herdr</a> when one agent isn't enough and managing five by hand is a job in itself. You talk to one coordinator agent. It starts a separate agent for each task on its own branch, gives every one of them the same goal, instructions and memory, and Herdr's own sidebar shows you which threads need you, which are ready for review and which are still working.</p>
+<p align="center">Herdr Projects lets you run a larger piece of work in <a href="https://herdr.dev">Herdr</a> when one agent isn't enough and managing five by hand is a job in itself. You talk to a coordinator agent for each line of work — a project can run several independent <b>lanes</b>, each with its own coordinator, its own task sections and its own inbox, over the same repositories, memory and settings. Each coordinator starts a separate agent for each task on its own branch, gives every one of them the same goal, instructions and memory, and Herdr's own sidebar shows you which threads need you, which are ready for review and which are still working.</p>
 
 <p align="center"><a href="https://github.com/eliasstravik/herdr-projects/blob/main/assets/herdr-projects-launch.mp4"><img src="assets/herdr-projects-launch.webp" width="88%" alt="Animation: you tell a coordinator what you want, it starts three threads that each work on their own branch, and an overview groups them as ready for review, waiting on you, and working" /></a></p>
 
@@ -127,6 +127,10 @@ In `~/.herdr-projects/<name>/` by default: `PROJECT.md` for your settings and st
 ### Do I have to start every thread through the coordinator?
 
 No. Run `herdr-projects thread start` yourself, or take an agent pane you already started and make it a thread with `thread adopt`. The `herdr-projects adopt-workspace` command turns the workspace you're in into a project with its agent as the first thread.
+
+### When should I use a lane instead of a new project?
+
+Use a lane when the work belongs to the same project — the same repositories, memory, instructions and safety settings — but is a separate line you want a separate coordinator to run: production fixes beside feature work, two product areas, or a long migration. Each lane gets its own coordinator, its own `TASKS.md` sections and its own inbox, while repositories, worktrees, branches, pull requests and memory stay shared. Start one with `herdr-projects open <project> --lane <name>`; `herdr-projects lane list <project>` shows every lane. Start a new project instead when the goal, repositories, memory or settings are genuinely different: a project keeps its own folder, memory and settings, not just its own line of work.
 
 ### What if the safety settings aren't enough?
 

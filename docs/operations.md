@@ -5,7 +5,7 @@ How Herdr Projects works, what it writes where, what its safety settings do and 
 ## How it works
 
 - **It relies on Herdr and nothing else.** No other plugin is needed or called. Pull requests open in your browser, text files open in a new Herdr tab running `$EDITOR`.
-- **A project is a folder.** `~/.herdr-projects/<slug>/` holds `AGENTS.md`, which tells any agent started in that folder that it is the coordinator and which commands to run. `CLAUDE.md` is a link to it. Several coordinators can share the folder; running several independent lines of work ("lanes"), each with its own coordinator, task section and inbox, is designed in [`lanes.md`](lanes.md) and not implemented yet.
+- **A project is a folder.** `~/.herdr-projects/<slug>/` holds `AGENTS.md`, which tells any agent started in that folder that it is a coordinator and which commands to run. `CLAUDE.md` is a link to it. One project can run several independent lines of work — **lanes** — each with its own coordinator instance, its own `TASKS.md` sections (`## <lane>/<list>`) and its own inbox; the project's repositories, worktrees, branches, pull-request flow, safety settings, memory and instructions stay shared. A project with no `lanes.json` keeps the old single-coordinator behaviour. [`lanes.md`](lanes.md) describes the model; `open --lane` starts a lane.
 - **The coordinator is an ordinary agent** following a skill (`herdr-projects skill` prints it). Plugin code does not route messages, plan work or decide anything.
 - **The binary does mechanics.** Starting a thread, copying reports, cleaning up after a resolve: each is one deterministic subcommand. It talks to Herdr through Herdr's CLI. The exception is the agent view (`focus`, `unfocus`, the default sort): Herdr 0.9.1 has no CLI for `agent.view.set`, so those send one JSON line to the socket.
 - **Agents report their own progress.** `herdr-projects report --percent N --activity "..."`, run by the agent in its pane, writes one small JSON file per pane under `<root>/.progress/` which the ticker shows on the pane's sub-line for five minutes. Thread briefs and the coordinator skill carry the instructions, so any agent reports; hooks in Claude Code, Codex, Droid, Gemini CLI and Copilot CLI (installed by `configure`) also inject them and a reminder, but only in a project's coordinator and local thread panes: every other pane gets no hook text and no record. A conversation keeps what a hook injected before 0.2.35; start a fresh session to drop it. There is no daemon and no database.
@@ -21,7 +21,7 @@ How Herdr Projects works, what it writes where, what its safety settings do and 
   PROJECT.md              settings (TOML between +++ lines) and your standing instructions
   AGENTS.md, CLAUDE.md    who is the coordinator, by working directory; written by the binary
   MEMORY.md, memory/      project memory; the coordinator's
-  TASKS.md                the task list, each task with optional indented notes; the coordinator's
+  TASKS.md                the task list; shared `## <list>` and per-lane `## <lane>/<list>` sections, with optional indented notes
   routines/<name>.md      routines, including pr-followup.md; the coordinator's
                           a scheduled prompt fires only when the project changed
                           since its last item: open threads' status, reports and
@@ -35,6 +35,10 @@ How Herdr Projects works, what it writes where, what its safety settings do and 
   inbox/, inbox/done/     events for the coordinator
   library/<id>/           home copy of files a thread produced
   .state/                 status, coordinator record, live coordinators, ticker state, lock
+  .state/lanes.json       the lane registry (exists only once a project has lanes)
+  .state/inbox-seen/<lane>.json  each lane's read state; a project without lanes keeps inbox-seen.json
+  .state/ticker.json      ticker state; with lanes, `nudged`, `renudged_at`, `box_pane` and
+                          `box_empty_since` are maps keyed by lane id instead of one value
 ~/.herdr-projects/.ticker.lock  .ticker.log  .progress/  .trash/
 ~/.config/herdr-projects/config.toml             yours: root, profiles, safety tables, machines
 ~/.config/herdr-projects/owned.json              what `configure` changed, for `unconfigure`
@@ -50,8 +54,9 @@ Every thread works from `<its working directory>/.herdr-project/<project>-<id>/`
 | Command | What it does |
 | --- | --- |
 | `new <name> [--goal] [--repo PATH[@MACHINE]]... [--thread-profile P] [--coordinator-profile P]` | Create a project folder. The profiles default to `[defaults]` in config.toml, else `claude`. |
-| `open <project> [--profile P] [--new] [--tab] [--session N \| --socket P] [--rebind]` | A coordinator agent in the project folder; focuses a running one. From a shell pane inside Herdr it runs in that pane and quitting it returns to the shell; `--tab`, the popup, actions and a terminal outside Herdr use a tab of the project's workspace. |
-| `context <project> [--peek]` | The digest the coordinator reads every turn. |
+| `open <project> [--profile P] [--new] [--tab] [--lane NAME] [--lane-name LABEL] [--session N \| --socket P] [--rebind]` | A coordinator agent in the project folder; focuses a running one. `--lane` opens or focuses that lane's coordinator and creates the lane when it does not exist; `--lane-name` sets a new lane's label. From a shell pane inside Herdr it runs in that pane and quitting it returns to the shell; `--tab`, the popup, actions and a terminal outside Herdr use a tab of the project's workspace. |
+| `context <project> [--peek]` | The digest the coordinator reads every turn; with lanes, the shared part plus the reader's own lane. |
+| `task add <project> <list> "<title>" [--owner O] [--lane L] [--notes T]`, `task move <project> "<title>" <list>`, `task done <project> "<title>"` | Safe `TASKS.md` writers: one locked read-modify-write, every byte outside the changed task preserved. `--lane` writes `## <lane>/<list>`; without it the list is shared. |
 | `assignable <project> [--refresh] [--check OWNER]` | Who TASKS.md tasks may be assigned to (see [Task owners](#task-owners)); `--check` refuses an owner that is not valid. |
 | `coordinator prompt <project> --text-file F` | A sentence to the coordinator (the popup's task keys use it). |
 | `thread start <project> --title T [--repo PATH] [--kind worktree\|tab\|checkout\|home] [--profile P] [--machine M] [--base REF] --task-file F [--from-task TITLE]` | New thread; `-` reads the task from standard input. `--kind` is the placement (default: worktree with `--repo`, home without; `tab` gives the thread a Space of its own; `checkout` runs on the repo's main checkout; `home` is a tab of the project's own Space on `threads/<id>/`); `--profile` is the agent, one the project allows. `--from-task` adds a TASKS.md task's notes and takes `--profile` and `--machine` from its owner. |
@@ -69,6 +74,23 @@ Every thread works from `<its working directory>/.herdr-project/<project>-<id>/`
 | `open-file <path>`, `open-url <url>` | Open a text file in a new tab with `$EDITOR`, or a PR in the browser. |
 | `ticker start \| run \| stop \| status`, `doctor [--fix]`, `skill` | Housekeeping. `doctor --fix` also relinks `~/.local/bin/herdr-projects`. |
 | `update [--check]` | Update to the newest release: fetch, rebuild, `doctor --fix`, restart the ticker. |
+
+## Lanes
+
+A lane is one line of work inside a project: its own coordinator pane, its own `TASKS.md` sections and its own inbox, over the project's shared repositories, worktrees, branches, memory and safety settings. A project without `.state/lanes.json` behaves exactly as it did before lanes.
+
+| Command | What it does |
+| --- | --- |
+| `open <project> --lane <name> [--lane-name <label>]` | Open or focus that lane's coordinator; a missing lane is created. No `--lane`: the default lane, the old behaviour. |
+| `lane list <project> [--json]` | Every lane, its status and default, the rule each live pane matched, thread and inbox counts, and any open lane whose coordinator is missing. |
+| `lane adopt <lane> [--project <slug>]` | Claim the current pane as that lane's coordinator (run it in the pane). For a tab you started by hand. |
+| `lane assign <lane> <pane> [--project <slug>]` | The explicit handover: point the lane at another coordinator pane. The only command that moves ownership. |
+| `lane rename <lane> <label> [--name <name>] [--project <slug>]` | Change the display label and optionally the CLI handle; the id never changes. |
+| `lane close <lane> [--project <slug>]` / `lane open <lane> [--project <slug>]` | Retire a lane once its threads are resolved / reopen it. `close` never kills the coordinator and `open` never starts one. |
+
+**Lane ids are unique inside one project, not across projects** — every project's first lane is `c-1`. So `lane adopt/assign/rename/close/open` take `--project <slug>`; without it the binary uses the project whose home the current pane works in, else the one project that has that lane, and refuses when several do. `lane list` and `task` take the project as their positional `<project>` argument.
+
+`hp task` is the only safe writer for `TASKS.md`: a lane's coordinator writes its own `## <lane>/<list>` sections and the shared `## <list>` sections, never another lane's. The skill enforces the convention; the command enforces the lock.
 
 ## Groups
 
@@ -89,7 +111,7 @@ Threads idle for `auto_resolve_days` are resolved (and cleaned) after a final co
 | Section | Keys |
 | --- | --- |
 | threads | `↵` jump to the pane · `1`-`9` send that Next line to the thread · `s` stop (Escape) · `r` restart with a kind picker · `a` ack · `x` resolve · `o` open the PR · `i` detail (report, Next list, files: `↵` opens, `y` copies the path) · `c` start or focus a coordinator of a chosen kind · `S` sweep |
-| tasks | `↵` jump to the delegated thread (or show the notes of a task without one) · `i` notes (a task with notes ends in `≡`) · `d` delegate · `m` done · `D` drop (each sends a sentence to the coordinator, which stays the only writer of TASKS.md) |
+| tasks | `↵` jump to the delegated thread (or show the notes of a task without one) · `i` notes (a task with notes ends in `≡`) · `d` delegate · `m` done · `D` drop (each sends a sentence to the coordinator, which writes the change with `hp task`) |
 | inbox | `↵` detail · `a` done |
 | routines | `↵` enable or disable · `i` the prompt |
 | settings | `↵` edit (also a safety row) · `Y` yolo mode on or off (asks before turning on) · `p` pause or resume · `A` archive · `X` delete (asks first). Unscoped, the rows are the all-projects safety defaults |
@@ -206,6 +228,10 @@ The coordinator runs the binary every turn, so allow-list it in your agent by su
   "Bash(<binary> --root <root> report:*)",
   "Bash(<binary> --root <root> inbox done:*)",
   "Bash(<binary> --root <root> list:*)",
+  "Bash(<binary> --root <root> lane list:*)",
+  "Bash(<binary> --root <root> task add:*)",
+  "Bash(<binary> --root <root> task move:*)",
+  "Bash(<binary> --root <root> task done:*)",
   "Bash(<binary> --root <root> routine list:*)",
   "Bash(<binary> --root <root> thread list:*)",
   "Bash(<binary> --root <root> thread show:*)",
@@ -221,7 +247,8 @@ The coordinator runs the binary every turn, so allow-list it in your agent by su
 
 - Allow `thread start` only where you've set `start_threads = "auto"`. Left off the list, every thread start meets your agent's own permission prompt.
 - With `thread keys` on the list, the coordinator answers a thread's questions and permission prompts itself, by the skill's rules, and its trust screens when `trust_screens` is `coordinator`. Remove it to confirm each answer first.
-- Never allow `thread resolve`, `sweep`, `delete`, `rename`, `archive`, `routine approve`, `configure` or `unconfigure`.
+- With lanes, the split is: **allow** `context`, `lane list`, `task add`, `task move`, `task done` and the thread's read-only commands; **keep behind your agent's permission prompt** `lane adopt`, `lane assign`, `lane close`, `lane open`, `lane rename`, `thread resolve`, `sweep` and `routine approve`. The first group is read plus safe write; the second changes ownership or lifecycle — the same level as `thread resolve`. The thread steering commands in the list above (`thread prompt`, `thread next`, `thread keys`, `thread ack`, `thread restart`) stay allowed as before.
+- Never allow `lane adopt`, `lane assign`, `lane close`, `lane open`, `lane rename`, `thread resolve`, `sweep`, `delete`, `rename`, `archive`, `routine approve`, `configure` or `unconfigure`.
 
 ## What the safety settings do and don't stop
 
