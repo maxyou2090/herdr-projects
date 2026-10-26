@@ -168,6 +168,13 @@ grouping key and lifecycle (`src/sidebar.rs`, `src/grouping.rs`,
 `skill/COORDINATOR.md` with the ambiguous-pane warning in `hp doctor`
 (`src/doctor.rs`), both added by commit 7.
 
+`coordinator::open` asks the same resolver for "is a coordinator running"
+(`lanes::classify_all`, `src/coordinator.rs`), so a coordinator whose shell has
+left the project folder is focused instead of being answered with a second
+agent on the same session; and a new coordinator tab goes to the recorded home
+Space for as long as that Space exists (`coordinator::home_space`, same file),
+not only while one of its panes works in the folder.
+
 | In the binary | Where |
 |---|---|
 | `context`'s `Coordinators:` line, every turn | `lanes::identity_line` |
