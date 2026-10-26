@@ -78,11 +78,18 @@ pub fn thread_display(thread: &Thread) -> String {
     format!("{} · {}", thread.id, thread.title)
 }
 
-/// A coordinator's row name: the project's name, marked as its group's head
-/// in the agents list (see `grouping::HEAD_MARK`).
-pub fn coordinator_display(project: &Project) -> String {
+/// A coordinator's row name: the project's name, plus ` · <lane label>` when
+/// the project has a lane registry (`docs/lanes.md` §9), marked as its group's
+/// head in the agents list (see `grouping::HEAD_MARK`). The gate is the
+/// registry, not the lane count: a project that never wrote `lanes.json` reads
+/// exactly as before, and a project with lanes shows them even for one lane —
+/// including the default — so two coordinators are never two identical rows.
+pub fn coordinator_display(project: &Project, lane: Option<&str>) -> String {
     let name = project.read_project_md().map(|(s, _)| project::display_name(&s.name, &project.slug)).unwrap_or_else(|_| project.slug.clone());
-    format!("{name}{}", crate::grouping::HEAD_MARK)
+    match crate::lanes::display_label(project, lane) {
+        Some(label) => format!("{name} · {label}{}", crate::grouping::HEAD_MARK),
+        None => format!("{name}{}", crate::grouping::HEAD_MARK),
+    }
 }
 
 /// Reports one pane's row: display name, project, rank and — for a
@@ -167,10 +174,14 @@ pub fn sub_line(state_line: &str, activity: &str) -> String {
 }
 
 /// The groups of a project's open threads, as the ticker last persisted them.
+/// A closed lane's threads are not counted (§9): `needs-you` and the project
+/// row must not carry a lane that has been put away. Without a registry every
+/// thread counts, exactly as before.
 pub fn recorded_groups(project: &Project) -> Vec<Group> {
     crate::thread::list(project)
         .into_iter()
         .filter(|t| t.status != crate::thread::Status::Resolved)
+        .filter(|t| crate::lanes::thread_visible(project, &t.lane))
         .filter_map(|t| Group::from_token(&t.last_group))
         .collect()
 }
@@ -741,6 +752,41 @@ sidebar = { agents = { rows = [[{ token = "$hp_top", fg = "#cba6f7", bold = true
         assert_eq!(state_line(Group::Idle, &t, &live("idle"), now), "idle");
         let no_pr = Thread { pr: String::new(), ..t };
         assert_eq!(state_line(Group::ReadyForReview, &no_pr, &live("idle"), now), "review · report");
+    }
+
+    #[test]
+    fn a_coordinator_row_names_its_lane_exactly_when_the_registry_exists() {
+        let world = crate::scenarios::World::new();
+        let project = world.project("demo", "a.sock");
+        let mark = crate::grouping::HEAD_MARK;
+        // No registry: today's row, byte for byte, and no invented label.
+        assert_eq!(coordinator_display(&project, None), format!("Demo{mark}"));
+        assert_eq!(coordinator_display(&project, Some("c-1")), format!("Demo{mark}"));
+        // One lane **with** a registry still shows it: the gate is the file,
+        // not the lane count (§9).
+        crate::lanes::Registry {
+            lanes: vec![crate::lanes::Lane { id: "c-1".into(), name: "fix".into(), label: "抢修".into(), ..Default::default() }],
+            default: "c-1".into(),
+            next: 2,
+        }
+        .save(&project)
+        .unwrap();
+        assert_eq!(coordinator_display(&project, Some("c-1")), format!("Demo · 抢修{mark}"));
+        crate::lanes::Registry {
+            lanes: vec![
+                crate::lanes::Lane { id: "c-1".into(), name: "fix".into(), label: "抢修".into(), ..Default::default() },
+                crate::lanes::Lane { id: "c-2".into(), name: "books".into(), label: "收藏".into(), ..Default::default() },
+            ],
+            default: "c-1".into(),
+            next: 3,
+        }
+        .save(&project)
+        .unwrap();
+        // With a registry even the default shows its lane, so rows differ.
+        assert_eq!(coordinator_display(&project, Some("c-1")), format!("Demo · 抢修{mark}"));
+        assert_eq!(coordinator_display(&project, Some("c-2")), format!("Demo · 收藏{mark}"));
+        // A pane that resolved to no lane is not given a label by guess.
+        assert_eq!(coordinator_display(&project, None), format!("Demo{mark}"));
     }
 
     #[test]

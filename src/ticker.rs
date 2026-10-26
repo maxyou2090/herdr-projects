@@ -548,17 +548,30 @@ fn part(ctx: &Ctx, project: &Project, record: &project::Coordinator, coordinator
         (report, text)
     };
     let mut panes: Vec<crate::grouping::PaneRow> = Vec::new();
+    // A closed lane takes no sidebar row (§6.4); its live pane is still on the
+    // `Coordinators:` line and in `lane list`, and is shown there, not here.
     let recorded = (!record.pane_id.is_empty()).then(|| record.pane_id.clone());
-    for pane in coordinators.iter().map(|c| c.pane_id.clone()).chain(recorded) {
+    for pane in coordinators
+        .iter()
+        .filter(|c| crate::lanes::coordinator_visible(project, &c.lane))
+        .map(|c| c.pane_id.clone())
+        .chain(recorded.filter(|_| crate::lanes::coordinator_visible(project, &crate::lanes::default_lane_id(project))))
+    {
         if panes.iter().any(|p| p.pane == pane) {
             continue;
         }
+        let lane = coordinators
+            .iter()
+            .find(|c| c.pane_id == pane)
+            .map(|c| c.lane.clone())
+            .unwrap_or_else(|| crate::lanes::default_lane_id(project));
         let (report, text) = activity(&pane);
         let line = coordinators.iter().find(|c| c.pane_id == pane).map(|c| coordinator::row_state(c, report.as_ref()).1).unwrap_or_default();
         let sub = if paused { String::new() } else { crate::sidebar::sub_line(&line, &text) };
-        panes.push(crate::grouping::PaneRow { key: crate::grouping::coordinator_key(slug, &pane), pane, sub });
+        let rank = crate::lanes::coordinator_rank(project, &lane);
+        panes.push(crate::grouping::PaneRow { key: crate::grouping::coordinator_key(slug, rank, &pane), pane, sub });
     }
-    for t in &threads {
+    for t in threads.iter().filter(|t| crate::lanes::thread_visible(project, &t.lane)) {
         let rank = thread::Group::from_token(&t.last_group).map(thread::Group::rank).unwrap_or(9);
         if !t.pane_id.is_empty() {
             let sub = if paused { String::new() } else { crate::sidebar::sub_line(&t.state_line, &activity(&t.pane_id).1) };
@@ -917,7 +930,7 @@ fn tick_cheap(ctx: &Ctx, project: &Project, sessions: &mut Sessions) -> Result<O
         // A pane the resolver could not place keeps no claim at all: rule 4
         // never assigns an `Ambiguous` pane a lane.
         let lane = (!c.lane.is_empty()).then(|| c.lane.clone());
-        crate::sidebar::report_pane(&herdr, &c.pane_id, &crate::sidebar::coordinator_display(project), slug, group, lane.as_deref());
+        crate::sidebar::report_pane(&herdr, &c.pane_id, &crate::sidebar::coordinator_display(project, lane.as_deref()), slug, group, lane.as_deref());
     }
 
     let pass = thread_pass(project, &herdr, &record.socket, &open_threads(project, false), &agents, &panes, None)?;
@@ -1136,6 +1149,34 @@ mod tests {
         assert_eq!(decide_start(&held("v0"), "v1", false), StartAction::StopThenSpawn);
         // A stop in progress: finish it, then spawn.
         assert_eq!(decide_start(&held("v1"), "v1", true), StartAction::StopThenSpawn);
+    }
+
+    #[test]
+    fn the_sidebar_part_carries_lane_rank_and_drops_a_closed_lane() {
+        let world = crate::scenarios::World::new();
+        let project = world.project("demo", "a.sock");
+        crate::lanes::Registry {
+            lanes: vec![
+                crate::lanes::Lane { id: "c-1".into(), name: "fix".into(), label: "抢修".into(), pane_id: "w1:p1".into(), ..Default::default() },
+                crate::lanes::Lane { id: "c-2".into(), name: "books".into(), label: "收藏".into(), pane_id: "w9:p9".into(), ..Default::default() },
+                crate::lanes::Lane { id: "c-3".into(), name: "old".into(), label: "归档".into(), pane_id: "w8:p8".into(), status: crate::lanes::Status::Closed, ..Default::default() },
+            ],
+            default: "c-1".into(),
+            next: 4,
+        }
+        .save(&project)
+        .unwrap();
+        let record = project.coordinator().unwrap();
+        // Deliberately not in declaration order: the keys, not the input, sort.
+        let live = vec![
+            crate::coordinator::LivePane { pane_id: "w9:p9".into(), lane: "c-2".into(), ..Default::default() },
+            crate::coordinator::LivePane { pane_id: "w1:p1".into(), lane: "c-1".into(), ..Default::default() },
+            crate::coordinator::LivePane { pane_id: "w8:p8".into(), lane: "c-3".into(), ..Default::default() },
+        ];
+        let part = part(&world.ctx(), &project, &record, &live, &[], false);
+        let mut keys: Vec<&str> = part.panes.iter().map(|row| row.key.as_str()).collect();
+        keys.sort();
+        assert_eq!(keys, ["demo!0!00!w1:p1", "demo!0!01!w9:p9"], "lane rank, then pane; the closed lane has no row");
     }
 
     #[test]

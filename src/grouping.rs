@@ -73,8 +73,17 @@ pub struct ProjectPart {
 pub type Parts = BTreeMap<String, ProjectPart>;
 
 /// `!` sorts before every slug character, so keys sort as their slugs do.
-pub fn coordinator_key(slug: &str, pane: &str) -> String {
-    format!("{slug}!0!{pane}")
+///
+/// With lanes (`docs/lanes.md` §9) the key carries the lane's rank between the
+/// `!0!` coordinator marker and the pane, so coordinators sort by lane and
+/// panes break ties inside a lane. The rank is fixed-width: keys are sorted as
+/// plain strings, and `10` would otherwise sort before `2`. `None` — a project
+/// with no registry — keeps today's two-part key exactly.
+pub fn coordinator_key(slug: &str, lane_rank: Option<usize>, pane: &str) -> String {
+    match lane_rank {
+        Some(rank) => format!("{slug}!0!{rank:02}!{pane}"),
+        None => format!("{slug}!0!{pane}"),
+    }
 }
 
 pub fn thread_key(slug: &str, rank: u8, id: &str) -> String {
@@ -303,13 +312,13 @@ mod tests {
 
     fn parts() -> Parts {
         let mut parts = Parts::new();
-        parts.insert("beta".into(), ProjectPart { panes: vec![row("b1", coordinator_key("beta", "b1"), "")], home: "wb".into(), spaces: vec!["wb".into()] });
+        parts.insert("beta".into(), ProjectPart { panes: vec![row("b1", coordinator_key("beta", None, "b1"), "")], home: "wb".into(), spaces: vec!["wb".into()] });
         parts.insert(
             "alpha".into(),
             ProjectPart {
                 panes: vec![
                     row("a2", thread_key("alpha", 4, "t-0002"), "~40% · Writing"),
-                    row("a1", coordinator_key("alpha", "a1"), ""),
+                    row("a1", coordinator_key("alpha", None, "a1"), ""),
                     row("a3", thread_key("alpha", 1, "t-0003"), "review · report"),
                 ],
                 home: "wa".into(),
@@ -492,6 +501,55 @@ mod tests {
         }
         assert!(quiet >= 5, "workspace.move kept firing: {:?}", list.borrow());
         assert_eq!(*list.borrow(), s(&["wP2", "wP3", "wP4", "wa", "repo", "wt2", "wt3", "wb", "mine"]));
+    }
+
+    #[test]
+    fn coordinators_sort_by_lane_declaration_order_and_the_rank_is_fixed_width() {
+        let world = crate::scenarios::World::new();
+        let project = world.project("demo", "a.sock");
+        // Eleven lanes, so rank 10 has to sort after 9: `{rank:02}` is what
+        // keeps a plain string sort honest (`10` sorts before `2` without it).
+        let lanes: Vec<crate::lanes::Lane> = (1..=11)
+            .map(|n| crate::lanes::Lane { id: format!("c-{n}"), name: format!("lane-{n}"), label: format!("L{n}"), ..Default::default() })
+            .collect();
+        crate::lanes::Registry { lanes, default: "c-1".into(), next: 12 }.save(&project).unwrap();
+        // Declaration order, the default first.
+        assert_eq!(crate::lanes::coordinator_rank(&project, "c-1"), Some(0));
+        assert_eq!(crate::lanes::coordinator_rank(&project, "c-2"), Some(1));
+        assert_eq!(crate::lanes::coordinator_rank(&project, "c-10"), Some(9));
+        assert_eq!(crate::lanes::coordinator_rank(&project, "c-11"), Some(10));
+        let mut keys: Vec<(String, String)> = (1..=11)
+            .map(|n| {
+                let id = format!("c-{n}");
+                let key = coordinator_key("demo", crate::lanes::coordinator_rank(&project, &id), &format!("w{n}:p1"));
+                (key, id)
+            })
+            .collect();
+        keys.sort();
+        let order: Vec<&str> = keys.iter().map(|(_, id)| id.as_str()).collect();
+        assert_eq!(order, ["c-1", "c-2", "c-3", "c-4", "c-5", "c-6", "c-7", "c-8", "c-9", "c-10", "c-11"]);
+        assert!(coordinator_key("demo", Some(9), "w9:p1") < coordinator_key("demo", Some(10), "w10:p1"));
+        // A pane that resolved to no lane ranks after every lane.
+        assert_eq!(crate::lanes::coordinator_rank(&project, ""), Some(11));
+        // The default lane comes first even when it is declared second.
+        let swapped = world.project("swapped", "c.sock");
+        crate::lanes::Registry {
+            lanes: vec![
+                crate::lanes::Lane { id: "c-1".into(), name: "one".into(), ..Default::default() },
+                crate::lanes::Lane { id: "c-2".into(), name: "two".into(), ..Default::default() },
+            ],
+            default: "c-2".into(),
+            next: 3,
+        }
+        .save(&swapped)
+        .unwrap();
+        assert_eq!(crate::lanes::coordinator_rank(&swapped, "c-2"), Some(0));
+        assert_eq!(crate::lanes::coordinator_rank(&swapped, "c-1"), Some(1));
+
+        // No registry: today's two-part key, exactly.
+        let plain = world.project("plain", "b.sock");
+        assert_eq!(crate::lanes::coordinator_rank(&plain, "c-1"), None);
+        assert_eq!(coordinator_key("plain", crate::lanes::coordinator_rank(&plain, "c-1"), "w1:p1"), "plain!0!w1:p1");
     }
 
     #[test]

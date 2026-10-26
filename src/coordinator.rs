@@ -663,7 +663,8 @@ pub fn row_state(pane: &LivePane, report: Option<&crate::progress::Record>) -> (
 /// read exactly as they did before lanes.
 pub fn report_tokens(herdr: &Herdr, project: &Project, pane_id: &str) {
     let lane = crate::lanes::token_for_pane(project, pane_id);
-    crate::sidebar::report_pane(herdr, pane_id, &crate::sidebar::coordinator_display(project), &project.slug, crate::thread::Group::Idle, lane.as_deref());
+    let display = crate::sidebar::coordinator_display(project, lane.as_deref());
+    crate::sidebar::report_pane(herdr, pane_id, &display, &project.slug, crate::thread::Group::Idle, lane.as_deref());
 }
 
 /// Renames a workspace whose label is not the project's display name — the
@@ -704,6 +705,14 @@ fn name_tab(herdr: &Herdr, tab_id: &str) {
 /// caller that resolves to no lane is refused when several lanes could be
 /// meant, naming `hp lane list` — never guessed.
 pub fn prompt(ctx: &Ctx, slug: &str, text: &str) -> Result<()> {
+    prompt_to(ctx, slug, text, None)
+}
+
+/// [`prompt`] with an **explicit** lane: the popup's `d`/`m`/`D` keys name the
+/// task's lane, so a plugin pane that resolves to nothing still has exactly one
+/// honest destination (§9, §12 commit 6). The lane must exist and be open; an
+/// unknown or closed handle is an error, never a fallback to the default lane.
+pub fn prompt_to(ctx: &Ctx, slug: &str, text: &str, lane: Option<&str>) -> Result<()> {
     let project = Project::load(&ctx.root, slug)?;
     let text = text.trim();
     if text.is_empty() {
@@ -712,7 +721,20 @@ pub fn prompt(ctx: &Ctx, slug: &str, text: &str) -> Result<()> {
     let view = crate::threads::session_view(ctx, &project).with_context(|| format!("the herdr session of `{slug}` is not reachable; run `open {slug}` first"))?;
     let record = project.coordinator().unwrap_or_default();
     let ready = |a: &&Agent| a.agent_status != "blocked" && a.agent_status != "unknown";
-    let (target, missing) = match prompt_lane(ctx, &project, &record, &view.agents)? {
+    let lane = match lane {
+        Some(handle) => {
+            let registry = crate::lanes::Registry::load(&project)
+                .with_context(|| format!("`{slug}` has no lanes yet; run `open {slug} --lane <name>` first"))?;
+            let lane = registry.find(handle).with_context(|| format!("no lane `{handle}` in `{slug}`; `hp lane list {slug}` shows its lanes"))?;
+            if !lane.is_open() {
+                let name = if lane.label.is_empty() { &lane.name } else { &lane.label };
+                bail!("lane `{name}` ({}) is closed; reopen it with `lane open {}` first", lane.id, lane.id);
+            }
+            Some(lane.id.clone())
+        }
+        None => prompt_lane(ctx, &project, &record, &view.agents)?,
+    };
+    let (target, missing) = match lane {
         // No registry: today's pick, over every pane the one record matches.
         None => (
             view.agents.iter().filter(|a| is_coordinator(&record, a)).filter(ready).max_by_key(|a| a.state_change_seq),

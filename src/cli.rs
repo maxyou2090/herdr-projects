@@ -409,6 +409,9 @@ enum CoordinatorCommand {
     /// Send a sentence to the project's coordinator (the popup's task keys use this)
     Prompt {
         slug: String,
+        /// The lane to send to (by id, name or label); default: the caller's own
+        #[arg(long, value_name = "LANE")]
+        lane: Option<String>,
         /// The text; `-` reads standard input
         #[arg(long, value_name = "FILE")]
         text_file: String,
@@ -796,9 +799,12 @@ pub fn run() -> Result<()> {
             )
         }
         Command::Coordinator { command } => match command {
-            CoordinatorCommand::Prompt { slug, text_file } => {
+            CoordinatorCommand::Prompt { slug, lane, text_file } => {
                 let text = read_text(&text_file)?;
-                coordinator::prompt(&ctx, &slug, &text)
+                match lane.as_deref() {
+                    Some(lane) => coordinator::prompt_to(&ctx, &slug, &text, Some(lane)),
+                    None => coordinator::prompt(&ctx, &slug, &text),
+                }
             }
         },
         Command::Context { slug, peek } => coordinator::context(&ctx, &slug, peek),

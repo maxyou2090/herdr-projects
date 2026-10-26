@@ -82,7 +82,10 @@ pub fn empty(ctx: &Ctx, project: &Project, herdr: &Herdr, include_focused: bool)
                 in_use.push(t.workspace_id);
             }
         }
-        coordinators.extend(other.coordinator().map(|c| c.workspace_id));
+        // Every open lane's Space, not just the default lane's (§9): a lane
+        // whose coordinator still lives in a home Space keeps it from the
+        // orphan sweep. A closed lane protects nothing (§6.4).
+        coordinators.extend(crate::lanes::open_spaces(&other));
     }
     recorded.retain(|(id, _)| !in_use.contains(id) && !coordinators.contains(id));
     own.retain(|(id, _, _)| !in_use.contains(id) && !coordinators.contains(id));
@@ -588,6 +591,56 @@ mod tests {
         assert_eq!(close(&f), 0);
         f.busy.borrow_mut().clear();
         assert_eq!(close(&f), 1);
+    }
+
+    /// Two lanes with two coordinator panes; `live` records the second lane's
+    /// pane in `w8`, the orphan home Space, which only the lane keeps alive.
+    fn two_lanes_in(project: &Project, lane: crate::lanes::Status) {
+        crate::lanes::Registry {
+            lanes: vec![
+                crate::lanes::Lane { id: "c-1".into(), name: "fix".into(), label: "抢修".into(), pane_id: "w1:p1".into(), ..Default::default() },
+                crate::lanes::Lane { id: "c-2".into(), name: "books".into(), label: "收藏".into(), pane_id: "w8:p2".into(), status: lane, ..Default::default() },
+            ],
+            default: "c-1".into(),
+            next: 3,
+        }
+        .save(project)
+        .unwrap();
+        crate::coordinator::save_live(
+            project,
+            &[crate::coordinator::LivePane { pane_id: "w8:p2".into(), workspace_id: "w8".into(), lane: "c-2".into(), ..Default::default() }],
+        )
+        .unwrap();
+    }
+
+    fn with_home_and_a_lane(lane: crate::lanes::Status) -> Fixture {
+        let f = fixture();
+        f.workspaces.borrow_mut().push(home_json(&f));
+        *f.world.panes.borrow_mut() = format!(
+            "[{},{},{}]",
+            f.world.coordinator_pane(&f.project),
+            pane_json("w9", "w9:t1", "w9:p1", &f.repo),
+            pane_json("w8", "w8:t2", "w8:p2", "/tmp")
+        );
+        two_lanes_in(&f.project, lane);
+        f
+    }
+
+    #[test]
+    fn an_open_lane_protects_its_home_space_and_a_closed_lane_does_not() {
+        // Open: the lane's coordinator lives in w8, so the sweep keeps it and
+        // closes only the repository's primary Space.
+        let f = with_home_and_a_lane(crate::lanes::Status::Open);
+        assert_eq!(close(&f), 1);
+        {
+            let calls = f.world.runner.calls.borrow();
+            assert!(!calls.iter().any(|c| c.args.ends_with(&["close".to_string(), "w8".to_string()])), "an open lane keeps its Space");
+        }
+        // Closed: the same live pane no longer protects it (§6.4, §9).
+        let f = with_home_and_a_lane(crate::lanes::Status::Closed);
+        assert_eq!(close(&f), 2);
+        let calls = f.world.runner.calls.borrow();
+        assert!(calls.iter().any(|c| c.args.ends_with(&["close".to_string(), "w8".to_string()])), "a closed lane must not block the sweep");
     }
 
     #[test]
