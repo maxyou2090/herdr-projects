@@ -430,7 +430,7 @@ pub fn add(project: &Project, list: &str, title: &str, options: &AddOptions<'_>)
             .find(|task| task.title.to_lowercase() == title.to_lowercase())
         {
             bail!(
-                "TASKS.md already has a task titled \"{}\" in list \"{}\"; titles must be unique for `hp task move` and `hp task done`",
+                "TASKS.md already has a task titled \"{}\" in list \"{}\"; titles must be unique for `hp task` commands",
                 title,
                 found.display_list(registry.as_ref())
             );
@@ -570,6 +570,137 @@ pub fn done(project: &Project, title: &str, lane: Option<&str>) -> Result<String
             task.display_list(registry.as_ref())
         ))
     })
+}
+
+/// `hp task delete`: remove the uniquely titled task's whole block — its line
+/// and its indented notes — and no other byte. An empty section keeps its
+/// heading; removing that would be a second edit the caller did not ask for.
+pub fn delete(project: &Project, title: &str, lane: Option<&str>) -> Result<String> {
+    let title = clean_title(title)?;
+    let registry = Registry::load(project);
+    with_tasks(project, |document| {
+        let tasks = located_tasks(&document.lines, registry.as_ref());
+        let task = unique_task(&tasks, &title, registry.as_ref())?;
+        guard_task_lane(registry.as_ref(), task.lane.as_deref(), lane, &title, "delete")?;
+        let display = task.display_list(registry.as_ref());
+        let removed = task.end - task.start;
+        document.lines.drain(task.start..task.end);
+        Ok(format!("deleted \"{title}\" from \"{display}\" ({removed} line(s))"))
+    })
+}
+
+/// What `hp task thread` writes onto the task line.
+#[derive(Debug, Clone, Default)]
+pub struct ThreadOptions<'a> {
+    /// The thread id to record (`t-0012`); `None` with `clear` removes it.
+    pub thread: Option<&'a str>,
+    /// `--owner`: set or replace the owner in the same write. `None` keeps
+    /// whatever owner the line already has.
+    pub owner: Option<&'a str>,
+    /// `--clear`: remove the thread id instead of setting one.
+    pub clear: bool,
+}
+
+/// `hp task thread`: record the thread that runs a task, optionally setting
+/// its owner in the same locked write, and touch only that task line. A
+/// different existing id is refused rather than silently replaced — one task
+/// must not point at two threads; `--clear` removes the old id first.
+pub fn record_thread(project: &Project, title: &str, options: &ThreadOptions<'_>, lane: Option<&str>) -> Result<String> {
+    let title = clean_title(title)?;
+    let wanted = options.thread.map(str::trim).filter(|id| !id.is_empty());
+    if options.clear && wanted.is_some() {
+        bail!("pass a thread id or `--clear`, not both");
+    }
+    if wanted.is_none() && !options.clear {
+        bail!("pass the thread id (`t-0012`) or `--clear` to remove it");
+    }
+    if let Some(id) = wanted && !is_thread_id(id) {
+        bail!("thread ids look like `t-0012`; got `{id}`");
+    }
+    let new_owner = options.owner.map(Owner::parse).filter(|owner| *owner != Owner::Unassigned);
+    let registry = Registry::load(project);
+    with_tasks(project, |document| {
+        let tasks = located_tasks(&document.lines, registry.as_ref());
+        let task = unique_task(&tasks, &title, registry.as_ref())?;
+        guard_task_lane(registry.as_ref(), task.lane.as_deref(), lane, &title, "thread")?;
+        let line = document.lines[task.start].text.clone();
+        let (prefix, task_title, old_owner, old_thread) = task_line_parts(&line).ok_or_else(|| {
+            anyhow::anyhow!("TASKS.md line {} is not a `- [ ]` task line", task.start + 1)
+        })?;
+        let owner = match &new_owner {
+            Some(owner) => Some(owner.to_string()).filter(|text| !text.is_empty()),
+            None => old_owner.clone(),
+        };
+        let thread = if options.clear { None } else { wanted.map(str::to_string) };
+        if let (Some(old), Some(new)) = (&old_thread, &thread)
+            && old != new
+            && !options.clear
+        {
+            bail!(
+                "task \"{}\" already records thread {old}; clear it with `hp task thread {} \"{}\" --clear` first, then record {new}",
+                task.title, project.slug, task.title
+            );
+        }
+        if old_thread == thread && owner == old_owner {
+            return Ok(format!(
+                "\"{}\" in \"{}\" already records {}; nothing was changed",
+                task.title,
+                task.display_list(registry.as_ref()),
+                match &thread {
+                    Some(id) => format!("thread {id}"),
+                    None => "no thread".to_string(),
+                }
+            ));
+        }
+        let mut rebuilt = format!("{prefix} {task_title}");
+        if let Some(owner) = owner.filter(|owner| !owner.is_empty()) {
+            rebuilt.push_str(&format!(" ({owner})"));
+        }
+        if let Some(id) = &thread {
+            rebuilt.push_str(&format!(" · {id}"));
+        }
+        document.lines[task.start].text = rebuilt;
+        Ok(match (&thread, options.clear) {
+            (Some(id), _) => format!("recorded thread {id} on \"{}\" in \"{}\"", task.title, task.display_list(registry.as_ref())),
+            (None, true) => format!("cleared the thread on \"{}\" in \"{}\"", task.title, task.display_list(registry.as_ref())),
+            _ => format!("updated \"{}\" in \"{}\"", task.title, task.display_list(registry.as_ref())),
+        })
+    })
+}
+
+/// The bytes before a task's title, its raw title, and the owner text and
+/// thread id already on the line. Raw owner text is kept so a write that does
+/// not pass `--owner` cannot quietly normalise an existing `(agent → t-0007)`.
+fn task_line_parts(line: &str) -> Option<(String, String, Option<String>, Option<String>)> {
+    if !is_task_line(line) {
+        return None;
+    }
+    let start = line.len() - line.trim_start().len();
+    let after = &line[start..];
+    let close = after.find(']')?;
+    let body = line[start + close + 1..].trim_start();
+    let mut thread = None;
+    let (head, explicit) = match body.rsplit_once('·') {
+        Some((head, id)) if is_thread_id(id.trim()) => (head.trim_end(), Some(id.trim().to_string())),
+        _ => (body, None),
+    };
+    thread = thread.or(explicit);
+    let (title, owner) = match head.rfind('(').filter(|_| head.ends_with(')')) {
+        Some(open) => {
+            let inner = head[open + 1..head.len() - 1].trim();
+            match inner.split_once('→') {
+                Some((who, id)) if is_thread_id(id.trim()) => {
+                    if thread.is_none() {
+                        thread = Some(id.trim().to_string());
+                    }
+                    (head[..open].trim_end().to_string(), Some(who.trim().to_string()).filter(|text| !text.is_empty()))
+                }
+                _ => (head[..open].trim_end().to_string(), Some(inner.to_string()).filter(|text| !text.is_empty())),
+            }
+        }
+        None => (head.trim_end().to_string(), None),
+    };
+    Some((line[..start + close + 1].to_string(), title, owner, thread))
 }
 
 fn clean_title(title: &str) -> Result<String> {
@@ -786,7 +917,7 @@ fn guard_task_lane(
         })
         .unwrap_or_else(|| "this command runs outside a lane".to_string());
     bail!(
-        "task \"{title}\" belongs to lane `{label}` ({lane_id}); a coordinator writes only its own lane's lists ({run_as}), so `hp task {verb}` is refused — run it from that lane's coordinator or edit TASKS.md by hand"
+        "task \"{title}\" belongs to lane `{label}` ({lane_id}); a coordinator writes only its own lane's lists ({run_as}), so `hp task {verb}` is refused — run it from that lane's coordinator, or ask the user"
     );
 }
 
@@ -1167,7 +1298,7 @@ fn unique_task<'a>(
                 .collect();
             places.sort();
             bail!(
-                "TASKS.md has {} tasks titled \"{title}\": {}; `hp task move` and `hp task done` need a unique title",
+                "TASKS.md has {} tasks titled \"{title}\": {}; `hp task` needs a unique title",
                 found.len(),
                 places.join(", ")
             )
@@ -1542,6 +1673,81 @@ mod tests {
         assert!(message.contains("done"), "{message}");
         let after = read_tasks(&project);
         assert_only_changed(DIRTY, &after, &["- [ ] Write the docs (me)"], &["- [x] Write the docs (me)"]);
+    }
+
+    #[test]
+    fn delete_preserves_every_other_byte() {
+        let (_home, project) = temp_project("demo");
+        two_lanes(&project);
+        write_tasks(&project, DIRTY);
+        delete(&project, "Old books", Some("c-2")).unwrap();
+        let after = read_tasks(&project);
+        assert_only_changed(DIRTY, &after, &["- [x] Old books"], &[]);
+        assert!(after.contains("## 收藏/Backlog\n\n## Archive/Odd"), "an empty section keeps its heading: {after}");
+
+        write_tasks(&project, DIRTY);
+        delete(&project, "Truncated log lines hide the 500", Some("c-1")).unwrap();
+        let after = read_tasks(&project);
+        assert_only_changed(
+            DIRTY,
+            &after,
+            &["- [ ] Truncated log lines hide the 500 (codex-fast@m1) · t-0171", "  codex logs line 1", "  line 2"],
+            &[],
+        );
+        assert!(after.contains("- [ ] Rotate the leaked signing key (me)"), "the other task stays: {after}");
+    }
+
+    #[test]
+    fn thread_preserves_every_other_byte() {
+        let (_home, project) = temp_project("demo");
+        two_lanes(&project);
+        write_tasks(&project, DIRTY);
+        let options = ThreadOptions { thread: Some("t-0012"), owner: Some("codex-fast"), clear: false };
+        let message = record_thread(&project, "Write the docs", &options, Some("c-1")).unwrap();
+        assert!(message.contains("t-0012"), "{message}");
+        let after = read_tasks(&project);
+        assert_only_changed(DIRTY, &after, &["- [ ] Write the docs (me)"], &["- [ ] Write the docs (codex-fast) · t-0012"]);
+
+        // The same write again is a no-op; a different id is refused until the
+        // old one is cleared.
+        let once = read_tasks(&project);
+        let again = record_thread(&project, "Write the docs", &options, Some("c-1")).unwrap();
+        assert!(again.contains("already records"), "{again}");
+        assert_eq!(read_tasks(&project), once);
+        let other = ThreadOptions { thread: Some("t-0099"), owner: None, clear: false };
+        let error = record_thread(&project, "Write the docs", &other, Some("c-1")).unwrap_err().to_string();
+        assert!(error.contains("already records thread t-0012") && error.contains("--clear"), "{error}");
+        assert_eq!(read_tasks(&project), once, "a refused thread write must not write");
+
+        let cleared = ThreadOptions { thread: None, owner: None, clear: true };
+        record_thread(&project, "Write the docs", &cleared, Some("c-1")).unwrap();
+        let after = read_tasks(&project);
+        assert_only_changed(&once, &after, &["- [ ] Write the docs (codex-fast) · t-0012"], &["- [ ] Write the docs (codex-fast)"]);
+    }
+
+    #[test]
+    fn delete_and_thread_refuse_duplicate_titles() {
+        let (_home, project) = temp_project("demo");
+        two_lanes(&project);
+        let text = "# Tasks\n\n## Backlog\n- [ ] Same title\n\n## 抢修/Backlog\n- [ ] Same title\n";
+        write_tasks(&project, text);
+        let error = delete(&project, "Same title", Some("c-1")).unwrap_err().to_string();
+        assert!(error.contains("2 tasks titled"), "{error}");
+        let options = ThreadOptions { thread: Some("t-0001"), owner: None, clear: false };
+        let error = record_thread(&project, "Same title", &options, Some("c-1")).unwrap_err().to_string();
+        assert!(error.contains("2 tasks titled"), "{error}");
+        assert_eq!(read_tasks(&project), text, "a refused write must not write");
+    }
+
+    #[test]
+    fn delete_and_thread_work_without_a_registry() {
+        let (_home, project) = temp_project("demo");
+        write_tasks(&project, "# Tasks\n\n## Backlog\n- [ ] One\n- [ ] Two\n");
+        record_thread(&project, "Two", &ThreadOptions { thread: Some("t-0003"), owner: None, clear: false }, None).unwrap();
+        assert!(read_tasks(&project).contains("- [ ] Two · t-0003"));
+        delete(&project, "One", None).unwrap();
+        assert!(!read_tasks(&project).contains("- [ ] One"));
+        assert!(!project.state_dir().join("lanes.json").exists(), "hp task must not create a registry");
     }
 
     #[test]

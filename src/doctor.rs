@@ -53,6 +53,51 @@ pub fn run(ctx: &Ctx, session: &SessionFlags, fix: bool) -> Result<bool> {
     Ok(healthy)
 }
 
+/// §5.4's promise for `doctor`: a pane that is alive but cannot be tied to its
+/// lane — an `Ambiguous` pane, or a lane whose recorded pane is alive but no
+/// rule recognizes it (`degraded`) — is reported with the command that fixes
+/// it. Empty without a lane registry, so a pre-lane project's report is byte
+/// for byte what it was.
+fn lane_notes(project: &project::Project, agents: &[crate::herdr::Agent]) -> Vec<String> {
+    if !crate::lanes::exists(project) {
+        return Vec::new();
+    }
+    let view = crate::lanes::View {
+        registry: crate::lanes::Registry::for_project(project),
+        agents: agents.to_vec(),
+        home: crate::lanes::project_home(project),
+        slug: project.slug.clone(),
+        this_pane: String::new(),
+        reachable: true,
+        counts: Default::default(),
+    };
+    let mut notes: Vec<String> = view
+        .sightings()
+        .iter()
+        .filter_map(|sighting| match &sighting.resolution {
+            crate::lanes::LaneResolution::Ambiguous { reason } => {
+                Some(format!("pane {} is ambiguous: {reason}", sighting.pane_id))
+            }
+            _ => None,
+        })
+        .collect();
+    for status in view.lane_statuses().iter().filter(|s| !s.orphan && !s.shown) {
+        let name = view
+            .registry
+            .get(&status.lane_id)
+            .map(|lane| if lane.label.is_empty() { lane.name.clone() } else { lane.label.clone() })
+            .unwrap_or_default();
+        let lane = if name.is_empty() { status.lane_id.clone() } else { format!("{} ({name})", status.lane_id) };
+        notes.push(format!(
+            "lane {lane} is alive in pane {} but unrecognized ({}); run `hp lane adopt {}` in it",
+            status.pane_id.as_deref().unwrap_or(""),
+            status.why,
+            status.lane_id,
+        ));
+    }
+    notes
+}
+
 fn report(
     env: &Env,
     root: &Path,
@@ -324,6 +369,12 @@ fn report(
                     &label,
                     format!("{}; {}", project.status(), notes.join("; ")),
                 );
+                // §5.4: a lane pane that is alive but unrecognizable is a
+                // warning, never a FAIL — the project still works, but the
+                // alternative is the silent stall this line exists to end.
+                for note in lane_notes(&project, &agents) {
+                    check(&mut out, None, &format!("lanes {slug}"), note);
+                }
             }
             (Err(error), _) | (_, Err(error)) => check(&mut out, None, &label, format!("session at {socket} unreachable: {error}")),
         }
@@ -647,6 +698,68 @@ mod tests {
         let (text, _) = report(&env, &root, &cfg, &flags, &runner, true, Some(&moved));
         assert!(text.contains("is not this plugin's link"), "{text}");
         assert_eq!(crate::setup::skill_state(&link, &moved), crate::setup::SkillState::Foreign);
+    }
+
+    #[test]
+    fn a_project_without_a_lane_registry_gets_no_lane_warning() {
+        let home = tempfile::tempdir().unwrap();
+        let env = Env::for_test(home.path(), &[]);
+        let runner = runner_with_herdr("herdr 0.9.1\n");
+        let root = home.path().join("root");
+        project::create(&root, "demo", "", vec![]).unwrap();
+        let (text, _) = report(&env, &root, &home.path().join("cfg"), &SessionFlags::default(), &runner, false, None);
+        assert!(!text.contains("lanes demo"), "{text}");
+    }
+
+    #[test]
+    fn an_ambiguous_lane_pane_is_a_warning_that_names_lane_adopt() {
+        let home = tempfile::tempdir().unwrap();
+        let env = Env::for_test(home.path(), &[]);
+        let root = home.path().join("root");
+        let project = project::create(&root, "demo", "", vec![]).unwrap();
+        let cwd = project.canonical_dir().to_string_lossy().into_owned();
+        let lane = |id: &str, label: &str| crate::lanes::Lane { id: id.into(), name: id.into(), label: label.into(), ..Default::default() };
+        crate::lanes::Registry { lanes: vec![lane("c-1", "fix"), lane("c-2", "books")], default: "c-1".into(), next: 3 }
+            .save(&project)
+            .unwrap();
+        let runner = runner_with_herdr("herdr 0.9.1\n");
+        runner.on("pane list", ok(r#"{"result":{"panes":[]}}"#));
+        let agent = crate::scenarios::agent_json("w1", "w1:t1", "w1:p1", &cwd, "hpc-demo", "idle");
+        runner.on("agent list", ok(&format!(r#"{{"result":{{"agents":[{agent}]}}}}"#)));
+        let (text, healthy) = report(&env, &root, &home.path().join("cfg"), &SessionFlags::default(), &runner, false, None);
+        assert!(healthy, "a warning must not fail the report: {text}");
+        assert!(text.contains("[warn] lanes demo: pane w1:p1 is ambiguous"), "{text}");
+        assert!(text.contains("hp lane adopt"), "{text}");
+    }
+
+    #[test]
+    fn a_lane_whose_live_pane_is_unrecognized_is_a_warning_that_names_lane_adopt() {
+        let home = tempfile::tempdir().unwrap();
+        let env = Env::for_test(home.path(), &[]);
+        let root = home.path().join("root");
+        let project = project::create(&root, "demo", "", vec![]).unwrap();
+        crate::lanes::Registry {
+            lanes: vec![crate::lanes::Lane {
+                id: "c-1".into(),
+                name: "fix".into(),
+                label: "抢修".into(),
+                pane_id: "w1:p1".into(),
+                agent_session: "sess-old".into(),
+                ..Default::default()
+            }],
+            default: "c-1".into(),
+            next: 2,
+        }
+        .save(&project)
+        .unwrap();
+        let runner = runner_with_herdr("herdr 0.9.1\n");
+        runner.on("pane list", ok(r#"{"result":{"panes":[]}}"#));
+        let agent = crate::scenarios::agent_json_session("w1", "w1:p1", "/elsewhere", "sess-new");
+        runner.on("agent list", ok(&format!(r#"{{"result":{{"agents":[{agent}]}}}}"#)));
+        let (text, healthy) = report(&env, &root, &home.path().join("cfg"), &SessionFlags::default(), &runner, false, None);
+        assert!(healthy, "a warning must not fail the report: {text}");
+        assert!(text.contains("[warn] lanes demo: lane c-1 (抢修) is alive in pane w1:p1 but unrecognized"), "{text}");
+        assert!(text.contains("hp lane adopt c-1"), "{text}");
     }
 
     #[test]
