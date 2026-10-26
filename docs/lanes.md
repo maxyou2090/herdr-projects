@@ -300,6 +300,19 @@ Semantics, spelled out, because two places now write pane metadata:
   join that list; `sidebar::clear_pane` (`src/sidebar.rs:105`) and
   `grouping::clear` (`src/grouping.rs:227`) must clear it.
 - The token value is the lane **id**, so a rename cannot make a token lie.
+- **A lane id is unique inside one project, not across projects.** Every
+  project's first lane is `c-1`, and one Herdr session holds panes of several
+  projects. So a lane claim is only read against *this* project's lane table
+  when the pane's own `hp_project` token — the one every report writes — is
+  absent or equal to this project's slug; a pane whose report names another
+  project is not this project's coordinator at all. This is a **correctness
+  requirement, not an optimisation**: without it `rexa`'s coordinator would
+  resolve to `law`'s default lane, and cross-project mixing is the exact thing
+  lanes exist to end. The cost is bounded and one-directional: if `hp_project`
+  expires (TTL, `clear_pane`, a ticker that stopped) while `hp_lane` survives,
+  the pane falls through to rules 2-5 of §5.2 — a *degradation*, never a wrong
+  answer. A pane that carries no `hp_project` at all (a hand-written report,
+  an adopted pane) is judged by the rules, not refused for silence.
 
 ### 5.2 Resolution order
 
@@ -322,7 +335,8 @@ Each rule and why it sits where it does:
   written by the process that knows; it costs one already-happening metadata
   read; it cannot be produced accidentally by a thread (a thread's `own_dir` is
   under a worktree or `threads/<id>/`, never the project home — but a token is
-  positive evidence regardless of directories).
+  positive evidence regardless of directories). It is read only for panes this
+  project owns: see the `hp_project` scoping in §5.1.
 - **Rule 2 second** because a token can be missing (server restart, TTL while the
   ticker was down, `open` started a moment ago). The pair `(pane_id,
   agent_session)` is already the fallback that rescues the `law` coordinator
@@ -392,22 +406,56 @@ So visibility is a standing output, not an event:
   live pane in the project folder:
 
   ```text
-  Coordinators: w1D3:p1 (token, lane c-1, this pane) · w1AB:p1 (ambiguous: no token, no record match — run `hp lane adopt <lane>` in it) · default lane c-1
+  Coordinators: w1D3:p1 (token, lane c-1, this pane) · w1AB:p1 (ambiguous: no token, no record match, 2 open lanes share this folder — run `hp lane adopt <lane>` in it) · lanes c-1 c-2 of 2 (default c-1)
   ```
 
   Each entry is `pane (rule, lane, this pane|other pane)`; `rule` is `token`,
-  `record`, `dir` or `none`. An `ambiguous` entry carries the reason and the
-  command that fixes it — a coordinator reading its own digest must be able to
+  `record`, `dir` or `none`, and a `Known` answer to a **closed** lane adds
+  `, closed`. An `ambiguous` entry carries the reason — including **how many
+  open lanes are contesting the folder**, which is the one fact that tells a
+  person whether a lane was closed by mistake or opened by mistake — and the
+  command that fixes it. A coordinator reading its own digest must be able to
   hand the user a one-line fix, not the word "ambiguous".
 
-  A pane that resolves to a **closed** lane is marked `closed` and is not
-  treated as anyone's coordinator for nudging (§6.4), but it still appears on
-  this line: "a lane that is put away but whose pane is still running" is
-  exactly the state a person forgets about, and it should be visible rather than
-  discovered later as a stray agent.
+  The words on the line, and what each one means — they are separate answers,
+  not spellings of one another:
+
+  | Word | What it says | The fix it comes with |
+  | --- | --- | --- |
+  | `token` / `record` / `dir` | a rule resolved this pane to a lane (§5.2) | none needed |
+  | `ambiguous` | one of two refusals, both printed with their reason: **several open lanes** could claim the pane and no positive signal says which (`no token, no record match, 2 open lanes share this folder`), or **a token names a lane the registry does not have** (`token hp_lane=c-9 names no lane`) — a stale or hand-written claim, which says "a coordinator" but not "which" | `hp lane adopt <lane>` in that pane |
+  | `none` | the pane works **in the project folder** and **no lane claims it** — nothing resolved it *and* the folder alone gave no answer (every lane is closed, so there is not one open lane for rule 3). It is never folded into the default lane; it is listed so the pane is not invisible | the entry carries no command of its own; `hp lane adopt <lane>` in that pane is what makes it explicit |
+  | `degraded` | the lane recorded this pane, the pane is **alive**, and no rule matches it any more (its recorded session id changed, its shell drifted out of the folder) | `hp lane adopt <lane>` |
+  | `orphan` | the lane's recorded pane is **not listed at all**, or it never recorded one (printed by `lane list`, never on this line) | `hp open <slug> --lane <lane>` |
+  | `closed` | the pane resolved to a lane that has been put away (§6.4); it is nobody's coordinator for nudging, but it is shown rather than left to be discovered later as a stray agent | none |
+
+  **`degraded` and `orphan` are not the same failure and must not share a
+  fix.** Both are "this lane has no working coordinator right now", but
+  `degraded` means the process is running and merely unrecognized — suggesting
+  `open` there starts a *second* coordinator beside the one already working,
+  which §6.4 forbids — while `orphan` means the pane is genuinely gone, and
+  `open` is exactly right. This is why the line and `lane list` decide between
+  the two once, before either prints (`View::lane_statuses`, `src/lanes.rs`).
+
+  **The digest also names the pane it is being read from**, when Herdr lists
+  that pane as an agent and nothing above mentions it:
+
+  ```text
+  this pane w7:p7 is no lane's coordinator (run `hp lane adopt <lane>` in it)
+  ```
+
+  Without that, the `herdr-projects` incident's own shape — a coordinator that
+  matches no rule — was the one pane a digest said nothing about, which is the
+  same silence this section exists to end, only seen from the near side. A pane
+  outside Herdr (`HERDR_PANE_ID` unset), or one that is only a shell and no
+  agent, is said nothing about.
 - **`hp lane list`** prints the same fact per lane and per live pane (the
   matched rule included), plus open lanes whose coordinator is missing entirely
-  and closed lanes as `closed`.
+  and closed lanes as `closed`. Its first line **is** the `Coordinators:` line —
+  both are rendered from one `View`, so the two cannot drift apart — and its
+  rows name each lane's panes as `pane(rule)` (`-` when a lane has none).
+  `--json` adds `goal`, `profile`, `pane_id` and an `orphan` flag per lane, set
+  from the same `degraded`/`orphan` decision the text uses.
 - **The `nudge`/`prompt`/`place_tab` paths still refuse** on `Ambiguous` (§5.2
   rule 4), and a refused nudge is logged by the ticker as a held reason
   (`nudge_held`, `src/ticker.rs:907`, `:915`, logged when it changes at
