@@ -732,7 +732,7 @@ fn thread_pass(project: &Project, herdr: &Herdr, socket: &str, threads: &[thread
             })?;
         }
         if live.pane_exists {
-            crate::sidebar::report_pane(herdr, &t.pane_id, &crate::sidebar::thread_display(t), slug, group);
+            crate::sidebar::report_pane(herdr, &t.pane_id, &crate::sidebar::thread_display(t), slug, group, None);
         }
         // A thread sitting idle with a failed retry on its pane has lost its
         // turn: no report is coming, so it is reported for the coordinator
@@ -887,7 +887,10 @@ fn tick_cheap(ctx: &Ctx, project: &Project, sessions: &mut Sessions) -> Result<O
         let terminal = agents.iter().find(|a| a.pane_id == c.pane_id).map(|a| a.terminal_id.clone()).unwrap_or_default();
         let report = crate::progress::self_report(&ctx.root, &record.socket, &c.pane_id, &terminal);
         let (group, _) = coordinator::row_state(c, report.as_ref());
-        crate::sidebar::report_pane(&herdr, &c.pane_id, &crate::sidebar::coordinator_display(project), slug, group);
+        // The lane claim, refreshed every tick from the registry, so a pane
+        // whose shell drifted keeps saying which lane it is (§5.1, risk (b)).
+        let lane = crate::lanes::token_for_pane(project, &c.pane_id);
+        crate::sidebar::report_pane(&herdr, &c.pane_id, &crate::sidebar::coordinator_display(project), slug, group, lane.as_deref());
     }
 
     let pass = thread_pass(project, &herdr, &record.socket, &open_threads(project, false), &agents, &panes, None)?;

@@ -518,8 +518,12 @@ pub fn row_state(pane: &LivePane, report: Option<&crate::progress::Record>) -> (
     }
 }
 
+/// Reports a coordinator pane's row, claiming the lane the registry ties it to
+/// (`hp_lane`). A project with no lane registry claims nothing, so its rows
+/// read exactly as they did before lanes.
 pub fn report_tokens(herdr: &Herdr, project: &Project, pane_id: &str) {
-    crate::sidebar::report_pane(herdr, pane_id, &crate::sidebar::coordinator_display(project), &project.slug, crate::thread::Group::Idle);
+    let lane = crate::lanes::token_for_pane(project, pane_id);
+    crate::sidebar::report_pane(herdr, pane_id, &crate::sidebar::coordinator_display(project), &project.slug, crate::thread::Group::Idle, lane.as_deref());
 }
 
 /// Renames a workspace whose label is not the project's display name — the
@@ -584,6 +588,15 @@ pub fn context(ctx: &Ctx, slug: &str, peek: bool) -> Result<()> {
     Ok(())
 }
 
+/// The `Coordinators:` line §5.4 makes a hard requirement: one line per turn,
+/// naming the rule each live pane matched, the command that fixes one that
+/// matched nothing certain, and the lane whose recorded pane is alive but no
+/// longer recognizable. Printed even when Herdr cannot be reached — the
+/// week-long stall this exists for hid because nothing was ever said.
+fn identity(ctx: &Ctx, project: &Project, view: Option<&crate::threads::SessionView>) -> String {
+    crate::lanes::identity_line(&crate::lanes::View::with_session(ctx, project, view))
+}
+
 /// The digest and the ids of the inbox items it showed.
 pub fn digest(ctx: &Ctx, project: &Project, prefix: &str) -> Result<(String, Vec<String>)> {
     let mut out = String::new();
@@ -591,6 +604,10 @@ pub fn digest(ctx: &Ctx, project: &Project, prefix: &str) -> Result<(String, Vec
     let _ = writeln!(out, "Commands: {prefix}");
     let _ = writeln!(out, "Project: {slug} ({})", project.status());
     let _ = writeln!(out, "Folder: {}", project.dir().display());
+    // Read once: the identity line and the thread rows use the same view, so
+    // a turn costs no more Herdr than it did before.
+    let view = crate::threads::session_view(ctx, project);
+    out.push_str(&identity(ctx, project, view.as_ref()));
 
     match project.read_project_md() {
         Ok((settings, _)) => {
@@ -644,7 +661,7 @@ pub fn digest(ctx: &Ctx, project: &Project, prefix: &str) -> Result<(String, Vec
     let tasks = crate::tasks::compact(&crate::tasks::read(&project.dir()));
     let _ = writeln!(out, "{}", if tasks.trim().is_empty() { "(none)" } else { tasks.trim() });
 
-    let rows = crate::threads::rows(ctx, project);
+    let rows = crate::threads::rows_with_view(project, view.as_ref());
     let open: Vec<_> = rows.iter().filter(|r| r.group != crate::thread::Group::Resolved).collect();
     let _ = writeln!(out, "\n## Open threads ({})", open.len());
     for row in open {

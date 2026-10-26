@@ -283,3 +283,50 @@ mod progress_hooks {
         }
     }
 }
+
+#[test]
+fn lane_list_prints_the_identity_line_and_creates_no_state() {
+    let home = tempfile::tempdir().unwrap();
+    let root = home.path().join("root");
+    let root_arg = root.to_str().unwrap();
+    assert!(hp(home.path(), &["--root", root_arg, "new", "Demo"]).status.success());
+
+    // A project that was never opened, with no reachable session: `lane list`
+    // still says who it would treat as its coordinator, and says it cannot see
+    // any pane. Silence is the failure this line exists to prevent.
+    let out = hp(home.path(), &["--root", root_arg, "lane", "list", "demo"]);
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    let text = String::from_utf8(out.stdout).unwrap();
+    let lines: Vec<&str> = text.lines().collect();
+    assert_eq!(lines.len(), 2, "{lines:?}");
+    assert_eq!(lines[0], "Coordinators: session unreachable (no pane checked) · default lane c-1");
+    assert_eq!(lines[1], "c-1\tdefault\topen\tdefault\tDemo\tlast_active=-\tpanes=-");
+
+    // --json answers the same facts.
+    let out = hp(home.path(), &["--root", root_arg, "lane", "list", "demo", "--json"]);
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    let value: serde_json::Value = serde_json::from_str(&String::from_utf8(out.stdout).unwrap()).unwrap();
+    assert_eq!(value[0]["id"], "c-1");
+    assert_eq!(value[0]["name"], "default");
+    assert_eq!(value[0]["label"], "Demo");
+    assert_eq!(value[0]["status"], "open");
+    assert_eq!(value[0]["default"], true);
+    assert_eq!(value[0]["panes"].as_array().unwrap().len(), 0);
+
+    // Nothing was created by looking: the registry stays lazy (§10), and the
+    // digest reads exactly what it read before lanes existed.
+    assert!(!root.join("demo/.state/lanes.json").exists(), "a read writes no registry");
+    let context = hp(home.path(), &["--root", root_arg, "context", "demo", "--peek"]);
+    assert!(context.status.success(), "{}", String::from_utf8_lossy(&context.stderr));
+    let digest = String::from_utf8(context.stdout).unwrap();
+    assert!(
+        digest.contains("Coordinators: session unreachable (no pane checked) · default lane c-1\n"),
+        "{digest}"
+    );
+    assert!(!root.join("demo/.state/lanes.json").exists());
+    assert!(!root.join("demo/.state/coordinator.json").exists(), "context records no coordinator either");
+
+    // A slug that is not a project is refused, and an unknown lane command too.
+    assert!(!hp(home.path(), &["--root", root_arg, "lane", "list", "../x"]).status.success());
+    assert!(!hp(home.path(), &["--root", root_arg, "lane", "adopt", "demo", "c-1"]).status.success());
+}

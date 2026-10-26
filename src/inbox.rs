@@ -23,6 +23,11 @@ pub struct Item {
     /// Empty except for `routine` items.
     #[serde(skip)]
     pub body: String,
+    /// The lane this item is addressed to: its **id** (`docs/lanes.md` §4.3).
+    /// Empty on every item written before lanes, and an empty lane reads as the
+    /// default lane's (§10). Nothing writes it yet and seen-state is still one
+    /// global set: the per-lane split of `seen`/`mark_seen` is commit 2.
+    pub lane: String,
 }
 
 fn inbox_dir(project: &Project) -> PathBuf {
@@ -68,6 +73,9 @@ pub fn write(project: &Project, kind: &str, subject: &str, event: &str, summary:
         summary: summary.chars().map(|c| if c.is_control() { ' ' } else { c }).collect(),
         event: event.to_string(),
         body: String::new(),
+        // Still written to no lane: the writer is commit 2, and an empty lane
+        // reads as the default lane's.
+        lane: String::new(),
     };
     let mut text = format!("+++\n{}+++\n", toml::to_string(&item)?);
     if !body.is_empty() {

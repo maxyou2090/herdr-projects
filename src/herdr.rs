@@ -227,6 +227,13 @@ pub struct Agent {
     /// gate typing.
     #[serde(default)]
     pub interactive_ready: bool,
+    /// The pane's reported metadata tokens (`hp_project`, `hp_rank`,
+    /// `hp_lane`, …) as `agent list` gives them. Read-only here: this module
+    /// never writes them, and `lanes::resolve` rule 1 is the only reader —
+    /// without this field the strongest identity signal would silently never
+    /// fire, since serde would just skip the key.
+    #[serde(default)]
+    pub tokens: std::collections::BTreeMap<String, String>,
 }
 
 impl Agent {

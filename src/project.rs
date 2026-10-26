@@ -407,18 +407,39 @@ impl Project {
         std::iter::once(self.slug.clone()).chain(self.former_slugs()).map(|s| format!("hp/{s}/")).collect()
     }
 
+    /// The project's coordinator record.
+    ///
+    /// A project with a lane registry answers from its **default lane**
+    /// (`docs/lanes.md` §10): `coordinator.json` becomes the lane's view, and
+    /// the sixty-odd call sites of this function keep working unchanged.
+    /// A project with no `lanes.json` — every project until `open` learns to
+    /// write one — reads the file itself, byte for byte as before. Nothing
+    /// here creates a registry.
     pub fn coordinator(&self) -> Option<Coordinator> {
-        read_json(&self.state_dir().join("coordinator.json"))
+        if crate::lanes::exists(self) {
+            return crate::lanes::Registry::for_project(self).default_coordinator(self);
+        }
+        read_json(&self.coordinator_path())
+    }
+
+    pub fn coordinator_path(&self) -> PathBuf {
+        self.state_dir().join(crate::lanes::COORDINATOR_FILE)
     }
 
     /// Read-modify-write of `coordinator.json` under the lock: re-reads the
     /// file, lets `change` touch only the fields its step owns, writes.
+    ///
+    /// It reads and writes the **file**, never [`Project::coordinator`], so a
+    /// lane registry cannot feed a synthesized record back into the record it
+    /// was synthesized from. Writing `coordinator.json` stays this function's
+    /// job alone; the double write to `lanes.json` belongs to `open` (§12,
+    /// commit 4).
     pub fn update_coordinator(&self, change: impl FnOnce(&mut Coordinator)) -> Result<Coordinator> {
         let _lock = self.lock()?;
-        let mut record = self.coordinator().unwrap_or_default();
+        let mut record = crate::lanes::read_coordinator(self).unwrap_or_default();
         change(&mut record);
         record.updated = now();
-        write_json(&self.state_dir().join("coordinator.json"), &record)?;
+        write_json(&self.coordinator_path(), &record)?;
         Ok(record)
     }
 

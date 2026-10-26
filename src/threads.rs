@@ -61,7 +61,7 @@ fn git(runner: &dyn Runner, repo: &str, args: &[&str], timeout: Duration) -> Res
 }
 
 pub fn report_thread_tokens(herdr: &Herdr, thread: &Thread, slug: &str, group: Group) {
-    crate::sidebar::report_pane(&herdr.on_machine(&thread.machine), &thread.pane_id, &crate::sidebar::thread_display(thread), slug, group);
+    crate::sidebar::report_pane(&herdr.on_machine(&thread.machine), &thread.pane_id, &crate::sidebar::thread_display(thread), slug, group, None);
 }
 
 fn clear_thread_tokens(herdr: &Herdr, thread: &Thread) {
@@ -1168,11 +1168,16 @@ pub struct Row {
 }
 
 pub fn rows(ctx: &Ctx, project: &Project) -> Vec<Row> {
-    let view = session_view(ctx, project);
+    rows_with_view(project, session_view(ctx, project).as_ref())
+}
+
+/// The same rows from a session view the caller already has, so one digest
+/// costs one pair of Herdr lists rather than two.
+pub fn rows_with_view(project: &Project, view: Option<&SessionView>) -> Vec<Row> {
     let now = jiff::Timestamp::now();
     thread::list(project)
         .into_iter()
-        .map(|t| row(&t, &project.root, view.as_ref(), now))
+        .map(|t| row(&t, &project.root, view, now))
         .collect()
 }
 

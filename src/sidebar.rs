@@ -16,6 +16,9 @@ use crate::thread::{Group, Live, Thread};
 pub const TOKEN_TTL_MS: u64 = 300_000;
 /// Tokens this plugin wrote before 0.2.0; cleared on every report.
 pub const OLD_TOKENS: [&str; 4] = ["project", "thread", "review", "rank"];
+/// The token every report writes naming the project a pane belongs to. It is
+/// what tells one project's lane table from another's (`lanes::resolve`).
+pub const PROJECT_TOKEN: &str = "hp_project";
 pub const POPUP_ACTION: &str = "herdr-projects.open-popup";
 pub const DEFAULT_KEY: &str = "prefix+a";
 /// Minutes without a self-report after which a working row says "Nm quiet".
@@ -82,13 +85,24 @@ pub fn coordinator_display(project: &Project) -> String {
     format!("{name}{}", crate::grouping::HEAD_MARK)
 }
 
-/// Reports one pane's row: display name, project and rank, with a TTL so the
-/// row falls back to Herdr's own when the ticker stops. Never `--seq`: token
+/// Reports one pane's row: display name, project, rank and — for a
+/// coordinator whose lane the registry names — its lane claim, with a TTL so
+/// the row falls back to Herdr's own when the ticker stops. Never `--seq`: token
 /// patches are per key and the grouping tokens come from `grouping`.
-pub fn report_pane(herdr: &Herdr, pane: &str, display: &str, slug: &str, group: Group) {
+///
+/// `lane` is the **id** to write as `hp_lane` (`docs/lanes.md` §5.1), or
+/// `None` for no claim: a thread pane never claims a lane, and a project with
+/// no lane registry reports none, so the token appears exactly where a
+/// registry says it should. `hp_lane` is never in `OLD_TOKENS`: those are
+/// cleared on every report, which would erase the claim as fast as it is
+/// written.
+pub fn report_pane(herdr: &Herdr, pane: &str, display: &str, slug: &str, group: Group, lane: Option<&str>) {
     let ttl = TOKEN_TTL_MS.to_string();
     let rank = group.rank().to_string();
-    let tokens = [format!("hp_project={slug}"), format!("hp_rank={rank}")];
+    let mut tokens = vec![format!("hp_project={slug}"), format!("hp_rank={rank}")];
+    if let Some(lane) = lane.filter(|lane| !lane.is_empty()) {
+        tokens.push(format!("{}={lane}", crate::lanes::TOKEN));
+    }
     let mut args = vec!["pane", "report-metadata", pane, "--source", crate::herdr::SOURCE, "--display-agent", display, "--ttl-ms", &ttl];
     for token in &tokens {
         args.push("--token");
@@ -101,13 +115,14 @@ pub fn report_pane(herdr: &Herdr, pane: &str, display: &str, slug: &str, group: 
     let _ = herdr.call(&args, CALL_TIMEOUT);
 }
 
-/// Clears every token and the display name this plugin set on a pane.
+/// Clears every token and the display name this plugin set on a pane — ours,
+/// the lane claim, and the grouping tokens `grouping::clear` also removes.
 pub fn clear_pane(herdr: &Herdr, pane: &str) {
     if pane.is_empty() {
         return;
     }
     let mut args = vec!["pane", "report-metadata", pane, "--source", crate::herdr::SOURCE, "--clear-display-agent"];
-    for name in ["hp_project", "hp_rank"].into_iter().chain(OLD_TOKENS) {
+    for name in ["hp_project", "hp_rank", crate::lanes::TOKEN].into_iter().chain(OLD_TOKENS) {
         args.push("--clear-token");
         args.push(name);
     }
