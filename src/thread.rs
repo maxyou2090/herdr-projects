@@ -148,8 +148,9 @@ pub struct Thread {
     /// The lane this thread belongs to: its **id**, never its name, so
     /// renaming a lane touches no thread file (`docs/lanes.md` §4.2). Empty
     /// on every record written before lanes; empty reads as the default lane,
-    /// which is why nothing needs migrating (§10). Nothing writes it yet —
-    /// the writer is commit 2.
+    /// which is why nothing needs migrating (§10). `threads::start` and
+    /// `adopt::adopt` write it once, at creation, from the initiating
+    /// coordinator's lane; no other path ever rewrites it.
     pub lane: String,
 }
 

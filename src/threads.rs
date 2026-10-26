@@ -185,6 +185,10 @@ pub fn start(ctx: &Ctx, slug: &str, args: StartArgs) -> Result<Thread> {
 
     let profile = thread_profile(ctx, &project, &machine, args.profile.as_deref())?;
     let kind = placement(args.kind, !repo.is_empty(), !machine.is_empty())?;
+    // Ownership is written once, at creation, from the lane the initiating
+    // coordinator pane claims (§4.2). Everything else — open, adopt, ticker —
+    // leaves an existing record's lane alone (§6.3).
+    let lane = crate::lanes::lane_of_initiator(ctx, &project, &view.agents);
     let record = thread::allocate(&project, |t| {
         t.title = args.title.trim().to_string();
         t.kind = kind;
@@ -192,6 +196,7 @@ pub fn start(ctx: &Ctx, slug: &str, args: StartArgs) -> Result<Thread> {
         t.machine = machine.clone();
         profile.apply(t);
         t.base = args.base.clone().unwrap_or_default();
+        t.lane = lane;
     })?;
     let id = record.id.clone();
     {
@@ -890,8 +895,9 @@ pub fn resolve(ctx: &Ctx, slug: &str, id: &str, args: &ResolveArgs) -> Result<()
     for note in &notes {
         println!("  - {note}");
     }
-    let event_id = crate::inbox::write(
+    let event_id = crate::inbox::write_in(
         &project,
+        &crate::inbox::lane_of_thread(&project, id),
         "thread-state",
         id,
         "resolved",
@@ -1033,7 +1039,7 @@ fn last_pr_lookup(ctx: &Ctx, project: &Project, t: &Thread) -> Option<crate::pr:
             r.pr_state = state;
             r.pr_review = review;
         });
-        let _ = crate::inbox::write(project, "pr", &t.id, "PR found at resolve", &format!("{}: pull request {} (found at resolve)", crate::steps::thread_label(t), pr::describe_change(None, &summary)), "");
+        let _ = crate::inbox::write_in(project, &crate::inbox::lane_of_thread(project, &t.id), "pr", &t.id, "PR found at resolve", &format!("{}: pull request {} (found at resolve)", crate::steps::thread_label(t), pr::describe_change(None, &summary)), "");
     }
     Some(summary)
 }

@@ -63,10 +63,14 @@ pub struct State {
     pub routines: routine::States,
     /// Hashes of files a `config-error` item was already written for.
     pub config_errors: BTreeSet<String>,
-    /// Hash of the set of unseen item ids that was last nudged.
-    pub nudged: String,
-    /// When the aged reminder last went out, to space repeats.
-    pub renudged_at: String,
+    /// lane id -> hash of the set of unseen item ids last nudged in that lane.
+    /// Commit 2 still nudges the default lane only; commit 3 routes each lane
+    /// to its own entry. The old scalar shape is accepted on read (§4.4).
+    #[serde(default, deserialize_with = "string_or_map")]
+    pub nudged: BTreeMap<String, String>,
+    /// lane id -> when that lane's aged reminder last went out.
+    #[serde(default, deserialize_with = "string_or_map")]
+    pub renudged_at: BTreeMap<String, String>,
     /// thread id -> the last_state_change an idle-without-report item was
     /// written for.
     pub idle_noted: BTreeMap<String, String>,
@@ -74,26 +78,118 @@ pub struct State {
     /// at the first sight of work. An idle thread whose report still matches
     /// it ended a turn that touched no report.
     pub working_report: BTreeMap<String, String>,
-    /// The coordinator pane whose input box was seen empty since
-    /// `box_empty_since`, while a nudge waits for it.
-    pub box_pane: String,
-    pub box_empty_since: String,
+    /// lane id -> the coordinator pane whose input box was seen empty since
+    /// `box_empty_since`, while that lane's nudge waits for it.
+    #[serde(default, deserialize_with = "string_or_map")]
+    pub box_pane: BTreeMap<String, String>,
+    #[serde(default, deserialize_with = "string_or_map")]
+    pub box_empty_since: BTreeMap<String, String>,
     pub session_item_written: bool,
     /// thread id -> the retry-failure line last reported from its pane.
     pub error_seen: BTreeMap<String, String>,
     /// thread id -> when the ticker first saw its pull request merged.
     pub merged_seen: BTreeMap<String, String>,
+    /// The default lane in force for this load. Not part of the file; the
+    /// per-lane maps are keyed by lane id, and the default lane is the one
+    /// `nudge` still reads and writes until commit 3. `State::default()` (a
+    /// test or a fresh ticker) falls back to [`crate::lanes::FALLBACK_ID`].
+    #[serde(skip)]
+    pub default_lane: String,
+}
+
+/// Accepts both the pre-lanes scalar shape and the per-lane map of §4.4. A
+/// scalar is the default lane's value; the key is [`crate::lanes::FALLBACK_ID`]
+/// because every scalar file predates lanes and therefore belongs to `c-1`.
+fn string_or_map<'de, D>(deserializer: D) -> std::result::Result<BTreeMap<String, String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum Shape {
+        Scalar(String),
+        Map(BTreeMap<String, String>),
+    }
+    Ok(match Shape::deserialize(deserializer)? {
+        Shape::Scalar(value) => {
+            if value.is_empty() {
+                BTreeMap::new()
+            } else {
+                BTreeMap::from([(crate::lanes::FALLBACK_ID.to_string(), value)])
+            }
+        }
+        Shape::Map(map) => map,
+    })
 }
 
 pub fn load_state(project: &Project) -> State {
-    project::read_json(&project.state_dir().join("ticker.json")).unwrap_or_default()
+    let mut state: State = project::read_json(&project.state_dir().join("ticker.json")).unwrap_or_default();
+    let default_lane = crate::lanes::default_lane_id(project);
+    // A scalar is always `c-1`'s, but a project whose default lane has since
+    // been elected elsewhere must still find it in the default slot.
+    if default_lane != crate::lanes::FALLBACK_ID {
+        for slots in [&mut state.nudged, &mut state.renudged_at, &mut state.box_pane, &mut state.box_empty_since] {
+            if let Some(value) = slots.remove(crate::lanes::FALLBACK_ID) {
+                slots.entry(default_lane.clone()).or_insert(value);
+            }
+        }
+    }
+    state.default_lane = default_lane;
+    state
 }
 
 /// Only the ticker writes this file, so its own read-modify-write is safe; the
 /// write still happens under the project lock, like every `.state/` write.
+///
+/// A project with `lanes.json` gets the four fields as maps (§4.4). A project
+/// without one gets the old scalar shape, so its `ticker.json` is unchanged
+/// byte for byte — the zero-change promise for the nine real projects.
 pub fn save_state(project: &Project, state: &State) -> Result<()> {
     let _lock = project.lock()?;
-    project::write_json(&project.state_dir().join("ticker.json"), state)
+    let path = project.state_dir().join("ticker.json");
+    if crate::lanes::split_in_use(project) {
+        return project::write_json(&path, state);
+    }
+    let default_lane = crate::lanes::default_lane_id(project);
+    let value = |slots: &BTreeMap<String, String>| slots.get(&default_lane).cloned().unwrap_or_default();
+    #[derive(Serialize)]
+    struct LegacyState<'a> {
+        last_pr_check: &'a str,
+        prs: &'a BTreeMap<String, pr::Summary>,
+        pr_ignored: &'a BTreeMap<String, String>,
+        pr_line_noted: &'a BTreeMap<String, String>,
+        routines: &'a routine::States,
+        config_errors: &'a BTreeSet<String>,
+        nudged: String,
+        renudged_at: String,
+        idle_noted: &'a BTreeMap<String, String>,
+        working_report: &'a BTreeMap<String, String>,
+        box_pane: String,
+        box_empty_since: String,
+        session_item_written: bool,
+        error_seen: &'a BTreeMap<String, String>,
+        merged_seen: &'a BTreeMap<String, String>,
+    }
+    project::write_json(
+        &path,
+        &LegacyState {
+            last_pr_check: &state.last_pr_check,
+            prs: &state.prs,
+            pr_ignored: &state.pr_ignored,
+            pr_line_noted: &state.pr_line_noted,
+            routines: &state.routines,
+            config_errors: &state.config_errors,
+            nudged: value(&state.nudged),
+            renudged_at: value(&state.renudged_at),
+            idle_noted: &state.idle_noted,
+            working_report: &state.working_report,
+            box_pane: value(&state.box_pane),
+            box_empty_since: value(&state.box_empty_since),
+            session_item_written: state.session_item_written,
+            error_seen: &state.error_seen,
+            merged_seen: &state.merged_seen,
+        },
+    )
 }
 
 /// Continuous-failure tracking for `gh` or a machine: one item when it has
@@ -266,7 +362,7 @@ pub fn write_thread_items(project: &Project, state: &mut State, transitions: &[T
                 summary.push_str(&format!(" on machine `{}` (reach it with `herdr --remote <ssh target>`, or select the machine in herdr's sidebar)", t.machine));
             }
         }
-        inbox::write(project, "thread-state", &t.id, transition_event(change), &summary, "")?;
+        inbox::write_in(project, &inbox::lane_of_thread(project, &t.id), "thread-state", &t.id, transition_event(change), &summary, "")?;
         if change.to == Group::WaitingOnYou {
             let reason = if !t.state_line.is_empty() && t.state_line != "needs you" { t.state_line.clone() } else { format!("needs you · {}", change.note) };
             let reason = if !t.activity.is_empty() && t.activity == crate::progress::WAITING { format!("needs you · {}", t.activity) } else { reason };
@@ -287,7 +383,7 @@ pub fn write_thread_items(project: &Project, state: &mut State, transitions: &[T
         if let Some(notes) = copy_notes.get(&t.id) {
             summary.push_str(&format!("; not everything was copied: {}", notes.join("; ")));
         }
-        inbox::write(project, "thread-state", &t.id, "new report", &summary, "")?;
+        inbox::write_in(project, &inbox::lane_of_thread(project, &t.id), "thread-state", &t.id, "new report", &summary, "")?;
         notifier.send(&t.id, &format!("review · new report: {}", t.title), crate::notify::Sound::Done, false);
         let hash = t.report_hash.clone();
         thread::update(project, &t.id, |t| t.last_review_item_hash = hash)?;
@@ -320,7 +416,7 @@ pub fn write_stuck_items(project: &Project, state: &mut State, stuck: &[Stuck], 
             project.slug,
             t.id,
         );
-        inbox::write(project, "thread-error", &t.id, "stalled on a failed retry", &summary, "")?;
+        inbox::write_in(project, &inbox::lane_of_thread(project, &t.id), "thread-error", &t.id, "stalled on a failed retry", &summary, "")?;
         notifier.send(&t.id, &format!("stalled · {}", s.line), crate::notify::Sound::Request, false);
     }
     Ok(())
@@ -397,7 +493,7 @@ pub fn write_idle_notes(project: &Project, state: &mut State, now: jiff::Timesta
             project.slug,
             t.id
         );
-        inbox::write(project, "thread-state", &t.id, "idle without report", &summary, "")?;
+        inbox::write_in(project, &inbox::lane_of_thread(project, &t.id), "thread-state", &t.id, "idle without report", &summary, "")?;
         state.idle_noted.insert(t.id.clone(), t.last_state_change.clone());
         state.working_report.remove(&t.id);
     }
@@ -499,8 +595,11 @@ const REMINDED: &str = "a reminder went out recently; the next waits for its spa
 /// `RE_NUDGE_AFTER_SECS` old, at most every `RE_NUDGE_EVERY_SECS`: an
 /// interrupted turn cannot strand them silently.
 pub fn nudge(project: &Project, state: &mut State, settings: &Settings, herdr: &Herdr, coordinator_ready: Option<&crate::coordinator::LivePane>, now: jiff::Timestamp) -> Result<NudgeOutcome> {
-    let seen = inbox::seen(project);
-    let unhandled = inbox::unhandled(project);
+    // Commit 2 keeps the old single nudge path: one set, the default lane's.
+    // Per-lane routing is commit 3.
+    let lane = crate::lanes::default_lane_id(project);
+    let seen = inbox::seen_in(project, &lane);
+    let unhandled = inbox::unhandled_in(project, &lane);
     if unhandled.is_empty() {
         forget_box(state);
         return Ok(NudgeOutcome::Quiet);
@@ -510,7 +609,7 @@ pub fn nudge(project: &Project, state: &mut State, settings: &Settings, herdr: &
         return aged_renudge(state, settings, herdr, coordinator_ready, &unhandled, now);
     }
     let hash = hash_ids(&unseen.iter().map(|i| i.id.clone()).collect());
-    if hash == state.nudged {
+    if hash == state.slot_value(&state.nudged) {
         forget_box(state);
         return Ok(NudgeOutcome::Held(WAITING_FOR_READ));
     }
@@ -531,7 +630,8 @@ pub fn nudge(project: &Project, state: &mut State, settings: &Settings, herdr: &
     // `agent_blocked` and other errors are returned, logged by the caller,
     // and the nudge is retried on a later tick.
     herdr.agent_prompt(&pane.pane_id, &nudge_text(&unseen))?;
-    state.nudged = hash;
+    let key = state.slot_key().to_string();
+    state.nudged.insert(key, hash);
     forget_box(state);
     Ok(NudgeOutcome::Delivered)
 }
@@ -552,7 +652,7 @@ fn aged_renudge(state: &mut State, settings: &Settings, herdr: &Herdr, coordinat
     if now.as_second() - oldest.as_second() < RE_NUDGE_AFTER_SECS {
         return Ok(NudgeOutcome::Held(NOT_AGED));
     }
-    if state.renudged_at.parse::<jiff::Timestamp>().is_ok_and(|at| now.as_second() - at.as_second() < RE_NUDGE_EVERY_SECS) {
+    if state.slot_value(&state.renudged_at).parse::<jiff::Timestamp>().is_ok_and(|at| now.as_second() - at.as_second() < RE_NUDGE_EVERY_SECS) {
         return Ok(NudgeOutcome::Held(REMINDED));
     }
     let Some(pane) = coordinator_ready else {
@@ -563,14 +663,27 @@ fn aged_renudge(state: &mut State, settings: &Settings, herdr: &Herdr, coordinat
         return Ok(NudgeOutcome::Held(BOX_NOT_QUIET));
     }
     herdr.agent_prompt(&pane.pane_id, &nudge_text(&quiet))?;
-    state.renudged_at = now.to_string();
+    let key = state.slot_key().to_string();
+    state.renudged_at.insert(key, now.to_string());
     forget_box(state);
     Ok(NudgeOutcome::Delivered)
 }
 
+impl State {
+    /// The key `nudge` reads and writes in this commit: the default lane.
+    fn slot_key(&self) -> &str {
+        if self.default_lane.is_empty() { crate::lanes::FALLBACK_ID } else { &self.default_lane }
+    }
+
+    fn slot_value<'a>(&self, slots: &'a BTreeMap<String, String>) -> &'a str {
+        slots.get(self.slot_key()).map(String::as_str).unwrap_or("")
+    }
+}
+
 fn forget_box(state: &mut State) {
-    state.box_pane.clear();
-    state.box_empty_since.clear();
+    let key = state.slot_key().to_string();
+    state.box_pane.remove(&key);
+    state.box_empty_since.remove(&key);
 }
 
 /// True once the pane's input box has been seen empty on this tick and on an
@@ -583,12 +696,14 @@ fn box_quiet(state: &mut State, herdr: &Herdr, pane: &crate::coordinator::LivePa
         forget_box(state);
         return Ok(false);
     }
-    if state.box_pane != pane.pane_id || state.box_empty_since.is_empty() {
-        state.box_pane = pane.pane_id.clone();
-        state.box_empty_since = now.to_string();
+    let key = state.slot_key().to_string();
+    let empty_since = state.box_empty_since.get(&key).cloned().unwrap_or_default();
+    if state.box_pane.get(&key).map(String::as_str) != Some(pane.pane_id.as_str()) || empty_since.is_empty() {
+        state.box_pane.insert(key.clone(), pane.pane_id.clone());
+        state.box_empty_since.insert(key, now.to_string());
         return Ok(false);
     }
-    Ok(thread::seconds_since(&state.box_empty_since, now) >= NUDGE_QUIET_SECS)
+    Ok(thread::seconds_since(&empty_since, now) >= NUDGE_QUIET_SECS)
 }
 
 /// Step 2, every two minutes.
@@ -654,7 +769,7 @@ pub fn pull_requests(ctx: &Ctx, project: &Project, state: &mut State, memory: &m
             Err(note) => {
                 if state.pr_line_noted.get(&t.id) != Some(&t.report_hash) {
                     state.pr_line_noted.insert(t.id.clone(), t.report_hash.clone());
-                    errors.extend(inbox::write(project, "pr", &t.id, "bad PR: line", &format!("{}: {note}", thread_label(&t)), "").err());
+                    errors.extend(inbox::write_in(project, &inbox::lane_of_thread(project, &t.id), "pr", &t.id, "bad PR: line", &format!("{}: {note}", thread_label(&t)), "").err());
                 }
                 String::new()
             }
@@ -701,7 +816,7 @@ pub fn pull_requests(ctx: &Ctx, project: &Project, state: &mut State, memory: &m
             Ok(pr::Checked::Ignored(reason)) => {
                 if state.pr_ignored.get(&t.id) != Some(&url) {
                     state.pr_ignored.insert(t.id.clone(), url.clone());
-                    errors.extend(inbox::write(project, "pr", &t.id, "PR ignored", &format!("{}: the pull request in its report is ignored: {reason}", thread_label(&t)), "").err());
+                    errors.extend(inbox::write_in(project, &inbox::lane_of_thread(project, &t.id), "pr", &t.id, "PR ignored", &format!("{}: the pull request in its report is ignored: {reason}", thread_label(&t)), "").err());
                 }
             }
             Ok(pr::Checked::Summary(summary)) => {
@@ -720,7 +835,7 @@ pub fn pull_requests(ctx: &Ctx, project: &Project, state: &mut State, memory: &m
                     memory.gh_login = pr::own_login(ctx.runner, &t.origin);
                 }
                 let events = pr_events(old.as_ref(), &summary, memory.gh_login.as_deref());
-                errors.extend(inbox::write(project, "pr", &t.id, pr_event(&events, &summary), &format!("{}: pull request {change}", thread_label(&t)), "").err());
+                errors.extend(inbox::write_in(project, &inbox::lane_of_thread(project, &t.id), "pr", &t.id, pr_event(&events, &summary), &format!("{}: pull request {change}", thread_label(&t)), "").err());
                 let number = url.rsplit('/').next().unwrap_or("");
                 if merged {
                     notifier.send(&t.id, &format!("PR #{number} merged"), crate::notify::Sound::Done, false);
@@ -852,7 +967,7 @@ fn resolve_after_copy(ctx: &Ctx, project: &Project, t: &Thread, reason: &str, me
     let complete = copied.outcome == CopyOutcome::Complete;
     let notes = threads::clean(ctx, project, &resolved, &threads::Clean { keep_worktree: false, copy_complete: complete, merged_head });
     let why = if reason == "auto" { "it was idle for `auto_resolve_days` and was resolved automatically; `thread resolve --reopen` undoes it".to_string() } else { format!("resolved ({reason})") };
-    inbox::write(project, "thread-state", &t.id, "resolved", &format!("{}: {why}: {}", thread_label(t), notes.join("; ")), "")?;
+    inbox::write_in(project, &inbox::lane_of_thread(project, &t.id), "thread-state", &t.id, "resolved", &format!("{}: {why}: {}", thread_label(t), notes.join("; ")), "")?;
     Ok(true)
 }
 
@@ -1077,6 +1192,56 @@ mod tests {
         assert_eq!(state.routines["sweep"].quiet, 1);
     }
 
+    /// A real pre-lanes `ticker.json`: the four nudge fields are scalars. They
+    /// must land in the default lane's slots, or every nudge state resets on
+    /// the first tick after the upgrade — the shape of the 2026-10-07 stall.
+    #[test]
+    fn an_old_scalar_ticker_file_loads_into_the_default_lane_slots() {
+        let root = tempfile::tempdir().unwrap();
+        let project = project::create(root.path(), "demo", "", vec![]).unwrap();
+        std::fs::write(
+            project.state_dir().join("ticker.json"),
+            r#"{
+  "last_pr_check": "2026-10-26T04:11:30.568988Z",
+  "prs": {},
+  "pr_ignored": {},
+  "pr_line_noted": {},
+  "routines": {},
+  "config_errors": [],
+  "nudged": "a7ffcf4301c9e74816cb80c70a750846dc10cc1345cab1dabd950dfecb5e8f28",
+  "renudged_at": "2026-10-26T03:00:00Z",
+  "idle_noted": {},
+  "working_report": {},
+  "box_pane": "w1:p1",
+  "box_empty_since": "2026-10-26T02:59:00Z",
+  "session_item_written": false,
+  "error_seen": {},
+  "merged_seen": {}
+}"#,
+        )
+        .unwrap();
+        let state = load_state(&project);
+        assert_eq!(state.nudged.get("c-1").unwrap(), "a7ffcf4301c9e74816cb80c70a750846dc10cc1345cab1dabd950dfecb5e8f28");
+        assert_eq!(state.renudged_at.get("c-1").unwrap(), "2026-10-26T03:00:00Z");
+        assert_eq!(state.box_pane.get("c-1").unwrap(), "w1:p1");
+        assert_eq!(state.box_empty_since.get("c-1").unwrap(), "2026-10-26T02:59:00Z");
+        assert_eq!(state.last_pr_check, "2026-10-26T04:11:30.568988Z");
+        assert_eq!(state.default_lane, "c-1");
+        // Saving a project without a registry keeps the old scalar shape: no
+        // `ticker.json` field changes type for the nine real projects.
+        save_state(&project, &state).unwrap();
+        let text = std::fs::read_to_string(project.state_dir().join("ticker.json")).unwrap();
+        assert!(text.contains(r#""nudged": "a7ffcf4301c9e74816cb80c70a750846dc10cc1345cab1dabd950dfecb5e8f28""#), "{text}");
+        assert!(text.contains(r#""box_pane": "w1:p1""#), "{text}");
+        assert!(!text.contains(r#""nudged": {"#), "a pre-lane project keeps the scalar shape: {text}");
+        // A project with a registry gets the maps of §4.4.
+        crate::lanes::Registry::ensure_written(&project).unwrap();
+        save_state(&project, &state).unwrap();
+        let after = std::fs::read_to_string(project.state_dir().join("ticker.json")).unwrap();
+        assert!(after.contains(r#""nudged": {"#), "{after}");
+        assert!(after.contains(r#""c-1": "a7ffcf4301c9e74816cb80c70a750846dc10cc1345cab1dabd950dfecb5e8f28""#), "{after}");
+    }
+
     #[test]
     fn fresh_seen_items_are_not_reminded_and_nothing_is_spent() {
         let root = tempfile::tempdir().unwrap();
@@ -1089,8 +1254,8 @@ mod tests {
         let now = at("2026-10-08T14:10:00Z");
         // No coordinator: with nothing aged there is no delivery attempt at all.
         assert_eq!(nudge(&project, &mut state, &settings, &herdr, None, now).unwrap(), NudgeOutcome::Held(NOT_AGED));
-        assert_eq!(state.nudged, "");
-        assert_eq!(state.renudged_at, "");
+        assert!(state.nudged.is_empty());
+        assert!(state.renudged_at.is_empty());
     }
 
     #[test]
@@ -1104,9 +1269,9 @@ mod tests {
         let settings = Settings::default();
         let now = at("2026-10-08T14:10:00Z");
         assert_eq!(nudge(&project, &mut state, &settings, &herdr, None, now).unwrap(), NudgeOutcome::Held(NO_COORDINATOR));
-        assert_eq!(state.renudged_at, "", "a held reminder is not spent");
+        assert!(state.renudged_at.is_empty(), "a held reminder is not spent");
         // A recent reminder spaces the next one out, coordinator or not.
-        state.renudged_at = "2026-10-08T14:05:00Z".into();
+        state.renudged_at.insert(crate::lanes::FALLBACK_ID.into(), "2026-10-08T14:05:00Z".into());
         assert_eq!(nudge(&project, &mut state, &settings, &herdr, None, now).unwrap(), NudgeOutcome::Held(REMINDED));
     }
 

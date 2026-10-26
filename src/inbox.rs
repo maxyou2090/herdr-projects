@@ -25,8 +25,8 @@ pub struct Item {
     pub body: String,
     /// The lane this item is addressed to: its **id** (`docs/lanes.md` §4.3).
     /// Empty on every item written before lanes, and an empty lane reads as the
-    /// default lane's (§10). Nothing writes it yet and seen-state is still one
-    /// global set: the per-lane split of `seen`/`mark_seen` is commit 2.
+    /// default lane's (§10). `inbox::write_in` is the writer for items whose
+    /// thread has a lane; project-level events stay empty.
     pub lane: String,
 }
 
@@ -53,11 +53,19 @@ pub fn safe_subject(subject: &str) -> String {
     if cleaned.is_empty() { "item".to_string() } else { cleaned }
 }
 
-/// Writes one item. The id is `<UTC timestamp>-<kind>-<subject>-<n>`, where
-/// `<n>` is a counter allocated under the project lock, so two events in one
-/// tick never share a name. `event` is a fixed phrase from this binary. `body`
-/// is empty except for `routine` items.
+/// Writes one item to the default lane. The id is
+/// `<UTC timestamp>-<kind>-<subject>-<n>`, where `<n>` is a counter allocated
+/// under the project lock, so two events in one tick never share a name.
+/// `event` is a fixed phrase from this binary. `body` is empty except for
+/// `routine` items.
 pub fn write(project: &Project, kind: &str, subject: &str, event: &str, summary: &str, body: &str) -> Result<String> {
+    write_in(project, "", kind, subject, event, summary, body)
+}
+
+/// The same, addressed to one lane. `lane` is a lane **id**; empty is the
+/// default lane, which is what every project-level event (`session`, `space`,
+/// `outage`, `routine`, `rename`, `config-error`) writes.
+pub fn write_in(project: &Project, lane: &str, kind: &str, subject: &str, event: &str, summary: &str, body: &str) -> Result<String> {
     let _lock = project.lock()?;
     let counter_path = project.state_dir().join("inbox-counter.json");
     let n: u64 = project::read_json::<u64>(&counter_path).unwrap_or(0) + 1;
@@ -73,9 +81,7 @@ pub fn write(project: &Project, kind: &str, subject: &str, event: &str, summary:
         summary: summary.chars().map(|c| if c.is_control() { ' ' } else { c }).collect(),
         event: event.to_string(),
         body: String::new(),
-        // Still written to no lane: the writer is commit 2, and an empty lane
-        // reads as the default lane's.
-        lane: String::new(),
+        lane: lane.to_string(),
     };
     let mut text = format!("+++\n{}+++\n", toml::to_string(&item)?);
     if !body.is_empty() {
@@ -85,6 +91,13 @@ pub fn write(project: &Project, kind: &str, subject: &str, event: &str, summary:
     }
     project::write_atomic(&inbox_dir(project).join(format!("{id}.md")), text.as_bytes())?;
     Ok(id)
+}
+
+/// The lane of the thread an item is about, from its record: the id to pass
+/// to [`write_in`]. An absent record or an empty `lane` field is the default
+/// lane, which is exactly what the empty string means.
+pub fn lane_of_thread(project: &Project, id: &str) -> String {
+    crate::thread::load(project, id).map(|thread| thread.lane).unwrap_or_default()
 }
 
 /// Deletes handled items older than `days`.
@@ -121,22 +134,70 @@ pub fn unhandled(project: &Project) -> Vec<Item> {
     items
 }
 
+/// The unhandled items addressed to one lane. An empty item lane is the
+/// default lane (§10). Without a registry nothing is filtered at all — that is
+/// the zero-change promise for projects that never used lanes.
+pub fn unhandled_in(project: &Project, lane: &str) -> Vec<Item> {
+    let items = unhandled(project);
+    if !crate::lanes::split_in_use(project) {
+        return items;
+    }
+    let default_lane = crate::lanes::default_lane_id(project);
+    let lane = if lane.is_empty() { default_lane.clone() } else { lane.to_string() };
+    items
+        .into_iter()
+        .filter(|item| if item.lane.is_empty() { lane == default_lane } else { item.lane == lane })
+        .collect()
+}
+
+/// The seen set of the default lane. Without a registry this is the old
+/// single `.state/inbox-seen.json`; with one it is that lane's shard.
 pub fn seen(project: &Project) -> BTreeSet<String> {
-    project::read_json(&project.state_dir().join("inbox-seen.json")).unwrap_or_default()
+    seen_in(project, &crate::lanes::default_lane_id(project))
+}
+
+/// The seen set of one lane. With a `lanes.json` every lane gets its own
+/// `.state/inbox-seen/<lane>.json`; without one the old single file is used
+/// and no directory is ever created (§4.3, §10).
+pub fn seen_in(project: &Project, lane: &str) -> BTreeSet<String> {
+    if !crate::lanes::split_in_use(project) {
+        return project::read_json(&project.state_dir().join("inbox-seen.json")).unwrap_or_default();
+    }
+    let lane = if lane.is_empty() { crate::lanes::default_lane_id(project) } else { lane.to_string() };
+    project::read_json(&seen_path(project, &lane)).unwrap_or_default()
+}
+
+fn seen_path(project: &Project, lane: &str) -> PathBuf {
+    project.state_dir().join("inbox-seen").join(format!("{}.json", safe_subject(lane)))
 }
 
 /// Records that `context` showed these items, so they are nudged once only.
+/// The default lane's set.
 pub fn mark_seen(project: &Project, ids: &[String]) -> Result<()> {
+    mark_seen_in(project, &crate::lanes::default_lane_id(project), ids)
+}
+
+/// Records that one lane's `context` showed these items. The live set used to
+/// prune old ids is that same lane's [`unhandled_in`], never the project-wide
+/// one: pruning against another lane's live set would delete its seen records.
+pub fn mark_seen_in(project: &Project, lane: &str, ids: &[String]) -> Result<()> {
     if ids.is_empty() {
         return Ok(());
     }
     let _lock = project.lock()?;
-    let mut all = seen(project);
+    let mut all = seen_in(project, lane);
     all.extend(ids.iter().cloned());
-    // Ids of items that no longer exist are dropped so the file stays small.
-    let live: BTreeSet<String> = unhandled(project).into_iter().map(|i| i.id).collect();
+    // Ids of items that no longer exist are dropped so the file stays small,
+    // within this lane only.
+    let live: BTreeSet<String> = unhandled_in(project, lane).into_iter().map(|i| i.id).collect();
     all.retain(|id| live.contains(id));
-    project::write_json(&project.state_dir().join("inbox-seen.json"), &all)
+    if !crate::lanes::split_in_use(project) {
+        return project::write_json(&project.state_dir().join("inbox-seen.json"), &all);
+    }
+    let lane = if lane.is_empty() { crate::lanes::default_lane_id(project) } else { lane.to_string() };
+    let dir = project.state_dir().join("inbox-seen");
+    std::fs::create_dir_all(&dir)?;
+    project::write_json(&seen_path(project, &lane), &all)
 }
 
 /// An item id is also a file name, so it is checked before any path is built.
@@ -236,6 +297,81 @@ mod tests {
         let routine = unhandled(&project).into_iter().find(|i| i.kind == "routine").unwrap();
         assert!(routine.body.starts_with("Check the build."));
         assert!(routine.body.ends_with("```"));
+    }
+
+    fn two_lane_project() -> (tempfile::TempDir, Project) {
+        let root = tempfile::tempdir().unwrap();
+        let project = project::create(root.path(), "demo", "", vec![]).unwrap();
+        crate::lanes::Registry::ensure_written(&project).unwrap();
+        let mut registry = crate::lanes::Registry::load(&project).unwrap();
+        registry.create("books", "收藏");
+        registry.save(&project).unwrap();
+        (root, project)
+    }
+
+    #[test]
+    fn write_in_addresses_one_lane_and_lane_of_thread_reads_the_record() {
+        let (_root, project) = two_lane_project();
+        crate::thread::allocate(&project, |t| {
+            t.title = "Task".into();
+            t.lane = "c-2".into();
+        })
+        .unwrap();
+        let id = write_in(&project, "c-2", "thread-state", "t-0001", "idle", "s", "").unwrap();
+        let item = unhandled(&project).into_iter().find(|i| i.id == id).unwrap();
+        assert_eq!(item.lane, "c-2");
+        assert_eq!(lane_of_thread(&project, "t-0001"), "c-2");
+        assert_eq!(lane_of_thread(&project, "t-9999"), "", "an absent record is the default lane");
+        // A project-level event stays empty, i.e. the default lane.
+        let id = write(&project, "session", "session", "restarted", "s", "").unwrap();
+        assert_eq!(unhandled(&project).into_iter().find(|i| i.id == id).unwrap().lane, "");
+    }
+
+    #[test]
+    fn seen_state_is_one_file_without_a_registry_and_one_file_per_lane_with_one() {
+        let root = tempfile::tempdir().unwrap();
+        let project = project::create(root.path(), "demo", "", vec![]).unwrap();
+        write_item(&project, "20260917T000001Z-routine-r-1", "");
+        mark_seen(&project, &["20260917T000001Z-routine-r-1".to_string()]).unwrap();
+        assert!(project.state_dir().join("inbox-seen.json").is_file());
+        assert!(!project.state_dir().join("inbox-seen").exists(), "no registry, no directory");
+
+        // A registry switches to per-lane shards; the old file is neither read
+        // nor written any more, and reading a lane writes no directory yet.
+        let (_root, project) = two_lane_project();
+        assert!(seen_in(&project, "c-1").is_empty());
+        assert!(!project.state_dir().join("inbox-seen").exists());
+        let a = write_in(&project, "c-1", "thread-state", "t-0001", "idle", "a", "").unwrap();
+        mark_seen(&project, std::slice::from_ref(&a)).unwrap();
+        assert!(project.state_dir().join("inbox-seen/c-1.json").is_file());
+        assert!(seen(&project).contains(&a));
+        assert!(!project.state_dir().join("inbox-seen.json").exists(), "the old file is not written");
+        assert!(!project.state_dir().join("inbox-seen/c-2.json").exists(), "only the lane that read");
+    }
+
+    #[test]
+    fn marking_one_lanes_items_seen_leaves_another_lanes_items_and_seen_alone() {
+        let (_root, project) = two_lane_project();
+        let a = write_in(&project, "c-1", "thread-state", "t-0001", "idle", "a", "").unwrap();
+        let b = write_in(&project, "c-2", "thread-state", "t-0002", "idle", "b", "").unwrap();
+        assert_eq!(unhandled_in(&project, "c-1").len(), 1);
+        assert_eq!(unhandled_in(&project, "c-2").len(), 1);
+        // Lane A marks its item seen: B's item is untouched, and B's seen set
+        // is not created.
+        mark_seen_in(&project, "c-1", std::slice::from_ref(&a)).unwrap();
+        assert!(seen_in(&project, "c-1").contains(&a));
+        assert!(!seen_in(&project, "c-2").contains(&a));
+        assert!(!project.state_dir().join("inbox-seen/c-2.json").exists());
+        assert_eq!(unhandled_in(&project, "c-2").len(), 1, "B's item is still unhandled");
+        // B marks its own: A's file still exists and still has A's id. Pruning
+        // against B's live set must not delete it.
+        mark_seen_in(&project, "c-2", std::slice::from_ref(&b)).unwrap();
+        assert!(seen_in(&project, "c-1").contains(&a), "A's seen set survives B's mark_seen");
+        assert!(seen_in(&project, "c-2").contains(&b));
+        // Marking A again after B also keeps both.
+        mark_seen_in(&project, "c-1", std::slice::from_ref(&a)).unwrap();
+        assert!(seen_in(&project, "c-1").contains(&a));
+        assert!(seen_in(&project, "c-2").contains(&b));
     }
 
     #[test]

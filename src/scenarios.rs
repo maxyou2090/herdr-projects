@@ -1057,7 +1057,7 @@ fn idle_for_a_minute(project: &Project) {
 fn box_empty_for_a_while(project: &Project) {
     let mut state = crate::steps::load_state(project);
     assert!(!state.box_empty_since.is_empty(), "the box was not seen empty yet");
-    state.box_empty_since = "2026-01-01T00:00:00Z".into();
+    state.box_empty_since.insert(crate::lanes::default_lane_id(project), "2026-01-01T00:00:00Z".into());
     crate::steps::save_state(project, &state).unwrap();
 }
 
@@ -4047,4 +4047,108 @@ fn a_drifted_lane_keeps_its_token_from_the_registry_and_the_other_lane_is_left_u
     *world.agents.borrow_mut() = format!("[{}]", agent_json_session("w3", "w3:p1", "/elsewhere", "sess-3"));
     let (line, _) = digest_parts(&world, &project);
     assert_eq!(line, "Coordinators: lanes c-1 c-2 of 2 (default c-1)");
+}
+
+#[test]
+fn two_lanes_each_read_only_their_own_threads_and_inbox_items() {
+    let world = World::new();
+    let project = world.project("demo", "a.sock");
+    let dir = project.canonical_dir().to_string_lossy().into_owned();
+    crate::lanes::Registry {
+        lanes: vec![
+            crate::lanes::Lane { id: "c-1".into(), name: "fix".into(), label: "抢修".into(), ..Default::default() },
+            crate::lanes::Lane { id: "c-2".into(), name: "books".into(), label: "收藏".into(), ..Default::default() },
+        ],
+        default: "c-1".into(),
+        next: 3,
+    }
+    .save(&project)
+    .unwrap();
+    crate::thread::allocate(&project, |t| {
+        t.title = "fix the leak".into();
+        t.lane = "c-1".into();
+    })
+    .unwrap();
+    crate::thread::allocate(&project, |t| {
+        t.title = "sort the books".into();
+        t.lane = "c-2".into();
+    })
+    .unwrap();
+    let item_a = crate::inbox::write_in(&project, "c-1", "thread-state", "t-0001", "idle", "lane one item", "").unwrap();
+    let item_b = crate::inbox::write_in(&project, "c-2", "thread-state", "t-0002", "idle", "lane two item", "").unwrap();
+    *world.agents.borrow_mut() = format!(
+        "[{},{}]",
+        agent_json_tokens("w1", "w1:p1", &dir, &[("hp_project", "demo"), ("hp_lane", "c-1")]),
+        agent_json_tokens("w2", "w2:p1", &dir, &[("hp_project", "demo"), ("hp_lane", "c-2")]),
+    );
+    let digest_in = |pane: &str| {
+        let env = crate::paths::Env::for_test(world.home.path(), &[("HERDR_PANE_ID", pane), ("HERDR_SOCKET_PATH", &project.coordinator().unwrap().socket)]);
+        let ctx = Ctx { env: &env, root: world.root.clone(), config_dir: world.home.path().join("cfg"), runner: &world.runner, detached_ticker: false };
+        coordinator::digest(&ctx, &project, "hp").unwrap().0
+    };
+    let one = digest_in("w1:p1");
+    assert!(one.contains("- t-0001 [") && one.contains("fix the leak"), "{one}");
+    assert!(!one.contains("- t-0002 ["), "lane c-1 must not list c-2's thread: {one}");
+    assert_eq!(one.matches("## Open threads (1)").count(), 1, "{one}");
+    assert!(one.contains("## Inbox (1 unhandled)"), "{one}");
+    assert!(one.contains(&item_a) && one.contains("lane one item"), "{one}");
+    assert!(!one.contains(&item_b) && !one.contains("lane two item"), "lane c-1 must not list c-2's item: {one}");
+
+    let two = digest_in("w2:p1");
+    assert!(two.contains("- t-0002 [") && two.contains("sort the books"), "{two}");
+    assert!(!two.contains("- t-0001 ["), "lane c-2 must not list c-1's thread: {two}");
+    assert_eq!(two.matches("## Open threads (1)").count(), 1, "{two}");
+    assert!(two.contains("## Inbox (1 unhandled)"), "{two}");
+    assert!(two.contains(&item_b) && two.contains("lane two item"), "{two}");
+    assert!(!two.contains(&item_a) && !two.contains("lane one item"), "lane c-2 must not list c-1's item: {two}");
+    // Tasks are deliberately not split in this commit: both lanes see the
+    // same whole file (§8 says the split is commit 5).
+    assert_eq!(one.contains("## Tasks (TASKS.md)"), two.contains("## Tasks (TASKS.md)"));
+}
+
+#[test]
+fn a_single_lane_project_reads_the_same_digest_with_and_without_a_registry_and_with_content() {
+    let world = World::new();
+    let project = world.project("demo", "a.sock");
+    let dir = project.canonical_dir().to_string_lossy().into_owned();
+    crate::thread::allocate(&project, |t| t.title = "the only thread".into()).unwrap();
+    crate::inbox::write(&project, "thread-state", "t-0001", "idle", "an item", "").unwrap();
+    *world.agents.borrow_mut() = format!("[{}]", agent_json("w1", "w1:t1", "w1:p1", &dir, "hp-demo-coordinator", "idle"));
+    let without = digest_parts(&world, &project);
+    crate::lanes::Registry::ensure_written(&project).unwrap();
+    let with = digest_parts(&world, &project);
+    assert_eq!(without, with, "one synthesized lane changes not a byte of what a coordinator reads");
+    assert!(with.1.contains("- t-0001 [") && with.1.contains("an item"), "{with:?}");
+}
+
+#[test]
+fn thread_start_writes_the_initiating_coordinators_lane_and_restart_does_not_recompute_it() {
+    let world = World::new();
+    let project = world.project("demo", "a.sock");
+    let dir = project.canonical_dir().to_string_lossy().into_owned();
+    crate::lanes::Registry::ensure_written(&project).unwrap();
+    let mut registry = crate::lanes::Registry::load(&project).unwrap();
+    registry.create("books", "收藏");
+    registry.save(&project).unwrap();
+    *world.agents.borrow_mut() = format!(
+        "[{},{}]",
+        agent_json("w1", "w1:t1", "w1:p1", &dir, "hp-demo-coordinator", "idle"),
+        agent_json_tokens("w2", "w2:p1", &dir, &[("hp_project", "demo"), ("hp_lane", "c-2")]),
+    );
+    *world.panes.borrow_mut() = format!("[{}]", world.coordinator_pane(&project));
+    world.runner.on("tab create", ok(r#"{"result":{"root_pane":{"workspace_id":"w1","tab_id":"w1:t2","pane_id":"w1:p2"}}}"#));
+    world.runner.on("tab rename", ok(r#"{"result":{}}"#));
+    world.runner.on("pane get", ok(r#"{"result":{"pane":{"cwd":""}}}"#));
+    let env = crate::paths::Env::for_test(world.home.path(), &[("HERDR_PANE_ID", "w2:p1"), ("HERDR_SOCKET_PATH", &project.coordinator().unwrap().socket)]);
+    let ctx = Ctx { env: &env, root: world.root.clone(), config_dir: world.home.path().join("cfg"), runner: &world.runner, detached_ticker: false };
+    let args = |title: &str| StartArgs { title: title.into(), repo: None, machine: None, profile: None, kind: Some(Kind::Home), base: None, task: "Do it.".into() };
+    let t = threads::start(&ctx, "demo", args("Owned")).unwrap();
+    assert_eq!(t.lane, "c-2", "the initiator's lane is written at creation");
+    // A restart keeps the recorded lane even when the registry's default or
+    // the pane changes: only `thread start` writes ownership (§6.3).
+    registry.lanes[1].pane_id = "w8:p8".into();
+    registry.lanes[1].agent_session = "other".into();
+    registry.save(&project).unwrap();
+    let restarted = threads::restart(&ctx, "demo", &t.id, None).unwrap();
+    assert_eq!(restarted.lane, "c-2", "a restart never recomputes ownership");
 }
