@@ -332,3 +332,33 @@ fn lane_list_prints_the_identity_line_and_creates_no_state() {
     assert!(!hp(home.path(), &["--root", root_arg, "lane", "list", "../x"]).status.success());
     assert!(!hp(home.path(), &["--root", root_arg, "lane", "adopt", "demo", "c-1"]).status.success());
 }
+
+#[test]
+fn task_commands_write_tasks_md_and_work_without_a_lane_registry() {
+    let home = tempfile::tempdir().unwrap();
+    let root = home.path().join("root");
+    let root_arg = root.to_str().unwrap();
+    assert!(hp(home.path(), &["--root", root_arg, "new", "Demo"]).status.success());
+
+    let out = hp(home.path(), &["--root", root_arg, "task", "add", "demo", "Backlog", "Write docs", "--owner", "me", "--notes", "A note"]);
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    let tasks = std::fs::read_to_string(root.join("demo/TASKS.md")).unwrap();
+    assert_eq!(tasks, "# Tasks\n\n## Backlog\n- [ ] Write docs (me)\n  A note\n");
+
+    let out = hp(home.path(), &["--root", root_arg, "task", "move", "demo", "Write docs", "Later"]);
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    let tasks = std::fs::read_to_string(root.join("demo/TASKS.md")).unwrap();
+    assert_eq!(tasks, "# Tasks\n\n## Backlog\n\n## Later\n- [ ] Write docs (me)\n  A note\n");
+
+    let out = hp(home.path(), &["--root", root_arg, "task", "done", "demo", "Write docs"]);
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    let tasks = std::fs::read_to_string(root.join("demo/TASKS.md")).unwrap();
+    assert!(tasks.contains("## Later\n- [x] Write docs (me)\n  A note\n"), "{tasks}");
+
+    // No registry was created, and `context` prints the whole shared file.
+    assert!(!root.join("demo/.state/lanes.json").exists());
+    let out = hp(home.path(), &["--root", root_arg, "context", "demo", "--peek"]);
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    let context = String::from_utf8(out.stdout).unwrap();
+    assert!(context.contains("## Later\n- [x] Write docs (me)\n  notes: A note"), "{context}");
+}
