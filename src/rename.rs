@@ -501,6 +501,8 @@ fn advance(ctx: &Ctx, pending: &Pending) -> Result<Option<Next>> {
             // The ticker reopens after a rename: it must not resume a project
             // the user paused.
             person: false,
+            lane: None,
+            lane_name: None,
         };
         match crate::coordinator::open(ctx, to, &options) {
             Ok(()) => reopened = project.coordinator().filter(|c| !c.pane_id.is_empty()),

@@ -77,6 +77,12 @@ enum Command {
         /// Move the project to this session when its recorded socket no longer exists
         #[arg(long)]
         rebind: bool,
+        /// Open or focus this lane's coordinator (default: the default lane)
+        #[arg(long, value_name = "NAME")]
+        lane: Option<String>,
+        /// The display label when --lane creates a new lane (default: the name)
+        #[arg(long, value_name = "LABEL", requires = "lane")]
+        lane_name: Option<String>,
         #[command(flatten)]
         session: SessionArgs,
     },
@@ -318,6 +324,49 @@ enum LaneCommand {
         slug: String,
         #[arg(long)]
         json: bool,
+    },
+    /// Claim the current pane as LANE's coordinator (run it in that pane)
+    Adopt {
+        /// The lane name (or id)
+        lane: String,
+        /// The project; default: the project whose home this pane works in
+        #[arg(long, value_name = "SLUG")]
+        project: Option<String>,
+    },
+    /// Point a lane (and its threads) at another coordinator pane: the explicit handover
+    Assign {
+        /// The lane name (or id)
+        lane: String,
+        /// The pane that becomes its coordinator
+        pane: String,
+        #[arg(long, value_name = "SLUG")]
+        project: Option<String>,
+    },
+    /// Change a lane's display label, and optionally its CLI name
+    Rename {
+        /// The lane name (or id)
+        lane: String,
+        /// The new display label
+        label: String,
+        /// The new CLI handle
+        #[arg(long, value_name = "NAME")]
+        name: Option<String>,
+        #[arg(long, value_name = "SLUG")]
+        project: Option<String>,
+    },
+    /// Retire a lane once none of its threads is open
+    Close {
+        /// The lane name (or id)
+        lane: String,
+        #[arg(long, value_name = "SLUG")]
+        project: Option<String>,
+    },
+    /// Reopen a closed lane (starts no agent)
+    Open {
+        /// The lane name (or id)
+        lane: String,
+        #[arg(long, value_name = "SLUG")]
+        project: Option<String>,
     },
 }
 
@@ -682,7 +731,7 @@ pub fn run() -> Result<()> {
             }
             Ok(())
         }
-        Command::Open { slug, profile, new, tab, rebind, session } => {
+        Command::Open { slug, profile, new, tab, rebind, lane, lane_name, session } => {
             let person = std::io::stdin().is_terminal() && std::io::stdout().is_terminal();
             coordinator::open(
                 &ctx,
@@ -696,6 +745,8 @@ pub fn run() -> Result<()> {
                     // popup and agents' shell tools run `open` without one.
                     here: !tab && person,
                     person,
+                    lane,
+                    lane_name,
                 },
             )
         }
@@ -720,6 +771,23 @@ pub fn run() -> Result<()> {
         },
         Command::Lane { command } => match command {
             LaneCommand::List { slug, json } => lanes::lane_list(&ctx, &slug, json),
+            LaneCommand::Adopt { lane, project } => lanes::lane_adopt(&ctx, project.as_deref(), &lane),
+            LaneCommand::Assign { lane, pane, project } => {
+                let project = lanes::project_for_command(&ctx, &lane, project.as_deref())?;
+                lanes::lane_assign(&ctx, &project, &lane, &pane)
+            }
+            LaneCommand::Rename { lane, label, name, project } => {
+                let project = lanes::project_for_command(&ctx, &lane, project.as_deref())?;
+                lanes::lane_rename(&ctx, &project, &lane, &label, name.as_deref())
+            }
+            LaneCommand::Close { lane, project } => {
+                let project = lanes::project_for_command(&ctx, &lane, project.as_deref())?;
+                lanes::lane_close(&ctx, &project, &lane)
+            }
+            LaneCommand::Open { lane, project } => {
+                let project = lanes::project_for_command(&ctx, &lane, project.as_deref())?;
+                lanes::lane_open(&ctx, &project, &lane)
+            }
         },
         Command::Thread { command } => match command {
             ThreadCommand::Start { slug, title, repo, mut machine, mut profile, kind, base, task_file, from_task } => {
