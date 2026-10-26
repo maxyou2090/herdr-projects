@@ -56,7 +56,7 @@ Every thread works from `<its working directory>/.herdr-project/<project>-<id>/`
 | `new <name> [--goal] [--repo PATH[@MACHINE]]... [--thread-profile P] [--coordinator-profile P]` | Create a project folder. The profiles default to `[defaults]` in config.toml, else `claude`. |
 | `open <project> [--profile P] [--new] [--tab] [--lane NAME] [--lane-name LABEL] [--session N \| --socket P] [--rebind]` | A coordinator agent in the project folder; focuses a running one. `--lane` opens or focuses that lane's coordinator and creates the lane when it does not exist; `--lane-name` sets a new lane's label. From a shell pane inside Herdr it runs in that pane and quitting it returns to the shell; `--tab`, the popup, actions and a terminal outside Herdr use a tab of the project's workspace. |
 | `context <project> [--peek]` | The digest the coordinator reads every turn; with lanes, the shared part plus the reader's own lane. |
-| `task add <project> <list> "<title>" [--owner O] [--lane L] [--notes T]`, `task move <project> "<title>" <list>`, `task done <project> "<title>"` | Safe `TASKS.md` writers: one locked read-modify-write, every byte outside the changed task preserved. `--lane` writes `## <lane>/<list>`; without it the list is shared. |
+| `task add <project> <list> "<title>" [--owner O] [--lane L] [--notes T]`, `task move <project> "<title>" <list>`, `task done <project> "<title>"`, `task delete <project> "<title>"`, `task thread <project> "<title>" <thread-id> [--owner O]` (or `--clear` to remove the id) | Safe `TASKS.md` writers: one locked read-modify-write, every byte outside the changed task preserved. `--lane` writes `## <lane>/<list>`; without it the list is shared. `task delete` removes the line and its notes, keeping an empty heading; `task thread` records the owner and thread id on that one line. |
 | `assignable <project> [--refresh] [--check OWNER]` | Who TASKS.md tasks may be assigned to (see [Task owners](#task-owners)); `--check` refuses an owner that is not valid. |
 | `coordinator prompt <project> --text-file F` | A sentence to the coordinator (the popup's task keys use it). |
 | `thread start <project> --title T [--repo PATH] [--kind worktree\|tab\|checkout\|home] [--profile P] [--machine M] [--base REF] --task-file F [--from-task TITLE]` | New thread; `-` reads the task from standard input. `--kind` is the placement (default: worktree with `--repo`, home without; `tab` gives the thread a Space of its own; `checkout` runs on the repo's main checkout; `home` is a tab of the project's own Space on `threads/<id>/`); `--profile` is the agent, one the project allows. `--from-task` adds a TASKS.md task's notes and takes `--profile` and `--machine` from its owner. |
@@ -232,6 +232,8 @@ The coordinator runs the binary every turn, so allow-list it in your agent by su
   "Bash(<binary> --root <root> task add:*)",
   "Bash(<binary> --root <root> task move:*)",
   "Bash(<binary> --root <root> task done:*)",
+  "Bash(<binary> --root <root> task delete:*)",
+  "Bash(<binary> --root <root> task thread:*)",
   "Bash(<binary> --root <root> routine list:*)",
   "Bash(<binary> --root <root> thread list:*)",
   "Bash(<binary> --root <root> thread show:*)",
@@ -247,7 +249,7 @@ The coordinator runs the binary every turn, so allow-list it in your agent by su
 
 - Allow `thread start` only where you've set `start_threads = "auto"`. Left off the list, every thread start meets your agent's own permission prompt.
 - With `thread keys` on the list, the coordinator answers a thread's questions and permission prompts itself, by the skill's rules, and its trust screens when `trust_screens` is `coordinator`. Remove it to confirm each answer first.
-- With lanes, the split is: **allow** `context`, `lane list`, `task add`, `task move`, `task done` and the thread's read-only commands; **keep behind your agent's permission prompt** `lane adopt`, `lane assign`, `lane close`, `lane open`, `lane rename`, `thread resolve`, `sweep` and `routine approve`. The first group is read plus safe write; the second changes ownership or lifecycle — the same level as `thread resolve`. The thread steering commands in the list above (`thread prompt`, `thread next`, `thread keys`, `thread ack`, `thread restart`) stay allowed as before.
+- With lanes, the split is: **allow** `context`, `lane list`, `task add`, `task move`, `task done`, `task delete`, `task thread` and the thread's read-only commands; **keep behind your agent's permission prompt** `lane adopt`, `lane assign`, `lane close`, `lane open`, `lane rename`, `thread resolve`, `sweep` and `routine approve`. The first group is read plus safe write; the second changes ownership or lifecycle — the same level as `thread resolve`. The thread steering commands in the list above (`thread prompt`, `thread next`, `thread keys`, `thread ack`, `thread restart`) stay allowed as before.
 - Never allow `lane adopt`, `lane assign`, `lane close`, `lane open`, `lane rename`, `thread resolve`, `sweep`, `delete`, `rename`, `archive`, `routine approve`, `configure` or `unconfigure`.
 
 ## What the safety settings do and don't stop

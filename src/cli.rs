@@ -127,7 +127,7 @@ enum Command {
         #[command(subcommand)]
         command: InboxCommand,
     },
-    /// TASKS.md: add, move or tick a task without touching any other byte
+    /// TASKS.md: add, move, tick, delete or thread a task without touching any other byte
     Task {
         #[command(subcommand)]
         command: TaskCommand,
@@ -335,6 +335,24 @@ enum TaskCommand {
     },
     /// Tick a task's checkbox (`- [ ]` -> `- [x]`); the line stays
     Done { slug: String, title: String },
+    /// Delete a task and its indented notes; an empty list heading stays
+    Delete {
+        slug: String,
+        title: String,
+    },
+    /// Record the thread that runs a task, optionally setting its owner in the same write
+    Thread {
+        slug: String,
+        title: String,
+        /// The thread id, for example t-0012 (omit with --clear)
+        thread: Option<String>,
+        /// Remove the thread id instead of setting one
+        #[arg(long, conflicts_with = "thread")]
+        clear: bool,
+        /// Set or replace the task's owner in the same write
+        #[arg(long, value_name = "OWNER")]
+        owner: Option<String>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -837,6 +855,19 @@ pub fn run() -> Result<()> {
                 let project = Project::load(&ctx.root, &slug)?;
                 let lane = task_caller_lane(&ctx, &project);
                 println!("{}", crate::tasks::done(&project, &title, lane.as_deref())?);
+                Ok(())
+            }
+            TaskCommand::Delete { slug, title } => {
+                let project = Project::load(&ctx.root, &slug)?;
+                let lane = task_caller_lane(&ctx, &project);
+                println!("{}", crate::tasks::delete(&project, &title, lane.as_deref())?);
+                Ok(())
+            }
+            TaskCommand::Thread { slug, title, thread, clear, owner } => {
+                let project = Project::load(&ctx.root, &slug)?;
+                let lane = task_caller_lane(&ctx, &project);
+                let options = crate::tasks::ThreadOptions { thread: thread.as_deref(), owner: owner.as_deref(), clear };
+                println!("{}", crate::tasks::record_thread(&project, &title, &options, lane.as_deref())?);
                 Ok(())
             }
         },

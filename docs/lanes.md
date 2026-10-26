@@ -162,7 +162,7 @@ of `lanes::resolve` returning the three-valued `LaneResolution`
 `inbox::seen`/`mark_seen` (`src/inbox.rs`) and the `steps::State` maps
 (`src/steps.rs`); lane-routed nudge, prompt and discovery
 (`coordinator::nudge_target`, `prompt`, `discover`, same file); TASKS.md lane
-headings and `hp task add/move/done` (`src/tasks.rs`); the sidebar lane label,
+headings and `hp task add/move/done/delete/thread` (`src/tasks.rs`); the sidebar lane label,
 grouping key and lifecycle (`src/sidebar.rs`, `src/grouping.rs`,
 `src/ticker.rs`, `src/lifecycle.rs`); and the lane rules in
 `skill/COORDINATOR.md` with the ambiguous-pane warning in `hp doctor`
@@ -175,7 +175,7 @@ grouping key and lifecycle (`src/sidebar.rs`, `src/grouping.rs`,
 | `hp open --lane`, `--lane-name`; the `hp_lane` token | `src/coordinator.rs`, `src/sidebar.rs` |
 | `Thread.lane`, `inbox::Item::lane`, per-lane seen and `steps::State` maps | `src/thread.rs`, `src/inbox.rs`, `src/steps.rs` |
 | lane-routed nudge, prompt, discovery | `src/coordinator.rs` |
-| TASKS.md lane headings, `hp task add/move/done` | `src/tasks.rs` |
+| TASKS.md lane headings, `hp task add/move/done/delete/thread` | `src/tasks.rs` |
 | sidebar `· <lane label>`, grouping, lifecycle | `src/sidebar.rs`, `src/grouping.rs`, `src/ticker.rs` |
 | skill lane rules, `doctor` ambiguous-pane warning | `skill/COORDINATOR.md`, `src/doctor.rs` |
 
@@ -820,14 +820,18 @@ The narrow writer is built:
 hp task add <slug> <list> "<title>" [--owner O] [--lane L] [--notes TEXT]
 hp task move <slug> "<title>" <list>
 hp task done <slug> "<title>"        # ticks the box; keeps the line
+hp task delete <slug> "<title>"      # removes the line and its notes; the heading stays
+hp task thread <slug> "<title>" <thread-id> [--owner O]
+hp task thread <slug> "<title>" --clear   # remove the recorded id
 ```
 
 Each is one `project.lock()`-protected read-modify-write of `TASKS.md` that
 preserves every other section byte-for-byte — including CRLF/LF, comments,
 blank lines and a missing final newline. `hp task add` creates the `# Tasks`
-skeleton and a missing list on first use. `move`/`done` act on the caller's
-lane: a task in another lane's section is refused, and `--lane` on `add` writes
-that lane's heading. A project without `lanes.json` keeps every list shared and
+skeleton and a missing list on first use. `move`/`done`/`delete`/`thread` act on
+the caller's lane: a task in another lane's section is refused, and `--lane`
+on `add` writes that lane's heading. A project without `lanes.json` keeps every
+list shared and
 `hp task` works there unchanged. The skill says "never edit `TASKS.md`
 directly; use `hp task`", and the popup's existing "send a sentence to the
 coordinator" actions in `src/popup.rs` keep working unchanged.
