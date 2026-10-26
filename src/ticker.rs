@@ -1180,6 +1180,43 @@ mod tests {
     }
 
     #[test]
+    fn a_closed_lanes_live_pane_is_still_a_coordinator_but_not_a_sidebar_row() {
+        let world = crate::scenarios::World::new();
+        let project = world.project("demo", "a.sock");
+        let dir = project.canonical_dir().to_string_lossy().into_owned();
+        crate::lanes::Registry {
+            lanes: vec![
+                crate::lanes::Lane { id: "c-1".into(), name: "fix".into(), label: "抢修".into(), pane_id: "w1:p1".into(), ..Default::default() },
+                crate::lanes::Lane { id: "c-2".into(), name: "old".into(), label: "归档".into(), pane_id: "w2:p1".into(), status: crate::lanes::Status::Closed, ..Default::default() },
+            ],
+            default: "c-1".into(),
+            next: 3,
+        }
+        .save(&project)
+        .unwrap();
+        *world.agents.borrow_mut() = format!(
+            "[{},{}]",
+            crate::scenarios::agent_json_tokens("w1", "w1:p1", &dir, &[("hp_project", "demo"), ("hp_lane", "c-1")]),
+            crate::scenarios::agent_json_tokens("w2", "w2:p1", &dir, &[("hp_project", "demo"), ("hp_lane", "c-2")]),
+        );
+        *world.panes.borrow_mut() = format!("[{},{}]", crate::scenarios::pane_json("w1", "w1:t1", "w1:p1", &dir), crate::scenarios::pane_json("w2", "w2:t1", "w2:p1", &dir));
+        let ctx = world.ctx();
+        let view = crate::threads::session_view(&ctx, &project).unwrap();
+        // §6.4 + §5.4: put away but still running is a real state, and the
+        // `Coordinators:` line is the one place it stays visible.
+        let identity = crate::lanes::View::with_session(&ctx, &project, Some(&view));
+        let line = crate::lanes::identity_line(&identity);
+        assert!(line.contains("w2:p1 (token, lane c-2, closed"), "{line}");
+        assert!(line.contains("w1:p1 (token, lane c-1"), "{line}");
+        // §9: the sidebar, however, has no row for the closed lane.
+        let record = project.coordinator().unwrap();
+        let live = crate::coordinator::discover(&project, &record, &[], &view.agents, &crate::project::now());
+        let part = part(&ctx, &project, &record, &live, &view.agents, false);
+        assert!(part.panes.iter().any(|row| row.pane == "w1:p1"));
+        assert!(!part.panes.iter().any(|row| row.pane == "w2:p1"), "a closed lane takes no sidebar row: {:?}", part.panes);
+    }
+
+    #[test]
     fn start_and_run_create_nothing_without_projects() {
         let home = tempfile::tempdir().unwrap();
         let missing = home.path().join("root");
