@@ -217,6 +217,66 @@ pub fn load_all(project: &Project) -> (Vec<Routine>, Vec<Broken>) {
     (routines, broken)
 }
 
+// ----------------------------------------------------------------- journal
+
+/// The append-only record of routine changes, in the project's `.state/`.
+/// Nothing else reads it: it is not part of `context`, of `doctor`'s pass/fail
+/// checks or of routine parsing, so a project's behaviour never depends on it.
+pub fn journal_path(project: &Project) -> std::path::PathBuf {
+    project.state_dir().join("routine-journal.log")
+}
+
+/// Where a `routine toggle` came from: the popup, a Herdr pane, or a plain
+/// terminal. A file that changed on its own can be traced to the kind of
+/// caller that changed it.
+pub fn journal_source(env: &crate::paths::Env) -> String {
+    if env.var("HERDR_PLUGIN_STATE_DIR").is_some() {
+        "popup".to_string()
+    } else if let Some(pane) = env.var("HERDR_PANE_ID") {
+        format!("pane:{pane}")
+    } else {
+        "terminal".to_string()
+    }
+}
+
+/// One line for a journal entry: time, event, routine, resulting state,
+/// source, binary and root. `binary` and `root` are what tell the installed
+/// copy from a throwaway build at a scratch root.
+pub fn journal_line(project: &Project, action: &str, name: &str, state: &str, source: &str) -> String {
+    let binary = crate::paths::binary().map(|p| p.display().to_string()).unwrap_or_else(|_| "unknown".into());
+    format!("{}  {action}  {name}  {state}  source={source}  binary={binary}  root={}\n", project::now(), project.root.display())
+}
+
+/// Appends one line; the caller holds the project lock. The file is tiny and
+/// never rotated, so it is read whole and rewritten atomically.
+pub fn journal_locked(project: &Project, action: &str, name: &str, state: &str, source: &str) -> Result<()> {
+    let path = journal_path(project);
+    let mut text = match std::fs::read_to_string(&path) {
+        Ok(text) => text,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(error) => return Err(error).with_context(|| format!("could not read {}", path.display())),
+    };
+    if !text.is_empty() && !text.ends_with('\n') {
+        text.push('\n');
+    }
+    text.push_str(&journal_line(project, action, name, state, source));
+    project::write_atomic(&path, text.as_bytes())
+}
+
+/// The append for changes that must land even if the record cannot be written:
+/// a command that already changed a file stays changed, and the failure is
+/// said on stderr instead of turning into an error.
+pub fn journal_locked_or_warn(project: &Project, action: &str, name: &str, state: &str, source: &str) {
+    if let Err(error) = journal_locked(project, action, name, state, source) {
+        eprintln!("warning: could not record the routine change in {}: {error:#}", journal_path(project).display());
+    }
+}
+
+/// The journal's line count, for `doctor`'s "you may clean this up" hint.
+pub fn journal_lines(project: &Project) -> Option<usize> {
+    std::fs::read_to_string(journal_path(project)).ok().map(|text| text.lines().count())
+}
+
 // ---------------------------------------------------------------- approvals
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]

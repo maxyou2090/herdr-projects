@@ -3899,6 +3899,19 @@ fn digest_parts(world: &World, project: &Project) -> (String, String) {
 }
 
 #[test]
+fn routine_journal_lines_do_not_leak_into_the_digest() {
+    let world = World::new();
+    let project = world.project("demo", "a.sock");
+    // `new` already recorded the two default routines.
+    assert_eq!(crate::routine::journal_lines(&project), Some(2));
+    let before = digest_parts(&world, &project);
+    crate::settings::routine_toggle(&world.ctx(), "demo", "coordinator-sweep", Some(false)).unwrap();
+    crate::settings::routine_toggle(&world.ctx(), "demo", "coordinator-sweep", Some(true)).unwrap();
+    assert_eq!(crate::routine::journal_lines(&project), Some(4));
+    assert_eq!(digest_parts(&world, &project), before);
+}
+
+#[test]
 fn a_single_lane_project_prints_its_identity_line_and_nothing_else_in_the_digest_changes() {
     let world = World::new();
     let project = world.project("demo", "a.sock");

@@ -157,17 +157,19 @@ pub fn set(ctx: &Ctx, slug: &str, key: &str, value: &str) -> Result<()> {
     }
     if key == "name" {
         // The priming file names the project.
-        let _ = project::write_priming(&project, &crate::coordinator::current_prefix(&ctx.root)?);
+        let _ = project::write_priming(&project, &crate::coordinator::current_prefix(&ctx.root)?, "set");
     }
     println!("{slug}: {key} = {value}");
     Ok(())
 }
 
-/// `routine toggle <slug> <name> [--on|--off]`: flips `enabled`.
+/// `routine toggle <slug> <name> [--on|--off]`: flips `enabled` and records
+/// who did it in `.state/routine-journal.log`.
 pub fn routine_toggle(ctx: &Ctx, slug: &str, name: &str, to: Option<bool>) -> Result<()> {
     let project = Project::load(&ctx.root, slug)?;
     project::validate_slug(name)?;
     let path = project.dir().join("routines").join(format!("{name}.md"));
+    let _lock = project.lock()?;
     let text = std::fs::read_to_string(&path).with_context(|| format!("no routine `{name}` in `{slug}`"))?;
     let (front, body) = split(&text)?;
     let mut doc = front.parse::<DocumentMut>().context("the routine's front matter does not parse")?;
@@ -177,6 +179,9 @@ pub fn routine_toggle(ctx: &Ctx, slug: &str, name: &str, to: Option<bool>) -> Re
     let edited = join(&doc.to_string(), body);
     crate::routine::parse(name, &edited)?;
     project::write_atomic(&path, edited.as_bytes())?;
+    // Best effort: a routine that toggled stays toggled even if the record
+    // cannot be written.
+    crate::routine::journal_locked_or_warn(&project, "toggle", name, if enabled { "enabled" } else { "disabled" }, &crate::routine::journal_source(ctx.env));
     println!("routine `{name}` is now {}", if enabled { "enabled" } else { "disabled" });
     Ok(())
 }
@@ -307,6 +312,56 @@ mod tests {
         routine_toggle(&ctx, "demo", "nightly", None).unwrap();
         assert!(crate::routine::parse("nightly", &std::fs::read_to_string(&path).unwrap()).unwrap().enabled);
         assert!(routine_toggle(&ctx, "demo", "missing", None).is_err());
+    }
+
+    /// The last journal line, checked field by field: the time is the inbox id's
+    /// UTC `...Z` shape, and the binary and root name this exact caller.
+    fn assert_journal_line(line: &str, action: &str, name: &str, state: &str, source: &str, project: &Project) {
+        let mut parts = line.split("  ");
+        let stamp = parts.next().unwrap();
+        assert_eq!(stamp.len(), 20, "the time is `2026-10-27T09:22:15Z`: {line}");
+        assert!(stamp.ends_with('Z') && stamp.as_bytes()[..4].iter().all(u8::is_ascii_digit), "{line}");
+        assert_eq!(parts.next(), Some(action), "{line}");
+        assert_eq!(parts.next(), Some(name), "{line}");
+        assert_eq!(parts.next(), Some(state), "{line}");
+        assert_eq!(parts.next(), Some(source), "{line}");
+        let rest: Vec<&str> = parts.collect();
+        assert!(rest[0].starts_with("binary=") && rest[0].len() > "binary=".len(), "{line}");
+        assert_eq!(rest[1], format!("root={}", project.root.display()), "{line}");
+    }
+
+    fn world_ctx<'a>(world: &'a crate::scenarios::World, env: &'a crate::paths::Env) -> Ctx<'a> {
+        Ctx { env, root: world.root.clone(), config_dir: world.home.path().join("cfg"), runner: &world.runner, detached_ticker: false }
+    }
+
+    #[test]
+    fn routine_toggle_records_a_terminal_source() {
+        let world = crate::scenarios::World::new();
+        let project = world.project("demo", "a.sock");
+        routine_toggle(&world.ctx(), "demo", "coordinator-sweep", Some(false)).unwrap();
+        let journal = std::fs::read_to_string(crate::routine::journal_path(&project)).unwrap();
+        assert_journal_line(journal.lines().last().unwrap(), "toggle", "coordinator-sweep", "disabled", "source=terminal", &project);
+    }
+
+    #[test]
+    fn routine_toggle_records_a_popup_source() {
+        let world = crate::scenarios::World::new();
+        let project = world.project("demo", "a.sock");
+        // The popup wins over a pane id, which Herdr sets in the same process.
+        let env = crate::paths::Env::for_test(world.home.path(), &[("HERDR_PLUGIN_STATE_DIR", "/state"), ("HERDR_PANE_ID", "w1:p1")]);
+        routine_toggle(&world_ctx(&world, &env), "demo", "coordinator-sweep", Some(false)).unwrap();
+        let journal = std::fs::read_to_string(crate::routine::journal_path(&project)).unwrap();
+        assert_journal_line(journal.lines().last().unwrap(), "toggle", "coordinator-sweep", "disabled", "source=popup", &project);
+    }
+
+    #[test]
+    fn routine_toggle_records_a_pane_source() {
+        let world = crate::scenarios::World::new();
+        let project = world.project("demo", "a.sock");
+        let env = crate::paths::Env::for_test(world.home.path(), &[("HERDR_PANE_ID", "w1:p1")]);
+        routine_toggle(&world_ctx(&world, &env), "demo", "coordinator-sweep", Some(true)).unwrap();
+        let journal = std::fs::read_to_string(crate::routine::journal_path(&project)).unwrap();
+        assert_journal_line(journal.lines().last().unwrap(), "toggle", "coordinator-sweep", "enabled", "source=pane:w1:p1", &project);
     }
 
     #[test]

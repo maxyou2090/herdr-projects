@@ -782,7 +782,7 @@ pub fn run() -> Result<()> {
             let project = project::create(&ctx.root, &name, &goal, repos)?;
             crate::profiles::write_project_defaults(&project, &thread, &coordinator)?;
             let prefix = coordinator::current_prefix(&ctx.root)?;
-            project::write_priming(&project, &prefix)?;
+            project::write_priming(&project, &prefix, "new")?;
             println!("created `{}` at {}", project.slug, project.dir().display());
             println!("next: {prefix} open {}", project.slug);
             Ok(())

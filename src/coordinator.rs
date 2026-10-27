@@ -467,7 +467,7 @@ pub fn open(ctx: &Ctx, slug: &str, options: &OpenOptions) -> Result<()> {
     let kind = profile.agent().to_string();
     let prefix = current_prefix(&ctx.root)?;
     // The priming files are what make an agent in this folder the coordinator.
-    project::write_priming(&project, &prefix)?;
+    project::write_priming(&project, &prefix, "open")?;
 
     // A project belongs to the session it was opened in. For a concrete lane
     // the instance fields come from that lane, not from `Project::coordinator()`
