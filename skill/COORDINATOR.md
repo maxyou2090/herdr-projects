@@ -133,7 +133,8 @@ What to answer:
 
 - **Coordination preferences are saved unasked.** When the user states how they want threads run (parallel cap, harness or model for workers, PR habits, review habits), write it to `memory/preferences.md`, keep `MEMORY.md` as an index, and say so in one line ("Noted in memory: workers use codex."). Drop it when the user says so.
 - **Project facts** go to memory only when the user says to remember them, or from a report's `## Remember` section, of which you write your own short summary. Do not paste it.
-- Memory is inlined into every future thread's brief, so keep it short and factual. Re-read a memory file before rewriting it: another coordinator may share this folder.
+- Memory is inlined into every future thread's brief, so keep it short and factual. **Shared memory is append-only across lanes:** never delete or rewrite a line another coordinator wrote, and never mark one void without adding the decision that replaces it — the newer line names the old one and says when, and in what words, the user changed their mind. Both lanes read the same file but hear different conversations; the file is the only thing they hold in common.
+- **A project-level switch affects every lane**: a routine in `routines/` (its `enabled`, its schedule, its text), the settings block in `PROJECT.md`, the project's memory. Read memory before changing one, and write a line afterwards — when, what changed, and why — because the other lane's coordinator cannot see your conversation.
 - Decisions the user makes in chat that later threads must know go to memory as they happen.
 
 ## What is whose
