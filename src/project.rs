@@ -603,16 +603,33 @@ pub const PR_FOLLOWUP: &str = "routines/pr-followup.md";
 
 const PR_FOLLOWUP_TEMPLATE: &str = "+++\non = \"pr\"\nevents = [\"checks-failed\", \"review\"]\nenabled = true\n+++\n\nFix the failing checks and address the new review comments on your pull request. Read them with `gh`, push the fixes, reply where a reviewer asked something, and then rewrite your report. If a comment asks for something outside your task, say so in the report instead of doing it.\n";
 
-/// The ready-made `pr` routine (enabled by default; the popup or the
-/// coordinator turns it off). Written by `new` and by `doctor --fix` when
-/// missing.
+pub const COORDINATOR_SWEEP: &str = "routines/coordinator-sweep.md";
+
+/// The periodic coordinator sweep: list ready-for-review threads and check
+/// their reports were handled, close seen-but-not-done inbox items, and read
+/// the last line of every idle thread's pane. Its text is law's own file, kept
+/// byte for byte, so a backfilled project gets the file it already had.
+const COORDINATOR_SWEEP_TEMPLATE: &str = "+++\nschedule = \"every 20m\"\nenabled = true\n+++\n\n例行巡检并把账对平，只做核对与推进，不改代码：\n\n1. 列出所有 ready-for-review 的线程，逐个确认其报告已被处置：已 review、已合并或明确记录等待原因；报告标 Done 但未收口的，按既定验收流程推进（需要用户确认就先问）。\n2. inbox 里 seen 未 done 的项逐条了结，不允许长期滞留。\n3. 对每个 idle 线程的 pane 最后一条输出扫一眼：有口头交接或完成信息但没落进 threads/*.md 报告的，先让该线程补写报告，再按报告处置。\n\n上次巡检结论仍然成立且无变化的项，简要记一句即可，不要重复展开。\n";
+
+/// Every ready-made routine, as `(file, text)`: `pr-followup` (on a pull
+/// request) and `coordinator-sweep` (every twenty minutes). Both are enabled by
+/// default; the popup or the coordinator turns one off.
+const DEFAULT_ROUTINES: [(&str, &str); 2] = [(PR_FOLLOWUP, PR_FOLLOWUP_TEMPLATE), (COORDINATOR_SWEEP, COORDINATOR_SWEEP_TEMPLATE)];
+
+/// Writes the ready-made routines a project is missing. Written by `new` and by
+/// `doctor --fix`; a file that already exists is never touched, so text the
+/// user edited survives every later `open` and `doctor --fix`.
 pub fn write_default_routine(project: &Project) -> Result<bool> {
-    let path = project.dir().join(PR_FOLLOWUP);
-    if path.exists() {
-        return Ok(false);
+    let mut wrote = false;
+    for (file, text) in DEFAULT_ROUTINES {
+        let path = project.dir().join(file);
+        if path.exists() {
+            continue;
+        }
+        write_atomic(&path, text.as_bytes())?;
+        wrote = true;
     }
-    write_atomic(&path, PR_FOLLOWUP_TEMPLATE.as_bytes())?;
-    Ok(true)
+    Ok(wrote)
 }
 
 /// Writes `AGENTS.md`, `CLAUDE.md` (a relative symbolic link to it) and
@@ -677,8 +694,10 @@ pub fn priming_problems(project: &Project, prefix: &str) -> Vec<String> {
     if !dir.join("uploads").is_dir() {
         problems.push("uploads/ is missing".into());
     }
-    if !dir.join(PR_FOLLOWUP).exists() {
-        problems.push("routines/pr-followup.md is missing".into());
+    for (file, _) in DEFAULT_ROUTINES {
+        if !dir.join(file).exists() {
+            problems.push(format!("{file} is missing"));
+        }
     }
     problems
 }
@@ -727,7 +746,7 @@ pub fn create(root: &Path, name: &str, goal: &str, repos: Vec<Repo>) -> Result<P
         b"# Memory\n\nOne line per memory file: `- [title](memory/file.md): what it holds`.\n",
     )?;
     write_atomic(&dir.join("TASKS.md"), TASKS_TEMPLATE.as_bytes())?;
-    write_atomic(&dir.join(PR_FOLLOWUP), PR_FOLLOWUP_TEMPLATE.as_bytes())?;
+    write_default_routine(&project)?;
     write_json(&project.state_dir().join("project.json"), &ProjectState::default())?;
     // PROJECT.md last: a folder without it is not a project, so a half-made
     // skeleton is never picked up by `list` or the ticker.
@@ -824,7 +843,8 @@ mod tests {
         assert_eq!(settings.auto_resolve_days, 7);
         assert!(settings.nudge);
         assert!(project.dir().join(PR_FOLLOWUP).is_file());
-        assert!(crate::routine::load_all(&project).1.is_empty(), "the default routine parses");
+        assert!(project.dir().join(COORDINATOR_SWEEP).is_file());
+        assert!(crate::routine::load_all(&project).1.is_empty(), "the default routines parse");
         assert_eq!(
             settings.repos,
             vec![
@@ -835,6 +855,41 @@ mod tests {
         assert!(body.starts_with("# Instructions"));
         assert_eq!(project.status(), Status::Active);
         assert!(create(&root, "demo", "", vec![]).is_err());
+    }
+
+    #[test]
+    fn new_writes_both_default_routines_and_an_edited_one_is_never_rewritten() {
+        let root = tempfile::tempdir().unwrap();
+        let project = create(root.path(), "Demo", "", vec![]).unwrap();
+        let prefix = format!("{} --root {}", std::env::current_exe().unwrap().display(), root.path().display());
+
+        // `new` writes both defaults, and the sweep is the file law already has.
+        let sweep = std::fs::read_to_string(project.dir().join(COORDINATOR_SWEEP)).unwrap();
+        assert_eq!(sweep, COORDINATOR_SWEEP_TEMPLATE);
+        assert!(sweep.starts_with("+++\nschedule = \"every 20m\"\nenabled = true\n+++\n\n"), "{sweep}");
+        let (routines, broken) = crate::routine::load_all(&project);
+        assert!(broken.is_empty(), "{broken:?}");
+        let parsed = routines.iter().find(|r| r.name == "coordinator-sweep").expect("the sweep parses as a routine");
+        assert!(parsed.enabled, "an omitted `enabled` is not what makes it run: it says so");
+        assert_eq!(parsed.schedule_text, "every 20m");
+        assert_eq!(parsed.trigger, crate::routine::Trigger::Schedule(crate::routine::Schedule::Every(1200)));
+        assert!(parsed.command.is_empty(), "the sweep is a prompt, not a command");
+        assert!(parsed.prompt.starts_with("例行巡检并把账对平"), "{}", parsed.prompt);
+
+        // A second `write_priming` (any `open`, `doctor --fix`) leaves text the
+        // user edited alone, and reports nothing missing.
+        std::fs::write(project.dir().join(COORDINATOR_SWEEP), "+++\nschedule = \"daily 09:00\"\n+++\n\nMine.\n").unwrap();
+        write_priming(&project, &prefix).unwrap();
+        assert_eq!(std::fs::read_to_string(project.dir().join(COORDINATOR_SWEEP)).unwrap(), "+++\nschedule = \"daily 09:00\"\n+++\n\nMine.\n");
+        assert!(priming_problems(&project, &prefix).is_empty());
+
+        // A deleted sweep is reported by name, and `--fix`'s writer puts it back.
+        std::fs::remove_file(project.dir().join(COORDINATOR_SWEEP)).unwrap();
+        let problems = priming_problems(&project, &prefix);
+        assert_eq!(problems, ["routines/coordinator-sweep.md is missing"], "{problems:?}");
+        write_priming(&project, &prefix).unwrap();
+        assert!(project.dir().join(COORDINATOR_SWEEP).is_file());
+        assert!(priming_problems(&project, &prefix).is_empty());
     }
 
     #[test]

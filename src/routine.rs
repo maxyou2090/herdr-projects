@@ -540,8 +540,8 @@ mod tests {
         std::fs::write(project.dir().join("routines/Bad Name.md"), "+++\nschedule = \"every 1h\"\n+++\nP").unwrap();
         std::fs::write(project.dir().join("routines/broken.md"), "+++\nschedule = \n+++\n").unwrap();
         let (routines, broken) = load_all(&project);
-        // Theirs plus the default pr-followup routine.
-        assert_eq!(routines.len(), 2);
+        // Theirs plus the two default routines.
+        assert_eq!(routines.len(), 3);
         assert_eq!(broken.len(), 2);
         assert!(broken.iter().all(|b| b.hash.len() == 64));
     }
