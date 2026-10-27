@@ -1068,10 +1068,11 @@ pub fn run() -> Result<()> {
         }
         Command::Startup => {
             // Herdr may reinstall into another folder: keep the command's link current.
+            // The journal decides who may, as it does for the hooks.
             if let Ok(binary) = crate::paths::binary()
                 && crate::command_link::installable(&binary)
             {
-                let _ = crate::command_link::ensure(ctx.env, &binary);
+                let _ = crate::command_link::ensure(ctx.env, &binary, &ctx.root);
             }
             ticker::start(&ctx)?;
             crate::setup::apply_view(&ctx);
