@@ -41,7 +41,8 @@ How Herdr Projects works, what it writes where, what its safety settings do and 
                           `box_empty_since` are maps keyed by lane id instead of one value
 ~/.herdr-projects/.ticker.lock  .ticker.log  .progress/  .trash/
 ~/.config/herdr-projects/config.toml             yours: root, profiles, safety tables, machines
-~/.config/herdr-projects/owned.json              what `configure` changed, for `unconfigure`
+~/.config/herdr-projects/owned.json              what `configure` changed and which binary and root wrote it,
+                                                 for `unconfigure` and `doctor --fix`
 ~/.config/herdr-projects/approved-routines.json  written only by `routine approve`
 ```
 
@@ -70,9 +71,9 @@ Every thread works from `<its working directory>/.herdr-project/<project>-<id>/`
 | `pause`, `resume`, `archive`, `unarchive`, `delete [--force]` | Project lifecycle. |
 | `rename <project> <new-slug> [--name NAME] [--dry-run]` | A new slug (folder name), and with `--name` a new display name. Refused while a thread is not resolved. While agents run in the project folder (its coordinator, which may run it itself) the ticker takes over: once they are idle (at most 5 minutes) it closes their panes, renames, reopens the coordinator in the new folder resuming its conversation, and prompts it with a note; `thread start` is refused meanwhile. The folder moves in one step; the thread records, the coordinator record, `AGENTS.md`, the project's `[safety]` table (yolo, profile lists), routine approvals and the home Space's label follow it. Branches and worktrees keep `hp/<old>/` and `sweep` still finds them; the coordinator's conversation follows (Claude Code's transcript is copied to the new folder; other harnesses resume by id, one that cannot starts anew). It lists what it could not update (other machines), then runs `doctor`. Run it again to finish one that stopped halfway. |
 | `popup [project]`, `focus [project]`, `unfocus`, `overview [project]`, `needs-you --line` | Views. |
-| `configure [--key K] [--hooks-only] [--dry-run]`, `unconfigure`, `report`, `progress` | Sidebar, keys, hooks, the `autoproject` skill, self-reports. |
+| `configure [--key K] [--hooks-only] [--dry-run]`, `unconfigure`, `report`, `progress` | Sidebar, keys, hooks, the `autoproject` skill, self-reports. `configure` is the deliberate way to point the machine's files at the binary and root it runs as; `doctor --fix` only ever moves them toward the installation. |
 | `open-file <path>`, `open-url <url>` | Open a text file in a new tab with `$EDITOR`, or a PR in the browser. |
-| `ticker start \| run \| stop \| status`, `doctor [--fix]`, `skill` | Housekeeping. `doctor --fix` also relinks `~/.local/bin/herdr-projects`. |
+| `ticker start \| run \| stop \| status`, `doctor [--fix]`, `skill` | Housekeeping. `doctor --fix` also relinks `~/.local/bin/herdr-projects`, and repairs the machine's global files (the harness hooks, Herdr's `config.toml`, the skill links) only toward the installed binary and root: run from another build or with another `--root`, it says so and leaves them alone. |
 | `update [--check]` | Update to the newest release: fetch, rebuild, `doctor --fix`, restart the ticker. |
 
 ## Lanes
@@ -307,6 +308,7 @@ scripts/dev-server               # a throwaway `hp-dev` Herdr session with a scr
 scripts/dev-hp <subcommand>      # the binary against <repo>/.dev-root; pass --session hp-dev to open/doctor
 scripts/dev-herdr <args>         # herdr against that session
 HERDR_CONFIG_PATH=<copy> ...     # point configure and `herdr config check` at a scratch config
+HOME=<scratch> XDG_CONFIG_HOME=<scratch> ...  # a whole scratch config dir, for verifying `doctor --fix`
 ```
 
-Never develop against your default session, `~/.herdr-projects` or your real `config.toml`. [`herdr-notes.md`](herdr-notes.md) records what was verified about Herdr, and [`manual-test.md`](manual-test.md) lists the acceptance checks, including the visual ones only a person can confirm.
+Never develop against your default session, `~/.herdr-projects` or your real `config.toml`: `doctor --fix` from a scratch binary or `--root` refuses to repoint the hooks and the tab bar, but `configure` does not, so run it with `HOME` and `XDG_CONFIG_HOME` pointing at a scratch directory when the config dir is not a copy. [`herdr-notes.md`](herdr-notes.md) records what was verified about Herdr, and [`manual-test.md`](manual-test.md) lists the acceptance checks, including the visual ones only a person can confirm.
