@@ -2,11 +2,14 @@
 //! `$XDG_BIN_HOME`) to the plugin's binary, made at every plugin start and by
 //! `doctor --fix`, so a reinstall into another folder never leaves it broken.
 //! Only a missing entry, or a link that is dangling or points into Herdr's
-//! plugin folder, is ever (re)written; a file or anyone else's link is left alone.
+//! plugin folder, is ever considered for a rewrite; a file or anyone else's
+//! link is left alone.
+//! Like the hooks, a write consults the journal: only the installation recorded
+//! there may relink, so a throwaway release build cannot take the link over.
 
 use std::path::{Path, PathBuf};
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 
 use crate::paths::Env;
 
@@ -33,7 +36,7 @@ pub enum State {
     Ours,
     Missing,
     /// A link that is dangling or points to another build inside Herdr's
-    /// plugin folder: safe to replace.
+    /// plugin folder: a candidate for replacement, if the journal allows it.
     Stale(PathBuf),
     /// A file, or a link somewhere else (a checkout of the user's own): never touched.
     Foreign(String),
@@ -66,10 +69,24 @@ fn plugins_dir(env: &Env) -> PathBuf {
     config.parent().unwrap_or(Path::new("/")).join("plugins")
 }
 
-/// Makes the link when it is missing or stale; returns the state found.
-pub fn ensure(env: &Env, binary: &Path) -> Result<State> {
+/// The journal's installation, when it is not `binary` at `root`. The journal
+/// is the record of what the installation is, so the link follows the same
+/// rule as the hooks: a build at another root says so instead of relinking.
+fn refusal(env: &Env, binary: &Path, root: &Path) -> Option<String> {
+    let journal = crate::setup::load_journal(&env.config_dir());
+    let here = crate::setup::Installation { binary: binary.to_path_buf(), root: root.to_path_buf() };
+    crate::setup::may_repair(&journal, &here).err()
+}
+
+/// Makes the link when it is missing or stale; returns the state found. A
+/// journal naming another installation refuses the write, as it does for the
+/// hooks; `configure` is the deliberate way to point it here.
+pub fn ensure(env: &Env, binary: &Path, root: &Path) -> Result<State> {
     let found = state(env, binary);
-    if matches!(found, State::Missing | State::Stale(_)) {
+    if matches!(&found, State::Missing | State::Stale(_)) {
+        if let Some(refusal) = refusal(env, binary, root) {
+            bail!("{refusal}");
+        }
         let link = link_path(env);
         let dir = bin_dir(env);
         std::fs::create_dir_all(&dir).with_context(|| format!("could not create {}", dir.display()))?;
@@ -91,13 +108,24 @@ pub fn resolves_to(path_var: &str) -> Option<PathBuf> {
 }
 
 /// The `doctor` line: `(ok, detail)` where `None` is a warning.
-pub fn check(env: &Env, binary: &Path, path_var: &str, fix: bool) -> (Option<bool>, String) {
+pub fn check(env: &Env, binary: &Path, root: &Path, path_var: &str, fix: bool) -> (Option<bool>, String) {
     let link = link_path(env);
     if !installable(binary) {
         return (None, format!("{} is not an installed build, so {} was not checked", binary.display(), link.display()));
     }
+    let found = state(env, binary);
+    if matches!(&found, State::Missing | State::Stale(_))
+        && let Some(refusal) = refusal(env, binary, root)
+    {
+        let detail = match &found {
+            State::Missing => format!("{} is missing; {refusal}", link.display()),
+            State::Stale(old) => format!("{} links {}, not this binary; {refusal}", link.display(), old.display()),
+            _ => unreachable!(),
+        };
+        return (None, detail);
+    }
     let (found, fixed) = if fix {
-        match ensure(env, binary) {
+        match ensure(env, binary, root) {
             Ok(found) => {
                 let fixed = matches!(found, State::Missing | State::Stale(_));
                 (found, fixed)
@@ -145,13 +173,20 @@ mod tests {
         bin_dir(env).display().to_string() + ":/usr/bin"
     }
 
+    /// A journal entry recording `binary` at `root` as the installation, as
+    /// `configure` writes one.
+    fn journal_recording(env: &Env, binary: &Path, root: &Path) {
+        let entry = crate::setup::Owned::new(Some(String::new()), String::new(), "hooks", Some("hook".into()), binary, root);
+        crate::setup::save_journal(&env.config_dir(), &[("settings.json".to_string(), entry)].into()).unwrap();
+    }
+
     #[test]
     fn a_missing_link_is_made_and_then_ours() {
-        let (_home, env, binary) = setup();
-        assert_eq!(ensure(&env, &binary).unwrap(), State::Missing);
+        let (home, env, binary) = setup();
+        assert_eq!(ensure(&env, &binary, home.path()).unwrap(), State::Missing);
         assert_eq!(std::fs::read_link(link_path(&env)).unwrap(), binary);
-        assert_eq!(ensure(&env, &binary).unwrap(), State::Ours);
-        let (ok, detail) = check(&env, &binary, &path_with(&env), false);
+        assert_eq!(ensure(&env, &binary, home.path()).unwrap(), State::Ours);
+        let (ok, detail) = check(&env, &binary, home.path(), &path_with(&env), false);
         assert_eq!(ok, Some(true), "{detail}");
     }
 
@@ -160,7 +195,7 @@ mod tests {
         let (home, env, binary) = setup();
         std::fs::create_dir_all(bin_dir(&env)).unwrap();
         std::os::unix::fs::symlink(home.path().join("gone/herdr-projects"), link_path(&env)).unwrap();
-        assert!(matches!(ensure(&env, &binary).unwrap(), State::Stale(_)));
+        assert!(matches!(ensure(&env, &binary, home.path()).unwrap(), State::Stale(_)));
         assert_eq!(std::fs::read_link(link_path(&env)).unwrap(), binary);
 
         let other = home.path().join(".config/herdr/plugins/github/herdr-projects-old/target/release/herdr-projects");
@@ -168,10 +203,87 @@ mod tests {
         std::fs::write(&other, "").unwrap();
         std::fs::remove_file(link_path(&env)).unwrap();
         std::os::unix::fs::symlink(&other, link_path(&env)).unwrap();
-        let (ok, detail) = check(&env, &binary, &path_with(&env), true);
+        let (ok, detail) = check(&env, &binary, home.path(), &path_with(&env), true);
         assert_eq!(ok, Some(true), "{detail}");
         assert!(detail.starts_with("fixed:"), "{detail}");
         assert_eq!(std::fs::read_link(link_path(&env)).unwrap(), binary);
+    }
+
+    /// The incident PR #13 closed for the hooks, for the command link: a
+    /// managed install's link is dangling, a throwaway release build at another
+    /// root runs the repair path, and the journal says the installation is the
+    /// managed one. The link must stay where it was, with a visible reason.
+    #[test]
+    fn a_fix_from_another_release_build_does_not_take_the_command_link() {
+        let home = tempfile::tempdir().unwrap();
+        let env = Env::for_test(home.path(), &[("XDG_BIN_HOME", home.path().join("bin").to_str().unwrap())]);
+        let installed = home.path().join(".config/herdr/plugins/github/herdr-projects-abc/target/release/herdr-projects");
+        std::fs::create_dir_all(installed.parent().unwrap()).unwrap();
+        std::fs::write(&installed, "#!/bin/sh\n").unwrap();
+        let installed_root = home.path().join("projects");
+        std::fs::create_dir_all(&installed_root).unwrap();
+        journal_recording(&env, &installed, &installed_root);
+
+        std::fs::create_dir_all(bin_dir(&env)).unwrap();
+        let gone = home.path().join(".config/herdr/plugins/github/herdr-projects-old/target/release/herdr-projects");
+        std::os::unix::fs::symlink(&gone, link_path(&env)).unwrap();
+
+        let throwaway = home.path().join("tmp/build/target/release/herdr-projects");
+        std::fs::create_dir_all(throwaway.parent().unwrap()).unwrap();
+        std::fs::write(&throwaway, "#!/bin/sh\n").unwrap();
+        let scratch = home.path().join("scratch-root");
+
+        let (ok, detail) = check(&env, &throwaway, &scratch, &path_with(&env), true);
+        assert_eq!(std::fs::read_link(link_path(&env)).unwrap(), gone, "a throwaway release build took the link: {detail}");
+        assert_eq!(ok, None, "{detail}");
+        assert!(detail.contains("left alone: this is not the installation"), "{detail}");
+        let recorded = format!("{} --root {}", installed.canonicalize().unwrap().display(), installed_root.canonicalize().unwrap().display());
+        assert!(detail.contains(&recorded), "the recorded installation is named: {detail}");
+        assert!(detail.contains("`configure`"), "{detail}");
+
+        // The link still points inside Herdr's plugin folder: no different.
+        let other = gone.clone();
+        std::fs::create_dir_all(other.parent().unwrap()).unwrap();
+        std::fs::write(&other, "#!/bin/sh\n").unwrap();
+        std::fs::remove_file(link_path(&env)).unwrap();
+        std::os::unix::fs::symlink(&other, link_path(&env)).unwrap();
+        let (ok, detail) = check(&env, &throwaway, &scratch, &path_with(&env), true);
+        assert_eq!(std::fs::read_link(link_path(&env)).unwrap(), other, "a throwaway release build took the link: {detail}");
+        assert_eq!(ok, None, "{detail}");
+        assert!(detail.contains("left alone: this is not the installation"), "{detail}");
+
+        // Plugin start writes through `ensure`; it must refuse too.
+        let refused = ensure(&env, &throwaway, &scratch).unwrap_err().to_string();
+        assert!(refused.contains("left alone: this is not the installation"), "{refused}");
+        assert_eq!(std::fs::read_link(link_path(&env)).unwrap(), other);
+    }
+
+    /// The other half, as for the hooks: the installation recorded in the
+    /// journal still repairs its own link, and so does a moved install whose
+    /// recorded binary is gone, at the same root.
+    #[test]
+    fn the_installation_and_a_moved_install_still_refresh_the_link() {
+        let (home, env, installed) = setup();
+        let root = home.path().join("projects");
+        std::fs::create_dir_all(&root).unwrap();
+        journal_recording(&env, &installed, &root);
+        std::fs::create_dir_all(bin_dir(&env)).unwrap();
+        std::os::unix::fs::symlink(home.path().join("gone"), link_path(&env)).unwrap();
+
+        let (ok, detail) = check(&env, &installed, &root, &path_with(&env), true);
+        assert_eq!(ok, Some(true), "{detail}");
+        assert!(detail.starts_with("fixed:"), "{detail}");
+        assert_eq!(std::fs::read_link(link_path(&env)).unwrap(), installed);
+
+        // The recorded binary moved away; the binary now at that root repairs.
+        let moved = home.path().join("moved/target/release/herdr-projects");
+        std::fs::create_dir_all(moved.parent().unwrap()).unwrap();
+        std::fs::write(&moved, "#!/bin/sh\n").unwrap();
+        std::fs::remove_file(&installed).unwrap();
+        let (ok, detail) = check(&env, &moved, &root, &path_with(&env), true);
+        assert_eq!(ok, Some(true), "{detail}");
+        assert!(detail.starts_with("fixed:"), "{detail}");
+        assert_eq!(std::fs::read_link(link_path(&env)).unwrap(), moved);
     }
 
     #[test]
@@ -179,9 +291,9 @@ mod tests {
         let (home, env, binary) = setup();
         std::fs::create_dir_all(bin_dir(&env)).unwrap();
         std::fs::write(link_path(&env), "mine").unwrap();
-        assert!(matches!(ensure(&env, &binary).unwrap(), State::Foreign(_)));
+        assert!(matches!(ensure(&env, &binary, home.path()).unwrap(), State::Foreign(_)));
         assert_eq!(std::fs::read_to_string(link_path(&env)).unwrap(), "mine");
-        let (ok, detail) = check(&env, &binary, &path_with(&env), true);
+        let (ok, detail) = check(&env, &binary, home.path(), &path_with(&env), true);
         assert_eq!(ok, None);
         assert!(detail.contains("left alone"), "{detail}");
 
@@ -190,14 +302,14 @@ mod tests {
         std::fs::create_dir_all(own.parent().unwrap()).unwrap();
         std::fs::write(&own, "").unwrap();
         std::os::unix::fs::symlink(&own, link_path(&env)).unwrap();
-        assert!(matches!(ensure(&env, &binary).unwrap(), State::Foreign(_)));
+        assert!(matches!(ensure(&env, &binary, home.path()).unwrap(), State::Foreign(_)));
         assert_eq!(std::fs::read_link(link_path(&env)).unwrap(), own);
     }
 
     #[test]
     fn a_bin_dir_missing_from_path_is_a_warning_with_the_fix() {
-        let (_home, env, binary) = setup();
-        let (ok, detail) = check(&env, &binary, "/usr/bin", true);
+        let (home, env, binary) = setup();
+        let (ok, detail) = check(&env, &binary, home.path(), "/usr/bin", true);
         assert_eq!(ok, None);
         assert!(detail.contains("is not on your PATH: add `export PATH="), "{detail}");
         assert!(link_path(&env).is_symlink());
@@ -210,7 +322,7 @@ mod tests {
         std::fs::create_dir_all(&early).unwrap();
         std::fs::write(early.join(NAME), "").unwrap();
         let path = format!("{}:{}", early.display(), path_with(&env));
-        let (ok, detail) = check(&env, &binary, &path, true);
+        let (ok, detail) = check(&env, &binary, home.path(), &path, true);
         assert_eq!(ok, None);
         assert!(detail.contains("finds") && detail.contains("early"), "{detail}");
     }
@@ -220,7 +332,7 @@ mod tests {
         let home = tempfile::tempdir().unwrap();
         let env = Env::for_test(home.path(), &[("XDG_BIN_HOME", "/xdg/bin")]);
         assert_eq!(link_path(&env), PathBuf::from("/xdg/bin/herdr-projects"));
-        let (ok, _) = check(&env, Path::new("/src/target/debug/herdr-projects"), "", true);
+        let (ok, _) = check(&env, Path::new("/src/target/debug/herdr-projects"), home.path(), "", true);
         assert_eq!(ok, None);
         assert!(!Path::new("/xdg/bin").exists());
     }

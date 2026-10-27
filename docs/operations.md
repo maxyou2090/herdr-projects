@@ -73,7 +73,7 @@ Every thread works from `<its working directory>/.herdr-project/<project>-<id>/`
 | `popup [project]`, `focus [project]`, `unfocus`, `overview [project]`, `needs-you --line` | Views. |
 | `configure [--key K] [--hooks-only] [--dry-run]`, `unconfigure`, `report`, `progress` | Sidebar, keys, hooks, the `autoproject` skill, self-reports. `configure` is the deliberate way to point the machine's files at the binary and root it runs as; `doctor --fix` only ever moves them toward the installation. |
 | `open-file <path>`, `open-url <url>` | Open a text file in a new tab with `$EDITOR`, or a PR in the browser. |
-| `ticker start \| run \| stop \| status`, `doctor [--fix]`, `skill` | Housekeeping. `doctor --fix` also relinks `~/.local/bin/herdr-projects`, and repairs the machine's global files (the harness hooks, Herdr's `config.toml`, the skill links) only toward the installed binary and root: run from another build or with another `--root`, it says so and leaves them alone. |
+| `ticker start \| run \| stop \| status`, `doctor [--fix]`, `skill` | Housekeeping. `doctor --fix` also relinks `~/.local/bin/herdr-projects`, and repairs the machine's global files (the harness hooks, Herdr's `config.toml`, the skill links, the command link) only toward the installed binary and root: run from another build or with another `--root`, it says so and leaves them alone. The command link obeys the same rule as the hooks: only the installation recorded by `configure` may relink it, and `configure` is how to point it elsewhere on purpose. |
 | `update [--check]` | Update to the newest release: fetch, rebuild, `doctor --fix`, restart the ticker. |
 
 ## Lanes

@@ -151,7 +151,7 @@ fn report(
     {
         let binary = paths::binary().unwrap_or_default();
         let path_var = crate::USER_PATH.get().map(String::as_str).or(env.var("PATH")).unwrap_or("");
-        let (ok, detail) = crate::command_link::check(env, &binary, path_var, fix);
+        let (ok, detail) = crate::command_link::check(env, &binary, root, path_var, fix);
         check(&mut out, ok, "command", detail);
     }
 
