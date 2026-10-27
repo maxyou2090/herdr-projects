@@ -400,7 +400,18 @@ fn report(
 
     // Hooks: ours in place and pointing at this binary; the standalone
     // agent-progress plugin's hooks gone (never edited by this plugin).
+    //
+    // `--fix` only ever moves these files toward the installation that put them
+    // there: a run with another binary or root (a throwaway build under
+    // `/tmp`, a scratch root) says so and leaves them alone, instead of
+    // repointing every agent's progress reporting at a binary that goes away.
     let journal = crate::setup::load_journal(config_dir);
+    let here = crate::setup::Installation::here(root).ok();
+    let repair = match &here {
+        Some(here) => crate::setup::may_repair(&journal, here),
+        None => Err("left alone: this binary's own path is unknown, so it cannot be the installation".to_string()),
+    };
+    let refusal = repair.as_ref().err().map(String::as_str).unwrap_or_default();
     for agent in crate::setup::AGENTS {
         let file = crate::setup::hook_file(env, agent, None, None);
         let Ok(Some(text)) = crate::setup::read(&file) else {
@@ -422,6 +433,7 @@ fn report(
         match journal.get(&key) {
             None => check(&mut out, None, &label, "not configured; `configure` installs the progress hooks".into()),
             Some(_) if text.contains(&expected) => check(&mut out, Some(true), &label, format!("{} runs this binary", file.display())),
+            Some(_) if repair.is_err() => check(&mut out, None, &label, format!("{} runs another binary or root; {refusal}", file.display())),
             Some(_) if fix => {
                 let options = crate::setup::ConfigureOptions { clients: vec![agent.to_string()], claude_home: None, codex_home: None, dry_run: false, hooks: true, sidebar: false, key: None, herdr_config: None, skill: crate::setup::skill_source() };
                 let ctx = Ctx { env, root: root.to_path_buf(), config_dir: config_dir.to_path_buf(), runner, detached_ticker: false };
@@ -437,7 +449,8 @@ fn report(
     // The bundled skill, linked where each installed harness looks for skills.
     // `--fix` links it only for a harness the user already ran `configure`
     // for (its hooks or the link are journaled), so `update` alone brings a
-    // newly bundled skill to existing users without a new opt-in.
+    // newly bundled skill to existing users without a new opt-in. The link is
+    // global too, so the same rule applies: only the installation relinks it.
     if let Some(source) = skill.map(Path::to_path_buf).filter(|s| s.join("SKILL.md").is_file()) {
         for agent in ["claude", "codex"] {
             if !crate::setup::hook_file(env, agent, None, None).parent().is_some_and(Path::is_dir) {
@@ -449,6 +462,10 @@ fn report(
             let opted_in = journaled || journal.get(&*crate::setup::hook_file(env, agent, None, None).to_string_lossy()).is_some_and(|o| o.kind == "hooks");
             let state = crate::setup::skill_state(&link, &source);
             let repairable = matches!(state, crate::setup::SkillState::Missing) || matches!(state, crate::setup::SkillState::Elsewhere(_) if journaled);
+            if fix && opted_in && repairable && repair.is_err() {
+                check(&mut out, None, &label, format!("{} needs relinking; {refusal}", link.display()));
+                continue;
+            }
             if fix && opted_in && repairable {
                 let options = crate::setup::ConfigureOptions { clients: vec![agent.to_string()], claude_home: None, codex_home: None, dry_run: false, hooks: false, sidebar: false, key: None, herdr_config: None, skill: Some(source.clone()) };
                 let ctx = Ctx { env, root: root.to_path_buf(), config_dir: config_dir.to_path_buf(), runner, detached_ticker: false };
@@ -458,12 +475,12 @@ fn report(
                 }
                 continue;
             }
-            let repair = if opted_in { "`doctor --fix`" } else { "`configure`" };
+            let repair_hint = if opted_in { "`doctor --fix`" } else { "`configure`" };
             match state {
                 crate::setup::SkillState::Ours => check(&mut out, Some(true), &label, format!("{} links the bundled `{}` skill", link.display(), crate::setup::SKILL)),
-                crate::setup::SkillState::Missing => check(&mut out, None, &label, format!("{} is missing; {repair} links the bundled skill", link.display())),
-                crate::setup::SkillState::Elsewhere(old) if journaled => check(&mut out, None, &label, format!("{} links {}, another checkout; {repair} relinks it", link.display(), old.display())),
-                _ => check(&mut out, None, &label, format!("{} is not this plugin's link, so the bundled skill is not installed; move it away and run {repair}", link.display())),
+                crate::setup::SkillState::Missing => check(&mut out, None, &label, format!("{} is missing; {repair_hint} links the bundled skill", link.display())),
+                crate::setup::SkillState::Elsewhere(old) if journaled => check(&mut out, None, &label, format!("{} links {}, another checkout; {repair_hint} relinks it", link.display(), old.display())),
+                _ => check(&mut out, None, &label, format!("{} is not this plugin's link, so the bundled skill is not installed; move it away and run {repair_hint}", link.display())),
             }
         }
     }
@@ -478,6 +495,7 @@ fn report(
         match journal.get(&key) {
             None => check(&mut out, None, "sidebar", "not configured; `configure` adds the sidebar rows, the popup key and the tab-bar count".into()),
             Some(_) if sidebar_current(&text, &expected) => check(&mut out, Some(true), "sidebar", format!("{} has the rows, the popup key and the tab-bar entry", file.display())),
+            Some(_) if repair.is_err() => check(&mut out, None, "sidebar", format!("{} lacks the project grouping rows (or still has the 0.2.18 headings or 0.2.19 rails), or its tab-bar entry runs another binary or root; {refusal}", file.display())),
             Some(_) if fix => {
                 let options = crate::setup::ConfigureOptions { clients: vec![], claude_home: None, codex_home: None, dry_run: false, hooks: true, sidebar: true, key: None, herdr_config: None, skill: crate::setup::skill_source() };
                 let ctx = Ctx { env, root: root.to_path_buf(), config_dir: config_dir.to_path_buf(), runner, detached_ticker: false };
@@ -676,7 +694,7 @@ mod tests {
         assert_eq!(crate::setup::skill_state(&link, &source), crate::setup::SkillState::Missing);
 
         // Configured before the skill shipped: hooks journaled, no link yet.
-        let hooks = crate::setup::Owned { before: None, after: "{}".into(), kind: "hooks".into(), command: Some("x".into()) };
+        let hooks = crate::setup::Owned { before: None, after: "{}".into(), kind: "hooks".into(), command: Some("x".into()), binary: None, root: None };
         crate::setup::save_journal(&cfg, &[(claude.join("settings.json").to_string_lossy().into_owned(), hooks)].into()).unwrap();
         let (text, _) = report(&env, &root, &cfg, &flags, &runner, false, Some(&source));
         assert!(text.contains("`doctor --fix` links the bundled skill"), "{text}");
@@ -698,6 +716,116 @@ mod tests {
         let (text, _) = report(&env, &root, &cfg, &flags, &runner, true, Some(&moved));
         assert!(text.contains("is not this plugin's link"), "{text}");
         assert_eq!(crate::setup::skill_state(&link, &moved), crate::setup::SkillState::Foreign);
+    }
+
+    /// A machine whose hooks and Herdr config were installed by `binary` with
+    /// `home/projects` as the root, as `configure` leaves it: the two files and
+    /// the journal entries that record which installation wrote them.
+    fn configured_machine(home: &Path, binary: &Path) -> (Env, std::path::PathBuf, std::path::PathBuf, std::path::PathBuf) {
+        let claude = home.join("claude-config");
+        let herdr_config = home.join("herdr/config.toml");
+        let root = home.join("projects");
+        std::fs::create_dir_all(&claude).unwrap();
+        std::fs::create_dir_all(herdr_config.parent().unwrap()).unwrap();
+        let env = Env::for_test(
+            home,
+            &[("CLAUDE_CONFIG_DIR", claude.to_str().unwrap()), ("HERDR_CONFIG_PATH", herdr_config.to_str().unwrap())],
+        );
+        if binary.starts_with(home) && !binary.exists() {
+            std::fs::create_dir_all(binary.parent().unwrap()).unwrap();
+            std::fs::write(binary, "").unwrap();
+        }
+        let command = crate::setup::hook_command(binary, &root, "claude");
+        let tab = crate::setup::tab_command(binary, &root);
+        let hooks = crate::setup::hooks("{}", &command, false).unwrap();
+        let config = crate::sidebar::config_edit("", &crate::sidebar::Spec { key: "prefix+a".into(), tab_command: tab.clone() }, false).unwrap();
+        std::fs::write(claude.join("settings.json"), &hooks).unwrap();
+        std::fs::write(&herdr_config, &config).unwrap();
+        let owned = |after: &str, kind: &str, command: String| crate::setup::Owned::new(Some(String::new()), after.to_string(), kind, Some(command), binary, &root);
+        crate::setup::save_journal(
+            &home.join("cfg"),
+            &[
+                (claude.join("settings.json").to_string_lossy().into_owned(), owned(&hooks, "hooks", command)),
+                (herdr_config.to_string_lossy().into_owned(), owned(&config, "config", tab)),
+            ]
+            .into(),
+        )
+        .unwrap();
+        (env, root, claude.join("settings.json"), herdr_config)
+    }
+
+    /// The incident this guards: a verification run with a throwaway build and
+    /// a scratch root repointed every harness hook and Herdr's tab bar at a
+    /// binary under `/tmp`, and nothing said so. `--fix` from that run must
+    /// leave both files byte for byte, and name the installation instead.
+    #[test]
+    fn a_fix_from_another_binary_or_root_rewrites_no_global_file() {
+        let home = tempfile::tempdir().unwrap();
+        let installed = home.path().join("plugin/target/release/herdr-projects");
+        let (env, _root, hooks_file, herdr_config) = configured_machine(home.path(), &installed);
+        let before = (std::fs::read_to_string(&hooks_file).unwrap(), std::fs::read_to_string(&herdr_config).unwrap());
+        let runner = runner_with_herdr("herdr 0.9.1\n");
+        let scratch = home.path().join("scratch-root");
+        let (text, _) = report(&env, &scratch, &home.path().join("cfg"), &SessionFlags::default(), &runner, true, None);
+        assert_eq!(std::fs::read_to_string(&hooks_file).unwrap(), before.0, "a throwaway run rewrote the hooks: {text}");
+        assert_eq!(std::fs::read_to_string(&herdr_config).unwrap(), before.1, "a throwaway run rewrote Herdr's config: {text}");
+        assert!(text.contains("[warn] hooks claude: ") && text.contains("left alone: this is not the installation"), "{text}");
+        let recorded = format!("{} --root {}", installed.display(), home.path().join("projects").display());
+        assert!(text.contains(&recorded), "the recorded installation is named: {text}");
+        assert!(text.contains("[warn] sidebar: ") && text.contains("left alone: this is not the installation"), "the sidebar obeys the same rule: {text}");
+
+        // The real root, and a binary that is not the installation: still refused.
+        let (text, _) = report(&env, &home.path().join("projects"), &home.path().join("cfg"), &SessionFlags::default(), &runner, true, None);
+        assert_eq!(std::fs::read_to_string(&hooks_file).unwrap(), before.0, "another binary rewrote the hooks: {text}");
+        assert!(text.contains("[warn] hooks claude: ") && text.contains("left alone: this is not the installation"), "{text}");
+    }
+
+    /// The other half: the installation that wrote the journal repairs an entry
+    /// that points elsewhere, which is what `--fix` is for.
+    #[test]
+    fn a_fix_from_the_installation_still_repairs_what_points_elsewhere() {
+        let home = tempfile::tempdir().unwrap();
+        let binary = crate::paths::binary().unwrap();
+        let (env, root, hooks_file, herdr_config) = configured_machine(home.path(), &binary);
+        let cfg = home.path().join("cfg");
+        let journal = crate::setup::load_journal(&cfg);
+        let here = crate::setup::Installation { binary: binary.clone(), root: root.clone() };
+        assert_eq!(crate::setup::may_repair(&journal, &here), Ok(()));
+        // Another binary, or another root, is not the installation.
+        let other = |binary: std::path::PathBuf, root: std::path::PathBuf| crate::setup::Installation { binary, root };
+        assert!(crate::setup::may_repair(&journal, &other(home.path().join("tmp/release/herdr-projects"), root.clone())).is_err());
+        assert!(crate::setup::may_repair(&journal, &other(binary.clone(), home.path().join("scratch-root"))).is_err());
+
+        // A hook file and a tab bar pointing at a binary that moved away.
+        std::fs::write(&hooks_file, crate::setup::hooks("{}", &crate::setup::hook_command(Path::new("/moved/herdr-projects"), &root, "claude"), false).unwrap()).unwrap();
+        let tab = crate::setup::tab_command(Path::new("/moved/herdr-projects"), &root);
+        std::fs::write(&herdr_config, crate::sidebar::config_edit("", &crate::sidebar::Spec { key: "prefix+a".into(), tab_command: tab }, false).unwrap()).unwrap();
+        let runner = runner_with_herdr("herdr 0.9.1\n");
+        // The sidebar repair reads Herdr's built-in keys and has it check the result.
+        runner.on("--default-config", crate::runner::fake::ok("[keys]\n"));
+        runner.on("config check", crate::runner::fake::ok(""));
+        let (text, _) = report(&env, &root, &cfg, &SessionFlags::default(), &runner, true, None);
+        assert!(text.contains("[ok  ] hooks claude: fixed:") && !text.contains("left alone: this is not the installation"), "{text}");
+        assert!(text.contains("[ok  ] sidebar: fixed:"), "{text}");
+        assert!(std::fs::read_to_string(&hooks_file).unwrap().contains(&crate::setup::hook_command(&binary, &root, "claude")), "{text}");
+        assert!(std::fs::read_to_string(&herdr_config).unwrap().contains(&crate::setup::tab_command(&binary, &root)), "{text}");
+    }
+
+    /// A machine nobody configured stays unconfigured, and `--fix` invents
+    /// nothing: `configure` is the way to install the hooks.
+    #[test]
+    fn a_machine_with_no_journal_entry_is_not_configured_and_a_fix_writes_nothing() {
+        let home = tempfile::tempdir().unwrap();
+        let claude = home.path().join("claude-config");
+        std::fs::create_dir_all(&claude).unwrap();
+        let settings = claude.join("settings.json");
+        std::fs::write(&settings, "{\"theme\":\"dark\"}").unwrap();
+        let env = Env::for_test(home.path(), &[("CLAUDE_CONFIG_DIR", claude.to_str().unwrap())]);
+        let runner = runner_with_herdr("herdr 0.9.1\n");
+        let (text, _) = report(&env, &home.path().join("root"), &home.path().join("cfg"), &SessionFlags::default(), &runner, true, None);
+        assert!(text.contains("[warn] hooks claude: not configured; `configure` installs the progress hooks"), "{text}");
+        assert_eq!(std::fs::read_to_string(&settings).unwrap(), "{\"theme\":\"dark\"}");
+        assert!(crate::setup::load_journal(&home.path().join("cfg")).is_empty());
     }
 
     #[test]

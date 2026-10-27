@@ -63,7 +63,10 @@ fn harness_of(command: &str) -> &'static Harness {
 }
 
 /// One file the plugin edited: its text before the first edit, after the last
-/// one, what kind of edit, and the hook command (for hook files).
+/// one, what kind of edit, and the hook command (for hook files). `binary`
+/// and `root` record the installation that made the edit, so a repair never
+/// moves the machine's files toward another one; journals written before they
+/// existed leave them out.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct Owned {
     pub before: Option<String>,
@@ -71,9 +74,132 @@ pub struct Owned {
     pub kind: String,
     #[serde(default)]
     pub command: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub binary: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub root: Option<String>,
+}
+
+impl Owned {
+    /// An edit `configure` is about to make, stamped with the binary and root
+    /// making it, so [`installation`] can tell an installation from a
+    /// throwaway run later.
+    pub fn new(before: Option<String>, after: String, kind: &str, command: Option<String>, binary: &Path, root: &Path) -> Self {
+        Owned {
+            before,
+            after,
+            kind: kind.into(),
+            command,
+            binary: Some(binary.to_string_lossy().into_owned()),
+            root: Some(root.to_string_lossy().into_owned()),
+        }
+    }
 }
 
 pub type Journal = BTreeMap<String, Owned>;
+
+/// The binary and root a global file was pointed at.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Installation {
+    pub binary: PathBuf,
+    pub root: PathBuf,
+}
+
+impl Installation {
+    /// This run's binary and root, as `configure` would write them.
+    pub fn here(root: &Path) -> Result<Self> {
+        Ok(Installation {
+            binary: crate::paths::binary()?,
+            root: std::path::absolute(root).unwrap_or_else(|_| root.to_path_buf()),
+        })
+    }
+
+    /// The same installation spelled differently: a root reached through a
+    /// symbolic link and one spelled directly are one root.
+    fn canonical(&self) -> Installation {
+        let canonical = |p: &Path| std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
+        Installation { binary: canonical(&self.binary), root: canonical(&self.root) }
+    }
+}
+
+/// The words of a journaled shell command, as [`quote`] writes them: runs of
+/// plain characters and single-quoted runs with its `'\''` escapes.
+fn shell_words(command: &str) -> Vec<String> {
+    let mut words = Vec::new();
+    let mut word = String::new();
+    let mut quoted = false;
+    let mut chars = command.chars().peekable();
+    while let Some(c) = chars.next() {
+        match c {
+            '\'' => quoted = !quoted,
+            '\\' if quoted && chars.peek() == Some(&'\'') => {
+                chars.next();
+                word.push('\'');
+            }
+            c if c.is_whitespace() && !quoted => {
+                if !word.is_empty() {
+                    words.push(std::mem::take(&mut word));
+                }
+            }
+            c => word.push(c),
+        }
+    }
+    if !word.is_empty() {
+        words.push(word);
+    }
+    words
+}
+
+/// The installation a journaled command runs: `<binary> --root <root> …`.
+fn command_installation(command: &str) -> Option<Installation> {
+    let words = shell_words(command);
+    let binary = words.first()?;
+    if !binary.ends_with(crate::command_link::NAME) {
+        return None;
+    }
+    let at = words.iter().position(|w| w == "--root")?;
+    Some(Installation { binary: PathBuf::from(binary), root: PathBuf::from(words.get(at + 1)?) })
+}
+
+/// The installation the journal says the machine's files were pointed at: the
+/// binary and root the last edit recorded, or, for an entry written before
+/// those were recorded, the command it wrote. `None` when the journal records
+/// neither (no entry, or only skill links), which a repair treats as before.
+pub fn installation(journal: &Journal) -> Option<Installation> {
+    journal
+        .values()
+        .find_map(|owned| {
+            Some(Installation {
+                binary: PathBuf::from(owned.binary.as_deref()?),
+                root: PathBuf::from(owned.root.as_deref()?),
+            })
+        })
+        .or_else(|| journal.values().find_map(|owned| command_installation(owned.command.as_deref()?)))
+}
+
+/// Whether a repair run from `here` may move the machine's global files: only
+/// the installation that put them there, or the binary that replaced one whose
+/// recorded path is gone (a moved install), with the root the files were
+/// configured with. A verification run with a throwaway binary or root would
+/// repoint every agent's hooks at something that disappears, so it is refused
+/// with the recorded installation. A journal that records none, and a machine
+/// with no entry at all, repair as they always did; `configure` is the
+/// deliberate way to point the files somewhere else.
+pub fn may_repair(journal: &Journal, here: &Installation) -> Result<(), String> {
+    let Some(installed) = installation(journal).map(|installed| installed.canonical()) else {
+        return Ok(());
+    };
+    let here = here.canonical();
+    let same_root = installed.root == here.root;
+    if same_root && (installed.binary == here.binary || !installed.binary.exists()) {
+        return Ok(());
+    }
+    Err(format!(
+        "left alone: this is not the installation (the files were configured with {} --root {}); run `doctor --fix` with that binary, or `configure` to point them here on purpose",
+        installed.binary.display(),
+        installed.root.display()
+    ))
+}
 
 pub fn journal_path(config_dir: &Path) -> PathBuf {
     config_dir.join("owned.json")
@@ -334,7 +460,11 @@ pub fn has_agent_progress_hooks(text: &str) -> bool {
 }
 
 /// Installs the hooks. Every edit is journaled before it is made, so a killed
-/// run never leaves hooks `unconfigure` cannot identify as its own.
+/// run never leaves hooks `unconfigure` cannot identify as its own. Each entry
+/// records the binary and root that made it, which is what lets `doctor --fix`
+/// refuse to move the machine's files toward a throwaway build (see
+/// [`may_repair`]); `configure` itself always writes, since running it is the
+/// deliberate way to point the hooks and the config somewhere else.
 pub fn configure(ctx: &Ctx, options: &ConfigureOptions) -> Result<Vec<String>> {
     let binary = crate::paths::binary()?;
     let clients: Vec<String> = if options.clients.is_empty() {
@@ -362,7 +492,7 @@ pub fn configure(ctx: &Ctx, options: &ConfigureOptions) -> Result<Vec<String>> {
             continue;
         }
         notes.push(format!("{}: {} hook entries for `{command}`", file.display(), if before.is_some() { "adding" } else { "creating with" }));
-        edits.push((file, Owned { before, after, kind: "hooks".into(), command: Some(command) }));
+        edits.push((file, Owned::new(before, after, "hooks", Some(command), &binary, &ctx.root)));
     }
     let mut links: Vec<(PathBuf, Option<PathBuf>)> = Vec::new();
     if let Some(source) = &options.skill {
@@ -425,7 +555,7 @@ pub fn configure(ctx: &Ctx, options: &ConfigureOptions) -> Result<Vec<String>> {
         } else {
             crate::sidebar::check_config(&ctx.env.herdr_bin(), ctx.runner, &after, &ctx.config_dir)?;
             notes.push(format!("{}: adding the project grouping rows, the popup key `{key}` and the tab-bar entry", file.display()));
-            edits.push((file, Owned { before, after, kind: "config".into(), command: Some(command) }));
+            edits.push((file, Owned::new(before, after, "config", Some(command), &binary, &ctx.root)));
         }
     }
     if options.dry_run {
@@ -441,7 +571,7 @@ pub fn configure(ctx: &Ctx, options: &ConfigureOptions) -> Result<Vec<String>> {
     }
     let source = options.skill.as_ref().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
     for (link, _) in &links {
-        journal.insert(link.to_string_lossy().into_owned(), Owned { before: None, after: source.clone(), kind: "skill".into(), command: None });
+        journal.insert(link.to_string_lossy().into_owned(), Owned::new(None, source.clone(), "skill", None, &binary, &ctx.root));
     }
     save_journal(&ctx.config_dir, &journal)?;
     for (index, (path, edit)) in edits.iter().enumerate() {
@@ -626,13 +756,59 @@ mod tests {
         assert!(!hooks(&copilot, command, true).unwrap().contains("herdr-projects"));
     }
 
+    /// Journals written before the installation was recorded still name it:
+    /// the command they carry starts with `<binary> --root <root>`, quoted the
+    /// way `configure` wrote it, so an upgrade needs no migration step.
+    #[test]
+    fn an_old_journal_reads_its_installation_from_the_recorded_command() {
+        let binary = Path::new("/Users/x y/herdr-projects");
+        let root = Path::new("/Users/x y/.herdr-projects");
+        let mut owned = Owned::new(None, "x".into(), "config", Some(tab_command(binary, root)), binary, root);
+        owned.binary = None;
+        owned.root = None;
+        let journal: Journal = [("/Users/x y/.config/herdr/config.toml".to_string(), owned)].into();
+        let installed = installation(&journal).unwrap();
+        assert_eq!((installed.binary.as_path(), installed.root.as_path()), (binary, root));
+        let here = Installation { binary: binary.to_path_buf(), root: root.to_path_buf() };
+        assert_eq!(may_repair(&journal, &here), Ok(()));
+        let throwaway = Installation { binary: "/private/tmp/hp-verify/release/herdr-projects".into(), root: "/tmp/sweepcheck".into() };
+        assert!(may_repair(&journal, &throwaway).is_err());
+        // The shape this machine's journal had: plain paths and a hook command.
+        let plain: Journal = [("/Users/x/.claude/settings.json".to_string(), Owned { before: None, after: "x".into(), kind: "hooks".into(), command: Some("/Users/x/repos/herdr-projects/target/release/herdr-projects --root /Users/x/.herdr-projects hook --agent claude 2>/dev/null || true".into()), binary: None, root: None })].into();
+        assert_eq!(
+            installation(&plain),
+            Some(Installation { binary: "/Users/x/repos/herdr-projects/target/release/herdr-projects".into(), root: "/Users/x/.herdr-projects".into() })
+        );
+        // A skill link records no command, so it names no installation either.
+        let skills: Journal = [("/Users/x/skills/autoproject".to_string(), Owned::new(None, "/p/skill".into(), "skill", None, binary, root))].into();
+        assert_eq!(installation(&skills).map(|i| i.binary), Some(binary.to_path_buf()));
+    }
+
+    /// An install that moved: the recorded binary is gone and its successor
+    /// runs at the same root, so it repairs; a binary that is still there is
+    /// the installation, and another build at the same root does not take over.
+    #[test]
+    fn a_moved_install_repairs_at_the_root_it_was_configured_with() {
+        let home = tempfile::tempdir().unwrap();
+        let root = home.path().join("root");
+        let gone = home.path().join("gone/target/release/herdr-projects");
+        std::fs::create_dir_all(&root).unwrap();
+        let journal: Journal = [("/h".to_string(), Owned::new(None, "x".into(), "hooks", Some(hook_command(&gone, &root, "claude")), &gone, &root))].into();
+        let here = Installation { binary: home.path().join("new/target/release/herdr-projects"), root: root.clone() };
+        assert_eq!(may_repair(&journal, &here), Ok(()));
+        assert!(may_repair(&journal, &Installation { root: home.path().join("scratch"), ..here.clone() }).is_err());
+        std::fs::create_dir_all(gone.parent().unwrap()).unwrap();
+        std::fs::write(&gone, "").unwrap();
+        assert!(may_repair(&journal, &here).is_err(), "a binary that still exists is the installation");
+    }
+
     #[test]
     fn removal_baseline_keeps_the_original_or_the_users_later_edits() {
-        let previous = Owned { before: Some("original".into()), after: "configured".into(), kind: "hooks".into(), command: Some(CMD.into()) };
-        let unchanged = Owned { before: Some("configured".into()), after: "configured2".into(), kind: "hooks".into(), command: Some(CMD.into()) };
+        let previous = Owned::new(Some("original".into()), "configured".into(), "hooks", Some(CMD.into()), Path::new("/p/herdr-projects"), Path::new("/r"));
+        let unchanged = Owned::new(Some("configured".into()), "configured2".into(), "hooks", Some(CMD.into()), Path::new("/p/herdr-projects"), Path::new("/r"));
         assert_eq!(removal_baseline(&previous, &unchanged).unwrap().as_deref(), Some("original"));
         let edited_text = format!("{}\n", hooks("{\"theme\":\"dark\"}", CMD, false).unwrap());
-        let edited = Owned { before: Some(edited_text.clone()), after: "x".into(), kind: "hooks".into(), command: Some(CMD.into()) };
+        let edited = Owned::new(Some(edited_text.clone()), "x".into(), "hooks", Some(CMD.into()), Path::new("/p/herdr-projects"), Path::new("/r"));
         let baseline = removal_baseline(&previous, &edited).unwrap().unwrap();
         assert!(baseline.contains("dark") && !baseline.contains("herdr-projects"));
     }
