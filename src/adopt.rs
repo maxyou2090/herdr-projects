@@ -174,10 +174,10 @@ pub fn adopt_workspace(ctx: &Ctx, args: &AdoptWorkspace) -> Result<()> {
         .filter(|s| !s.is_empty());
     let repos = is_repo.map(|path| vec![project::Repo { path, machine: None }]).unwrap_or_default();
 
-    let project = project::create(&ctx.root, &args.name, &args.goal, repos)?;
+    let project = project::create_from(&ctx.root, &args.name, &args.goal, repos, "adopt")?;
     let config = crate::profiles::load(&ctx.config_dir)?;
     crate::profiles::write_project_defaults(&project, &config.new_project_default(crate::profiles::Role::Thread), &config.new_project_default(crate::profiles::Role::Coordinator))?;
-    project::write_priming(&project, &coordinator::current_prefix(&ctx.root)?)?;
+    project::write_priming(&project, &coordinator::current_prefix(&ctx.root)?, "adopt")?;
     println!("created `{}` at {}", project.slug, project.dir().display());
     coordinator::open(ctx, &project.slug, &coordinator::OpenOptions { session: SessionFlags { session: None, socket: Some(session.socket.clone()) }, rebind: false, profile: None, new: false, here: false, person: true, lane: None, lane_name: None })?;
     let adopted = adopt(ctx, &project.slug, &args.pane, &args.name, None)?;

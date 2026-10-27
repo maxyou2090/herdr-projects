@@ -56,6 +56,20 @@ fn peek_records_nothing_and_context_records_seen_items() {
 }
 
 #[test]
+fn routine_toggle_leaves_a_journal_line() {
+    let home = tempfile::tempdir().unwrap();
+    let root = home.path().join("root");
+    let root_arg = root.to_str().unwrap();
+    assert!(hp(home.path(), &["--root", root_arg, "new", "demo"]).status.success());
+    let out = hp(home.path(), &["--root", root_arg, "routine", "toggle", "demo", "coordinator-sweep", "--off"]);
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    let journal = std::fs::read_to_string(root.join("demo/.state/routine-journal.log")).unwrap();
+    let line = journal.lines().last().unwrap();
+    assert!(line.contains("  toggle  coordinator-sweep  disabled  source=terminal  binary="), "{line}");
+    assert!(line.ends_with(&format!("  root={root_arg}")), "{line}");
+}
+
+#[test]
 fn path_like_names_and_slugs_are_refused() {
     let home = tempfile::tempdir().unwrap();
     let root = home.path().join("root");

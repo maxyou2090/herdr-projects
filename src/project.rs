@@ -616,10 +616,19 @@ const COORDINATOR_SWEEP_TEMPLATE: &str = "+++\nschedule = \"every 20m\"\nenabled
 /// default; the popup or the coordinator turns one off.
 const DEFAULT_ROUTINES: [(&str, &str); 2] = [(PR_FOLLOWUP, PR_FOLLOWUP_TEMPLATE), (COORDINATOR_SWEEP, COORDINATOR_SWEEP_TEMPLATE)];
 
-/// Writes the ready-made routines a project is missing. Written by `new` and by
+/// Writes the ready-made routines a project is missing, recording each one in
+/// `.state/routine-journal.log`. Written by `create` and by `open` or
 /// `doctor --fix`; a file that already exists is never touched, so text the
-/// user edited survives every later `open` and `doctor --fix`.
-pub fn write_default_routine(project: &Project) -> Result<bool> {
+/// user edited survives every later `open` and `doctor --fix`. `source` is the
+/// command that got here.
+pub fn write_default_routine(project: &Project, source: &str) -> Result<bool> {
+    let _lock = project.lock()?;
+    write_default_routine_locked(project, source)
+}
+
+/// The write itself. `create` runs it before `PROJECT.md` exists, when there is
+/// no project to lock yet and no other command can see the folder.
+fn write_default_routine_locked(project: &Project, source: &str) -> Result<bool> {
     let mut wrote = false;
     for (file, text) in DEFAULT_ROUTINES {
         let path = project.dir().join(file);
@@ -627,14 +636,17 @@ pub fn write_default_routine(project: &Project) -> Result<bool> {
             continue;
         }
         write_atomic(&path, text.as_bytes())?;
+        let name = file.trim_start_matches("routines/").trim_end_matches(".md");
+        let enabled = crate::routine::parse(name, text).map(|r| r.enabled).unwrap_or(true);
+        crate::routine::journal_locked_or_warn(project, "create", name, if enabled { "enabled" } else { "disabled" }, source);
         wrote = true;
     }
     Ok(wrote)
 }
 
 /// Writes `AGENTS.md`, `CLAUDE.md` (a relative symbolic link to it) and
-/// creates `uploads/`. Idempotent; used by `new` and by `doctor --fix`.
-pub fn write_priming(project: &Project, prefix: &str) -> Result<()> {
+/// creates `uploads/`. Idempotent; used by `open` and by `doctor --fix`.
+pub fn write_priming(project: &Project, prefix: &str, source: &str) -> Result<()> {
     let dir = project.dir();
     let (settings, _) = project.read_project_md()?;
     let name = display_name(&settings.name, &project.slug);
@@ -666,7 +678,7 @@ pub fn write_priming(project: &Project, prefix: &str) -> Result<()> {
     if !dir.join("uploads").is_dir() {
         std::fs::create_dir(dir.join("uploads"))?;
     }
-    write_default_routine(project)?;
+    write_default_routine(project, source)?;
     Ok(())
 }
 
@@ -705,6 +717,12 @@ pub fn priming_problems(project: &Project, prefix: &str) -> Vec<String> {
 /// Creates the folder and skeleton files. The only code path that creates a
 /// project's directories. Fails if the slug exists.
 pub fn create(root: &Path, name: &str, goal: &str, repos: Vec<Repo>) -> Result<Project> {
+    create_from(root, name, goal, repos, "new")
+}
+
+/// `create`, naming the command that got here for the routine journal's create
+/// lines (for example `adopt`).
+pub fn create_from(root: &Path, name: &str, goal: &str, repos: Vec<Repo>, source: &str) -> Result<Project> {
     let slug = slug_from_name(name)?;
     let project = Project {
         root: root.to_path_buf(),
@@ -746,7 +764,7 @@ pub fn create(root: &Path, name: &str, goal: &str, repos: Vec<Repo>) -> Result<P
         b"# Memory\n\nOne line per memory file: `- [title](memory/file.md): what it holds`.\n",
     )?;
     write_atomic(&dir.join("TASKS.md"), TASKS_TEMPLATE.as_bytes())?;
-    write_default_routine(&project)?;
+    write_default_routine_locked(&project, source)?;
     write_json(&project.state_dir().join("project.json"), &ProjectState::default())?;
     // PROJECT.md last: a folder without it is not a project, so a half-made
     // skeleton is never picked up by `list` or the ticker.
@@ -879,7 +897,7 @@ mod tests {
         // A second `write_priming` (any `open`, `doctor --fix`) leaves text the
         // user edited alone, and reports nothing missing.
         std::fs::write(project.dir().join(COORDINATOR_SWEEP), "+++\nschedule = \"daily 09:00\"\n+++\n\nMine.\n").unwrap();
-        write_priming(&project, &prefix).unwrap();
+        write_priming(&project, &prefix, "open").unwrap();
         assert_eq!(std::fs::read_to_string(project.dir().join(COORDINATOR_SWEEP)).unwrap(), "+++\nschedule = \"daily 09:00\"\n+++\n\nMine.\n");
         assert!(priming_problems(&project, &prefix).is_empty());
 
@@ -887,9 +905,29 @@ mod tests {
         std::fs::remove_file(project.dir().join(COORDINATOR_SWEEP)).unwrap();
         let problems = priming_problems(&project, &prefix);
         assert_eq!(problems, ["routines/coordinator-sweep.md is missing"], "{problems:?}");
-        write_priming(&project, &prefix).unwrap();
+        write_priming(&project, &prefix, "open").unwrap();
         assert!(project.dir().join(COORDINATOR_SWEEP).is_file());
         assert!(priming_problems(&project, &prefix).is_empty());
+    }
+
+    #[test]
+    fn new_records_both_default_routines_as_create_events() {
+        let root = tempfile::tempdir().unwrap();
+        let project = create(root.path(), "Demo", "", vec![]).unwrap();
+        let journal = std::fs::read_to_string(crate::routine::journal_path(&project)).unwrap();
+        let lines: Vec<&str> = journal.lines().collect();
+        assert_eq!(lines.len(), 2, "{journal}");
+        for (line, name) in lines.iter().zip(["pr-followup", "coordinator-sweep"]) {
+            let mut parts = line.split("  ");
+            assert_eq!(parts.next().unwrap().len(), 20, "{line}");
+            assert_eq!((parts.next(), parts.next(), parts.next(), parts.next()), (Some("create"), Some(name), Some("enabled"), Some("source=new")), "{line}");
+            let rest: Vec<&str> = parts.collect();
+            assert!(rest[0].starts_with("binary="), "{line}");
+            assert_eq!(rest[1], format!("root={}", project.root.display()), "{line}");
+        }
+        // A later pass finds both files and records nothing.
+        assert!(!write_default_routine(&project, "open").unwrap());
+        assert_eq!(crate::routine::journal_lines(&project), Some(2));
     }
 
     #[test]
@@ -897,7 +935,7 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let project = create(root.path(), "Demo Project", "", vec![]).unwrap();
         let prefix = format!("{} --root {}", std::env::current_exe().unwrap().display(), root.path().display());
-        write_priming(&project, &prefix).unwrap();
+        write_priming(&project, &prefix, "open").unwrap();
         let text = std::fs::read_to_string(project.dir().join("AGENTS.md")).unwrap();
         assert!(text.contains("you are the coordinator of Demo Project"));
         assert!(text.contains(&format!("`{prefix} skill`")));
@@ -909,24 +947,24 @@ mod tests {
         assert!(priming_problems(&project, &prefix).is_empty());
 
         // Idempotent, and a stale binary path is reported.
-        write_priming(&project, &prefix).unwrap();
+        write_priming(&project, &prefix, "open").unwrap();
         let stale = agents_md("Demo Project", "demo-project", "/no/such/binary --root /r");
         std::fs::write(project.dir().join("AGENTS.md"), stale).unwrap();
         let problems = priming_problems(&project, &prefix);
         assert_eq!(problems.len(), 1, "{problems:?}");
         assert!(problems[0].contains("does not exist"));
-        write_priming(&project, &prefix).unwrap();
+        write_priming(&project, &prefix, "open").unwrap();
         assert!(priming_problems(&project, &prefix).is_empty());
 
         // A foreign AGENTS.md is kept beside ours.
         std::fs::write(project.dir().join("AGENTS.md"), "codex notes").unwrap();
-        write_priming(&project, &prefix).unwrap();
+        write_priming(&project, &prefix, "open").unwrap();
         assert_eq!(std::fs::read_to_string(project.dir().join("AGENTS.md.before-herdr-projects")).unwrap(), "codex notes");
         // A hand-written CLAUDE.md is kept beside the link, not lost.
         std::fs::remove_file(project.dir().join("CLAUDE.md")).unwrap();
         std::fs::write(project.dir().join("CLAUDE.md"), "mine").unwrap();
         assert!(priming_problems(&project, &prefix).iter().any(|p| p.contains("CLAUDE.md")));
-        write_priming(&project, &prefix).unwrap();
+        write_priming(&project, &prefix, "open").unwrap();
         assert_eq!(std::fs::read_to_string(project.dir().join("CLAUDE.md.before-herdr-projects")).unwrap(), "mine");
         assert!(priming_problems(&project, &prefix).is_empty());
     }

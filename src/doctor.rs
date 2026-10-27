@@ -268,12 +268,17 @@ fn report(
         if problems.is_empty() {
             check(&mut out, Some(true), &label, "AGENTS.md, CLAUDE.md link and uploads/ are in place".into());
         } else if fix {
-            match project::write_priming(&project, &prefix) {
+            match project::write_priming(&project, &prefix, "doctor-fix") {
                 Ok(()) => check(&mut out, Some(true), &label, format!("fixed: {}", problems.join("; "))),
                 Err(error) => check(&mut out, Some(false), &label, format!("could not fix ({error:#}): {}", problems.join("; "))),
             }
         } else {
             check(&mut out, None, &label, format!("{}; `doctor --fix` repairs this", problems.join("; ")));
+        }
+        // The routine journal is append-only and never rotated: a hint, never a
+        // failure, once it is long enough that a person may want to clean it.
+        if let Some(lines) = crate::routine::journal_lines(&project).filter(|lines| *lines > 2000) {
+            check(&mut out, None, &format!("journal {slug}"), format!("routine-journal.log has {lines} lines; it is never rotated, so delete it once the history is no longer needed"));
         }
         for other in &slugs {
             if other > slug && crate::names::collide(slug, other) {
@@ -623,6 +628,24 @@ mod tests {
         assert!(text.contains("[ok  ] files demo: AGENTS.md, CLAUDE.md link and uploads/ are in place"), "{text}");
     }
 
+    #[test]
+    fn doctor_fix_records_the_default_routine_it_restores() {
+        let home = tempfile::tempdir().unwrap();
+        let env = Env::for_test(home.path(), &[]);
+        let runner = runner_with_herdr("herdr 0.9.1\n");
+        let root = home.path().join("root");
+        let project = project::create(&root, "demo", "", vec![]).unwrap();
+        assert_eq!(crate::routine::journal_lines(&project), Some(2));
+        std::fs::remove_file(project.dir().join(project::COORDINATOR_SWEEP)).unwrap();
+
+        let (text, _) = report(&env, &root, &home.path().join("cfg"), &SessionFlags::default(), &runner, true, None);
+        assert!(text.contains("[ok  ] files demo: fixed:"), "{text}");
+        assert!(project.dir().join(project::COORDINATOR_SWEEP).is_file());
+        let journal = std::fs::read_to_string(crate::routine::journal_path(&project)).unwrap();
+        assert_eq!(journal.lines().count(), 3, "{journal}");
+        assert!(journal.lines().last().unwrap().contains("  create  coordinator-sweep  enabled  source=doctor-fix  binary="), "{journal}");
+    }
+
     /// exe.dev VMs: `origin` is on `github.localhost` and plain `gh` is logged
     /// in nowhere. Doctor asks that host, not `gh auth status`.
     #[test]
@@ -899,7 +922,7 @@ mod tests {
         let long = "x".repeat(30);
         for suffix in ["a", "b"] {
             let project = project::create(&root, &format!("{long}-{suffix}"), "", vec![]).unwrap();
-            project::write_priming(&project, &crate::coordinator::current_prefix(&root).unwrap()).unwrap();
+            project::write_priming(&project, &crate::coordinator::current_prefix(&root).unwrap(), "doctor-fix").unwrap();
         }
         let (text, healthy) = report(&env, &root, &home.path().join("cfg"), &SessionFlags::default(), &runner, false, None);
         assert!(!healthy);

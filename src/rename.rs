@@ -345,7 +345,7 @@ pub fn run(ctx: &Ctx, args: &Args) -> Result<Outcome> {
         let _lock = project.lock()?;
         write_atomic(&project.project_md(), text.as_bytes()).with_context(|| finish.clone())?;
     }
-    project::write_priming(&project, &crate::coordinator::current_prefix(&ctx.root)?).with_context(|| finish.clone())?;
+    project::write_priming(&project, &crate::coordinator::current_prefix(&ctx.root)?, "rename").with_context(|| finish.clone())?;
     for t in threads.iter().filter(|t| !t.is_remote()) {
         thread::update(&project, &t.id, |t| {
             for field in [&mut t.cwd, &mut t.worktree_path, &mut t.thread_dir] {
