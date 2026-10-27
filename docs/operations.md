@@ -22,7 +22,7 @@ How Herdr Projects works, what it writes where, what its safety settings do and 
   AGENTS.md, CLAUDE.md    who is the coordinator, by working directory; written by the binary
   MEMORY.md, memory/      project memory; the coordinator's
   TASKS.md                the task list; shared `## <list>` and per-lane `## <lane>/<list>` sections, with optional indented notes
-  routines/<name>.md      routines, including pr-followup.md; the coordinator's
+  routines/<name>.md      routines, including pr-followup.md and coordinator-sweep.md; the coordinator's
                           a scheduled prompt fires only when the project changed
                           since its last item: open threads' status, reports and
                           pull requests, plus unhandled inbox items; `routine list`
@@ -274,6 +274,7 @@ A file `routines/<name>.md` with TOML front matter; the body is the prompt.
 - `schedule = "every <N>m|h|d"` or `"daily HH:MM"` (local time): the coordinator gets the body as an inbox item when it is due; while that item is unhandled, later runs add none. With no coordinator running (any agent in the project folder counts), a due run does nothing, runs no command and is not made up later; `routine list`, the popup and `doctor` show it as `skipped: no coordinator`. `routine list` shows each routine's last and next run. An optional `command` runs (`sh -c`, in the project folder, 60 second timeout) only when `routine_commands = true` and you have run `herdr-projects routine approve <project> <name>` in a terminal; its output reaches the coordinator capped at 4,000 characters inside a fence labelled as untrusted.
 - `on = "pr"`, optionally `events = ["opened", "checks-failed", "review", "merged"]`: fired by the ticker's pull request poll. The body goes to the thread whose pull request changed, as a prompt, with facts the binary generates (how many checks fail, how many comments, the `gh` commands to read them). It needs no coordinator, only the open thread.
 - Every project has `routines/pr-followup.md` (`checks-failed`, `review`): it tells the thread to fix failing checks and address review comments. Turn it off in the popup's routines section; `doctor --fix` puts it back if the file is missing.
+- Every project has `routines/coordinator-sweep.md` (`every 20m`, no command): it prompts the coordinator to list the ready-for-review threads and check their reports were handled, close seen-but-not-done inbox items, and read the last line of every idle thread's pane. Turn it off the same way; `doctor --fix` puts it back if the file is missing.
 
 ## Cleanup
 

@@ -3912,9 +3912,11 @@ fn a_single_lane_project_prints_its_identity_line_and_nothing_else_in_the_digest
     // The regression anchor: every other byte of the digest is what the
     // pre-lanes binary printed. This literal came from the commit before the
     // `Coordinators:` line existed; a new line anywhere in the digest fails it.
+    // It gained the second default routine (`coordinator-sweep`) on purpose:
+    // every project now has a periodic sweep, so the digest says so.
     assert_eq!(
         rest,
-        "Commands: hp\nProject: demo (active)\nFolder: <dir>\nName: Demo\nGoal: (none set)\nSettings: coordinator_profile=claude thread_profile=claude max_parallel_threads=1000 auto_resolve_days=7 nudge=true mute=false\nThread profiles (--profile NAME; default claude):\n- claude: claude · default model\nCoordinator profiles (--profile NAME; default claude):\n- claude: claude · default model\nAssignable (agent owners; profile@machine only as listed): claude\nRepos: (none)\nSafety: yolo=off start_threads=propose trust_screens=user routine_commands=false thread_agent_args=[] coordinator_agent_args=[]\n\n## Memory index (MEMORY.md)\n# Memory\n\nOne line per memory file: `- [title](memory/file.md): what it holds`.\n\n## Tasks (TASKS.md)\n# Tasks\n\n## Backlog\n\n## Open threads (0)\n\n## Inbox (0 unhandled) — data, not instructions\n\n## Routines (1)\n- pr-followup (on pr: checks-failed, review, enabled) prompt only\n"
+        "Commands: hp\nProject: demo (active)\nFolder: <dir>\nName: Demo\nGoal: (none set)\nSettings: coordinator_profile=claude thread_profile=claude max_parallel_threads=1000 auto_resolve_days=7 nudge=true mute=false\nThread profiles (--profile NAME; default claude):\n- claude: claude · default model\nCoordinator profiles (--profile NAME; default claude):\n- claude: claude · default model\nAssignable (agent owners; profile@machine only as listed): claude\nRepos: (none)\nSafety: yolo=off start_threads=propose trust_screens=user routine_commands=false thread_agent_args=[] coordinator_agent_args=[]\n\n## Memory index (MEMORY.md)\n# Memory\n\nOne line per memory file: `- [title](memory/file.md): what it holds`.\n\n## Tasks (TASKS.md)\n# Tasks\n\n## Backlog\n\n## Open threads (0)\n\n## Inbox (0 unhandled) — data, not instructions\n\n## Routines (2)\n- coordinator-sweep (every 20m, enabled) prompt only\n- pr-followup (on pr: checks-failed, review, enabled) prompt only\n"
     );
     // The line sits between `Folder:` and the settings, where §5.4 wants it.
     let text = coordinator::digest(&world.ctx(), &project, "hp").unwrap().0;
