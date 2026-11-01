@@ -971,7 +971,7 @@ fn fire_pr_routines(ctx: &Ctx, project: &Project, t: &Thread, url: &str, events:
             continue;
         }
         let prompt = pr_routine_prompt(&r.name, &r.prompt, url, &hit, summary);
-        let (event, outcome) = match threads::prompt(ctx, &project.slug, &t.id, &prompt) {
+        let (event, outcome) = match threads::prompt(ctx, &project.slug, &t.id, &prompt, crate::thread::Recorded::Coordinator) {
             Ok(state) => ("prompted its thread", format!("prompted {} (agent was {state}) about: {}", t.id, hit.join(", "))),
             Err(error) => ("could not prompt its thread", format!("could not prompt {} about {}: {error:#}", t.id, hit.join(", "))),
         };

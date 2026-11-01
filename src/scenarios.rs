@@ -2613,14 +2613,16 @@ fn a_tab_thread_gets_a_brief_with_the_project_header_and_prompts_are_recorded() 
     *world.agents.borrow_mut() = format!("[{}]", agent_json("w1", "w1:t2", "w1:p2", &t.cwd, "hp-demo-t-0001", "working"));
     // Text someone typed in the thread's box is never merged with a prompt.
     *world.screen.borrow_mut() = claude_screen(Some("wait, one more thing"));
-    let refused = threads::prompt(&ctx, "demo", "t-0001", "Also check the docs.").unwrap_err().to_string();
+    let refused = threads::prompt(&ctx, "demo", "t-0001", "Also check the docs.", crate::thread::Recorded::Coordinator).unwrap_err().to_string();
     assert!(refused.contains("draft_in_box"), "{refused}");
     assert_eq!(world.runner.count("agent prompt"), 0);
     *world.screen.borrow_mut() = claude_screen(None);
-    threads::prompt(&ctx, "demo", "t-0001", "Also check the docs.").unwrap();
+    // The user's own words are recorded with their mark; the text is not altered.
+    threads::prompt(&ctx, "demo", "t-0001", "Also check the docs.", crate::thread::Recorded::User).unwrap();
     let task = std::fs::read_to_string(thread::task_path(&project, "t-0001")).unwrap();
     assert!(task.contains("## Follow-ups"));
-    assert!(task.ends_with("Also check the docs.\n"));
+    assert!(task.ends_with(&format!("({})\n\nAlso check the docs.\n", thread::VERBATIM_MARK)), "{task}");
+    assert_eq!(task.matches(thread::VERBATIM_MARK).count(), 1);
 
     // `thread next --line 1` forwards the report's own line and records it too.
     std::fs::write(thread::home_report_path(&project, "t-0001"), "## Report\nok\n## Next\n- Open the PR\n").unwrap();
@@ -3382,7 +3384,7 @@ fn thread_brief_delivers_a_pending_brief_once_and_only_to_a_ready_agent() {
     set_agents(&world, &project, "working");
     assert!(threads::brief(&ctx, "demo", "t-0001").unwrap_err().to_string().contains("not ready"));
     // The prompt refusal and the restart refusal both point at it.
-    assert!(threads::prompt(&ctx, "demo", "t-0001", "hi").unwrap_err().to_string().contains("`thread brief`"));
+    assert!(threads::prompt(&ctx, "demo", "t-0001", "hi", crate::thread::Recorded::Coordinator).unwrap_err().to_string().contains("`thread brief`"));
     assert_eq!(world.runner.count("agent prompt"), 0);
 
     set_agents(&world, &project, "idle");
@@ -3434,7 +3436,7 @@ fn prompts_never_reach_a_trust_screen_and_keys_follow_the_trust_setting() {
     *world.screen.borrow_mut() = TRUST_SCREEN.into();
     let ctx = world.ctx();
 
-    let err = threads::prompt(&ctx, "demo", &t.id, "go on").unwrap_err().to_string();
+    let err = threads::prompt(&ctx, "demo", &t.id, "go on", crate::thread::Recorded::Coordinator).unwrap_err().to_string();
     assert!(err.contains("trust_screen"), "{err}");
     assert_eq!(world.runner.count("agent prompt"), 0);
 
