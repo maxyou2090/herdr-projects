@@ -48,6 +48,11 @@ pub const PR_INTERVAL_SECS: i64 = 120;
 /// report since the merge is resolved after this long.
 pub const MERGE_GRACE_SECS: i64 = 600;
 pub const DONE_RETENTION_DAYS: u64 = 30;
+/// How stale the tick heartbeat may be before `hp context` says the ticker is
+/// not running instead of repeating the last stored reason as if it were
+/// current. Several ticks' worth, so one slow tick (an ssh call, a copy, a
+/// project ahead of this one in the loop) is never mistaken for a dead ticker.
+pub const TICK_STALE_SECS: i64 = 300;
 const DEFAULT_OUTAGE_SECS: i64 = 600;
 
 /// `.state/ticker.json`: what the ticker compared against last time.
@@ -99,6 +104,19 @@ pub struct State {
     pub error_seen: BTreeMap<String, String>,
     /// thread id -> when the ticker first saw its pull request merged.
     pub merged_seen: BTreeMap<String, String>,
+    /// When this project's last tick started, UTC. The ticker writes it every
+    /// tick; `hp context` runs in another process and reads it to tell a live
+    /// ticker from one that died holding a reason (see [`held_note`]).
+    #[serde(default)]
+    pub tick_at: String,
+    /// lane id -> why that lane's nudge last held: items waited and no prompt
+    /// went out. Cleared when the lane is quiet or the prompt is delivered.
+    #[serde(default, deserialize_with = "string_or_map")]
+    pub held_reason: BTreeMap<String, String>,
+    /// lane id -> when the lane's current `held_reason` started. Kept while
+    /// the reason stays the same, so the digest can say how long.
+    #[serde(default, deserialize_with = "string_or_map")]
+    pub held_since: BTreeMap<String, String>,
     /// The default lane in force for this load. Not part of the file: the
     /// per-lane maps are keyed by lane id, and an empty lane argument reads as
     /// this one. `State::default()` (a test or a fresh ticker) falls back to
@@ -138,7 +156,7 @@ pub fn load_state(project: &Project) -> State {
     // A scalar is always `c-1`'s, but a project whose default lane has since
     // been elected elsewhere must still find it in the default slot.
     if default_lane != crate::lanes::FALLBACK_ID {
-        for slots in [&mut state.nudged, &mut state.renudged_at, &mut state.box_pane, &mut state.box_empty_since] {
+        for slots in [&mut state.nudged, &mut state.renudged_at, &mut state.box_pane, &mut state.box_empty_since, &mut state.held_reason, &mut state.held_since] {
             if let Some(value) = slots.remove(crate::lanes::FALLBACK_ID) {
                 slots.entry(default_lane.clone()).or_insert(value);
             }
@@ -179,6 +197,9 @@ pub fn save_state(project: &Project, state: &State) -> Result<()> {
         session_item_written: bool,
         error_seen: &'a BTreeMap<String, String>,
         merged_seen: &'a BTreeMap<String, String>,
+        tick_at: &'a str,
+        held_reason: String,
+        held_since: String,
     }
     project::write_json(
         &path,
@@ -198,6 +219,9 @@ pub fn save_state(project: &Project, state: &State) -> Result<()> {
             session_item_written: state.session_item_written,
             error_seen: &state.error_seen,
             merged_seen: &state.merged_seen,
+            tick_at: &state.tick_at,
+            held_reason: value(&state.held_reason),
+            held_since: value(&state.held_since),
         },
     )
 }
@@ -584,8 +608,8 @@ pub enum NudgeOutcome {
     Held(&'static str),
 }
 
-const NO_COORDINATOR: &str = "items wait but no coordinator is idle long enough";
-const BOX_NOT_QUIET: &str = "items wait for the coordinator's input box to look empty";
+pub(crate) const NO_COORDINATOR: &str = "items wait but no coordinator is idle long enough";
+pub(crate) const BOX_NOT_QUIET: &str = "items wait for the coordinator's input box to look empty";
 const WAITING_FOR_READ: &str = "items were announced and wait for the coordinator to read them";
 const NOT_AGED: &str = "shown items sit unhandled but none is old enough for a reminder";
 const REMINDED: &str = "a reminder went out recently; the next waits for its spacing";
@@ -698,6 +722,76 @@ impl State {
 
     fn slot_value<'a>(&self, slots: &'a BTreeMap<String, String>, lane: &str) -> &'a str {
         slots.get(self.key(lane)).map(String::as_str).unwrap_or("")
+    }
+
+    /// The reason this lane's nudge last held and when that reason started,
+    /// or `None` when the last tick had nothing held for the lane.
+    pub fn held(&self, lane: &str) -> Option<(&str, &str)> {
+        let reason = self.slot_value(&self.held_reason, lane);
+        if reason.is_empty() {
+            return None;
+        }
+        Some((reason, self.slot_value(&self.held_since, lane)))
+    }
+
+    /// Records that the lane's nudge held for `reason` at `now`. The start
+    /// time is kept while the reason is the same, so the digest can say how
+    /// long it has been that way; a different reason starts over.
+    pub fn hold(&mut self, lane: &str, reason: &str, now: jiff::Timestamp) {
+        let key = self.key(lane).to_string();
+        if self.held_reason.get(&key).map(String::as_str) == Some(reason) {
+            self.held_since.entry(key).or_insert_with(|| now.to_string());
+            return;
+        }
+        self.held_reason.insert(key.clone(), reason.to_string());
+        self.held_since.insert(key, now.to_string());
+    }
+
+    /// The lane's items were announced, or nothing waits for one: there is
+    /// nothing left to explain.
+    pub fn released(&mut self, lane: &str) {
+        let key = self.key(lane).to_string();
+        self.held_reason.remove(&key);
+        self.held_since.remove(&key);
+    }
+}
+
+/// The one clause `hp context` adds to the Inbox heading when the ticker had
+/// items to announce and could not: what held the nudge, and for how long.
+/// `None` — the heading exactly as it always was — when nothing waits, when
+/// the last tick announced the lane's items, or when no tick has been
+/// recorded yet. A heartbeat older than [`TICK_STALE_SECS`] means the ticker
+/// is not running: the stored reason is then not shown as if it were current.
+pub fn held_note(project: &Project, lane: &str, waiting: usize, now: jiff::Timestamp) -> Option<String> {
+    if waiting == 0 {
+        return None;
+    }
+    let state = load_state(project);
+    if state.tick_at.is_empty() {
+        return None;
+    }
+    let (reason, since) = state.held(lane)?;
+    // Only a reason that means "no prompt went out" is a delivery failure.
+    // The aged-reminder reasons (`WAITING_FOR_READ`, `NOT_AGED`, `REMINDED`)
+    // all describe items a coordinator was already told about: those keep the
+    // usual heading, because an announced item costs no space.
+    if reason != NO_COORDINATOR && reason != BOX_NOT_QUIET {
+        return None;
+    }
+    let tick_age = thread::seconds_since(&state.tick_at, now);
+    if tick_age > TICK_STALE_SECS {
+        return Some(format!("the ticker is not running (no tick for {}): nothing announced these items", span_text(tick_age)));
+    }
+    Some(format!("no prompt reached a coordinator for {}: {reason}", span_text(thread::seconds_since(since, now))))
+}
+
+/// `35s`, `42m`, `2h 5m`: coarse on purpose — the point is "a while", not a
+/// stopwatch. A timestamp in the future reads as no time at all.
+fn span_text(secs: i64) -> String {
+    match secs.max(0) {
+        s if s < 60 => format!("{s}s"),
+        s if s < 3600 => format!("{}m", s / 60),
+        s => format!("{}h {}m", s / 3600, s % 3600 / 60),
     }
 }
 

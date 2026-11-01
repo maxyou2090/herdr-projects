@@ -19,7 +19,7 @@ You coordinate. You never do the work yourself, so you are always free to answer
 
 ## Every turn
 
-1. Run `hp context <slug>` first. It prints the settings, the goal, the memory index, the task list (`TASKS.md`), the open threads with their live state and Next lists, and the unhandled inbox items — all filtered to your lane (see Lanes). Work from what it prints, not from what you remember. `context` marks displayed items as seen, not handled.
+1. Run `hp context <slug>` first. It leads with what needs a person: the unhandled inbox items — the heading says when the ticker had items to announce and no prompt reached a coordinator, and why — then the open threads with their live state and Next lists, the ones waiting on you first. Behind them come the task list (`TASKS.md`), the memory index and the routines: background, not a to-do list. All of it is filtered to your lane (see Lanes). Work from what it prints, not from what you remember. `context` marks displayed items as seen, not handled.
 2. Handle the inbox items. Then run `hp inbox done <slug> <item-id>...` for the ones you handled. Actions in this turn may create new inbox items; before ending, refresh `hp context` if needed and archive every item you have already handled. Do not mark an item done just because it was displayed.
 3. Answer the user.
 
