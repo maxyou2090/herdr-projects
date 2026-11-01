@@ -1061,6 +1061,18 @@ fn box_empty_for_a_while(project: &Project) {
     crate::steps::save_state(project, &state).unwrap();
 }
 
+/// Backdates when the ticker started holding the nudge for the reason it
+/// holds now, so a digest about a standing hold does not depend on the clock:
+/// `steps::held_note` stays quiet while the nudge may still be inside its own
+/// waiting time (`HELD_NOTE_AFTER_SECS`).
+fn held_for_a_while(project: &Project) {
+    let mut state = crate::steps::load_state(project);
+    assert!(!state.held_reason.is_empty(), "the nudge was not held yet");
+    let since = jiff::Timestamp::now() - jiff::SignedDuration::from_secs(crate::steps::HELD_NOTE_AFTER_SECS);
+    state.held_since.insert(crate::lanes::default_lane_id(project), since.to_string());
+    crate::steps::save_state(project, &state).unwrap();
+}
+
 fn nudges(world: &World) -> Vec<String> {
     world.runner.calls.borrow().iter().filter(|c| c.display().contains("agent prompt")).filter_map(|c| c.args.last().cloned()).filter(|a| a.starts_with("[hp inbox]")).collect()
 }
@@ -4597,6 +4609,9 @@ fn the_digest_says_why_no_prompt_went_out_and_puts_what_needs_a_person_first() {
     *world.panes.borrow_mut() = format!("[{}]", pane_json("w1", "w1:t1", "w1:p1", &dir));
     let ctx = world.ctx();
     ticker::tick_project_with(&ctx, &project, &mut Memory::new(&ctx)).unwrap();
+    // A hold that has lasted the nudge's whole waiting time is news; the digest
+    // would say nothing about a younger one (see `steps::held_note`).
+    held_for_a_while(&project);
 
     let digest = coordinator::digest(&ctx, &project, "hp").unwrap().0;
     // The marker stays in front of the clause: the summaries next to it carry

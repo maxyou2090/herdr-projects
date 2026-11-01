@@ -18,6 +18,15 @@ use crate::{inbox, pr, routine};
 /// long: Herdr 0.9.1 cannot say when a key was last pressed in a pane, and
 /// typing shows in the box.
 pub const NUDGE_QUIET_SECS: i64 = 10;
+/// How long a lane's nudge must already have been held before `hp context`
+/// calls it news ([`held_note`]). Every wait the nudge actually has must have
+/// run out first: a coordinator idle for `NUDGE_IDLE_SECS`, its input box
+/// empty for `NUDGE_QUIET_SECS`, and one ticker `TICK` — the nudge only acts
+/// on a tick, so the first tick after both other waits hold is the earliest
+/// it can go out. A hold younger than their sum is the normal "not announced
+/// yet" of a fresh item, not a delivery failure. Derived from those three,
+/// never a number of its own, so the timing cannot drift from the nudge's.
+pub const HELD_NOTE_AFTER_SECS: i64 = crate::coordinator::NUDGE_IDLE_SECS + NUDGE_QUIET_SECS + crate::ticker::TICK.as_secs() as i64;
 /// A shown-but-unhandled item is reminded about once the oldest one is this
 /// old, so an interrupted coordinator turn cannot strand it silently.
 pub const RE_NUDGE_AFTER_SECS: i64 = 30 * 60;
@@ -782,7 +791,16 @@ pub fn held_note(project: &Project, lane: &str, waiting: usize, now: jiff::Times
     if tick_age > TICK_STALE_SECS {
         return Some(format!("the ticker is not running (no tick for {}): nothing announced these items", span_text(tick_age)));
     }
-    Some(format!("no prompt reached a coordinator for {}: {reason}", span_text(thread::seconds_since(since, now))))
+    let held_for = thread::seconds_since(since, now);
+    // The nudge is allowed to wait `HELD_NOTE_AFTER_SECS` (idle, quiet box,
+    // one tick) before a coordinator can be prompted at all; until then "no
+    // prompt went out yet" is what every new item looks like, so the heading
+    // stays the plain one a healthy project prints. Only past that is the same
+    // hold news.
+    if held_for < HELD_NOTE_AFTER_SECS {
+        return None;
+    }
+    Some(format!("no prompt reached a coordinator for {}: {reason}", span_text(held_for)))
 }
 
 /// `35s`, `42m`, `2h 5m`: coarse on purpose — the point is "a while", not a
@@ -1672,6 +1690,46 @@ mod tests {
         assert_eq!(
             sent,
             [("w1:p1".to_string(), "[hp inbox] t-0001 idle".to_string()), ("w2:p1".to_string(), "[hp inbox] t-0002 idle".to_string())]
+        );
+    }
+
+    /// The heading's clause is the ticker's standing verdict, not a live
+    /// countdown. While the nudge is still inside its own waiting time — a
+    /// coordinator idle for `NUDGE_IDLE_SECS`, its input box empty for
+    /// `NUDGE_QUIET_SECS`, and the tick it can only act on — every fresh item
+    /// would otherwise read as a delivery failure for its first minute and a
+    /// half. Past that it is news, worded exactly as before.
+    #[test]
+    fn a_held_nudge_is_only_news_once_the_nudge_has_had_its_waiting_time() {
+        let root = tempfile::tempdir().unwrap();
+        let project = project::create(root.path(), "demo", "", vec![]).unwrap();
+        let now = at("2026-10-08T14:10:00Z");
+        // 60s idle + 10s quiet box + one 15s tick: the whole time a nudge may
+        // legitimately still be waiting.
+        assert_eq!(HELD_NOTE_AFTER_SECS, 85, "the threshold is the nudge's three waits");
+        let heading = |secs: i64, reason: &str| {
+            let mut state = State { tick_at: now.to_string(), ..Default::default() };
+            state.hold("", reason, now - jiff::SignedDuration::from_secs(secs));
+            save_state(&project, &state).unwrap();
+            held_note(&project, "", 1, now)
+        };
+        // A coordinator that only just went idle, and a box checked once: the
+        // nudge has not had its chance, so the heading stays the healthy one.
+        assert_eq!(heading(HELD_NOTE_AFTER_SECS - 1, NO_COORDINATOR), None);
+        assert_eq!(heading(0, NO_COORDINATOR), None, "a fresh hold is what every new item looks like");
+        assert_eq!(heading(HELD_NOTE_AFTER_SECS - 1, BOX_NOT_QUIET), None);
+        // One second past the nudge's whole waiting time the same holds are news.
+        assert_eq!(
+            heading(HELD_NOTE_AFTER_SECS, NO_COORDINATOR).as_deref(),
+            Some("no prompt reached a coordinator for 1m: items wait but no coordinator is idle long enough")
+        );
+        assert_eq!(
+            heading(HELD_NOTE_AFTER_SECS, BOX_NOT_QUIET).as_deref(),
+            Some("no prompt reached a coordinator for 1m: items wait for the coordinator's input box to look empty")
+        );
+        assert_eq!(
+            heading(44 * 60, NO_COORDINATOR).as_deref(),
+            Some("no prompt reached a coordinator for 44m: items wait but no coordinator is idle long enough")
         );
     }
 
