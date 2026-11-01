@@ -103,7 +103,7 @@ pub fn when_text(routine: &Routine, state: Option<&State>, now: &jiff::Zoned) ->
     };
     let skipped = state.map(|s| s.skipped).filter(|n| *n > 0).map(|n| format!(" · {n} run(s) skipped while its item was unhandled")).unwrap_or_default();
     let alone = state.map(|s| s.no_coordinator).filter(|n| *n > 0).map(|n| format!(" · skipped: no coordinator ({n} run(s))")).unwrap_or_default();
-    let quiet = state.map(|s| s.quiet).filter(|n| *n > 0).map(|n| format!(" · {n} quiet run(s): nothing changed since its last item")).unwrap_or_default();
+    let quiet = state.map(|s| s.quiet).filter(|n| *n > 0).map(|n| format!(" · {n} quiet run(s): nothing needed a person since its last item")).unwrap_or_default();
     format!("last {} · next {next}{skipped}{alone}{quiet}", last.map(local).unwrap_or_else(|| "never".into()))
 }
 
@@ -434,8 +434,8 @@ pub struct State {
     pub output_hash: String,
     /// Command hash the last "needs approval" item was written for.
     pub approval_item_for: String,
-    /// Due runs of a prompt-only routine that wrote nothing because the
-    /// project had not changed since the item it last fired on.
+    /// Due runs of a prompt-only routine that wrote nothing because nothing
+    /// that needs a person had changed since the item it last fired on.
     pub quiet: u32,
     /// Runs of a prompt-only routine that wrote nothing because its last item
     /// was still unhandled.

@@ -1182,33 +1182,48 @@ pub fn auto_resolve(ctx: &Ctx, project: &Project, settings: &Settings, memory: &
     errors
 }
 
-/// Step 3, plus `config-error` items for files that do not parse. A due
-/// What a prompt-only routine could act on: every thread that is not
-/// resolved (its status, report and pull request state), the inbox items that
-/// wait for someone to handle them, and the routine's own prompt (editing it
-/// re-arms the routine). Items of routine kinds are left out: they have their
-/// own wake paths, and their own lifecycle would otherwise change the
-/// fingerprint on every run, defeating the quiet check.
+/// What a prompt-only routine could act on, measured by the one question it
+/// asks: does anything need a person? A thread counts when the group the
+/// ticker last computed for it is one the project counts as needing the user
+/// ([`crate::sidebar::needs_you`]: waiting on you, or ready for review — a new
+/// report, an open pull request, a prompt on its pane, a failed or dead
+/// thread), or when its launch failed before a group was ever computed. A
+/// thread that is merely working, reporting or landing contributes nothing: a
+/// thread talking to itself is not a reason to sweep. The group comes from
+/// `last_group`, which the ticker writes from the live view earlier in the
+/// same tick, so this adds no Herdr call. An unhandled inbox item counts by
+/// its id alone: `inbox::seen` is the *default lane's* set, so with lanes it
+/// can flip while another lane's coordinator is the one that acts, and it
+/// tells the routine nothing an unhandled item does not already tell it. The
+/// routine's own prompt stays in: editing it re-arms the routine. Items of
+/// routine kinds are left out: they have their own wake paths, and their own
+/// lifecycle would otherwise change the fingerprint on every run, defeating
+/// the quiet check. Everything is sorted by id and holds no timestamp, so a
+/// restart or a different read order produces the same hash.
 fn prompt_fingerprint(project: &Project, routine: &routine::Routine) -> String {
     let mut text = String::new();
     for t in thread::list(project).into_iter().filter(|t| t.status != Status::Resolved) {
-        text.push_str(&format!("{} {:?} {} {}\n", t.id, t.status, t.report_hash, t.pr_state));
+        let needs_person = if t.status == Status::Failed {
+            Some("failed")
+        } else {
+            Group::from_token(&t.last_group).filter(|g| crate::sidebar::needs_you(*g)).map(Group::token)
+        };
+        if let Some(group) = needs_person {
+            text.push_str(&format!("{} {group}\n", t.id));
+        }
     }
-    let seen = inbox::seen(project);
     let mut items = inbox::unhandled(project);
     items.retain(|i| i.kind != "routine" && i.kind != "routine-approval");
     items.sort_by(|a, b| a.id.cmp(&b.id));
     for i in &items {
         text.push_str(&i.id);
-        if seen.contains(&i.id) {
-            text.push_str(" seen");
-        }
         text.push('\n');
     }
     text.push_str(&routine.prompt);
     thread::sha256_hex(text.as_bytes())
 }
 
+/// Step 3, plus `config-error` items for files that do not parse. A due
 /// scheduled routine does nothing unless the project has a live coordinator
 /// (`coordinator`): no item, no command. The run still counts as its last, so
 /// a coordinator that appears later gets the next scheduled run, not a backlog.
@@ -1257,10 +1272,10 @@ pub fn routines(ctx: &Ctx, project: &Project, state: &mut State, routine_command
                 entry.skipped += 1;
                 continue;
             }
-            // A quiet run: nothing the prompt could act on has changed since
-            // the item this routine last fired on, so the coordinator would
-            // only re-derive what it already knows and wait for the user
-            // again. Counted, nothing delivered; any real change re-arms it.
+            // A quiet run: nothing that needs a person has changed since the
+            // item this routine last fired on, so the coordinator would only
+            // re-derive what it already knows and wait for the user again.
+            // Counted, nothing delivered; any new needs-you fact re-arms it.
             let fingerprint = prompt_fingerprint(project, r);
             if fingerprint == entry.output_hash {
                 entry.quiet += 1;
@@ -1321,55 +1336,175 @@ mod tests {
         inbox::mark_seen(project, &ids).unwrap();
     }
 
+    /// A project with one due, prompt-only `sweep` routine, and its setup for
+    /// the `every 1m` schedule the tests drive.
+    fn sweep_project(root: &std::path::Path) -> Project {
+        let project = project::create(root, "demo", "", vec![]).unwrap();
+        std::fs::create_dir_all(project.dir().join("routines")).unwrap();
+        std::fs::write(project.dir().join("routines").join("sweep.md"), "+++\nschedule = \"every 1m\"\n+++\nGo.\n").unwrap();
+        project
+    }
+
+    /// A UTC zoned time on the sweep's minute grid.
+    fn zoned(text: &str) -> jiff::Zoned {
+        let utc = "2026-10-08T14:00:00+00:00[UTC]".parse::<jiff::Zoned>().unwrap().time_zone().clone();
+        at(text).to_zoned(utc)
+    }
+
+    /// The one item of `kind` the last due run wrote, and moved out of the
+    /// inbox so the next run compares fingerprints again.
+    fn take_fired(project: &Project, kind: &str) -> String {
+        let items: Vec<_> = inbox::unhandled(project).into_iter().filter(|i| i.kind == kind).collect();
+        assert_eq!(items.len(), 1, "{items:?}");
+        let id = items[0].id.clone();
+        inbox::done(project, &[id.clone()], false).unwrap();
+        id
+    }
+
     #[test]
     fn a_prompt_routine_fires_on_change_and_stays_quiet_between_changes() {
         let root = tempfile::tempdir().unwrap();
-        let project = project::create(root.path(), "demo", "", vec![]).unwrap();
-        std::fs::create_dir_all(project.dir().join("routines")).unwrap();
-        std::fs::write(
-            project.dir().join("routines").join("sweep.md"),
-            "+++\nschedule = \"every 1m\"\n+++\nGo.\n",
-        )
-        .unwrap();
         let runner = FakeRunner::new();
         let env = crate::paths::Env::for_test(root.path(), &[]);
+        let project = sweep_project(root.path());
         let ctx = Ctx { env: &env, root: root.path().to_path_buf(), config_dir: root.path().join("cfg"), runner: &runner, detached_ticker: true };
         let mut state = State::default();
-        let utc = "2026-10-08T14:00:00+00:00[UTC]".parse::<jiff::Zoned>().unwrap().time_zone().clone();
-        let zoned = |t: &str| at(t).to_zoned(utc.clone());
+        let due = |state: &mut State, t: &str| routines(&ctx, &project, state, false, true, None, &zoned(t));
 
         // The first look only records a last run; the first due run fires.
-        assert!(routines(&ctx, &project, &mut state, false, true, None, &zoned("2026-10-08T14:00:00Z")).is_empty());
-        assert!(routines(&ctx, &project, &mut state, false, true, None, &zoned("2026-10-08T14:01:00Z")).is_empty());
-        let fired = inbox::unhandled(&project);
-        assert_eq!(fired.len(), 1);
-        assert_eq!(fired[0].kind, "routine");
+        assert!(due(&mut state, "2026-10-08T14:00:00Z").is_empty());
+        assert!(due(&mut state, "2026-10-08T14:01:00Z").is_empty());
+        take_fired(&project, "routine");
         assert_eq!(state.routines["sweep"].quiet, 0);
 
-        // The coordinator handled the item and nothing else changed: the next
-        // due run is quiet, so a delivered project waiting on its user is not
-        // swept again every interval.
-        inbox::done(&project, &[fired[0].id.clone()], false).unwrap();
-        assert!(routines(&ctx, &project, &mut state, false, true, None, &zoned("2026-10-08T14:02:00Z")).is_empty());
+        // An item that appears and is handled before the next due run leaves
+        // the fingerprint where it was: one event does not re-arm the sweep.
+        let handled = inbox::write_in(&project, "", "thread-state", "t-0001", "new report", "s", "").unwrap();
+        inbox::done(&project, &[handled], false).unwrap();
+        assert!(due(&mut state, "2026-10-08T14:02:00Z").is_empty());
         assert!(inbox::unhandled(&project).is_empty());
         assert_eq!(state.routines["sweep"].quiet, 1);
 
-        // Any real change re-arms it: a thread appears with a report.
-        thread::allocate(&project, |t| {
-            t.title = "hands".into();
+        // A thread that is only working and reporting needs no person, so the
+        // sweep stays quiet: the shape of a project with ten busy threads.
+        let t = thread::allocate(&project, |t| {
+            t.title = "busy".into();
             t.status = Status::Open;
             t.report_hash = "abc".into();
+            t.acked_report_hash = "abc".into();
+            t.last_group = Group::Working.token().into();
         })
         .unwrap();
-        assert!(routines(&ctx, &project, &mut state, false, true, None, &zoned("2026-10-08T14:03:00Z")).is_empty());
-        let rearm = inbox::unhandled(&project);
-        assert_eq!(rearm.len(), 1);
+        thread::update(&project, &t.id, |t| t.report_hash = "def".into()).unwrap();
+        assert!(due(&mut state, "2026-10-08T14:03:00Z").is_empty());
+        assert!(inbox::unhandled(&project).is_empty());
+        assert_eq!(state.routines["sweep"].quiet, 2);
+
+        // The turn ends with a report nobody has read: the group the ticker
+        // writes says ready for review, and that re-arms the sweep.
+        thread::update(&project, &t.id, |t| t.last_group = Group::ReadyForReview.token().into()).unwrap();
+        assert!(due(&mut state, "2026-10-08T14:04:00Z").is_empty());
+        take_fired(&project, "routine");
         assert_eq!(state.routines["sweep"].quiet, 0, "a firing run resets the quiet count");
 
-        // Handling that item without further change goes quiet again.
-        inbox::done(&project, &[rearm[0].id.clone()], false).unwrap();
-        assert!(routines(&ctx, &project, &mut state, false, true, None, &zoned("2026-10-08T14:04:00Z")).is_empty());
+        // Handling the item did not ack the report: the same person is still
+        // owed the review, so the identical fact is not news a second time.
+        assert!(due(&mut state, "2026-10-08T14:05:00Z").is_empty());
         assert!(inbox::unhandled(&project).is_empty());
+        assert_eq!(state.routines["sweep"].quiet, 1);
+
+        // Editing the prompt re-arms it.
+        std::fs::write(project.dir().join("routines").join("sweep.md"), "+++\nschedule = \"every 1m\"\n+++\nGo, differently.\n").unwrap();
+        assert!(due(&mut state, "2026-10-08T14:06:00Z").is_empty());
+        take_fired(&project, "routine");
+        assert_eq!(state.routines["sweep"].quiet, 0);
+    }
+
+    /// Rule 1: a thread that works, reports and is read must not re-arm the
+    /// sweep, however often it reports. This is the law-live shape: ten busy
+    /// threads and nothing waiting for a person.
+    #[test]
+    fn a_thread_that_keeps_reporting_does_not_re_arm_the_sweep() {
+        let root = tempfile::tempdir().unwrap();
+        let runner = FakeRunner::new();
+        let env = crate::paths::Env::for_test(root.path(), &[]);
+        let project = sweep_project(root.path());
+        let ctx = Ctx { env: &env, root: root.path().to_path_buf(), config_dir: root.path().join("cfg"), runner: &runner, detached_ticker: true };
+        let mut state = State::default();
+        let due = |state: &mut State, t: &str| routines(&ctx, &project, state, false, true, None, &zoned(t));
+        assert!(due(&mut state, "2026-10-08T14:00:00Z").is_empty());
+        assert!(due(&mut state, "2026-10-08T14:01:00Z").is_empty());
+        take_fired(&project, "routine");
+
+        let t = thread::allocate(&project, |t| {
+            t.title = "busy".into();
+            t.status = Status::Open;
+            t.report_hash = "r0".into();
+            t.acked_report_hash = "r0".into();
+            t.last_group = Group::Working.token().into();
+        })
+        .unwrap();
+        for (n, now) in ["2026-10-08T14:02:00Z", "2026-10-08T14:03:00Z", "2026-10-08T14:04:00Z", "2026-10-08T14:05:00Z", "2026-10-08T14:06:00Z"]
+            .into_iter()
+            .enumerate()
+        {
+            // Each report is read by the coordinator and acked.
+            thread::update(&project, &t.id, |t| {
+                t.report_hash = format!("r{}", n + 1);
+                t.acked_report_hash = t.report_hash.clone();
+            })
+            .unwrap();
+            assert!(due(&mut state, now).is_empty());
+            assert!(inbox::unhandled(&project).is_empty(), "a busy thread is no reason to sweep at {now}");
+        }
+        assert_eq!(state.routines["sweep"].quiet, 5);
+    }
+
+    /// Rule 2: each new fact that needs a person re-arms the sweep once, and
+    /// one that stays unhandled is not a new fact on the next run.
+    #[test]
+    fn each_new_needs_you_fact_re_arms_the_sweep_once() {
+        let root = tempfile::tempdir().unwrap();
+        let runner = FakeRunner::new();
+        let env = crate::paths::Env::for_test(root.path(), &[]);
+        let project = sweep_project(root.path());
+        let ctx = Ctx { env: &env, root: root.path().to_path_buf(), config_dir: root.path().join("cfg"), runner: &runner, detached_ticker: true };
+        let mut state = State::default();
+        let due = |state: &mut State, t: &str| routines(&ctx, &project, state, false, true, None, &zoned(t));
+        assert!(due(&mut state, "2026-10-08T14:00:00Z").is_empty());
+        assert!(due(&mut state, "2026-10-08T14:01:00Z").is_empty());
+        take_fired(&project, "routine");
+
+        // A thread newly waiting on you: the ticker's own group is the fact.
+        let t = thread::allocate(&project, |t| {
+            t.title = "blocked".into();
+            t.status = Status::Open;
+            t.last_group = Group::Working.token().into();
+        })
+        .unwrap();
+        assert!(due(&mut state, "2026-10-08T14:02:00Z").is_empty());
+        thread::update(&project, &t.id, |t| t.last_group = Group::WaitingOnYou.token().into()).unwrap();
+        assert!(due(&mut state, "2026-10-08T14:03:00Z").is_empty());
+        take_fired(&project, "routine");
+
+        // Still waiting on you is not news: the sweep goes quiet again.
+        assert!(due(&mut state, "2026-10-08T14:04:00Z").is_empty());
+        assert!(inbox::unhandled(&project).is_empty());
+        assert_eq!(state.routines["sweep"].quiet, 1);
+
+        // A new unhandled item re-arms it, seen or not: seeing belongs to a
+        // lane's reader, and this item's own lane may be another coordinator.
+        let item = inbox::write_in(&project, "", "thread-state", "t-0001", "blocked on a prompt", "s", "").unwrap();
+        inbox::mark_seen(&project, std::slice::from_ref(&item)).unwrap();
+        assert!(due(&mut state, "2026-10-08T14:05:00Z").is_empty());
+        take_fired(&project, "routine");
+
+        // The item is still unhandled and nothing else changed: one event, one
+        // sweep, not one per interval.
+        assert!(due(&mut state, "2026-10-08T14:06:00Z").is_empty());
+        let left = inbox::unhandled(&project);
+        assert_eq!(left.len(), 1);
+        assert_eq!(left[0].id, item);
         assert_eq!(state.routines["sweep"].quiet, 1);
     }
 
