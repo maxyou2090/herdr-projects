@@ -19,13 +19,14 @@ use crate::{inbox, pr, routine};
 /// typing shows in the box.
 pub const NUDGE_QUIET_SECS: i64 = 10;
 /// How long a lane's nudge must already have been held before `hp context`
-/// calls it news ([`held_note`]). Both of the nudge's own waits must have run
-/// out first — a coordinator idle for `NUDGE_IDLE_SECS` and its input box
-/// empty for `NUDGE_QUIET_SECS` — so a hold younger than their sum is the
-/// normal "not announced yet" of a fresh item, not a delivery failure.
-/// Derived from those two, never a number of its own, so the timing cannot
-/// drift from the nudge's.
-pub const HELD_NOTE_AFTER_SECS: i64 = crate::coordinator::NUDGE_IDLE_SECS + NUDGE_QUIET_SECS;
+/// calls it news ([`held_note`]). Every wait the nudge actually has must have
+/// run out first: a coordinator idle for `NUDGE_IDLE_SECS`, its input box
+/// empty for `NUDGE_QUIET_SECS`, and one ticker `TICK` — the nudge only acts
+/// on a tick, so the first tick after both other waits hold is the earliest
+/// it can go out. A hold younger than their sum is the normal "not announced
+/// yet" of a fresh item, not a delivery failure. Derived from those three,
+/// never a number of its own, so the timing cannot drift from the nudge's.
+pub const HELD_NOTE_AFTER_SECS: i64 = crate::coordinator::NUDGE_IDLE_SECS + NUDGE_QUIET_SECS + crate::ticker::TICK.as_secs() as i64;
 /// A shown-but-unhandled item is reminded about once the oldest one is this
 /// old, so an interrupted coordinator turn cannot strand it silently.
 pub const RE_NUDGE_AFTER_SECS: i64 = 30 * 60;
@@ -791,10 +792,11 @@ pub fn held_note(project: &Project, lane: &str, waiting: usize, now: jiff::Times
         return Some(format!("the ticker is not running (no tick for {}): nothing announced these items", span_text(tick_age)));
     }
     let held_for = thread::seconds_since(since, now);
-    // The nudge is allowed to wait `HELD_NOTE_AFTER_SECS` before a coordinator
-    // can be prompted at all; until then "no prompt went out yet" is what
-    // every new item looks like, so the heading stays the plain one a healthy
-    // project prints. Only past that is the same hold news.
+    // The nudge is allowed to wait `HELD_NOTE_AFTER_SECS` (idle, quiet box,
+    // one tick) before a coordinator can be prompted at all; until then "no
+    // prompt went out yet" is what every new item looks like, so the heading
+    // stays the plain one a healthy project prints. Only past that is the same
+    // hold news.
     if held_for < HELD_NOTE_AFTER_SECS {
         return None;
     }
@@ -1559,14 +1561,17 @@ mod tests {
     /// The heading's clause is the ticker's standing verdict, not a live
     /// countdown. While the nudge is still inside its own waiting time — a
     /// coordinator idle for `NUDGE_IDLE_SECS`, its input box empty for
-    /// `NUDGE_QUIET_SECS` — every fresh item would otherwise read as a
-    /// delivery failure for its first minute. Past that it is news, worded
-    /// exactly as before.
+    /// `NUDGE_QUIET_SECS`, and the tick it can only act on — every fresh item
+    /// would otherwise read as a delivery failure for its first minute and a
+    /// half. Past that it is news, worded exactly as before.
     #[test]
     fn a_held_nudge_is_only_news_once_the_nudge_has_had_its_waiting_time() {
         let root = tempfile::tempdir().unwrap();
         let project = project::create(root.path(), "demo", "", vec![]).unwrap();
         let now = at("2026-10-08T14:10:00Z");
+        // 60s idle + 10s quiet box + one 15s tick: the whole time a nudge may
+        // legitimately still be waiting.
+        assert_eq!(HELD_NOTE_AFTER_SECS, 85, "the threshold is the nudge's three waits");
         let heading = |secs: i64, reason: &str| {
             let mut state = State { tick_at: now.to_string(), ..Default::default() };
             state.hold("", reason, now - jiff::SignedDuration::from_secs(secs));
