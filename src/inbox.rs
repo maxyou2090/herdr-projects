@@ -150,12 +150,6 @@ pub fn unhandled_in(project: &Project, lane: &str) -> Vec<Item> {
         .collect()
 }
 
-/// The seen set of the default lane. Without a registry this is the old
-/// single `.state/inbox-seen.json`; with one it is that lane's shard.
-pub fn seen(project: &Project) -> BTreeSet<String> {
-    seen_in(project, &crate::lanes::default_lane_id(project))
-}
-
 /// The seen set of one lane. With a `lanes.json` every lane gets its own
 /// `.state/inbox-seen/<lane>.json`; without one the old single file is used
 /// and no directory is ever created (§4.3, §10).
@@ -261,7 +255,7 @@ mod tests {
         assert_eq!(items[1].body, "body text");
 
         mark_seen(&project, &[items[0].id.clone()]).unwrap();
-        assert_eq!(seen(&project).len(), 1);
+        assert_eq!(seen_in(&project, crate::lanes::FALLBACK_ID).len(), 1);
 
         assert_eq!(done(&project, &[items[0].id.clone()], false).unwrap(), 1);
         assert_eq!(unhandled(&project).len(), 1);
@@ -344,7 +338,7 @@ mod tests {
         let a = write_in(&project, "c-1", "thread-state", "t-0001", "idle", "a", "").unwrap();
         mark_seen(&project, std::slice::from_ref(&a)).unwrap();
         assert!(project.state_dir().join("inbox-seen/c-1.json").is_file());
-        assert!(seen(&project).contains(&a));
+        assert!(seen_in(&project, crate::lanes::FALLBACK_ID).contains(&a));
         assert!(!project.state_dir().join("inbox-seen.json").exists(), "the old file is not written");
         assert!(!project.state_dir().join("inbox-seen/c-2.json").exists(), "only the lane that read");
     }
