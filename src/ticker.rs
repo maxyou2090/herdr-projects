@@ -877,10 +877,25 @@ pub(crate) fn open_threads(project: &Project, remote: bool) -> Vec<thread::Threa
         .collect()
 }
 
+/// The tick's heartbeat, written for every active project before anything can
+/// return early. `hp context` runs in another process, so the persisted state
+/// is the only place the two meet: the time goes there and nowhere else.
+fn tick_cheap(ctx: &Ctx, project: &Project, sessions: &mut Sessions) -> Result<Option<Seen>> {
+    let mut state = steps::load_state(project);
+    let before = state.clone();
+    state.tick_at = project::now();
+    let result = tick_cheap_body(ctx, project, sessions, &mut state);
+    let saved = if state == before { Ok(()) } else { steps::save_state(project, &state) };
+    match result {
+        Err(error) => Err(error),
+        Ok(seen) => saved.map(|()| seen),
+    }
+}
+
 /// Returns `Ok(None)` when the project's session cannot be reached, or it has
 /// no record and no agent works in its folder: then no state is read, so
 /// nothing is ever reported as gone.
-fn tick_cheap(ctx: &Ctx, project: &Project, sessions: &mut Sessions) -> Result<Option<Seen>> {
+fn tick_cheap_body(ctx: &Ctx, project: &Project, sessions: &mut Sessions, state: &mut steps::State) -> Result<Option<Seen>> {
     let recorded = project.coordinator().filter(|r| !r.socket.is_empty() && Path::new(&r.socket).exists());
     let record = match recorded {
         Some(record) => record,
@@ -950,11 +965,11 @@ fn tick_cheap(ctx: &Ctx, project: &Project, sessions: &mut Sessions) -> Result<O
     // per lane: each lane's coordinator hears only its own lane's items, and
     // one lane's announcement is never spent on another's (§4.4, §12 commit
     // 3). Without a registry there is exactly one lane, so this is the single
-    // nudge run it always was.
+    // nudge run it always was. What the decision was — and when it started
+    // being that — is recorded per lane, because the ticker's log is not what
+    // a coordinator reads: `hp context` is (see `steps::held_note`).
     let mut nudge_held: std::collections::BTreeMap<String, String> = Default::default();
     if let Ok((settings, _)) = project.read_project_md() {
-        let mut state = steps::load_state(project);
-        let before = state.clone();
         let now = jiff::Timestamp::now();
         let targets = coordinator::nudge_target(project, &coordinators, now);
         for lane in crate::lanes::routes(project) {
@@ -962,18 +977,16 @@ fn tick_cheap(ctx: &Ctx, project: &Project, sessions: &mut Sessions) -> Result<O
             // reason rather than a delivery — an `Ambiguous` pane never has a
             // lane here, so it is never nudged.
             let target = targets.get(&lane).copied();
-            match steps::nudge(project, &mut state, &settings, &herdr, &lane, target, now) {
-                Ok(steps::NudgeOutcome::Delivered) | Ok(steps::NudgeOutcome::Quiet) => {}
+            match steps::nudge(project, state, &settings, &herdr, &lane, target, now) {
+                Ok(steps::NudgeOutcome::Delivered) | Ok(steps::NudgeOutcome::Quiet) => state.released(&lane),
                 Ok(steps::NudgeOutcome::Held(why)) => {
-                    nudge_held.insert(lane, why.to_string());
+                    nudge_held.insert(lane.clone(), why.to_string());
+                    state.hold(&lane, why, now);
                 }
                 Err(error) => {
                     first_error = first_error.or(Some(error.context(format!("nudge {lane}"))));
                 }
             }
-        }
-        if state != before {
-            steps::save_state(project, &state)?;
         }
     }
 
