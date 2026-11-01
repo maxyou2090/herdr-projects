@@ -21,6 +21,9 @@ How Herdr Projects works, what it writes where, what its safety settings do and 
   PROJECT.md              settings (TOML between +++ lines) and your standing instructions
   AGENTS.md, CLAUDE.md    who is the coordinator, by working directory; written by the binary
   MEMORY.md, memory/      project memory; the coordinator's
+  memory/decisions.md     why work was not started, or was handed to another lane;
+                          append-only and shared by every lane's coordinator, and
+                          never inlined into a brief (only MEMORY.md is)
   TASKS.md                the task list; shared `## <list>` and per-lane `## <lane>/<list>` sections, with optional indented notes
   routines/<name>.md      routines, including pr-followup.md and coordinator-sweep.md; the coordinator's
                           a scheduled prompt fires only when the project changed
@@ -30,7 +33,10 @@ How Herdr Projects works, what it writes where, what its safety settings do and 
   uploads/                files you give the threads
   scratch/                the coordinator's temporary files
   threads/<id>.toml       thread record          threads/<id>.md       home copy of its report
-  threads/<id>.task.md    the task and every forwarded prompt (## Follow-ups)
+  threads/<id>.task.md    the task and every forwarded prompt (## Follow-ups): an entry
+                          marked `(the user's own words, forwarded unchanged)` is the
+                          user's message as they wrote it, one without the mark is the
+                          coordinator's own words
   threads/<id>.next.md    Next lines the coordinator added    threads/<id>/  a no-repo thread's folder
   inbox/, inbox/done/     events for the coordinator
   library/<id>/           home copy of files a thread produced
@@ -61,7 +67,7 @@ Every thread works from `<its working directory>/.herdr-project/<project>-<id>/`
 | `assignable <project> [--refresh] [--check OWNER]` | Who TASKS.md tasks may be assigned to (see [Task owners](#task-owners)); `--check` refuses an owner that is not valid. |
 | `coordinator prompt <project> --text-file F` | A sentence to the coordinator (the popup's task keys use it). |
 | `thread start <project> --title T [--repo PATH] [--kind worktree\|tab\|checkout\|home] [--profile P] [--machine M] [--base REF] --task-file F [--from-task TITLE]` | New thread; `-` reads the task from standard input. `--kind` is the placement (default: worktree with `--repo`, home without; `tab` gives the thread a Space of its own; `checkout` runs on the repo's main checkout; `home` is a tab of the project's own Space on `threads/<id>/`); `--profile` is the agent, one the project allows. `--from-task` adds a TASKS.md task's notes and takes `--profile` and `--machine` from its owner. |
-| `thread prompt`, `thread next [--line N \| --add TEXT]`, `thread stop`, `thread restart [--profile P]` | Steer a thread. Prompts are recorded in its task file. |
+| `thread prompt [--verbatim]`, `thread next [--line N \| --add TEXT]`, `thread stop`, `thread restart [--profile P]` | Steer a thread. Prompts are recorded in its task file; `--verbatim` marks one as the user's own words, forwarded unchanged, so a later reader can tell it from the coordinator's own text. |
 | `thread read [--lines N]`, `thread keys [KEY]... [--text T]`, `thread brief` | Answer a thread's pane without going there: print what it shows (a trust dialog, a question menu, a permission prompt), then type text and press keys (`up`, `down`, `enter`, `esc`, `tab`, a digit). `thread keys` refuses a trust screen when `trust_screens` is `user`. `thread brief` sends a brief the ticker has not delivered yet (the ticker waits for a settled, empty input box, counts a brief sent only once the agent starts working, never types it twice, and after three unconfirmed tries leaves an inbox item). |
 | `thread list/show [--json]`, `thread ack`, `thread adopt` | Look at threads. |
 | `thread resolve [--keep-worktree] [--discard-uncopied] [--skip-copy] [--reopen]` | Final copy home, then clean up. |

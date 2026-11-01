@@ -498,14 +498,14 @@ mod tests {
         let ctx = world.ctx();
         thread::update(&project, "t-0001", |t| t.prompt_pending = false).unwrap();
         *reply.borrow_mut() = Err(STALLED.into());
-        let error = crate::threads::prompt(&ctx, "demo", "t-0001", "Also the docs.").unwrap_err().to_string();
+        let error = crate::threads::prompt(&ctx, "demo", "t-0001", "Also the docs.", crate::thread::Recorded::Coordinator).unwrap_err().to_string();
         assert!(error.contains("prompt_unconfirmed") && error.contains("Do not send it again"), "{error}");
         assert_eq!(prompts(&world), 1);
         // It was typed, so the task file records it.
         assert!(std::fs::read_to_string(thread::task_path(&project, "t-0001")).unwrap().contains("Also the docs."));
         // A refusal before typing records nothing.
         *reply.borrow_mut() = Err(r#"{"error":{"code":"agent_blocked","message":"blocked"}}"#.into());
-        assert!(crate::threads::prompt(&ctx, "demo", "t-0001", "Second.").is_err());
+        assert!(crate::threads::prompt(&ctx, "demo", "t-0001", "Second.", crate::thread::Recorded::Coordinator).is_err());
         assert!(!std::fs::read_to_string(thread::task_path(&project, "t-0001")).unwrap().contains("Second."));
     }
 

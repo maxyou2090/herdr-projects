@@ -18,6 +18,11 @@ pub const MEMORY_CAP_CHARS: usize = 32_000;
 pub const LIBRARY_CAP_KB: u64 = 50 * 1024;
 pub const MAX_LAUNCH_ATTEMPTS: u32 = 3;
 
+/// Memory files a brief does not inline: their `MEMORY.md` line is what a
+/// thread needs, and the body is an append-only log that only a coordinator
+/// reads. Everything else in `memory/` is inlined, so these stay unbounded.
+pub const INDEX_ONLY_MEMORY: &[&str] = &["decisions.md"];
+
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Default)]
 #[serde(rename_all = "lowercase")]
 pub enum Status {
@@ -315,9 +320,25 @@ pub fn agent_name(slug: &str, id: &str) -> String {
     crate::names::thread(slug, id)
 }
 
+/// What a `## Follow-ups` entry records: a coordinator's own words, or the
+/// user's message forwarded unchanged. The text sent to the agent is the same
+/// either way; only the heading's mark differs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Recorded {
+    Coordinator,
+    User,
+}
+
+/// The mark a `## Follow-ups` heading carries when the entry below it is the
+/// user's own words, forwarded unchanged.
+pub const VERBATIM_MARK: &str = "the user's own words, forwarded unchanged";
+
 /// Appends a forwarded prompt to `threads/<id>.task.md` under `## Follow-ups`
-/// with a timestamp, so a restarted thread re-reads it with its task.
-pub fn append_follow_up(project: &Project, id: &str, text: &str) -> Result<()> {
+/// with a timestamp, so a restarted thread re-reads it with its task. The
+/// heading keeps the `### <time>` shape in both cases; `Recorded::User` adds
+/// the mark after it, so a later reader can tell a forwarded message from a
+/// coordinator's paraphrase.
+pub fn append_follow_up(project: &Project, id: &str, text: &str, recorded: Recorded) -> Result<()> {
     let _lock = project.lock()?;
     let path = task_path(project, id);
     let mut task = std::fs::read_to_string(&path).unwrap_or_default();
@@ -327,7 +348,11 @@ pub fn append_follow_up(project: &Project, id: &str, text: &str) -> Result<()> {
     if !task.lines().any(|l| l.trim() == "## Follow-ups") {
         task.push_str("\n## Follow-ups\n");
     }
-    task.push_str(&format!("\n### {}\n\n{}\n", project::now(), text.trim()));
+    let heading = match recorded {
+        Recorded::Coordinator => format!("### {}", project::now()),
+        Recorded::User => format!("### {} ({VERBATIM_MARK})", project::now()),
+    };
+    task.push_str(&format!("\n{heading}\n\n{}\n", text.trim()));
     write_atomic(&path, task.as_bytes())
 }
 
@@ -495,7 +520,7 @@ pub fn brief_for(project: &Project, thread: &Thread, task: &str, restart: bool) 
             entries
                 .flatten()
                 .filter_map(|e| e.file_name().into_string().ok())
-                .filter(|n| n.ends_with(".md") && !n.starts_with('.'))
+                .filter(|n| n.ends_with(".md") && !n.starts_with('.') && !INDEX_ONLY_MEMORY.contains(&n.as_str()))
                 .collect()
         })
         .unwrap_or_default();
@@ -1246,6 +1271,21 @@ mod tests {
     }
 
     #[test]
+    fn an_index_only_memory_file_is_not_inlined_into_a_brief() {
+        let root = tempfile::tempdir().unwrap();
+        let project = project::create(root.path(), "demo", "", vec![]).unwrap();
+        std::fs::write(project.dir().join("MEMORY.md"), "# Memory\n\n- [Decisions](memory/decisions.md): routed\n").unwrap();
+        std::fs::create_dir_all(project.dir().join("memory")).unwrap();
+        std::fs::write(project.dir().join("memory/decisions.md"), "DECISION BODY\n").unwrap();
+        std::fs::write(project.dir().join("memory/fact.md"), "FACT BODY\n").unwrap();
+        let brief = brief_for(&project, &Thread::default(), "Do it.", false).unwrap();
+        // The index line reaches the brief; the append-only log's body does not.
+        assert!(brief.contains("memory/decisions.md"), "{brief}");
+        assert!(brief.contains("FACT BODY"), "{brief}");
+        assert!(!brief.contains("DECISION BODY"), "{brief}");
+    }
+
+    #[test]
     fn brief_order_and_memory_cap() {
         let files = vec![
             ("a.md".to_string(), "alpha fact".to_string()),
@@ -1313,13 +1353,24 @@ mod tests {
         let project = project::create(root.path(), "demo", "", vec![]).unwrap();
         let t = allocate(&project, |_| {}).unwrap();
         std::fs::write(task_path(&project, &t.id), "The task.").unwrap();
-        append_follow_up(&project, &t.id, "Also do Y.\n").unwrap();
-        append_follow_up(&project, &t.id, "And Z.").unwrap();
+        append_follow_up(&project, &t.id, "Also do Y.\n", Recorded::Coordinator).unwrap();
+        append_follow_up(&project, &t.id, "And Z.", Recorded::Coordinator).unwrap();
         let text = std::fs::read_to_string(task_path(&project, &t.id)).unwrap();
         assert!(text.starts_with("The task.\n\n## Follow-ups\n\n### 20"), "{text}");
         assert_eq!(text.matches("## Follow-ups").count(), 1);
         assert_eq!(text.matches("\n### ").count(), 2);
         assert!(text.ends_with("And Z.\n"));
+        // The user's own words carry a mark after the timestamp; the text
+        // below it is recorded unchanged, and the `## Follow-ups` shape holds.
+        append_follow_up(&project, &t.id, "  Make it blue.  ", Recorded::User).unwrap();
+        let text = std::fs::read_to_string(task_path(&project, &t.id)).unwrap();
+        let marked = text.lines().find(|l| l.contains(VERBATIM_MARK)).unwrap();
+        assert!(marked.starts_with("### 20") && marked.ends_with(&format!("({VERBATIM_MARK})")), "{marked}");
+        // The text under the mark is exactly what was sent, trimmed at its ends.
+        assert!(text.ends_with(&format!("({VERBATIM_MARK})\n\nMake it blue.\n")), "{text}");
+        assert_eq!(text.matches(VERBATIM_MARK).count(), 1);
+        assert_eq!(text.matches("## Follow-ups").count(), 1);
+        assert_eq!(text.matches("\n### ").count(), 3);
 
         // The coordinator's extra Next lines come after the report's.
         std::fs::write(home_report_path(&project, &t.id), "## Next\n- From the report\n").unwrap();

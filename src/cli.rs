@@ -480,6 +480,9 @@ enum ThreadCommand {
         /// The text; `-` reads standard input
         #[arg(long, value_name = "FILE")]
         text_file: String,
+        /// The text is the user's own words, forwarded unchanged: its entry in the task file says so, instead of standing as the coordinator's own summary
+        #[arg(long)]
+        verbatim: bool,
     },
     /// A thread's Next list: print it, forward line N as a prompt, or add a line
     Next {
@@ -932,10 +935,12 @@ pub fn run() -> Result<()> {
             ThreadCommand::Brief { slug, id } => threads::brief(&ctx, &slug, &id),
             ThreadCommand::Read { slug, id, lines } => threads::read(&ctx, &slug, &id, lines),
             ThreadCommand::Keys { slug, id, keys, text } => threads::keys(&ctx, &slug, &id, &keys, text.as_deref()),
-            ThreadCommand::Prompt { slug, id, text_file } => {
+            ThreadCommand::Prompt { slug, id, text_file, verbatim } => {
                 let text = read_text(&text_file)?;
-                let state = threads::prompt(&ctx, &slug, &id, &text)?;
-                println!("sent to {id} (agent was {state})");
+                let recorded = if verbatim { crate::thread::Recorded::User } else { crate::thread::Recorded::Coordinator };
+                let state = threads::prompt(&ctx, &slug, &id, &text, recorded)?;
+                let mark = if verbatim { format!("; recorded as {}", crate::thread::VERBATIM_MARK) } else { String::new() };
+                println!("sent to {id} (agent was {state}){mark}");
                 Ok(())
             }
             ThreadCommand::Adopt { slug, pane, title, task_file } => {

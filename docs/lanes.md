@@ -935,8 +935,9 @@ coordinator" actions in `src/popup.rs` keep working unchanged.
 Explicitly out of scope for plan B:
 
 - **Memory partitioning (plan C).** Today `thread::brief_for` (`src/thread.rs`)
-  inlines the whole `MEMORY.md` plus every `memory/*.md` into every brief, capped
-  at `MEMORY_CAP_CHARS = 32_000` (`src/thread.rs`; the cap is applied inside
+  inlines the whole `MEMORY.md` plus every `memory/*.md` (except index-only ones
+  such as `memory/decisions.md`) into every brief, capped at
+  `MEMORY_CAP_CHARS = 32_000` (`src/thread.rs`; the cap is applied inside
   `brief_for`). `law` is at 14 KB of `MEMORY.md` and 29 memory files, so a
   lane-specific memory split (e.g. `memory/<lane>/` or a `lane:` tag on each
   file) is where this goes next —

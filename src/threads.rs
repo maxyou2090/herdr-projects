@@ -10,7 +10,7 @@ use crate::herdr::{Agent, Herdr, Pane};
 use crate::paths::Ctx;
 use crate::project::{self, Project};
 use crate::runner::{Cmd, Runner};
-use crate::thread::{self, CopyOutcome, Group, Kind, Live, Status, Thread};
+use crate::thread::{self, CopyOutcome, Group, Kind, Live, Recorded, Status, Thread};
 use crate::{coordinator, remote, ticker};
 
 const GIT_TIMEOUT: Duration = Duration::from_secs(5);
@@ -601,7 +601,9 @@ pub fn restart(ctx: &Ctx, slug: &str, id: &str, profile: Option<&str>) -> Result
 
 /// Sends a follow-up. The one sender that does not use the ready-for-a-prompt
 /// predicate: agents queue a message that arrives while they work.
-pub fn prompt(ctx: &Ctx, slug: &str, id: &str, text: &str) -> Result<String> {
+/// `recorded` only decides how the task file marks the entry: the text is sent
+/// the same way, and every guard below runs either way.
+pub fn prompt(ctx: &Ctx, slug: &str, id: &str, text: &str, recorded: Recorded) -> Result<String> {
     let project = Project::load(&ctx.root, slug)?;
     let record = thread::load(&project, id)?;
     if text.trim().is_empty() {
@@ -640,7 +642,7 @@ pub fn prompt(ctx: &Ctx, slug: &str, id: &str, text: &str) -> Result<String> {
     }
     // Written after the send, so the task file never claims a prompt that was
     // refused; a restarted thread re-reads it with its task.
-    thread::append_follow_up(&project, id, text)?;
+    thread::append_follow_up(&project, id, text, recorded)?;
     if let Err(error) = sent {
         bail!(
             "prompt_unconfirmed: the text was typed into {id}'s pane ({}) but the agent was not seen starting on it ({error}). Do not send it again: `thread read` shows whether it sits in the input box, and `thread keys {slug} {id} enter` submits it",
@@ -681,7 +683,7 @@ pub fn next(ctx: &Ctx, slug: &str, id: &str, line: Option<usize>, add: Option<&s
         }
         Some(n) => {
             let text = lines.get(n.wrapping_sub(1)).with_context(|| format!("{id} has no Next line {n} ({} lines)", lines.len()))?;
-            let state = prompt(ctx, slug, id, text)?;
+            let state = prompt(ctx, slug, id, text, Recorded::Coordinator)?;
             println!("sent Next line {n} to {id} (agent was {state}): {text}");
             Ok(())
         }

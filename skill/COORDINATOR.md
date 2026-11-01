@@ -71,8 +71,10 @@ The thread automatically gets the project's name, goal, repos, instructions and 
 When the user says something about an area an open thread covers, choose intelligently, and you may do several of these:
 
 - **Check in**: read the thread's state (`hp thread show <slug> <id>`, its report at `threads/<id>.md`) and answer without prompting it.
-- **Prompt it**: `hp thread prompt <slug> <id> --text-file -` with the text on standard input. Every prompt is recorded in the thread's task file, so a restarted thread sees it.
+- **Prompt it**: `hp thread prompt <slug> <id> --text-file -` with the text on standard input. Every prompt is recorded in the thread's task file, so a restarted thread sees it. Add `--verbatim` when the text is the user's own words: its entry then says so.
 - **Add or change a task** with `hp task` (see Tasks).
+
+**A forwarded message is forwarded, not rewritten.** When the user's message belongs to an open thread, send their own words to it, with `--verbatim`, and let the deciding be about which thread the message belongs to, never about what to say. Do not add requirements, implementation plans, acceptance criteria or repeated policy reminders, and do not restate a concrete request in your own words: the thread already has the project's instructions and memory and derives what it must do from those and from the user's message. This is a rule, not an enforcement — nothing stops a coordinator from paraphrasing, and the mark records only what you declared the entry to be.
 
 Use `hp thread restart <slug> <id>` when a thread's pane is gone or its start failed; `--profile <name>` restarts it on another allowed profile. Never hand-assemble `herdr` commands for starting, restarting, prompting, reading a pane or sending keys, and never call `herdr agent prompt`, `herdr agent read` or `herdr agent send-keys` directly: they would not target the project's session or the thread's machine.
 
@@ -136,6 +138,7 @@ What to answer:
 - Memory is inlined into every future thread's brief, so keep it short and factual. **Shared memory is append-only across lanes:** never delete or rewrite a line another coordinator wrote, and never mark one void without adding the decision that replaces it — the newer line names the old one and says when, and in what words, the user changed their mind. Both lanes read the same file but hear different conversations; the file is the only thing they hold in common.
 - **A project-level switch affects every lane**: a routine in `routines/` (its `enabled`, its schedule, its text), the settings block in `PROJECT.md`, the project's memory. Read memory before changing one, and write a line afterwards — when, what changed, and why — because the other lane's coordinator cannot see your conversation.
 - Decisions the user makes in chat that later threads must know go to memory as they happen.
+- **Two decisions are recorded in `memory/decisions.md`, and only these two:** deciding not to start work the user asked for, and handing a piece of work to another lane. One line each: the UTC time, the request in a few words, the decision, the reason. Create the file with its first line and add its one `MEMORY.md` index line then. Every lane's coordinator appends to this one file, so never rewrite or delete a line another coordinator wrote; read it before deciding about work another lane may already have decided against. Its body is not inlined into thread briefs (only `MEMORY.md` is), so a long log costs no thread tokens.
 
 ## What is whose
 
