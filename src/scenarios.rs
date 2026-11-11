@@ -1881,6 +1881,69 @@ fn a_prompt_routine_gives_an_item_with_its_prompt_each_time_it_is_due() {
 }
 
 #[test]
+fn a_sweep_the_coordinator_archived_does_not_call_itself_back() {
+    let (world, project, _) = finished_world("idle");
+    settle(&project);
+    write_routine(&project, "sweep", "+++\nschedule = \"every 20m\"\n+++\nSweep the project.\n");
+    let ctx = world.ctx();
+    // First sight of a routine only records its last run.
+    ticker::tick_project(&ctx, &project).unwrap();
+    assert!(inbox::unhandled(&project).is_empty());
+
+    // A pull request event needs the coordinator: the due sweep says so.
+    inbox::write(&project, "pr", "t-0001", "merged", "t-0001: its pull request merged", "").unwrap();
+    make_due(&project, "sweep");
+    ticker::tick_project(&ctx, &project).unwrap();
+    assert_eq!(items_of(&project, "routine").len(), 1);
+
+    // The coordinator answers a sweep by archiving what it read. That is the
+    // whole answer, so the next due point must stay quiet (t-0029), and so
+    // must the ones that follow while thread states keep churning.
+    let ids: Vec<String> = inbox::unhandled(&project).into_iter().map(|i| i.id).collect();
+    inbox::done(&project, &ids, false).unwrap();
+    for _ in 0..3 {
+        inbox::write(&project, "thread-state", "t-0001", "idle", "t-0001 is now idle", "").unwrap();
+        make_due(&project, "sweep");
+        ticker::tick_project(&ctx, &project).unwrap();
+        assert!(items_of(&project, "routine").is_empty(), "the archived sweep called itself back");
+        let ids: Vec<String> = inbox::unhandled(&project).into_iter().map(|i| i.id).collect();
+        inbox::done(&project, &ids, false).unwrap();
+    }
+    assert_eq!(crate::steps::load_state(&project).routines["sweep"].quiet, 3);
+}
+
+#[test]
+fn a_new_report_after_an_archived_sweep_is_reason_to_sweep_again() {
+    let (world, project, t) = finished_world("idle");
+    settle(&project);
+    write_routine(&project, "sweep", "+++\nschedule = \"every 20m\"\n+++\nSweep the project.\n");
+    let ctx = world.ctx();
+    ticker::tick_project(&ctx, &project).unwrap();
+    inbox::write(&project, "pr", "t-0001", "merged", "t-0001: its pull request merged", "").unwrap();
+    make_due(&project, "sweep");
+    ticker::tick_project(&ctx, &project).unwrap();
+    let ids: Vec<String> = inbox::unhandled(&project).into_iter().map(|i| i.id).collect();
+    inbox::done(&project, &ids, false).unwrap();
+
+    // The archived sweep stays quiet once.
+    make_due(&project, "sweep");
+    ticker::tick_project(&ctx, &project).unwrap();
+    assert!(items_of(&project, "routine").is_empty());
+    assert_eq!(crate::steps::load_state(&project).routines["sweep"].quiet, 1);
+
+    // A report nobody has looked at yet is a new fact that needs a person:
+    // the thread moves to ready for review, and the sweep must say so again.
+    std::fs::create_dir_all(&t.thread_dir).unwrap();
+    std::fs::write(Path::new(&t.thread_dir).join("report.md"), "## Report\ndone\n").unwrap();
+    set_agents(&world, &project, "done");
+    make_due(&project, "sweep");
+    ticker::tick_project(&ctx, &project).unwrap();
+    assert_eq!(thread::load(&project, "t-0001").unwrap().last_group, "ready-for-review");
+    assert_eq!(items_of(&project, "routine").len(), 1, "a report waiting for a person is a reason to sweep");
+    assert_eq!(crate::steps::load_state(&project).routines["sweep"].quiet, 0);
+}
+
+#[test]
 fn one_config_error_item_per_file_hash() {
     let (world, project, _) = finished_world("idle");
     settle(&project);

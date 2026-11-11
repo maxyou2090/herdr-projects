@@ -1200,6 +1200,39 @@ pub fn auto_resolve(ctx: &Ctx, project: &Project, settings: &Settings, memory: &
     errors
 }
 
+/// Item kinds a prompt-only routine ignores when it asks "did anything new
+/// need a person?", each for its own reason:
+///
+/// - `routine`, `routine-approval`: the routine's own lifecycle. It has its
+///   own wake paths, and its due item would change the fingerprint on every
+///   run, defeating the quiet check at once.
+/// - `thread-state`: a restatement of a thread's own progress, not a new fact
+///   for the coordinator. Every state change writes one with a fresh id, so
+///   the law project produced about 40 in three hours (t-0029) and the sweep
+///   could never stay quiet. Nothing is lost by leaving it out: a thread that
+///   waits on you or has a report to read is counted from its record's group
+///   ([`prompt_fingerprint`]), a failed launch sets `Status::Failed` (also
+///   counted there), a stuck pane writes a `thread-error` item (counted), and
+///   the item itself still reaches the coordinator through the nudge, whose
+///   own kinds do include `thread-state` ([`RE_NUDGE_KINDS`]). The events
+///   that only a `thread-state` item carries (`brief not delivered`, `idle
+///   without report`, `resolved`) are one person's reading task, not a reason
+///   to interrupt that person with a sweep.
+///
+/// Every other kind stays: `pr`, `thread-error`, `config-error`, `lane`,
+/// `session`, `outage`, `space` and `rename` are written once per distinct
+/// event by writers that dedupe, so each is a real change that needs a person
+/// and none of them churns.
+const PROMPT_IGNORED_KINDS: [&str; 3] = ["routine", "routine-approval", "thread-state"];
+
+/// The unhandled items a prompt-only routine may have to act on, oldest
+/// first ([`inbox::unhandled`] already sorts by id).
+fn prompt_items(project: &Project) -> Vec<inbox::Item> {
+    let mut items = inbox::unhandled(project);
+    items.retain(|i| !PROMPT_IGNORED_KINDS.contains(&i.kind.as_str()));
+    items
+}
+
 /// What a prompt-only routine could act on, measured by the one question it
 /// asks: does anything need a person? A thread counts when the group the
 /// ticker last computed for it is one the project counts as needing the user
@@ -1209,15 +1242,14 @@ pub fn auto_resolve(ctx: &Ctx, project: &Project, settings: &Settings, memory: &
 /// thread that is merely working, reporting or landing contributes nothing: a
 /// thread talking to itself is not a reason to sweep. The group comes from
 /// `last_group`, which the ticker writes from the live view earlier in the
-/// same tick, so this adds no Herdr call. An unhandled inbox item counts by
-/// its id alone: `inbox::seen` is the *default lane's* set, so with lanes it
-/// can flip while another lane's coordinator is the one that acts, and it
-/// tells the routine nothing an unhandled item does not already tell it. The
-/// routine's own prompt stays in: editing it re-arms the routine. Items of
-/// routine kinds are left out: they have their own wake paths, and their own
-/// lifecycle would otherwise change the fingerprint on every run, defeating
-/// the quiet check. Everything is sorted by id and holds no timestamp, so a
-/// restart or a different read order produces the same hash.
+/// same tick, so this adds no Herdr call. The routine's own prompt stays in:
+/// editing it re-arms the routine. Unhandled items are **not** hashed here:
+/// they are compared by id against the ids seen at the last fire
+/// (`routine::State::seen_items`), because a hash of the current set changes
+/// when the coordinator archives an item — which is how it answers a sweep,
+/// so the sweep would call itself back (t-0029). Everything is sorted by id
+/// and holds no timestamp, so a restart or a different read order produces the
+/// same hash.
 fn prompt_fingerprint(project: &Project, routine: &routine::Routine) -> String {
     let mut text = String::new();
     for t in thread::list(project).into_iter().filter(|t| t.status != Status::Resolved) {
@@ -1229,13 +1261,6 @@ fn prompt_fingerprint(project: &Project, routine: &routine::Routine) -> String {
         if let Some(group) = needs_person {
             text.push_str(&format!("{} {group}\n", t.id));
         }
-    }
-    let mut items = inbox::unhandled(project);
-    items.retain(|i| i.kind != "routine" && i.kind != "routine-approval");
-    items.sort_by(|a, b| a.id.cmp(&b.id));
-    for i in &items {
-        text.push_str(&i.id);
-        text.push('\n');
     }
     text.push_str(&routine.prompt);
     thread::sha256_hex(text.as_bytes())
@@ -1294,14 +1319,24 @@ pub fn routines(ctx: &Ctx, project: &Project, state: &mut State, routine_command
             // item this routine last fired on, so the coordinator would only
             // re-derive what it already knows and wait for the user again.
             // Counted, nothing delivered; any new needs-you fact re-arms it.
+            //
+            // Items are compared by id against the set seen at the last fire,
+            // not against the current set: the coordinator answers a sweep by
+            // archiving the items it read, and archiving must not itself be
+            // news (t-0029). An item that appeared after the last fire and is
+            // still unhandled is news; one that was already there is not,
+            // whether it was archived since or not.
             let fingerprint = prompt_fingerprint(project, r);
-            if fingerprint == entry.output_hash {
+            let items = prompt_items(project);
+            let unseen = items.iter().any(|i| !entry.seen_items.contains(&i.id));
+            if fingerprint == entry.output_hash && !unseen {
                 entry.quiet += 1;
                 continue;
             }
             entry.skipped = 0;
             entry.quiet = 0;
             entry.output_hash = fingerprint;
+            entry.seen_items = items.into_iter().map(|i| i.id).collect();
             errors.extend(inbox::write(project, "routine", &r.name, "due", &format!("routine `{}` is due", r.name), &r.prompt).err());
             crate::notify::Notifier::new(ctx, project).send(&r.name, "routine due; the coordinator handles it", crate::notify::Sound::None, false);
             continue;
@@ -1512,7 +1547,9 @@ mod tests {
 
         // A new unhandled item re-arms it, seen or not: seeing belongs to a
         // lane's reader, and this item's own lane may be another coordinator.
-        let item = inbox::write_in(&project, "", "thread-state", "t-0001", "blocked on a prompt", "s", "").unwrap();
+        // Its kind is one that needs a person (`thread-state` would not: see
+        // `a_restating_item_neither_arms_nor_quiets_the_sweep`).
+        let item = inbox::write_in(&project, "", "pr", "t-0001", "changes requested", "s", "").unwrap();
         inbox::mark_seen(&project, std::slice::from_ref(&item)).unwrap();
         assert!(due(&mut state, "2026-10-08T14:05:00Z").is_empty());
         take_fired(&project, "routine");
@@ -1524,6 +1561,121 @@ mod tests {
         assert_eq!(left.len(), 1);
         assert_eq!(left[0].id, item);
         assert_eq!(state.routines["sweep"].quiet, 1);
+    }
+
+    /// Handling is not news: the coordinator answers a sweep by archiving the
+    /// items it read, and archiving must not schedule the next sweep. A fact
+    /// that arrives after that does (t-0029).
+    #[test]
+    fn an_archived_needs_you_item_does_not_call_the_sweep_back() {
+        let root = tempfile::tempdir().unwrap();
+        let runner = FakeRunner::new();
+        let env = crate::paths::Env::for_test(root.path(), &[]);
+        let project = sweep_project(root.path());
+        let ctx = Ctx { env: &env, root: root.path().to_path_buf(), config_dir: root.path().join("cfg"), runner: &runner, detached_ticker: true };
+        let mut state = State::default();
+        let due = |state: &mut State, t: &str| routines(&ctx, &project, state, false, true, None, &zoned(t));
+        assert!(due(&mut state, "2026-10-08T14:00:00Z").is_empty());
+        assert!(due(&mut state, "2026-10-08T14:01:00Z").is_empty());
+        take_fired(&project, "routine");
+
+        // A pull request event needs the coordinator: the due run says so.
+        let item = inbox::write_in(&project, "", "pr", "t-0001", "merged", "s", "").unwrap();
+        assert!(due(&mut state, "2026-10-08T14:02:00Z").is_empty());
+        let sweep = take_fired(&project, "routine");
+        assert_eq!(state.routines["sweep"].quiet, 0);
+
+        // The coordinator read both and archived them. That is the whole
+        // answer to a sweep, and it must not call the next one.
+        inbox::done(&project, &[item, sweep], false).unwrap();
+        assert!(due(&mut state, "2026-10-08T14:03:00Z").is_empty());
+        assert!(inbox::unhandled(&project).is_empty());
+        assert_eq!(state.routines["sweep"].quiet, 1);
+
+        // A fact that arrives afterwards is news, once.
+        inbox::write_in(&project, "", "thread-error", "t-0002", "stalled on a failed retry", "s", "").unwrap();
+        assert!(due(&mut state, "2026-10-08T14:04:00Z").is_empty());
+        take_fired(&project, "routine");
+        assert_eq!(state.routines["sweep"].quiet, 0);
+    }
+
+    /// The law shape of t-0029: about 40 `thread-state` items in three hours,
+    /// one per thread state change, and the sweep fired every interval because
+    /// each fresh id changed the fingerprint. They are restatements, so they
+    /// neither arm the sweep nor quiet it.
+    #[test]
+    fn thread_state_churn_does_not_re_arm_the_sweep() {
+        let root = tempfile::tempdir().unwrap();
+        let runner = FakeRunner::new();
+        let env = crate::paths::Env::for_test(root.path(), &[]);
+        let project = sweep_project(root.path());
+        let ctx = Ctx { env: &env, root: root.path().to_path_buf(), config_dir: root.path().join("cfg"), runner: &runner, detached_ticker: true };
+        let mut state = State::default();
+        let due = |state: &mut State, t: &str| routines(&ctx, &project, state, false, true, None, &zoned(t));
+        assert!(due(&mut state, "2026-10-08T14:00:00Z").is_empty());
+        assert!(due(&mut state, "2026-10-08T14:01:00Z").is_empty());
+        take_fired(&project, "routine");
+
+        for (n, now) in ["2026-10-08T14:02:00Z", "2026-10-08T14:03:00Z", "2026-10-08T14:04:00Z", "2026-10-08T14:05:00Z", "2026-10-08T14:06:00Z"]
+            .into_iter()
+            .enumerate()
+        {
+            inbox::write_in(&project, "", "thread-state", "t-0001", "idle", "s", &format!("churn {n}")).unwrap();
+            assert!(due(&mut state, now).is_empty());
+            assert!(inbox::unhandled(&project).iter().all(|i| i.kind == "thread-state"), "the sweep fired on churn at {now}");
+        }
+        assert_eq!(state.routines["sweep"].quiet, 5);
+
+        // Archiving them afterwards is not news either.
+        let ids: Vec<String> = inbox::unhandled(&project).into_iter().map(|i| i.id).collect();
+        inbox::done(&project, &ids, false).unwrap();
+        assert!(due(&mut state, "2026-10-08T14:07:00Z").is_empty());
+        assert!(inbox::unhandled(&project).is_empty());
+        assert_eq!(state.routines["sweep"].quiet, 6);
+    }
+
+    /// The fingerprint is the needs-you shape of the project plus the prompt.
+    /// Item ids are compared separately, and only for kinds that need a
+    /// person: a restating kind is not a fact, and a needs-you kind is not part
+    /// of the hash, so archiving it cannot change the hash.
+    #[test]
+    fn the_fingerprint_holds_the_people_who_are_owed_something_and_not_the_item_ids() {
+        let root = tempfile::tempdir().unwrap();
+        let project = sweep_project(root.path());
+        let sweep = |project: &Project| routine::load_all(project).0.into_iter().find(|r| r.name == "sweep").unwrap();
+        let empty = prompt_fingerprint(&project, &sweep(&project));
+
+        // Restating kinds and the routine's own lifecycle are left out.
+        inbox::write_in(&project, "", "thread-state", "t-0001", "idle", "s", "").unwrap();
+        inbox::write_in(&project, "", "routine", "sweep", "due", "s", "").unwrap();
+        inbox::write_in(&project, "", "routine-approval", "sweep", "needs approval", "s", "").unwrap();
+        assert_eq!(prompt_fingerprint(&project, &sweep(&project)), empty);
+        assert!(prompt_items(&project).is_empty(), "no kind here needs a person");
+
+        // A kind that needs a person is seen, but by id, not by hash.
+        let pr = inbox::write_in(&project, "", "pr", "t-0001", "merged", "s", "").unwrap();
+        assert_eq!(prompt_fingerprint(&project, &sweep(&project)), empty);
+        assert_eq!(prompt_items(&project).into_iter().map(|i| i.id).collect::<Vec<_>>(), vec![pr.clone()]);
+
+        // A thread that waits on you, and a failed launch, are in the hash.
+        let t = thread::allocate(&project, |t| {
+            t.title = "blocked".into();
+            t.status = Status::Open;
+            t.last_group = Group::WaitingOnYou.token().into();
+        })
+        .unwrap();
+        assert_ne!(prompt_fingerprint(&project, &sweep(&project)), empty);
+        thread::update(&project, &t.id, |t| t.last_group = Group::Working.token().into()).unwrap();
+        assert_eq!(prompt_fingerprint(&project, &sweep(&project)), empty);
+        thread::update(&project, &t.id, |t| t.status = Status::Failed).unwrap();
+        assert_ne!(prompt_fingerprint(&project, &sweep(&project)), empty);
+
+        // Editing the prompt re-arms it.
+        let before = prompt_fingerprint(&project, &sweep(&project));
+        std::fs::write(project.dir().join("routines").join("sweep.md"), "+++\nschedule = \"every 1m\"\n+++\nGo, differently.\n").unwrap();
+        let edited = prompt_fingerprint(&project, &sweep(&project));
+        assert_ne!(edited, before);
+        assert_ne!(edited, empty);
     }
 
     /// A real pre-lanes `ticker.json`: the four nudge fields are scalars. They

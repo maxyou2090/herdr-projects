@@ -1,7 +1,7 @@
 //! Routines: scheduled prompts, and commands that run only when the user has
 //! both enabled routine commands and approved this exact command text.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::io::{BufRead, IsTerminal, Write as _};
 use std::path::Path;
 use std::time::Duration;
@@ -432,6 +432,12 @@ pub fn run_command(runner: &dyn Runner, project: &Project, routine: &Routine) ->
 pub struct State {
     pub last_run: String,
     pub output_hash: String,
+    /// Ids of the unhandled items a prompt-only routine saw at its last fire
+    /// (`steps::prompt_items`). A due run fires on an id that is not in here,
+    /// so an item the coordinator archived afterwards is not news a second
+    /// time: handling an item must not be what calls the sweep back (t-0029).
+    /// Written by the prompt-only branch only; an older file reads as empty.
+    pub seen_items: BTreeSet<String>,
     /// Command hash the last "needs approval" item was written for.
     pub approval_item_for: String,
     /// Due runs of a prompt-only routine that wrote nothing because nothing
