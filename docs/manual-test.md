@@ -52,6 +52,7 @@ scripts/dev-herdr pane read <pane>                   # read a pane; `pane send-k
 | 4 | Two `--kind tab` threads, each in its own workspace, show different `thread` tokens | Builder (`api snapshot`) |
 | 4 | A thread with no repository (the default, and `--kind home`) runs as a tab of the project's own Space on `threads/<id>/`; no new Space appears, a restart stays in that tab, and two of them coexist | Unit (scenario); manual run not done |
 | 4 | A `--kind tab` thread whose pane is killed restarts into the Space it already has (no second Space); a Space herdr no longer shows gets exactly one replacement, recorded; an empty one a resolved thread left is closed by the tick, never the project's home | Unit (scenario, spaces); manual run not done |
+| 4 | A `--kind checkout` thread works in the repository's main checkout but gets a Space of its own, never a tab of the project's Space; a restart reuses that Space; its empty Space is closed by the tick once resolved; it starts even while the project's Space is not open | Unit (scenario); manual run not done |
 | 4 | `overview` run without a terminal returns at once; a finished thread stays under Ready for review until `thread ack` | Builder |
 | 5 | A finishing thread gives one inbox item and one nudge, none after until a new item | Builder (with `nudge = true`), unit |
 | 5 | A second session with the plugin linked produces no "pane gone" items | Builder (`hp-dev2`) |

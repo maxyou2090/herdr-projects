@@ -3056,6 +3056,109 @@ fn a_tab_thread_gets_a_workspace_of_its_own_and_a_restart_reuses_it() {
 }
 
 #[test]
+fn a_checkout_thread_gets_a_workspace_of_its_own_and_a_restart_reuses_it() {
+    let world = World::new();
+    let project = world.project("demo", "a.sock");
+    let checkout = world.home.path().join("checkout");
+    std::fs::create_dir_all(&checkout).unwrap();
+    let checkout = std::fs::canonicalize(&checkout).unwrap().to_string_lossy().into_owned();
+    world.runner.on("pane get", ok(r#"{"result":{"pane":{"cwd":""}}}"#));
+    // `workspace create` hands out a fresh Space each time: w3, then w7 once
+    // the first is gone (ids move when a server restarts).
+    let created = Rc::new(RefCell::new(0usize));
+    let counter = created.clone();
+    world.runner.on_fn(
+        |c| c.display().contains("workspace create"),
+        move |_| {
+            let n = {
+                let mut n = counter.borrow_mut();
+                *n += 1;
+                *n
+            };
+            let id = if n == 1 { "w3" } else { "w7" };
+            Ok(ok(&format!(r#"{{"result":{{"root_pane":{{"workspace_id":"{id}","tab_id":"{id}:t1","pane_id":"{id}:p1"}}}}}}"#)))
+        },
+    );
+    world.runner.on_fn(
+        |c| c.display().contains("tab create"),
+        |c| {
+            let at = c.args.iter().position(|a| a == "--workspace").expect("tab create carries --workspace");
+            let id = c.args[at + 1].clone();
+            Ok(ok(&format!(r#"{{"result":{{"root_pane":{{"workspace_id":"{id}","tab_id":"{id}:t2","pane_id":"{id}:p2"}}}}}}"#)))
+        },
+    );
+    world.runner.on("tab close", ok(r#"{"result":{}}"#));
+    world.runner.on("workspace close", ok(r#"{"result":{}}"#));
+    world.runner.on("du -sk", ok("4\t/x\n"));
+    world.runner.on("rsync", ok(""));
+    // Herdr's Spaces, changeable mid-test: the project's home w1 plus the
+    // thread's own Space once it is made.
+    let spaces: Rc<RefCell<Vec<String>>> = Rc::new(RefCell::new(vec![r#"{"workspace_id":"w1","label":"Demo","pane_count":1}"#.into()]));
+    let listed = spaces.clone();
+    world.runner.on_fn(|c| c.display().contains("workspace list"), move |_| Ok(ok(&format!(r#"{{"result":{{"workspaces":[{}]}}}}"#, listed.borrow().join(",")))));
+    *world.panes.borrow_mut() = format!("[{}]", world.coordinator_pane(&project));
+    let ctx = world.ctx();
+    let args = || StartArgs { title: "Main checkout".into(), repo: Some(checkout.clone()), machine: None, profile: None, kind: Some(Kind::Checkout), base: None, task: "Look.".into() };
+    let t = threads::start(&ctx, "demo", args()).unwrap();
+    // A Space of its own on the repository's main checkout, not a tab of the
+    // project's home: the coordinator keeps its Space to itself.
+    assert_eq!((t.kind, t.cwd.as_str()), (Kind::Checkout, checkout.as_str()));
+    assert_eq!(world.runner.count("workspace create"), 1);
+    assert_eq!(world.runner.count("tab create"), 0);
+    assert_eq!((t.workspace_id.as_str(), t.own_workspace.as_str(), t.pane_id.as_str()), ("w3", "w3", "w3:p1"));
+    assert_eq!(world.runner.count("tab rename w3:t1 Main checkout"), 1);
+    spaces.borrow_mut().push(r#"{"workspace_id":"w3","label":"Main checkout","pane_count":0}"#.into());
+
+    // The pane is gone (a server restart moved the ids) but the Space is
+    // still open: the restart reuses it, never opens a second one.
+    threads::restart(&ctx, "demo", "t-0001", None).unwrap();
+    assert_eq!(world.runner.count("workspace create"), 1);
+    assert_eq!(world.runner.count("tab create --workspace w3"), 1);
+    assert_eq!(world.runner.count("tab create --workspace w1"), 0);
+    assert_eq!(thread::load(&project, "t-0001").unwrap().own_workspace, "w3");
+
+    // Resolving closes the thread's own tab, never the project's Space.
+    *world.panes.borrow_mut() = format!("[{},{}]", world.coordinator_pane(&project), pane_json("w3", "w3:t2", "w3:p2", &checkout));
+    threads::resolve(&ctx, "demo", "t-0001", &ResolveArgs::default()).unwrap();
+    assert_eq!(world.runner.count("tab close w3:t2"), 1);
+    assert_eq!(world.runner.count("workspace close"), 0);
+
+    // Its last tab closed, the Space is empty: the tick reclaims it instead
+    // of leaving an orphan no record points at, and the record forgets it.
+    *world.panes.borrow_mut() = format!("[{}]", world.coordinator_pane(&project));
+    assert_eq!(thread::load(&project, "t-0001").unwrap().status, Status::Resolved);
+    let view = threads::session_view(&ctx, &project).unwrap();
+    assert!(crate::spaces::close_empty(&ctx, &project, &view.herdr).is_empty());
+    assert_eq!(world.runner.count("workspace close w3"), 1);
+    assert_eq!(world.runner.count("workspace close w1"), 0);
+    assert_eq!(thread::load(&project, "t-0001").unwrap().own_workspace, "");
+}
+
+#[test]
+fn a_checkout_thread_starts_without_the_project_space_open() {
+    let world = World::new();
+    world.project("demo", "a.sock");
+    let checkout = world.home.path().join("checkout");
+    std::fs::create_dir_all(&checkout).unwrap();
+    let checkout = std::fs::canonicalize(&checkout).unwrap().to_string_lossy().into_owned();
+    world.runner.on("pane get", ok(r#"{"result":{"pane":{"cwd":""}}}"#));
+    world.runner.on("workspace create", ok(r#"{"result":{"root_pane":{"workspace_id":"w3","tab_id":"w3:t1","pane_id":"w3:p1"}}}"#));
+    world.runner.on("tab rename", ok(r#"{"result":{}}"#));
+    world.runner.on("workspace list", ok(r#"{"result":{"workspaces":[]}}"#));
+    // The coordinator's pane has left the project folder and its Space is
+    // closed; a checkout thread opens a Space of its own anyway.
+    *world.panes.borrow_mut() = format!("[{}]", pane_json("w5", "w5:t1", "w5:p1", "/tmp"));
+    *world.agents.borrow_mut() = "[]".into();
+    let ctx = world.ctx();
+    let args = StartArgs { title: "Main checkout".into(), repo: Some(checkout.clone()), machine: None, profile: None, kind: Some(Kind::Checkout), base: None, task: "Look.".into() };
+    let t = threads::start(&ctx, "demo", args).unwrap();
+    assert_eq!((t.workspace_id.as_str(), t.own_workspace.as_str()), ("w3", "w3"));
+    assert_eq!(t.cwd, checkout);
+    assert_eq!(world.runner.count("workspace create"), 1);
+    assert_eq!(world.runner.count("tab create"), 0);
+}
+
+#[test]
 fn a_home_thread_joins_the_project_space_and_a_restart_reuses_its_tab() {
     let world = World::new();
     let project = world.project("demo", "a.sock");
