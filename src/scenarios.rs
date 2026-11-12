@@ -5017,6 +5017,94 @@ fn lane_of(project: &Project, id: &str) -> crate::lanes::Lane {
     crate::lanes::Registry::load(project).unwrap().get(id).cloned().unwrap_or_else(|| panic!("no lane {id}"))
 }
 
+// ------------------------------------- no second coordinator beside a stray one
+
+/// `agents` JSON for one agent, whole list.
+fn one_agent(json: String) -> String {
+    format!("[{json}]")
+}
+
+#[test]
+fn open_refuses_beside_an_unclaimed_agent_working_in_the_project_folder() {
+    let (world, project) = new_tab_world();
+    let dir = project.canonical_dir().to_string_lossy().into_owned();
+    // An agent of this project no lane claims: it works in a folder inside the
+    // project folder, the record does not name it, and it carries no token.
+    // Starting a coordinator here would leave it running and unrouted (§1.6).
+    *world.agents.borrow_mut() = one_agent(agent_json("w9", "w9:t1", "w9:p1", &format!("{dir}/scratch"), "worker", "idle"));
+    let error = coordinator::open(&world.ctx(), "demo", &open_options(&world, None)).unwrap_err().to_string();
+    assert!(error.contains("w9:p1"), "the refusal names the pane: {error}");
+    assert!(error.contains("refusing to start a coordinator for `demo`"), "{error}");
+    assert!(error.contains("inside the project folder"), "{error}");
+    assert!(error.contains("lane adopt") && error.contains("--new"), "both ways out are named: {error}");
+    // Nothing started, no tab or Space made, and the lane record is untouched.
+    assert_eq!(world.runner.count("agent start"), 0);
+    assert_eq!(world.runner.count("tab create") + world.runner.count("workspace create"), 0);
+    let lane = lane_of(&project, "c-1");
+    assert_eq!((lane.pane_id.as_str(), lane.agent_session.as_str()), ("w1:p1", ""));
+    assert_eq!(project.coordinator().unwrap().pane_id, "w1:p1");
+}
+
+#[test]
+fn open_new_starts_anyway_beside_an_unclaimed_agent_in_the_project_folder() {
+    let (world, project) = new_tab_world();
+    let dir = project.canonical_dir().to_string_lossy().into_owned();
+    *world.agents.borrow_mut() = one_agent(agent_json("w9", "w9:t1", "w9:p1", &format!("{dir}/scratch"), "worker", "idle"));
+    // `--new` is the explicit "I want another one": it is not the accident.
+    let options = crate::coordinator::OpenOptions { new: true, ..open_options(&world, None) };
+    coordinator::open(&world.ctx(), "demo", &options).unwrap();
+    assert_eq!(world.runner.count("agent start"), 1);
+    assert_eq!(lane_of(&project, "c-1").pane_id, "w1:p2");
+}
+
+#[test]
+fn another_lanes_running_coordinator_does_not_block_opening_this_lane() {
+    let (world, project) = new_tab_world();
+    let dir = project.canonical_dir().to_string_lossy().into_owned();
+    two_lane_registry(&project);
+    // c-2 runs in the project home with its token; c-1 has no coordinator at
+    // all. Opening the default lane must not be held up by the other lane's.
+    *world.agents.borrow_mut() = one_agent(agent_json_tokens("w2", "w2:p1", &dir, &[("hp_project", "demo"), ("hp_lane", "c-2")]));
+    coordinator::open(&world.ctx(), "demo", &open_options(&world, None)).unwrap();
+    assert_eq!(world.runner.count("agent start"), 1, "c-1 starts beside c-2");
+    assert_eq!(lane_of(&project, "c-1").pane_id, "w1:p2");
+    assert_eq!(lane_of(&project, "c-2").pane_id, "w2:p1", "the running lane is left alone");
+}
+
+#[test]
+fn open_refuses_beside_a_coordinator_whose_shell_left_the_project_and_lost_its_record() {
+    let (world, _project) = new_tab_world();
+    let elsewhere = world.home.path().to_string_lossy().into_owned();
+    // The §1.6 accident itself: the pane works elsewhere and no record names
+    // it (the record was overwritten), so the folder says nothing. Its name
+    // still says what it is, which is why `open` can refuse.
+    *world.agents.borrow_mut() = one_agent(agent_json("w9", "w9:t1", "w9:p1", &elsewhere, "hpc-demo-3", "idle"));
+    let error = coordinator::open(&world.ctx(), "demo", &open_options(&world, None)).unwrap_err().to_string();
+    assert!(error.contains("w9:p1") && error.contains("hpc-demo-3"), "{error}");
+    assert!(error.contains("`open` gives this project's coordinators"), "{error}");
+    assert_eq!(world.runner.count("agent start"), 0);
+
+    // A `hp_lane` that names no lane is the same claim, and the registry's own
+    // refusal is quoted instead of guessed at.
+    *world.agents.borrow_mut() = one_agent(agent_json_tokens("w9", "w9:p1", &elsewhere, &[("hp_project", "demo"), ("hp_lane", "c-9")]));
+    let error = coordinator::open(&world.ctx(), "demo", &open_options(&world, None)).unwrap_err().to_string();
+    assert!(error.contains("w9:p1") && error.contains("token hp_lane=c-9 names no lane"), "{error}");
+    assert_eq!(world.runner.count("agent start"), 0);
+}
+
+#[test]
+fn a_home_thread_never_counts_as_the_stray_coordinator() {
+    let (world, project) = new_tab_world();
+    let folder = project.canonical_dir().join("threads/t-0001");
+    world.thread(&project, &folder, |t| t.kind = Kind::Home);
+    // A home thread works under `threads/` and a thread's pane carries
+    // `hp_project` with no `hp_lane` — both look like a stray coordinator to a
+    // careless test, and neither may block `open`.
+    *world.agents.borrow_mut() = one_agent(agent_json("w2", "w2:t1", "w2:p1", &folder.to_string_lossy(), "hp-demo-t-0001", "working"));
+    coordinator::open(&world.ctx(), "demo", &open_options(&world, None)).unwrap();
+    assert_eq!(world.runner.count("agent start"), 1);
+}
+
 #[test]
 fn open_without_a_lane_creates_no_lane_and_keeps_the_tab_name() {
     let (world, project) = new_tab_world();

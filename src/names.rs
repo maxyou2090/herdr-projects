@@ -35,6 +35,30 @@ pub fn is_valid(name: &str) -> bool {
         && name.len() <= MAX_AGENT_NAME
 }
 
+/// True when `name` is one [`coordinator`] gives `slug`: the first
+/// (`hpc-<slug>`) or a later one (`hpc-<slug>-N`). A project that lost track of
+/// a coordinator still has this in the pane, which is why `open` may read it as
+/// "a coordinator of mine" even when its shell has left the project folder.
+pub fn is_coordinator_name(slug: &str, name: &str) -> bool {
+    if name.is_empty() {
+        return false;
+    }
+    if name == coordinator(slug, 0) {
+        return true;
+    }
+    let prefix = format!("hpc-{}-", head(slug, 22));
+    name.strip_prefix(&prefix).is_some_and(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()))
+}
+
+/// True when `name` is one [`thread`] gives `slug` (`hp-<slug>-t-<digits>`).
+/// It is what tells a thread's pane from a coordinator's when both carry the
+/// project's `hp_project` token: a thread gets that token and never `hp_lane`,
+/// so the token alone cannot separate them.
+pub fn is_thread_name(slug: &str, name: &str) -> bool {
+    let prefix = format!("hp-{}-t-", head(slug, 21));
+    name.strip_prefix(&prefix).is_some_and(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()))
+}
+
 /// The first coordinator name that is not among `taken`.
 pub fn free_coordinator(slug: &str, taken: &[String]) -> String {
     (0..).map(|n| coordinator(slug, n)).find(|name| !taken.contains(name)).unwrap_or_default()
@@ -73,5 +97,29 @@ mod tests {
         assert!(collide(&format!("{long}-a"), &format!("{long}-b")));
         assert!(!collide("alpha", "beta"));
         assert!(!collide("alpha", "alpha"));
+    }
+
+    #[test]
+    fn coordinator_and_thread_names_are_told_apart() {
+        for (slug, name) in [("demo", "hpc-demo"), ("demo", "hpc-demo-2"), ("demo", "hpc-demo-12")] {
+            assert!(is_coordinator_name(slug, name), "{name}");
+            assert!(!is_thread_name(slug, name), "{name}");
+        }
+        for name in ["hp-demo", "hp-demo-t-0001", "hpc-demo-x", "hpc-demo-", "someone", ""] {
+            assert!(!is_coordinator_name("demo", name), "{name}");
+        }
+        for name in ["hp-demo-t-0001", "hp-demo-t-9999"] {
+            assert!(is_thread_name("demo", name), "{name}");
+        }
+        for name in ["hp-demo-t", "hp-demo-t-01x", "hpc-demo-t-0001"] {
+            assert!(!is_thread_name("demo", name), "{name}");
+        }
+        // Truncation is the same one `coordinator`/`thread` do, so a long slug
+        // is still recognised in both directions.
+        let long = "a".repeat(40);
+        assert!(is_coordinator_name(&long, &coordinator(&long, 3)));
+        assert!(is_thread_name(&long, &thread(&long, "t-0009")));
+        assert!(!is_coordinator_name(&long, &thread(&long, "t-0009")));
+        assert!(!is_thread_name(&long, &coordinator(&long, 0)));
     }
 }

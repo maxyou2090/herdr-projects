@@ -553,6 +553,41 @@ The CLI keeps its shape: `hp` below is the printed prefix
 - The lane is written into the record it starts and into `lanes.json`
   (`pane_id`, `agent_session`, `last_active`), and the pane gets `hp_lane`.
 
+**`open` never starts a coordinator beside an agent no lane claims.** Before it
+launches anything it looks at the session's agent list for a live pane that is
+clearly this project's — it works in the project home or in a folder inside the
+project folder (a home thread's `threads/<id>/` excluded), or its name is
+`hpc-<slug>[-N]`, or its `hp_lane` names a lane the registry does not have —
+while §5.2's `classify_all` resolves it to no lane at all. Such a pane is a
+coordinator the project has lost track of; starting a second one leaves the
+first running with nothing routed to it, which is exactly the accident §1.6
+records. `open` then refuses:
+
+```text
+refusing to start a coordinator for `law`: pane w1AB:p1 (claude `hpc-law-2`; its
+name `hpc-law-2` is one `open` gives this project's coordinators) runs an agent
+of this project that no lane claims.
+Give that pane a lane with `<prefix> lane adopt <lane>` inside it, close it, or
+pass `--new` to start another coordinator anyway.
+```
+
+Two ways past it, both deliberate: `lane adopt <lane>` in that pane (the fix for
+a coordinator that lost its lane), or `--new` ("I know, start another one").
+What the check deliberately does **not** do:
+
+- It is not "any process in the project folder": only agents Herdr lists.
+- Another lane's coordinator never blocks (`c-3` running does not stop `c-1`),
+  and neither does a pane §5.2 resolves to the lane being opened — that one is
+  focused instead. A live thread's pane is never a candidate either, though it
+  carries `hp_project` and no `hp_lane`.
+- A pane that is *ambiguous* only because several open lanes share the folder
+  (no token, no record match) is not refused: the ticker already reports it as
+  degraded, with the `lane adopt` command, and refusing there would block the
+  `open --lane <new>` that creates the ambiguity in the first place.
+- The check is not a fix for classification. It is the last line of defence:
+  it only stops the silent second start, and `lane adopt` remains how a lost
+  coordinator is brought back.
+
 ### 6.2 `hp lane adopt <name> [--project <slug>]`
 
 For the case where the user opened a tab and started an agent by hand. Adopt
@@ -746,7 +781,9 @@ The rule: **nothing is adopted automatically, and nothing is silently dropped.**
   (`lanes::orphan_lanes`, which counts the threads itself). The stricter test
   matters: a pane that is alive but unrecognized is `degraded`, not an orphan,
   and `open` beside it would start a second coordinator — §6.4 forbids that.
-  The fix for `degraded` is `hp lane adopt`, never `open`.
+  The fix for `degraded` is `hp lane adopt`, never `open`; `open` itself now
+  refuses beside an unclaimed agent (§6.1), so this is a backstop, not the only
+  guard.
 - It writes **one** inbox item, kind `lane` (a new kind next to `thread-state`,
   `session`, `space`, `routine`, `outage`; it renders through the existing
   nudge path, `steps::nudge_text`, `src/steps.rs`), addressed to the
