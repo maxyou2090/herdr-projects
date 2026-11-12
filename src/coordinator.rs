@@ -425,6 +425,96 @@ fn free_lane_handle(registry: &crate::lanes::Registry) -> String {
     }
 }
 
+/// The panes `open` must not start a coordinator beside: each runs an agent
+/// that belongs to this project yet resolves to no lane, so starting another
+/// would leave the first running and unrouted — the accident §1.6 records.
+///
+/// `identity` is [`crate::lanes::classify_all`]'s answer, in `agents` order. A
+/// pane that resolves to *any* lane is left alone: another lane's coordinator
+/// is not this lane's business, and this lane's own would have been focused
+/// above (a different profile is the documented "start one beside it"). A live
+/// thread's pane is left alone too.
+///
+/// Returns one line per pane: its id, what runs in it, and the signal that
+/// caught it. `None` when nothing is in the way.
+fn unclaimed(project: &Project, home: &Path, agents: &[Agent], identity: &[crate::lanes::LaneResolution]) -> Option<Vec<String>> {
+    let thread_panes: Vec<String> = crate::thread::list(project)
+        .into_iter()
+        .filter(|thread| matches!(thread.status, crate::thread::Status::Open | crate::thread::Status::Starting))
+        .map(|thread| thread.pane_id)
+        .filter(|pane| !pane.is_empty())
+        .collect();
+    let found: Vec<String> = agents
+        .iter()
+        .zip(identity)
+        // Known to any lane at all: another lane's coordinator is not this
+        // lane's business, and this lane's own was focused above.
+        .filter(|(_, resolution)| resolution.lane_id().is_none())
+        .filter(|(agent, _)| !thread_panes.contains(&agent.pane_id))
+        .filter_map(|(agent, resolution)| {
+            let why = stray_signal(project, home, agent, resolution)?;
+            let kind = if agent.agent.is_empty() { "agent" } else { agent.agent.as_str() };
+            let named = if agent.name.is_empty() { String::new() } else { format!(" `{}`", agent.name) };
+            Some(format!("{} ({kind}{named}; {why})", agent.pane_id))
+        })
+        .collect();
+    (!found.is_empty()).then_some(found)
+}
+
+/// What makes `agent` look like this project's coordinator although no lane
+/// claims it, or `None` when no signal does. Everything here is read from the
+/// `agent list` entry alone:
+///
+/// - a `hp_lane` token that names no lane: the lanes' own refusal
+///   ([`crate::lanes::LaneResolution::Ambiguous`] with a token), so the pane
+///   claims to be a coordinator and the registry cannot say whose. The token is
+///   the pane's own statement, so this needs no guess;
+/// - the project home, and any folder inside the project folder except
+///   `threads/` (a home thread's own folder). Worktree threads and
+///   `--kind checkout` threads work outside the project folder;
+/// - the agent name, which is `hpc-<slug>` for every coordinator `open`
+///   starts: this is the only signal left once the shell has `cd`-ed away,
+///   which is exactly the drift §1.6 is about;
+/// - last and weakest, `hp_project=<slug>` with no `hp_lane` — but a thread
+///   pane carries `hp_project` and no `hp_lane` by design
+///   (`sidebar::report_pane` writes one without the other), so the name must
+///   not be a thread's. That is why the token alone is never enough.
+///
+/// An [`crate::lanes::LaneResolution::Ambiguous`] pane **without** a token is
+/// several open lanes sharing the folder: the ticker already reports it as
+/// `degraded` with the `lane adopt` command that fixes it, and refusing here
+/// would block the `open --lane <new>` that is what makes the folder
+/// ambiguous in the first place. So it is left to that report.
+///
+/// A pane whose report names another project is never ours: lane ids repeat
+/// across projects, and the project token is what says whose claim to read.
+fn stray_signal(project: &Project, home: &Path, agent: &Agent, resolution: &crate::lanes::LaneResolution) -> Option<String> {
+    if !crate::lanes::ours(agent, &project.slug) {
+        return None;
+    }
+    let lane_token = agent.tokens.get(crate::lanes::TOKEN).map(String::as_str).filter(|value| !value.is_empty());
+    match resolution {
+        crate::lanes::LaneResolution::Ambiguous { reason } if lane_token.is_some() => return Some(reason.clone()),
+        crate::lanes::LaneResolution::Ambiguous { .. } => return None,
+        _ => {}
+    }
+    let own = Path::new(crate::herdr::own_dir(&agent.cwd, &agent.foreground_cwd));
+    if own == home {
+        return Some(format!("it works in the project home {}", home.display()));
+    }
+    if !own.as_os_str().is_empty() && own.starts_with(home) && !own.starts_with(home.join("threads")) {
+        return Some(format!("it works in {}, inside the project folder", own.display()));
+    }
+    if crate::names::is_coordinator_name(&project.slug, &agent.name) {
+        return Some(format!("its name `{}` is one `open` gives this project's coordinators", agent.name));
+    }
+    let project_token = agent.tokens.get(crate::sidebar::PROJECT_TOKEN).map(String::as_str);
+    if project_token == Some(project.slug.as_str()) && lane_token.is_none() && !crate::names::is_thread_name(&project.slug, &agent.name) {
+        return Some(format!("it carries `hp_project={}` and no `hp_lane`", project.slug));
+    }
+    None
+}
+
 pub fn open(ctx: &Ctx, slug: &str, options: &OpenOptions) -> Result<()> {
     let project = Project::load(&ctx.root, slug)?;
     if project.status() == Status::Archived {
@@ -560,6 +650,27 @@ pub fn open(ctx: &Ctx, slug: &str, options: &OpenOptions) -> Result<()> {
         println!("coordinator is running in pane {} ({} more: pass --new to start another)", record.pane_id, running.len() - 1);
         println!("Commands: {prefix}");
         return Ok(());
+    }
+
+    // The last line of defence before a second coordinator. Everything above
+    // asks "which lane is this pane?", and a pane none of the rules can name
+    // is treated as nobody — which is how a running coordinator came to be
+    // abandoned beside a freshly started one (§1.6, `docs/lanes.md` §5.4).
+    // So when a pane clearly runs an agent of this project and no lane claims
+    // it, refuse and say which pane and what to do, instead of starting
+    // another. `--new` is the explicit "I want a second one" and keeps working.
+    if !options.new
+        && let Some(parts) = unclaimed(&project, &dir, &agents, &identity)
+    {
+        let (what, verb, that) = match parts.len() {
+            1 => ("pane", "runs an agent", "that pane"),
+            _ => ("panes", "run agents", "those panes"),
+        };
+        bail!(
+            "refusing to start a coordinator for `{slug}`: {what} {} {verb} of this project that no lane claims.\n\
+             Give {that} a lane with `{prefix} lane adopt <lane>` inside it, close it, or pass `--new` to start another coordinator anyway.",
+            parts.join(", ")
+        );
     }
 
     // Start in the pane this command runs in, else reuse the recorded pane
