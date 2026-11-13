@@ -41,7 +41,7 @@ pub enum Kind {
     /// A Space of the thread's own on `threads/<id>/`, asked for explicitly
     /// with `thread start --kind tab`.
     Tab,
-    /// A tab in the project workspace whose working directory is the repo's
+    /// A Space of the thread's own whose working directory is the repo's
     /// main checkout, asked for explicitly with `thread start --kind checkout`.
     Checkout,
     /// A tab of the project's own workspace (its home Space) whose working

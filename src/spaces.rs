@@ -55,18 +55,22 @@ pub fn record(project: &Project, herdr: &Herdr) {
 /// must still show them as the repository's primary Space with no worktree
 /// Space under it — plus orphan home Spaces, plain Spaces still carrying the
 /// project's home label that no open thread and no coordinator uses, plus a
-/// tab thread's own plain Space (recorded and titled after it). None of
-/// them may hold an agent, and every pane must be an idle shell. A focused
-/// Space or pane is kept unless `include_focused`.
+/// thread's own plain Space (recorded and titled after it; tab and checkout
+/// threads have one). None of them may hold an agent, and every pane must be
+/// an idle shell. A focused Space or pane is kept unless `include_focused`.
 pub fn empty(ctx: &Ctx, project: &Project, herdr: &Herdr, include_focused: bool) -> Vec<Space> {
     let threads = thread::list(project);
     let mut recorded: Vec<(String, String)> = threads.iter().filter(|t| local_worktree(t) && !t.repo_workspace.is_empty()).map(|t| (t.repo_workspace.clone(), t.repo.clone())).collect();
-    // Tab threads' own Spaces: a plain Space named after the thread, which
-    // only its own tabs should work in.
-    let mut own: Vec<(String, String, String)> = threads
+    // Threads' own Spaces: a plain Space named after the thread, which only
+    // its own tabs should work in. A checkout thread works in the repo's main
+    // checkout, a tab thread in `threads/<id>/`.
+    let mut own: Vec<(String, String, std::path::PathBuf)> = threads
         .iter()
-        .filter(|t| t.kind == Kind::Tab && !thread::own_space_id(t).is_empty())
-        .map(|t| (thread::own_space_id(t).to_string(), t.title.clone(), t.id.clone()))
+        .filter(|t| matches!(t.kind, Kind::Tab | Kind::Checkout) && !thread::own_space_id(t).is_empty())
+        .map(|t| {
+            let folder = if t.kind == Kind::Checkout { std::path::PathBuf::from(&t.repo) } else { project.dir().join("threads").join(&t.id) };
+            (thread::own_space_id(t).to_string(), t.title.clone(), folder)
+        })
         .collect();
     let mut in_use = Vec::new();
     let mut coordinators = Vec::new();
@@ -144,11 +148,11 @@ pub fn empty(ctx: &Ctx, project: &Project, herdr: &Herdr, include_focused: bool)
             found.push(Space { id: w.workspace_id.clone(), label: w.label.clone() });
         }
     }
-    // Tab threads' own Spaces, once nothing uses them: a plain Space still
+    // Threads' own Spaces, once nothing uses them: a plain Space still
     // carrying the thread's title (herdr reuses ids after a server restart,
     // so the label and any panes are checked too). Their last tab is closed
     // at resolve, which leaves the Space itself empty.
-    for (id, label, thread_id) in own {
+    for (id, label, folder) in own {
         let Some(space) = workspaces.iter().find(|w| w.workspace_id == id) else {
             continue;
         };
@@ -156,7 +160,6 @@ pub fn empty(ctx: &Ctx, project: &Project, herdr: &Herdr, include_focused: bool)
             continue;
         }
         let own_panes: Vec<_> = panes.iter().filter(|p| p.workspace_id == id).collect();
-        let folder = project.dir().join("threads").join(&thread_id);
         let in_folder = own_panes.iter().any(|p| !p.cwd.is_empty() && Path::new(&p.cwd).starts_with(&folder));
         if own_panes.len() != space.pane_count
             || agents.iter().any(|a| a.workspace_id == id)
@@ -177,9 +180,12 @@ pub fn close(herdr: &Herdr, space: &Space) -> Result<(), crate::herdr::HerdrErro
     herdr.call(&["workspace", "close", &space.id], crate::herdr::CALL_TIMEOUT).map(|_| ())
 }
 
-/// Forgets a Space on every thread of `project` that recorded it. A tab
-/// thread's `workspace_id` names the same Space as its `own_workspace`, so
-/// a legacy record whose `own_workspace` was never written is forgotten too.
+/// Forgets a Space on every thread of `project` that recorded it. A tab or
+/// checkout thread's `workspace_id` names the same Space as its
+/// `own_workspace`, so a legacy tab record whose `own_workspace` was never
+/// written is forgotten too. (A legacy checkout record's `workspace_id` names
+/// the project's home instead, which is never closed here while the thread is
+/// open: `empty` keeps every Space an open thread still uses.)
 fn forget(project: &Project, id: &str) {
     for t in thread::list(project).into_iter().filter(|t| t.repo_workspace == id || t.own_workspace == id || (t.kind == Kind::Tab && t.workspace_id == id)) {
         let repo = t.repo_workspace == id;

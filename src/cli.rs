@@ -453,7 +453,7 @@ enum ThreadCommand {
         /// The agent's profile (harness, model, effort, flags), one the project allows (default: thread_profile in PROJECT.md); `context` lists them
         #[arg(long, alias = "agent", value_name = "NAME")]
         profile: Option<String>,
-        /// Placement, not the agent: worktree (default with --repo), home (default without: a tab of the project's own workspace on threads/<id>/), tab (a Space of its own), or checkout (a tab on the repo's main checkout)
+        /// Placement, not the agent: worktree (default with --repo: its own worktree and branch), tab (a Space of its own on threads/<id>/), checkout (a Space of its own on the repo's main checkout), or home (default without a repo: a tab of the project's own workspace on threads/<id>/)
         #[arg(long, value_name = "worktree|tab|checkout|home")]
         kind: Option<String>,
         #[arg(long, value_name = "REF")]

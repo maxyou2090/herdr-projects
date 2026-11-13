@@ -119,14 +119,31 @@ fn close_workspaces(project: &Project, view: &SessionView) -> Vec<String> {
     };
     let mut done = Vec::new();
     let home = project.coordinator().map(|c| c.workspace_id).unwrap_or_default();
-    for t in thread::list(project).iter().filter(|t| t.status != thread::Status::Resolved && !t.is_remote() && matches!(t.kind, thread::Kind::Worktree | thread::Kind::Tab)) {
+    for t in thread::list(project).iter().filter(|t| {
+        t.status != thread::Status::Resolved && !t.is_remote() && matches!(t.kind, thread::Kind::Worktree | thread::Kind::Tab | thread::Kind::Checkout)
+    }) {
         // A worktree thread's Space is on its worktree, a tab thread's on its
         // own `threads/<id>/` folder; one still living in the home (placed
         // before it got a Space of its own) is closed with the home below.
         // A home thread's tab sits in the home itself and closes with it too,
         // so it needs no entry here.
-        let root = if t.kind == thread::Kind::Worktree { t.worktree_path.as_str() } else { t.cwd.as_str() };
-        let workspace = view.panes.iter().find(|p| !root.is_empty() && p.workspace_id != home && std::path::Path::new(&p.cwd).starts_with(root)).map(|p| p.workspace_id.clone());
+        // A checkout thread's Space is named by its record (never by its
+        // folder: the repository's primary Space can hold panes in that same
+        // main checkout, and archive never closes it), and only by the
+        // `own_workspace` a record gets when it is placed in one: a legacy
+        // checkout thread's `workspace_id` names the project's home instead.
+        let workspace = if t.kind == thread::Kind::Checkout {
+            let own = t.own_workspace.as_str();
+            view.herdr
+                .workspace_list()
+                .unwrap_or_default()
+                .iter()
+                .find(|w| !own.is_empty() && own != home && w.workspace_id == own && w.worktree.is_none())
+                .map(|w| w.workspace_id.clone())
+        } else {
+            let root = if t.kind == thread::Kind::Worktree { t.worktree_path.as_str() } else { t.cwd.as_str() };
+            view.panes.iter().find(|p| !root.is_empty() && p.workspace_id != home && std::path::Path::new(&p.cwd).starts_with(root)).map(|p| p.workspace_id.clone())
+        };
         if let Some(workspace) = workspace
             && !done.contains(&workspace)
         {
@@ -331,5 +348,36 @@ mod tests {
         assert!(set_status(&ctx, "demo", Status::Paused).is_err());
         set_status(&ctx, "demo", Status::Active).unwrap();
         assert_eq!(project.status(), Status::Active);
+    }
+
+    #[test]
+    fn archive_closes_a_checkout_threads_own_space_and_never_the_repository_primary() {
+        let world = World::new();
+        let project = world.project("demo", "a.sock");
+        let repo = world.home.path().join("checkout");
+        std::fs::create_dir_all(&repo).unwrap();
+        let repo = std::fs::canonicalize(&repo).unwrap().to_string_lossy().into_owned();
+        world.thread(&project, std::path::Path::new(&repo), |t| {
+            t.kind = thread::Kind::Checkout;
+            t.title = "Main checkout".into();
+            t.repo = repo.clone();
+            t.worktree_path.clear();
+            t.workspace_id = "w3".into();
+            t.own_workspace = "w3".into();
+            t.tab_id = "w3:t1".into();
+            t.pane_id = "w3:p1".into();
+        });
+        *world.panes.borrow_mut() = format!("[{},{}]", world.coordinator_pane(&project), crate::scenarios::pane_json("w3", "w3:t1", "w3:p1", &repo));
+        // The repository's primary Space holds the same main checkout, and
+        // herdr's own unlinked worktree grouping says so: archive must leave
+        // it alone and close only the Space the thread recorded.
+        let listed = format!(
+            r#"[{{"workspace_id":"w1","label":"Demo","pane_count":1}},{{"workspace_id":"w3","label":"Main checkout","pane_count":1}},{{"workspace_id":"w9","label":"repo","pane_count":1,"worktree":{{"repo_key":"{repo}/.git","checkout_path":"{repo}","is_linked_worktree":false}}}}]"#
+        );
+        world.runner.on("workspace list", crate::runner::fake::ok(&format!(r#"{{"result":{{"workspaces":{listed}}}}}"#)));
+        world.runner.on("workspace close", crate::runner::fake::ok(r#"{"result":{}}"#));
+        set_status(&world.ctx(), "demo", Status::Archived).unwrap();
+        assert_eq!(world.runner.count("workspace close w3"), 1);
+        assert_eq!(world.runner.count("workspace close w9"), 0);
     }
 }

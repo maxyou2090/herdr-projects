@@ -126,7 +126,7 @@ pub fn placement(kind: Option<Kind>, has_repo: bool, remote: bool) -> Result<Kin
         (None, false) => Ok(Kind::Home),
         (Some(Kind::Worktree), false) | (Some(Kind::Checkout), false) => bail!("a worktree or checkout thread needs --repo"),
         (Some(Kind::Adopted), _) => bail!("an adopted thread is made with `thread adopt`"),
-        (Some(Kind::Tab) | Some(Kind::Checkout) | Some(Kind::Home), _) if remote => bail!("a tab, checkout or home thread runs in the project's own workspace, which is local; a remote repo needs a worktree thread"),
+        (Some(Kind::Tab) | Some(Kind::Checkout) | Some(Kind::Home), _) if remote => bail!("a tab, checkout or home thread is placed in this machine's herdr session, which is local; a remote repo needs a worktree thread"),
         (Some(kind), _) => Ok(kind),
     }
 }
@@ -321,14 +321,24 @@ fn write_brief(ctx: &Ctx, project: &Project, placed: &Thread, restart: bool) -> 
     Ok(())
 }
 
-/// A workspace of the thread's own on `threads/<id>/` for a tab thread, so
-/// the coordinator keeps its Space to itself; a tab of the project's own
-/// workspace, in the repo's main checkout, for a checkout thread; and a tab
-/// of the project's own workspace on `threads/<id>/` for a home thread.
+/// A workspace of the thread's own for a tab thread (on `threads/<id>/`), so
+/// the coordinator keeps its Space to itself; a workspace of its own on the
+/// repo's main checkout for a checkout thread, which likewise never joins the
+/// coordinator's Space; and a tab of the project's own workspace on
+/// `threads/<id>/` for a home thread.
 fn place_tab(project: &Project, view: &SessionView, record: &Thread) -> Result<Thread> {
-    let coordinator = project.coordinator().context("the project has never been opened")?;
-    let workspace = coordinator::project_workspace(&coordinator, &view.panes, &view.agents);
-    if workspace.is_none() && !view.agents.iter().any(|a| coordinator::is_coordinator(&coordinator, a)) {
+    let coordinator = project.coordinator();
+    let workspace = coordinator.as_ref().and_then(|c| coordinator::project_workspace(c, &view.panes, &view.agents));
+    // The project's own Space, as well as it can be named: a thread must
+    // never reuse it for a Space of its own, and a stale record may point at it.
+    let project_home = workspace.clone().or_else(|| coordinator.as_ref().map(|c| c.workspace_id.clone()).filter(|id| !id.is_empty())).unwrap_or_default();
+    // A home thread runs inside the project's own Space, so it has to be open.
+    // A checkout thread opens a Space of its own on the repo's main checkout
+    // and does not need the coordinator's Space (or the project opened at all).
+    if record.kind != Kind::Checkout
+        && workspace.is_none()
+        && !coordinator.as_ref().is_some_and(|c| view.agents.iter().any(|a| coordinator::is_coordinator(c, a)))
+    {
         bail!("the project's workspace is not open; run `open {}` first", project.slug);
     }
     let folder = if record.kind == Kind::Checkout {
@@ -342,16 +352,25 @@ fn place_tab(project: &Project, view: &SessionView, record: &Thread) -> Result<T
         folder
     };
     let folder = std::fs::canonicalize(&folder)?;
-    // The project's own Space, as well as it can be named: a tab thread must
-    // never reuse it, and a stale record may point at it.
-    let project_home = workspace.clone().unwrap_or_else(|| coordinator.workspace_id.clone());
-    // A tab thread reuses a Space of its own, never the project's home: the
-    // recorded one when the id still names it (the pane may be gone while
-    // the Space stays open), else one named by a pane working in its folder.
-    let own_space = if record.kind == Kind::Tab {
+    // A tab or checkout thread reuses a Space of its own, never the project's
+    // home: the recorded one when the id still names it (the pane may be gone
+    // while the Space stays open), else one named by a pane working in its
+    // folder. A checkout thread's folder is the repository's main checkout,
+    // which other panes may work in too, so there only a Space carrying the
+    // thread's title counts, exactly like the recorded one.
+    let own_space = if matches!(record.kind, Kind::Tab | Kind::Checkout) {
         let listed = view.herdr.workspace_list().unwrap_or_default();
+        let named = |id: &str| listed.iter().any(|w| w.workspace_id == id && w.worktree.is_none() && !w.label.ends_with(crate::grouping::HOME_MARK) && w.label == record.title);
         thread::recorded_own_space(record, &listed).filter(|w| w.workspace_id != project_home).map(|w| w.workspace_id.clone()).or_else(|| {
-            view.panes.iter().find(|p| !p.cwd.is_empty() && Path::new(&p.cwd).starts_with(&folder) && p.workspace_id != project_home).map(|p| p.workspace_id.clone())
+            view.panes
+                .iter()
+                .find(|p| {
+                    !p.cwd.is_empty()
+                        && Path::new(&p.cwd).starts_with(&folder)
+                        && p.workspace_id != project_home
+                        && (record.kind != Kind::Checkout || named(&p.workspace_id))
+                })
+                .map(|p| p.workspace_id.clone())
         })
     } else {
         None
@@ -373,8 +392,9 @@ fn place_tab(project: &Project, view: &SessionView, record: &Thread) -> Result<T
         }
         // Its own Space, never a tab of the project's home: a restart first
         // reuses the Space the thread already has (see `own_space`), and
-        // opens one only when that is really gone.
-        Kind::Tab => match own_space {
+        // opens one only when that is really gone. A checkout thread is
+        // placed the same way, on the repo's main checkout.
+        Kind::Tab | Kind::Checkout => match own_space {
             Some(id) => view.herdr.tab_create(&id, &folder, &record.title, false)?,
             None => {
                 let created = view.herdr.workspace_create(&folder, &record.title, false)?;
@@ -382,18 +402,7 @@ fn place_tab(project: &Project, view: &SessionView, record: &Thread) -> Result<T
                 created
             }
         },
-        // A checkout thread runs in a tab of the project's own workspace.
-        _ => match workspace {
-            Some(id) => view.herdr.tab_create(&id, &folder, &record.title, false)?,
-            // The coordinator runs in a pane of another workspace: the thread
-            // opens the project's own.
-            None => {
-                let (settings, _) = project.read_project_md()?;
-                let created = view.herdr.workspace_create(&folder, &crate::project::home_label(&settings.name, &project.slug), false)?;
-                let _ = view.herdr.call(&["tab", "rename", &created.tab_id, &record.title], crate::herdr::CALL_TIMEOUT);
-                created
-            }
-        },
+        Kind::Worktree | Kind::Adopted => bail!("a {:?} thread is not placed in a tab", record.kind),
     };
     let cwd = view.herdr.pane_cwd(&created.pane_id).unwrap_or_default();
     let cwd = if cwd.is_empty() { folder.to_string_lossy().into_owned() } else { cwd };
@@ -402,9 +411,9 @@ fn place_tab(project: &Project, view: &SessionView, record: &Thread) -> Result<T
         t.workspace_id = created.workspace_id.clone();
         t.tab_id = created.tab_id;
         t.pane_id = created.pane_id;
-        if record.kind == Kind::Tab {
-            // A tab thread always lives in its own Space: remember it, so a
-            // restart with the pane gone can reopen this one.
+        if matches!(record.kind, Kind::Tab | Kind::Checkout) {
+            // A tab or checkout thread always lives in its own Space:
+            // remember it, so a restart with the pane gone can reopen this one.
             t.own_workspace = created.workspace_id.clone();
         }
     })
