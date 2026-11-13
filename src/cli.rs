@@ -530,6 +530,14 @@ enum ThreadCommand {
         #[arg(long)]
         json: bool,
     },
+    /// Cross-check thread records against herdr's agents and panes (read only)
+    Audit {
+        /// The project; default: the project of the current herdr workspace
+        slug: Option<String>,
+        /// Machine-readable findings
+        #[arg(long)]
+        json: bool,
+    },
     /// Record an existing local agent pane as a thread of this project
     Adopt {
         slug: String,
@@ -951,6 +959,7 @@ pub fn run() -> Result<()> {
             }
             ThreadCommand::List { slug, json } => threads::print_list(&ctx, &slug, json),
             ThreadCommand::Show { slug, id, json } => threads::print_show(&ctx, &slug, &id, json),
+            ThreadCommand::Audit { slug, json } => crate::audit::run(&ctx, slug.as_deref(), json),
             ThreadCommand::Ack { slug, id } => threads::ack(&ctx, &slug, &id),
             ThreadCommand::Resolve { slug, id, reopen, keep_worktree, skip_copy, discard_uncopied } => {
                 threads::resolve(&ctx, &slug, &id, &ResolveArgs { reopen, keep_worktree, skip_copy, discard_uncopied })

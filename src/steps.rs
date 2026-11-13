@@ -1154,6 +1154,9 @@ fn other_pr_open(ctx: &Ctx, project: &Project, t: &Thread) -> bool {
 /// thread is not resolved and the next tick tries again. `merged_head` is the
 /// merged pull request's head commit (empty when there is none).
 fn resolve_after_copy(ctx: &Ctx, project: &Project, t: &Thread, reason: &str, merged_head: String) -> Result<bool> {
+    // Items about this thread that exist now are answered by the resolve
+    // below; ones it writes itself are newer and stay (see `threads::resolve`).
+    let started = project::now();
     let copied = threads::final_copy(ctx, project, t);
     if let CopyOutcome::Failed(error) = &copied.outcome {
         anyhow::bail!("{}: not resolved ({reason}) because the final copy failed: {error}", t.id);
@@ -1161,13 +1164,70 @@ fn resolve_after_copy(ctx: &Ctx, project: &Project, t: &Thread, reason: &str, me
     let resolved = thread::update(project, &t.id, |t| {
         t.status = Status::Resolved;
         t.resolved_reason = reason.to_string();
+        t.stray_agent.clear();
         t.prompt_pending = false;
     })?;
     let complete = copied.outcome == CopyOutcome::Complete;
-    let notes = threads::clean(ctx, project, &resolved, &threads::Clean { keep_worktree: false, copy_complete: complete, merged_head });
+    let cleaned = threads::clean(ctx, project, &resolved, &threads::Clean { keep_worktree: false, copy_complete: complete, merged_head });
     let why = if reason == "auto" { "it was idle for `auto_resolve_days` and was resolved automatically; `thread resolve --reopen` undoes it".to_string() } else { format!("resolved ({reason})") };
+    let archived = inbox::done_for_thread(project, &t.id, &started)?;
+    let mut notes = cleaned.notes;
+    if archived > 0 {
+        notes.push(format!("archived {archived} pending item(s) about {}", t.id));
+    }
     inbox::write_in(project, &inbox::lane_of_thread(project, &t.id), "thread-state", &t.id, "resolved", &format!("{}: {why}: {}", thread_label(t), notes.join("; ")), "")?;
+    // Never a silent clean close: a resolve that left the agent running is an
+    // error the ticker logs and an item the coordinator sees.
+    threads::report_stray(project, &t.id, &resolved, cleaned.stray)?;
     Ok(true)
+}
+
+/// How long an item about a resolved thread may stay in the inbox before the
+/// ticker archives it. Two aged-reminder windows ([`RE_NUDGE_EVERY_SECS`]): a
+/// person who was reading the item when the thread was resolved keeps it
+/// through the next reminder and is told again, and it is gone within the
+/// hour rather than sitting until someone notices. `thread resolve` itself
+/// archives its thread's items at once; this is the backstop for items that
+/// resolved before that existed, and for one written by a race it did not
+/// cover.
+pub const RESOLVED_ITEM_AFTER_SECS: i64 = 2 * RE_NUDGE_EVERY_SECS;
+
+/// Backstop, once per tick: an item whose thread is already resolved cannot
+/// be acted on, and an unhandled one is re-announced every
+/// [`RE_NUDGE_EVERY_SECS`] forever (little-world, 2026-11-13: 26 of 27
+/// unhandled items pointed at resolved threads). Moves such items to
+/// `inbox/done/` — they are kept there, not deleted — and returns what moved,
+/// `(item id, subject)`, for one aggregated log line per project rather than a
+/// line per item (a project that never archived has a whole backlog, and the
+/// ticker log keeps only its newer half).
+///
+/// Only [`inbox::THREAD_SUBJECT_KINDS`] are considered: no other kind's
+/// subject is a thread id, so nothing else can be matched by accident. A
+/// `pr` item is archived with the rest: once its thread is resolved there is
+/// no action left, its pull request's url and state stay in the thread record
+/// and the report, and the item itself is still readable in `inbox/done/` for
+/// [`DONE_RETENTION_DAYS`].
+pub fn archive_items_of_resolved_threads(project: &Project, now: jiff::Timestamp) -> Result<Vec<(String, String)>> {
+    let resolved: BTreeSet<String> = thread::list(project)
+        .into_iter()
+        .filter(|t| t.status == Status::Resolved)
+        .map(|t| t.id)
+        .collect();
+    if resolved.is_empty() {
+        return Ok(Vec::new());
+    }
+    let stale: Vec<(String, String)> = inbox::unhandled(project)
+        .into_iter()
+        .filter(|item| inbox::THREAD_SUBJECT_KINDS.contains(&item.kind.as_str()) && resolved.contains(&item.subject))
+        .filter(|item| item.created.parse::<jiff::Timestamp>().is_ok_and(|created| now.as_second() - created.as_second() >= RESOLVED_ITEM_AFTER_SECS))
+        .map(|item| (item.id, item.subject))
+        .collect();
+    if stale.is_empty() {
+        return Ok(Vec::new());
+    }
+    let ids: Vec<String> = stale.iter().map(|(id, _)| id.clone()).collect();
+    inbox::done(project, &ids, false)?;
+    Ok(stale)
 }
 
 /// Step 4. Measured from the later of the last state change, the last report
@@ -1412,6 +1472,42 @@ mod tests {
         let id = items[0].id.clone();
         inbox::done(project, &[id.clone()], false).unwrap();
         id
+    }
+
+    #[test]
+    fn items_about_a_resolved_thread_are_archived_only_once_they_are_old() {
+        let root = tempfile::tempdir().unwrap();
+        let project = project::create(root.path(), "demo", "", vec![]).unwrap();
+        let resolved = thread::allocate(&project, |t| t.status = Status::Resolved).unwrap();
+        let open = thread::allocate(&project, |t| t.status = Status::Open).unwrap();
+        let item = |id: &str, kind: &str, subject: &str, created: &str| {
+            let text = format!("+++\nid = \"{id}\"\nkind = \"{kind}\"\nsubject = \"{subject}\"\ncreated = \"{created}\"\nsummary = \"s\"\nevent = \"e\"\n+++\n");
+            std::fs::create_dir_all(project.dir().join("inbox")).unwrap();
+            std::fs::write(project.dir().join("inbox").join(format!("{id}.md")), text).unwrap();
+        };
+        let old = "2026-11-13T10:00:00Z";
+        let now = at("2026-11-13T12:00:00Z");
+        item("20261113T100000Z-thread-state-t-0001-1", "thread-state", &resolved.id, old);
+        item("20261113T100001Z-pr-t-0001-2", "pr", &resolved.id, old);
+        // A kind whose subject is not a thread id is never touched, even when
+        // the string happens to be one.
+        item("20261113T100002Z-routine-t-0001-3", "routine", &resolved.id, old);
+        // Young enough for a person to still be reading it.
+        item("20261113T113000Z-thread-state-t-0001-4", "thread-state", &resolved.id, "2026-11-13T11:30:00Z");
+        // The thread is still open: its items wait for it.
+        item("20261113T100003Z-thread-state-t-0002-5", "thread-state", &open.id, old);
+
+        let archived = archive_items_of_resolved_threads(&project, now).unwrap();
+        let ids: Vec<&str> = archived.iter().map(|(id, _)| id.as_str()).collect();
+        assert_eq!(ids, ["20261113T100000Z-thread-state-t-0001-1", "20261113T100001Z-pr-t-0001-2"], "{archived:?}");
+        assert!(archived.iter().all(|(_, subject)| *subject == resolved.id));
+        for id in ids {
+            assert!(project.dir().join("inbox/done").join(format!("{id}.md")).is_file(), "{id} was not archived");
+        }
+        let left: Vec<String> = inbox::unhandled(&project).into_iter().map(|i| i.id).collect();
+        assert_eq!(left.len(), 3, "{left:?}");
+        // Nothing left to archive: a second pass writes nothing.
+        assert!(archive_items_of_resolved_threads(&project, now).unwrap().is_empty());
     }
 
     #[test]

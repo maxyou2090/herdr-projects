@@ -354,7 +354,7 @@ pub fn tick(ctx: &Ctx, log: &Log, memory: &mut Memory) -> bool {
         }
     }
     for (project, seen) in &reachable {
-        for error in tick_slow(ctx, project, seen, memory) {
+        for error in tick_slow(ctx, project, seen, memory, log) {
             log.line(&format!("{}: {error:#}", project.slug));
         }
     }
@@ -640,7 +640,7 @@ pub fn tick_project(ctx: &Ctx, project: &Project) -> Result<bool> {
 #[cfg(test)]
 pub fn tick_project_with(ctx: &Ctx, project: &Project, memory: &mut Memory) -> Result<bool> {
     match tick_cheap(ctx, project, &mut Sessions::new(ctx))? {
-        Some(seen) => match tick_slow(ctx, project, &seen, memory).into_iter().next() {
+        Some(seen) => match tick_slow(ctx, project, &seen, memory, &Log::at(std::env::temp_dir().join("hp-test-tick.log"))).into_iter().next() {
             Some(error) => Err(error),
             None => Ok(true),
         },
@@ -1047,7 +1047,7 @@ fn remote_pass(ctx: &Ctx, project: &Project, herdr: &Herdr, machine: &str, threa
 
 /// Copies and launches, remote machines, then inbox items, pull requests,
 /// routines, auto-resolve and housekeeping.
-fn tick_slow(ctx: &Ctx, project: &Project, seen: &Seen, memory: &mut Memory) -> Vec<anyhow::Error> {
+fn tick_slow(ctx: &Ctx, project: &Project, seen: &Seen, memory: &mut Memory, log: &Log) -> Vec<anyhow::Error> {
     let mut errors = Vec::new();
     let mut copy_notes: std::collections::BTreeMap<String, Vec<String>> = Default::default();
     let herdr = Herdr::new(ctx.env.herdr_bin(), &seen.socket, ctx.runner);
@@ -1128,6 +1128,20 @@ fn tick_slow(ctx: &Ctx, project: &Project, seen: &Seen, memory: &mut Memory) -> 
     errors.extend(routine_pass(ctx, project, &mut state, seen.coordinator));
     if let Ok((settings, _)) = project.read_project_md() {
         errors.extend(steps::auto_resolve(ctx, project, &settings, memory, now));
+    }
+    // Backstop for inbox items whose thread is long resolved: they can no
+    // longer be acted on, and unhandled ones are re-announced forever.
+    match steps::archive_items_of_resolved_threads(project, now) {
+        Ok(archived) if !archived.is_empty() => {
+            let mut per_thread: std::collections::BTreeMap<&str, usize> = Default::default();
+            for (_, subject) in &archived {
+                *per_thread.entry(subject.as_str()).or_default() += 1;
+            }
+            let what: Vec<String> = per_thread.iter().map(|(id, n)| if *n > 1 { format!("{id} x{n}") } else { id.to_string() }).collect();
+            log.line(&format!("{}: archived {} item(s) about resolved threads: {}", project.slug, archived.len(), what.join(", ")));
+        }
+        Ok(_) => {}
+        Err(error) => errors.push(error.context("archiving items of resolved threads")),
     }
     // Repository Spaces: recorded when first seen, closed once empty.
     crate::spaces::record(project, &herdr);

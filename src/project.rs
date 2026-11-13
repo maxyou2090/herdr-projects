@@ -606,10 +606,12 @@ const PR_FOLLOWUP_TEMPLATE: &str = "+++\non = \"pr\"\nevents = [\"checks-failed\
 pub const COORDINATOR_SWEEP: &str = "routines/coordinator-sweep.md";
 
 /// The periodic coordinator sweep: list ready-for-review threads and check
-/// their reports were handled, close seen-but-not-done inbox items, and read
-/// the last line of every idle thread's pane. Its text is law's own file, kept
-/// byte for byte, so a backfilled project gets the file it already had.
-const COORDINATOR_SWEEP_TEMPLATE: &str = "+++\nschedule = \"every 20m\"\nenabled = true\n+++\n\n例行巡检并把账对平，只做核对与推进，不改代码：\n\n1. 列出所有 ready-for-review 的线程，逐个确认其报告已被处置：已 review、已合并或明确记录等待原因；报告标 Done 但未收口的，按既定验收流程推进（需要用户确认就先问）。\n2. inbox 里 seen 未 done 的项逐条了结，不允许长期滞留。\n3. 对每个 idle 线程的 pane 最后一条输出扫一眼：有口头交接或完成信息但没落进 threads/*.md 报告的，先让该线程补写报告，再按报告处置。\n\n上次巡检结论仍然成立且无变化的项，简要记一句即可，不要重复展开。\n";
+/// their reports were handled, close seen-but-not-done inbox items, read the
+/// last line of every idle thread's pane, and cross-check the registry against
+/// herdr (`thread audit`). Its text started as law's own file; the audit step is
+/// the one addition, and a project whose file already exists keeps its own text
+/// (nothing here overwrites it).
+const COORDINATOR_SWEEP_TEMPLATE: &str = "+++\nschedule = \"every 20m\"\nenabled = true\n+++\n\n例行巡检并把账对平，只做核对与推进，不改代码：\n\n1. 列出所有 ready-for-review 的线程，逐个确认其报告已被处置：已 review、已合并或明确记录等待原因；报告标 Done 但未收口的，按既定验收流程推进（需要用户确认就先问）。\n2. inbox 里 seen 未 done 的项逐条了结，不允许长期滞留。\n3. 对每个 idle 线程的 pane 最后一条输出扫一眼：有口头交接或完成信息但没落进 threads/*.md 报告的，先让该线程补写报告，再按报告处置。\n4. 跑一次 `hp thread audit <slug>`（只读）：resolved-but-running 说明有 agent 活过了它的线程，working-but-stale 说明有 agent 声称在工作却很久没写任何东西；把看到的如实报给用户，要不要杀掉那个进程由用户决定，不要自己动手。\n\n上次巡检结论仍然成立且无变化的项，简要记一句即可，不要重复展开。\n";
 
 /// Every ready-made routine, as `(file, text)`: `pr-followup` (on a pull
 /// request) and `coordinator-sweep` (every twenty minutes). Both are enabled by

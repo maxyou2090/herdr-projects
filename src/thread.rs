@@ -139,6 +139,11 @@ pub struct Thread {
     pub pr_state: String,
     pub pr_review: String,
     pub resolved_reason: String,
+    /// Set by `clean` when the thread was resolved but its agent was still
+    /// listed after the cleanup: the record keeps the fact, so a resolve that
+    /// left a process running never reads as a clean close (`thread show`
+    /// prints it, `thread list` shows it as the resolved row's note).
+    pub stray_agent: String,
     /// The sidebar's line 3 as the ticker last computed it (`needs you · ~55%`).
     pub state_line: String,
     /// Resolved with `--keep-worktree`: `sweep` leaves the worktree alone.

@@ -1020,6 +1020,15 @@ fn items_of(project: &Project, kind: &str) -> Vec<inbox::Item> {
     inbox::unhandled(project).into_iter().filter(|i| i.kind == kind).collect()
 }
 
+/// One item with its own `created` time, so a test can be old or young on
+/// purpose (the writers always say "now").
+fn item_at(project: &Project, id: &str, kind: &str, subject: &str, created: &str, lane: &str) {
+    let text = format!(
+        "+++\nid = \"{id}\"\nkind = \"{kind}\"\nsubject = \"{subject}\"\ncreated = \"{created}\"\nsummary = \"s\"\nevent = \"e\"\nlane = \"{lane}\"\n+++\n"
+    );
+    std::fs::write(project.dir().join("inbox").join(format!("{id}.md")), text).unwrap();
+}
+
 fn set_front_matter(project: &Project, extra: &str) {
     let text = std::fs::read_to_string(project.project_md()).unwrap();
     let key = extra.split('=').next().unwrap_or("").trim();
@@ -1482,7 +1491,26 @@ fn merged_seen_ago(project: &Project, secs: i64) {
 fn merged_world(agent_state: &str) -> (World, Project) {
     let (world, project) = pr_world(MERGED_JSON);
     set_agents(&world, &project, agent_state);
-    world.runner.on("worktree remove", ok(r#"{"result":{}}"#));
+    // `worktree remove --workspace X` closes X, and herdr forgets the panes it
+    // held and their agents: what is still listed afterwards is a process that
+    // outlived its pane (`threads::stray_agent`), not this thread's agent.
+    let agents = world.agents.clone();
+    let panes = world.panes.clone();
+    world.runner.on_fn(
+        |c| c.display().contains("worktree remove"),
+        move |c| {
+            let workspace = c.args.iter().position(|a| a == "--workspace").map(|at| c.args[at + 1].clone()).unwrap_or_default();
+            for list in [&agents, &panes] {
+                if workspace.is_empty() {
+                    continue;
+                }
+                let rows: Vec<serde_json::Value> = serde_json::from_str(&list.borrow()).unwrap_or_default();
+                let kept: Vec<serde_json::Value> = rows.into_iter().filter(|row| row["workspace_id"].as_str() != Some(workspace.as_str())).collect();
+                *list.borrow_mut() = serde_json::to_string(&kept).unwrap();
+            }
+            Ok(ok(r#"{"result":{}}"#))
+        },
+    );
     world.runner.on("rev-parse --verify --quiet refs/heads/hp/demo/t-0001-task", ok("merged-head\n"));
     world.runner.on("branch -D", ok(""));
     (world, project)
@@ -1524,7 +1552,14 @@ fn a_merged_thread_is_resolved_with_its_final_report_once_its_agent_is_done() {
     assert_eq!(world.runner.count("worktree remove"), 1);
     // The head commit from this tick's `gh` check, not only from a saved file.
     assert_eq!(world.runner.count("branch -D hp/demo/t-0001-task"), 1);
-    assert!(items_of(&project, "pr")[0].summary.contains("state MERGED"));
+    // The `pr` item this tick wrote is newer than the resolve (both landed in
+    // the same second), so it stays; one written before the resolve is
+    // archived by it, and the ticker archives this one once it is an hour old.
+    // The `pr` item this tick wrote is either newer than the resolve (the same
+    // second) and stays, or older and archived by it: it is never lost.
+    let live = items_of(&project, "pr").first().is_some_and(|i| i.summary.contains("state MERGED"));
+    let archived = std::fs::read_dir(project.dir().join("inbox/done")).unwrap().flatten().filter_map(|e| std::fs::read_to_string(e.path()).ok()).any(|text| text.contains("state MERGED"));
+    assert!(live || archived, "the merged pull request's item is gone");
     assert!(crate::steps::load_state(&project).merged_seen.is_empty());
 }
 
@@ -1634,7 +1669,11 @@ fn a_pull_request_opened_and_merged_between_two_passes_is_linked_and_its_branch_
     ticker::tick_project(&ctx, &project).unwrap();
     let t = thread::load(&project, "t-0001").unwrap();
     assert_eq!((t.pr.as_str(), t.pr_state.as_str()), (PR_URL, "MERGED"));
-    assert!(items_of(&project, "pr")[0].summary.contains("state MERGED"));
+    // The `pr` item this tick wrote is either newer than the resolve (the same
+    // second) and stays, or older and archived by it: it is never lost.
+    let live = items_of(&project, "pr").first().is_some_and(|i| i.summary.contains("state MERGED"));
+    let archived = std::fs::read_dir(project.dir().join("inbox/done")).unwrap().flatten().filter_map(|e| std::fs::read_to_string(e.path()).ok()).any(|text| text.contains("state MERGED"));
+    assert!(live || archived, "the merged pull request's item is gone");
 
     // Linked: later passes ask for the pull request itself, not the branch.
     let mut state = crate::steps::load_state(&project);
@@ -1692,7 +1731,11 @@ fn resolving_a_thread_with_an_unlinked_merged_pull_request_deletes_its_branch() 
         assert_eq!((t.status, t.pr.as_str(), t.pr_state.as_str()), (Status::Resolved, PR_URL, "MERGED"), "pr_line={pr_line}");
         assert_eq!(world.runner.count("gh pr list"), usize::from(!pr_line));
         assert_eq!(world.runner.count("branch -D hp/demo/t-0001-task"), 1, "pr_line={pr_line}");
-        assert!(items_of(&project, "pr")[0].summary.contains("state MERGED"));
+        // The `pr` item this tick wrote is either newer than the resolve (the same
+    // second) and stays, or older and archived by it: it is never lost.
+    let live = items_of(&project, "pr").first().is_some_and(|i| i.summary.contains("state MERGED"));
+    let archived = std::fs::read_dir(project.dir().join("inbox/done")).unwrap().flatten().filter_map(|e| std::fs::read_to_string(e.path()).ok()).any(|text| text.contains("state MERGED"));
+    assert!(live || archived, "the merged pull request's item is gone");
         let item = items_of(&project, "thread-state").into_iter().find(|i| i.summary.contains("resolved")).unwrap();
         assert!(item.summary.contains("deleted (its pull request is merged)"), "{}", item.summary);
     }
@@ -5636,4 +5679,225 @@ fn lane_adopt_with_one_lane_makes_that_lane_the_default() {
     let ctx = Ctx { env: &env, root: world.root.clone(), config_dir: world.home.path().join("cfg"), runner: &world.runner, detached_ticker: false };
     crate::lanes::lane_adopt(&ctx, Some("demo"), "default").unwrap();
     assert_eq!(crate::lanes::Registry::load(&project).unwrap().default, "c-1");
+}
+
+#[test]
+fn resolving_a_thread_archives_the_pending_items_about_it_and_no_others() {
+    let world = World::new();
+    let project = world.project("demo", "a.sock");
+    // The thread lives in a tab of its own whose tab is already gone: the
+    // resolve itself then writes nothing but its `resolved` item.
+    world.thread(&project, world.home.path(), |t| {
+        t.kind = Kind::Tab;
+        t.worktree_path.clear();
+        t.lane = "c-1".into();
+    });
+    let other = thread::allocate(&project, |t| {
+        t.title = "Other".into();
+        t.status = Status::Open;
+        t.kind = Kind::Tab;
+        t.pane_id = "w4:p1".into();
+        t.cwd = "/elsewhere".into();
+        t.lane = "c-2".into();
+        t.agent_name = thread::agent_name("demo", "t-0002");
+    })
+    .unwrap();
+    *world.panes.borrow_mut() = format!("[{}]", world.coordinator_pane(&project));
+
+    // Three items about t-0001 (every kind whose subject is a thread id), one
+    // about another thread in another lane, one of a kind that is never about
+    // a thread, and one created "after" the resolve started.
+    let old = "2020-01-01T00:00:00Z";
+    item_at(&project, "20200101T000000Z-thread-state-t-0001-1", "thread-state", "t-0001", old, "c-1");
+    item_at(&project, "20200101T000001Z-pr-t-0001-2", "pr", "t-0001", old, "c-1");
+    item_at(&project, "20200101T000002Z-thread-error-t-0001-3", "thread-error", "t-0001", old, "c-1");
+    item_at(&project, "20200101T000003Z-thread-state-t-0002-4", "thread-state", &other.id, old, "c-2");
+    item_at(&project, "20200101T000004Z-routine-t-0001-5", "routine", "t-0001", old, "");
+    item_at(&project, "20990101T000000Z-thread-state-t-0001-6", "thread-state", "t-0001", "2099-01-01T00:00:00Z", "c-1");
+
+    threads::resolve(&world.ctx(), "demo", "t-0001", &ResolveArgs { skip_copy: true, ..ResolveArgs::default() }).unwrap();
+
+    let left: Vec<(String, String)> = inbox::unhandled(&project).into_iter().map(|i| (i.kind, i.subject)).collect();
+    // The other thread's item, the routine item, the future one, and the
+    // `resolved` event this resolve wrote itself.
+    assert_eq!(left.len(), 4, "{left:?}");
+    assert!(left.contains(&("thread-state".into(), other.id.clone())), "another lane's item was moved: {left:?}");
+    let resolved_events = items_of(&project, "thread-state").into_iter().filter(|i| i.subject == "t-0001" && i.event == "resolved").count();
+    assert_eq!(resolved_events, 1, "the resolve's own event must stay");
+    for id in ["20200101T000000Z-thread-state-t-0001-1", "20200101T000001Z-pr-t-0001-2", "20200101T000002Z-thread-error-t-0001-3"] {
+        assert!(project.dir().join("inbox/done").join(format!("{id}.md")).is_file(), "{id} was not archived");
+    }
+    // The count line `thread resolve` prints.
+    assert_eq!(threads::archive_note("t-0001", 3), "archived 3 pending items about t-0001");
+    assert_eq!(threads::archive_note("t-0001", 1), "archived 1 pending item about t-0001");
+}
+
+#[test]
+fn a_resolve_that_leaves_the_agent_running_says_so_and_writes_an_item() {
+    let world = World::new();
+    let project = world.project("demo", "a.sock");
+    let cwd = world.home.path().to_string_lossy().into_owned();
+    let t = world.thread(&project, world.home.path(), |t| {
+        t.kind = Kind::Tab;
+        t.worktree_path.clear();
+    });
+    // Its pane is still there and its agent is still listed after the close.
+    *world.panes.borrow_mut() = format!("[{},{}]", world.coordinator_pane(&project), pane_json("w2", "w2:t1", "w2:p1", &cwd));
+    *world.agents.borrow_mut() = format!("[{}]", agent_json("w2", "w2:t1", "w2:p1", &cwd, &t.agent_name, "working"));
+    world.runner.on("tab close", ok(r#"{"result":{}}"#));
+
+    let error = threads::resolve(&world.ctx(), "demo", "t-0001", &ResolveArgs { skip_copy: true, ..ResolveArgs::default() }).unwrap_err();
+    let error = format!("{error:#}");
+    assert!(error.contains("t-0001") && error.contains("w2:p1") && error.contains("still"), "{error}");
+    // The resolve happened, but the record does not read as a clean close.
+    let record = thread::load(&project, "t-0001").unwrap();
+    assert_eq!(record.status, Status::Resolved);
+    assert!(record.stray_agent.contains("w2:p1"), "{record:?}");
+    let rows = threads::rows(&world.ctx(), &project);
+    assert!(rows[0].note.contains("still"), "the row must not hide it: {}", rows[0].note);
+    // And the coordinator hears about it.
+    let items = items_of(&project, "thread-error");
+    assert_eq!(items.len(), 1, "{items:?}");
+    assert_eq!((items[0].subject.as_str(), items[0].event.as_str()), ("t-0001", "agent outlived its pane"));
+    assert!(items[0].summary.contains("still running"), "{}", items[0].summary);
+}
+
+#[test]
+fn a_resolve_whose_agent_went_away_is_a_clean_close() {
+    let world = World::new();
+    let project = world.project("demo", "a.sock");
+    let cwd = world.home.path().to_string_lossy().into_owned();
+    world.thread(&project, world.home.path(), |t| {
+        t.kind = Kind::Tab;
+        t.worktree_path.clear();
+    });
+    *world.panes.borrow_mut() = format!("[{},{}]", world.coordinator_pane(&project), pane_json("w2", "w2:t1", "w2:p1", &cwd));
+    world.runner.on("tab close", ok(r#"{"result":{}}"#));
+
+    threads::resolve(&world.ctx(), "demo", "t-0001", &ResolveArgs { skip_copy: true, ..ResolveArgs::default() }).unwrap();
+    let record = thread::load(&project, "t-0001").unwrap();
+    assert_eq!((record.status, record.stray_agent.as_str()), (Status::Resolved, ""));
+    assert!(items_of(&project, "thread-error").is_empty());
+    assert_eq!(world.runner.count("tab close w2:t1"), 1);
+}
+
+#[test]
+fn audit_reports_the_three_mismatches_and_nothing_in_a_clean_project() {
+    let world = World::new();
+    let project = world.project("demo", "a.sock");
+    *world.panes.borrow_mut() = format!("[{}]", world.coordinator_pane(&project));
+    let ctx = world.ctx();
+    assert!(crate::audit::findings(&ctx, &project).unwrap().is_empty(), "an empty project is clean");
+    assert_eq!(crate::audit::json_value(&project, &[]), serde_json::json!({"project": "demo", "unusual": false, "findings": []}));
+
+    let folder = |name: &str| {
+        let path = world.home.path().join(name);
+        std::fs::create_dir_all(&path).unwrap();
+        path.to_string_lossy().into_owned()
+    };
+    let running = folder("running");
+    let stale = folder("stale");
+    // 1. Resolved, but its agent is still listed: the little-world incident.
+    let resolved = thread::allocate(&project, |t| {
+        t.title = "Resolved".into();
+        t.kind = Kind::Tab;
+        t.status = Status::Resolved;
+        t.agent = "claude".into();
+        t.agent_name = thread::agent_name("demo", &t.id);
+        t.pane_id = "w2:p1".into();
+        t.cwd = running.clone();
+        t.worktree_path.clear();
+    })
+    .unwrap();
+    // 2. An open adopted record whose pane is gone, and an adopted pane never
+    // comes back: nothing will move this thread again.
+    let adopted = thread::allocate(&project, |t| {
+        t.title = "Adopted".into();
+        t.kind = Kind::Adopted;
+        t.status = Status::Open;
+        t.pane_id = "w5:p1".into();
+        t.cwd = "/gone".into();
+    })
+    .unwrap();
+    // 3. A working agent that has written nothing for years.
+    let busy = thread::allocate(&project, |t| {
+        t.title = "Busy".into();
+        t.kind = Kind::Tab;
+        t.status = Status::Open;
+        t.agent = "claude".into();
+        t.agent_name = thread::agent_name("demo", &t.id);
+        t.pane_id = "w3:p1".into();
+        t.cwd = stale.clone();
+        t.worktree_path.clear();
+    })
+    .unwrap();
+    let mut record = thread::load(&project, &busy.id).unwrap();
+    record.updated = "2020-01-01T00:00:00Z".into();
+    record.last_state_change = "2020-01-01T00:00:00Z".into();
+    record.last_report_change = "2019-12-31T00:00:00Z".into();
+    std::fs::write(thread::record_path(&project, &busy.id), toml::to_string(&record).unwrap()).unwrap();
+    *world.agents.borrow_mut() = format!(
+        "[{},{}]",
+        agent_json("w2", "w2:t1", "w2:p1", &running, &resolved.agent_name, "working"),
+        agent_json("w3", "w3:t1", "w3:p1", &stale, &busy.agent_name, "working")
+    );
+
+    let found = crate::audit::findings(&ctx, &project).unwrap();
+    let kinds: Vec<(&str, &str)> = found.iter().map(|f| (f.kind, f.thread.as_str())).collect();
+    assert_eq!(
+        kinds,
+        [
+            (crate::audit::RESOLVED_BUT_RUNNING, resolved.id.as_str()),
+            (crate::audit::REGISTERED_PANE_MISSING, adopted.id.as_str()),
+            (crate::audit::WORKING_BUT_STALE, busy.id.as_str()),
+        ],
+        "{found:?}"
+    );
+    assert!(found[0].detail.contains("w2:p1") && found[0].detail.contains("working"), "{}", found[0].detail);
+    assert!(found[1].detail.contains("adopted"), "{}", found[1].detail);
+    assert!(found[2].detail.contains("nothing was written") && found[2].detail.contains("since 2020-01-01"), "{}", found[2].detail);
+
+    let value = crate::audit::json_value(&project, &found);
+    assert_eq!(value["unusual"], true);
+    assert_eq!(value["findings"][0]["kind"], "resolved-but-running");
+    assert_eq!(value["findings"][1]["thread"], adopted.id);
+    assert_eq!(value["findings"][2]["kind"], "working-but-stale");
+
+    // Nothing was changed by auditing it: still resolved, still adopted, and
+    // not one inbox item, one closed tab or one launched agent.
+    assert_eq!(thread::load(&project, &resolved.id).unwrap().status, Status::Resolved);
+    assert_eq!(thread::load(&project, &adopted.id).unwrap().kind, Kind::Adopted);
+    assert!(inbox::unhandled(&project).is_empty());
+    assert_eq!(world.runner.count("tab close"), 0);
+    assert_eq!(world.runner.count("agent start"), 0);
+}
+
+#[test]
+fn audit_says_so_when_the_session_is_unreachable_instead_of_guessing() {
+    let world = World::new();
+    let project = project::create(&world.root, "demo", "", vec![]).unwrap();
+    let error = crate::audit::findings(&world.ctx(), &project).unwrap_err().to_string();
+    assert!(error.contains("is not reachable") && error.contains("open demo"), "{error}");
+}
+
+#[test]
+fn the_ticker_archives_an_item_about_a_resolved_thread_once_it_is_old() {
+    let world = World::new();
+    let project = world.project("demo", "a.sock");
+    *world.panes.borrow_mut() = format!("[{}]", world.coordinator_pane(&project));
+    let resolved = thread::allocate(&project, |t| {
+        t.title = "Done".into();
+        t.status = Status::Resolved;
+    })
+    .unwrap();
+    let old = "20200101T000000Z-thread-state-t-0001-1";
+    item_at(&project, old, "thread-state", &resolved.id, "2020-01-01T00:00:00Z", "");
+    let young = "20990101T000000Z-thread-state-t-0001-2";
+    item_at(&project, young, "thread-state", &resolved.id, "2099-01-01T00:00:00Z", "");
+    let ctx = world.ctx();
+    let mut memory = Memory::new(&ctx);
+    ticker::tick_project_with(&ctx, &project, &mut memory).unwrap();
+    let left: Vec<String> = inbox::unhandled(&project).into_iter().map(|i| i.id).collect();
+    assert_eq!(left, [young], "the old item is archived, the young one stays");
+    assert!(project.dir().join("inbox/done").join(format!("{old}.md")).is_file());
 }
