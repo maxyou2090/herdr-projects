@@ -2,6 +2,7 @@ mod actions;
 mod adopt;
 mod agents;
 mod assign;
+mod audit;
 mod brief;
 mod cli;
 mod command_link;

@@ -519,7 +519,7 @@ pub fn restart_plan(thread: &Thread, live: &Live, branch_exists: bool, now: jiff
 
 /// Agents and panes of the server a thread lives in: the project's session,
 /// or its machine's through `herdr --machine`.
-fn lists_for(view: &SessionView, record: &Thread) -> Result<(Vec<Agent>, Vec<Pane>)> {
+pub(crate) fn lists_for(view: &SessionView, record: &Thread) -> Result<(Vec<Agent>, Vec<Pane>)> {
     if !record.is_remote() {
         return Ok((view.agents.clone(), view.panes.clone()));
     }
@@ -866,6 +866,7 @@ pub fn resolve(ctx: &Ctx, slug: &str, id: &str, args: &ResolveArgs) -> Result<()
         thread::update(&project, id, |t| {
             t.status = Status::Open;
             t.resolved_reason.clear();
+            t.stray_agent.clear();
         })?;
         println!("{id} is open again. Nothing was started; `thread restart {slug} {id}` brings its agent back.");
         return Ok(());
@@ -873,6 +874,11 @@ pub fn resolve(ctx: &Ctx, slug: &str, id: &str, args: &ResolveArgs) -> Result<()
     if record.status == Status::Resolved {
         bail!("{id} is already resolved; `sweep {slug}` cleans what is left of it");
     }
+    // The resolve starts here. Every item about this thread that already
+    // exists is an event nobody can act on once it is resolved, so the end of
+    // this function moves them to `inbox/done/`; what the resolve writes
+    // itself is newer and stays (see `inbox::done_for_thread`).
+    let started = project::now();
 
     // Every path that resolves a thread performs a final copy first.
     let mut copy_complete = !args.skip_copy;
@@ -895,16 +901,25 @@ pub fn resolve(ctx: &Ctx, slug: &str, id: &str, args: &ResolveArgs) -> Result<()
     let resolved = thread::update(&project, id, |t| {
         t.status = Status::Resolved;
         t.resolved_reason = "manual".into();
+        t.stray_agent.clear();
         t.prompt_pending = false;
     })?;
-    let notes = clean(ctx, &project, &resolved, &Clean {
+    let cleaned = clean(ctx, &project, &resolved, &Clean {
         keep_worktree: args.keep_worktree,
         copy_complete: copy_complete || args.discard_uncopied,
         merged_head: crate::steps::load_state(&project).prs.get(id).map(|s| s.head_oid.clone()).unwrap_or_default(),
     });
+    let notes = cleaned.notes;
+    // A resolved thread's earlier events are done with: archiving them keeps
+    // the inbox about what still needs someone (little-world, 2026-11-13:
+    // 26 of 27 unhandled items pointed at resolved threads).
+    let archived = crate::inbox::done_for_thread(&project, id, &started)?;
     println!("{id} resolved; its report and library are kept.");
     for note in &notes {
         println!("  - {note}");
+    }
+    if archived > 0 {
+        println!("  - {}", archive_note(id, archived));
     }
     let event_id = crate::inbox::write_in(
         &project,
@@ -922,7 +937,38 @@ pub fn resolve(ctx: &Ctx, slug: &str, id: &str, args: &ResolveArgs) -> Result<()
     if called_from_coordinator(ctx, &project) {
         crate::inbox::done(&project, &[event_id], false)?;
     }
-    Ok(())
+    report_stray(&project, id, &resolved, cleaned.stray)
+}
+
+/// The one line `thread resolve` prints when it archived the thread's earlier
+/// items.
+pub(crate) fn archive_note(id: &str, count: usize) -> String {
+    if count == 1 {
+        format!("archived 1 pending item about {id}")
+    } else {
+        format!("archived {count} pending items about {id}")
+    }
+}
+
+/// A resolve whose cleanup left the thread's agent running is not a clean
+/// close: the record says so, an item tells the coordinator, and the caller
+/// gets an error naming the pane. Nothing is killed here: what a surviving
+/// process is for is the user's decision, not this command's.
+pub fn report_stray(project: &Project, id: &str, record: &Thread, stray: Option<StrayAgent>) -> Result<()> {
+    let Some(stray) = stray else {
+        return Ok(());
+    };
+    let summary = format!(
+        "{id} \"{}\" is resolved but its agent is still running: {stray}",
+        record.title
+    );
+    thread::update(project, id, |t| t.stray_agent = stray.to_string())?;
+    crate::inbox::write_in(project, &crate::inbox::lane_of_thread(project, id), "thread-error", id, "agent outlived its pane", &summary, "")?;
+    bail!(
+        "{id} is resolved, but {stray}; nothing was killed. Check `herdr pane list` for {}, end it there (or kill its process), then run `sweep {}` for what is left",
+        stray.pane,
+        project.slug
+    )
 }
 
 /// A coordinator already knows the result of a resolve it initiated, so keep
@@ -949,7 +995,7 @@ pub struct Clean {
 /// Cleans up after a resolved thread: its worktree (never forced), its local
 /// branch when the pull request is merged, its tab. Reports and library are
 /// never touched. Returns one note per thing, for the output and the inbox.
-pub fn clean(ctx: &Ctx, project: &Project, t: &Thread, options: &Clean) -> Vec<String> {
+pub fn clean(ctx: &Ctx, project: &Project, t: &Thread, options: &Clean) -> Cleaned {
     let mut notes = Vec::new();
     let view = session_view(ctx, project);
     let mut merged = t.pr_state.eq_ignore_ascii_case("merged");
@@ -1015,6 +1061,7 @@ pub fn clean(ctx: &Ctx, project: &Project, t: &Thread, options: &Clean) -> Vec<S
         },
         Kind::Adopted => notes.push("its pane was left alone (an adopted pane is yours)".into()),
     }
+    let mut stray = None;
     if let Some(view) = &view {
         clear_thread_tokens(&view.herdr, t);
         // The repository Space herdr grouped the worktree under, once empty.
@@ -1023,8 +1070,71 @@ pub fn clean(ctx: &Ctx, project: &Project, t: &Thread, options: &Clean) -> Vec<S
                 notes.push(format!("{error:#}"));
             }
         }
+        stray = stray_agent(view, t);
     }
-    notes
+    Cleaned { notes, stray }
+}
+
+/// What a resolve saw: the notes it prints and archives, and an agent of the
+/// thread that outlived its own cleanup.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct Cleaned {
+    pub notes: Vec<String>,
+    pub stray: Option<StrayAgent>,
+}
+
+/// An agent of a resolved thread that herdr still lists, in a pane that is
+/// still there, after the cleanup that should have taken both away. The
+/// cleanup did not take effect; `stray_agent` says why this and not more.
+#[derive(Debug, Clone, PartialEq)]
+pub struct StrayAgent {
+    pub pane: String,
+    /// The agent's name, or its kind when it has no name.
+    pub name: String,
+    pub state: String,
+}
+
+impl std::fmt::Display for StrayAgent {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if self.state.is_empty() { write!(f, "agent {} is still in pane {}", self.name, self.pane) } else { write!(f, "agent {} is still in pane {} ({})", self.name, self.pane, self.state) }
+    }
+}
+
+/// The thread's agent, when it is still there after its cleanup.
+///
+/// Herdr lists agents per pane, so "still listed" alone proves nothing: a
+/// listing taken before the close would say so forever. What this asks is the
+/// narrow question herdr can answer — **an agent of this thread is listed, and
+/// the pane it lives in is still there** — which is the tab close that did not
+/// take effect, or a workspace that stayed open. A process that detaches from
+/// a pane that herdr has already forgotten cannot be seen by herdr at all; the
+/// resolve note for a failed close is what covers it.
+///
+/// Listed twice on purpose: the close and the listing go through the same
+/// server, and one more pair of calls turns an entry cached from the moment
+/// before the close into nothing to report, instead of a false alarm on every
+/// resolve. An unreachable session reports nothing: guessing here would block
+/// every resolve on that machine. `Kind::Adopted` panes are the user's and
+/// outlive their thread by design.
+fn stray_agent(view: &SessionView, t: &Thread) -> Option<StrayAgent> {
+    if t.kind == Kind::Adopted || t.pane_id.is_empty() {
+        return None;
+    }
+    let herdr = view.herdr.on_machine(&t.machine);
+    let look = || {
+        let agents = herdr.agent_list().ok()?;
+        let panes = herdr.pane_list().ok()?;
+        agents
+            .iter()
+            .find(|a| thread::agent_matches(t, a) && panes.iter().any(|p| p.pane_id == a.pane_id))
+            .map(|a| StrayAgent {
+                pane: a.pane_id.clone(),
+                name: if a.name.is_empty() { a.agent.clone() } else { a.name.clone() },
+                state: a.agent_status.clone(),
+            })
+    };
+    look()?;
+    look()
 }
 
 /// A last look for the thread's pull request before its branch is judged. The
@@ -1202,7 +1312,12 @@ fn row(t: &Thread, root: &Path, view: Option<&SessionView>, now: jiff::Timestamp
     // Before the first poll a thread that is waiting for its launch is Working.
     let recorded = Group::from_token(&t.last_group).unwrap_or(if t.prompt_pending { Group::Working } else { Group::Idle });
     if t.status == Status::Resolved {
-        return Row { thread: t.clone(), group: Group::Resolved, note: t.resolved_reason.clone() };
+        let note = if t.stray_agent.is_empty() {
+            t.resolved_reason.clone()
+        } else {
+            format!("{}; {}", t.resolved_reason, t.stray_agent)
+        };
+        return Row { thread: t.clone(), group: Group::Resolved, note };
     }
     let Some(view) = view else {
         // Records are still printed; panes are not treated as gone.

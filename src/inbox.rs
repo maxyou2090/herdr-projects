@@ -100,6 +100,38 @@ pub fn lane_of_thread(project: &Project, id: &str) -> String {
     crate::thread::load(project, id).map(|thread| thread.lane).unwrap_or_default()
 }
 
+/// The item kinds whose `subject` is a thread id. Every other kind names
+/// something else (a machine, a lane, a routine, a Space, a session, a file
+/// stem), so "the thread of this item" is only a question for these three.
+/// `thread-error` belongs here with the other two: it is written about a
+/// thread's own pane, and one still in the inbox after that thread is
+/// resolved describes a thread that no longer exists.
+pub const THREAD_SUBJECT_KINDS: [&str; 3] = ["thread-state", "pr", "thread-error"];
+
+/// Moves the items about one thread to `inbox/done/`: the ones an event about
+/// it left behind, which nobody can act on once the thread is resolved.
+/// `created_before` is the instant the resolve started, so an item this same
+/// resolve writes afterwards (`resolved`, a PR found at resolve) stays in the
+/// inbox with its usual meaning. Returns how many moved.
+pub fn done_for_thread(project: &Project, subject: &str, created_before: &str) -> Result<usize> {
+    let before = created_before.parse::<jiff::Timestamp>().ok();
+    let ids: Vec<String> = unhandled(project)
+        .into_iter()
+        .filter(|item| item.subject == subject && THREAD_SUBJECT_KINDS.contains(&item.kind.as_str()))
+        .filter(|item| match (item.created.parse::<jiff::Timestamp>().ok(), before) {
+            (Some(created), Some(before)) => created < before,
+            // An item or a resolve with an unreadable timestamp is left
+            // alone: archiving the wrong event is worse than a stale item.
+            _ => false,
+        })
+        .map(|item| item.id)
+        .collect();
+    if ids.is_empty() {
+        return Ok(0);
+    }
+    done(project, &ids, false)
+}
+
 /// Deletes handled items older than `days`.
 pub fn prune_done(project: &Project, days: u64) {
     let Ok(entries) = std::fs::read_dir(inbox_dir(project).join("done")) else {
