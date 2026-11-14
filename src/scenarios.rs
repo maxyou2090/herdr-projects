@@ -5901,3 +5901,209 @@ fn the_ticker_archives_an_item_about_a_resolved_thread_once_it_is_old() {
     assert_eq!(left, [young], "the old item is archived, the young one stays");
     assert!(project.dir().join("inbox/done").join(format!("{old}.md")).is_file());
 }
+
+// ------------------------------------------------- the audit on a clock
+
+/// Makes the ticker's own registry audit due on the next tick. It runs every
+/// `steps::AUDIT_EVERY_SECS`, and a project it has never audited only records
+/// the time first.
+fn audit_is_due(project: &Project) {
+    let mut state = crate::steps::load_state(project);
+    state.last_audit = "2026-01-01T00:00:00Z".into();
+    crate::steps::save_state(project, &state).unwrap();
+}
+
+/// A project one tick old with a single idle thread and an idle coordinator:
+/// no thread that needs a person, no unhandled item, nothing for a sweep
+/// routine to report.
+fn quiet_project() -> (World, Project) {
+    let (world, project, _) = finished_world("idle");
+    settle(&project);
+    world.runner.on("notification show", ok(r#"{"result":{"shown":true}}"#));
+    ticker::tick_project(&world.ctx(), &project).unwrap();
+    assert!(inbox::unhandled(&project).is_empty(), "the fixture starts clean");
+    (world, project)
+}
+
+/// A resolved thread whose agent is still listed, in a folder of its own so
+/// the pane and cwd match it and nothing else. This is the 2026-11-13 shape:
+/// resolved, so no group and no routine ever mentions it again.
+fn still_running_after_resolve(world: &World, project: &Project) -> Thread {
+    let folder = world.home.path().join("zombie");
+    std::fs::create_dir_all(&folder).unwrap();
+    let t = thread::allocate(project, |t| {
+        t.title = "Zombie".into();
+        t.kind = Kind::Tab;
+        t.status = Status::Resolved;
+        t.agent = "claude".into();
+        t.agent_name = thread::agent_name(&project.slug, &t.id);
+        t.pane_id = "w6:p1".into();
+        t.cwd = folder.to_string_lossy().into_owned();
+        t.worktree_path.clear();
+    })
+    .unwrap();
+    zombie_agent(world, project, &t, true);
+    t
+}
+
+/// The fixture's coordinator and idle thread, plus the resolved thread's own
+/// agent when `running`: the only difference between "it is still there" and
+/// "it is gone".
+fn zombie_agent(world: &World, project: &Project, zombie: &Thread, running: bool) {
+    set_agents(world, project, "idle");
+    if running {
+        let current = world.agents.borrow().trim_end_matches(']').to_string();
+        let extra = agent_json("w6", "w6:t1", &zombie.pane_id, &zombie.cwd, &zombie.agent_name, "working");
+        *world.agents.borrow_mut() = format!("{current},{extra}]");
+    }
+}
+
+#[test]
+fn the_audit_runs_on_a_quiet_project_and_writes_each_finding_once() {
+    let (world, project) = quiet_project();
+    let ctx = world.ctx();
+    write_routine(&project, "sweep", "+++\nschedule = \"every 20m\"\n+++\nSweep the project.\n");
+    // First sight of the routine only records its last run.
+    ticker::tick_project(&ctx, &project).unwrap();
+    let zombie = still_running_after_resolve(&world, &project);
+
+    // The quiet project has been sweeping for hours without a single item.
+    audit_is_due(&project);
+    make_due(&project, "sweep");
+    ticker::tick_project(&ctx, &project).unwrap();
+    let items = items_of(&project, "thread-audit");
+    assert_eq!(items.len(), 1, "{}", items.len());
+    assert_eq!(items[0].subject, zombie.id);
+    assert_eq!(items[0].event, "still running after it was resolved");
+    assert!(items[0].summary.contains("resolved, but its agent is still listed"), "{}", items[0].summary);
+    // The item is news to the sweep routine, so the coordinator hears it
+    // through the prompt it already reads: the trigger the fix adds is the item,
+    // not a louder routine.
+    assert_eq!(items_of(&project, "routine").len(), 1);
+    assert_eq!(crate::steps::load_state(&project).routines["sweep"].quiet, 0);
+
+    // The coordinator answers a sweep by archiving what it read.
+    let ids: Vec<String> = inbox::unhandled(&project).into_iter().map(|i| i.id).collect();
+    inbox::done(&project, &ids, false).unwrap();
+    make_due(&project, "sweep");
+    ticker::tick_project(&ctx, &project).unwrap();
+    assert!(items_of(&project, "thread-audit").is_empty(), "the audit writes each standing finding once");
+    assert_eq!(crate::steps::load_state(&project).routines["sweep"].quiet, 1, "a standing finding is not news on every sweep");
+
+    // A whole audit period later: still no second item, and the sweep is still
+    // quiet — the audit's own bookkeeping is not something that needs a person.
+    audit_is_due(&project);
+    make_due(&project, "sweep");
+    ticker::tick_project(&ctx, &project).unwrap();
+    assert!(items_of(&project, "thread-audit").is_empty());
+    assert!(items_of(&project, "routine").is_empty());
+    assert_eq!(crate::steps::load_state(&project).routines["sweep"].quiet, 2);
+    assert_eq!(
+        crate::steps::load_state(&project).audited.get(&zombie.id).map(String::as_str),
+        Some(crate::audit::RESOLVED_BUT_RUNNING)
+    );
+}
+
+#[test]
+fn an_audit_finding_that_goes_away_is_forgotten_and_reported_when_it_comes_back() {
+    let (world, project) = quiet_project();
+    let ctx = world.ctx();
+    let zombie = still_running_after_resolve(&world, &project);
+    audit_is_due(&project);
+    ticker::tick_project(&ctx, &project).unwrap();
+    assert_eq!(items_of(&project, "thread-audit").len(), 1);
+
+    // Its agent is gone: the finding is over. The ticker forgets it, so a new
+    // occurrence is news again instead of matching an old key forever.
+    zombie_agent(&world, &project, &zombie, false);
+    audit_is_due(&project);
+    ticker::tick_project(&ctx, &project).unwrap();
+    assert_eq!(items_of(&project, "thread-audit").len(), 1, "no new item while the finding is over");
+    assert!(crate::steps::load_state(&project).audited.is_empty());
+
+    // It comes back.
+    zombie_agent(&world, &project, &zombie, true);
+    audit_is_due(&project);
+    ticker::tick_project(&ctx, &project).unwrap();
+    assert_eq!(items_of(&project, "thread-audit").len(), 2, "the recurrence is a new item");
+}
+
+#[test]
+fn a_clean_project_gets_no_item_from_the_audit() {
+    let world = World::new();
+    let project = world.project("demo", "a.sock");
+    *world.panes.borrow_mut() = format!("[{}]", world.coordinator_pane(&project));
+    let ctx = world.ctx();
+    // No thread at all: this project is clean by construction, so anything the
+    // audit writes would be its own noise.
+    ticker::tick_project(&ctx, &project).unwrap();
+    assert!(!crate::steps::load_state(&project).last_audit.is_empty(), "the first tick records the clock");
+    audit_is_due(&project);
+    ticker::tick_project(&ctx, &project).unwrap();
+    assert!(inbox::unhandled(&project).is_empty(), "a clean project stays silent");
+    assert!(crate::steps::load_state(&project).audited.is_empty());
+}
+
+#[test]
+fn the_audit_writes_a_missing_pane_and_a_silent_working_agent_once_each() {
+    let (world, project) = quiet_project();
+    let ctx = world.ctx();
+    // An adopted record whose pane is gone: nothing can ever restart it.
+    let adopted = thread::allocate(&project, |t| {
+        t.title = "Adopted".into();
+        t.kind = Kind::Adopted;
+        t.status = Status::Open;
+        t.pane_id = "w5:p1".into();
+        t.cwd = "/gone".into();
+    })
+    .unwrap();
+    // An agent that says `working` while its record moves nothing.
+    let folder = world.home.path().join("silent");
+    std::fs::create_dir_all(&folder).unwrap();
+    let busy = thread::allocate(&project, |t| {
+        t.title = "Busy".into();
+        t.kind = Kind::Tab;
+        t.status = Status::Open;
+        t.agent = "claude".into();
+        t.agent_name = thread::agent_name(&project.slug, &t.id);
+        t.pane_id = "w3:p1".into();
+        t.cwd = folder.to_string_lossy().into_owned();
+        t.worktree_path.clear();
+    })
+    .unwrap();
+    thread::update(&project, &busy.id, |t| {
+        t.last_state = "working".into();
+        t.last_state_change = "2020-01-01T00:00:00Z".into();
+        t.last_report_change = "2019-12-31T00:00:00Z".into();
+    })
+    .unwrap();
+    let dir = project.canonical_dir().to_string_lossy().into_owned();
+    let home = world.home.path().to_string_lossy().into_owned();
+    let busy_cwd = busy.cwd.clone();
+    *world.agents.borrow_mut() = format!(
+        "[{},{},{}]",
+        agent_json("w1", "w1:t1", "w1:p1", &dir, &format!("hp-{}-coordinator", project.slug), "idle"),
+        agent_json("w2", "w2:t1", "w2:p1", &home, &format!("hp-{}-t-0001", project.slug), "idle"),
+        agent_json("w3", "w3:t1", "w3:p1", &busy_cwd, &busy.agent_name, "working")
+    );
+
+    audit_is_due(&project);
+    ticker::tick_project(&ctx, &project).unwrap();
+    let found: Vec<(String, String)> = items_of(&project, "thread-audit").into_iter().map(|i| (i.subject, i.event)).collect();
+    assert_eq!(
+        found,
+        [
+            (adopted.id.clone(), "pane gone and it cannot restart itself".to_string()),
+            (busy.id.clone(), "working but nothing written".to_string()),
+        ],
+        "{found:?}"
+    );
+
+    // A second period writes neither of them again.
+    audit_is_due(&project);
+    ticker::tick_project(&ctx, &project).unwrap();
+    assert_eq!(items_of(&project, "thread-audit").len(), 2);
+    let audited = crate::steps::load_state(&project).audited;
+    assert_eq!(audited.get(&adopted.id).map(String::as_str), Some(crate::audit::REGISTERED_PANE_MISSING));
+    assert_eq!(audited.get(&busy.id).map(String::as_str), Some(crate::audit::WORKING_BUT_STALE));
+}
