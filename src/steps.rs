@@ -33,6 +33,31 @@ pub const RE_NUDGE_AFTER_SECS: i64 = 30 * 60;
 /// At most one aged reminder per project per this long: a coordinator that
 /// leaves items sitting is reminded, not spammed.
 pub const RE_NUDGE_EVERY_SECS: i64 = 30 * 60;
+/// How often the ticker reruns the registry audit ([`crate::audit`]) on its own.
+///
+/// The check cannot ride on the sweep routine any more: a prompt routine is
+/// suppressed when nothing needs a person ([`prompt_fingerprint`]), and a
+/// thread that already says `resolved` never needs one — it is exactly the
+/// thread that runs for 22 hours unnoticed while the project looks quiet. So
+/// the ticker asks the question itself, on a clock, no matter how quiet the
+/// project is.
+///
+/// A third of [`crate::audit::WORKING_STALE_SECS`], which is what makes this a
+/// number rather than a habit: the audit's granularity is a fraction of the
+/// window it measures, so a thread that goes stale is reported within a third
+/// of the window (30 min) after it crosses it, not up to a whole window late,
+/// and a run lost to an unreachable machine still leaves two more inside the
+/// window. It is also the cost bound: one audit per
+/// `AUDIT_EVERY_SECS / TICK` = 120 ticks, and in that run the local agent and
+/// pane lists are the ones the tick already made (a remote machine costs the
+/// poll it is due anyway).
+pub const AUDIT_EVERY_SECS: i64 = crate::audit::WORKING_STALE_SECS / 3;
+/// The inbox kind of an audit finding. Its own kind, not `thread-error`: an
+/// audit finding is not a pane's retry failure, and `thread-error` belongs to
+/// [`inbox::THREAD_SUBJECT_KINDS`], which `thread resolve` and the ticker
+/// archive once the subject thread is resolved — that would silently delete
+/// the one finding about a thread that outlived its resolution.
+pub const AUDIT_KIND: &str = "thread-audit";
 /// Without a watched turn to compare against, a thread whose last state
 /// change trails its last report change by at least this long ended its
 /// turn without touching the report. A turn the ticker watched working is
@@ -50,8 +75,16 @@ pub const IDLE_NOTE_AFTER_SECS: i64 = 10 * 60;
 /// At most this many subjects are named in one nudge line.
 const NUDGE_SUBJECTS: usize = 5;
 /// Item kinds an aged reminder covers: the coordinator's own work. Others
-/// (`routine-approval`, `config-error`, `outage`) wait on the user instead.
-const RE_NUDGE_KINDS: [&str; 2] = ["thread-state", "routine"];
+/// (`routine-approval`, `config-error`, `outage`) wait on the user instead,
+/// and a `thread-error` is about a pane a person must look at, not an item the
+/// coordinator can finish.
+///
+/// `thread-audit` is here because its findings are the coordinator's own work
+/// and are the most expensive to leave alone: a resolved thread whose agent
+/// still runs leaks tokens for as long as nobody acts, and the audit writes
+/// each standing finding once, so without this reminder that one item could
+/// sit unread for days.
+const RE_NUDGE_KINDS: [&str; 3] = ["thread-state", "routine", AUDIT_KIND];
 pub const PR_INTERVAL_SECS: i64 = 120;
 /// A merged thread whose agent is not busy, reports no progress and wrote no
 /// report since the merge is resolved after this long.
@@ -111,6 +144,21 @@ pub struct State {
     pub session_item_written: bool,
     /// thread id -> the retry-failure line last reported from its pane.
     pub error_seen: BTreeMap<String, String>,
+    /// thread id -> the audit finding last written for it
+    /// (`resolved-but-running` and friends, see [`crate::audit`]). The dedup
+    /// key is the thread, the signature is the kind: one thread can only stand
+    /// in one of those states at a time. A value is written once and kept while
+    /// the finding stands, so the item is not written again when the
+    /// coordinator archives it; a finding that leaves the audit's view is
+    /// dropped, so a finding that comes back is news again.
+    #[serde(default)]
+    pub audited: BTreeMap<String, String>,
+    /// When the ticker last ran the registry audit, UTC. Empty on a project
+    /// this ticker has not audited yet: first sight only records the time
+    /// (like a routine's first `last_run`), so upgrading does not write a
+    /// burst of items for every project in one tick.
+    #[serde(default)]
+    pub last_audit: String,
     /// thread id -> when the ticker first saw its pull request merged.
     pub merged_seen: BTreeMap<String, String>,
     /// When this project's last tick started, UTC. The ticker writes it every
@@ -180,7 +228,10 @@ pub fn load_state(project: &Project) -> State {
 ///
 /// A project with `lanes.json` gets the four fields as maps (§4.4). A project
 /// without one gets the old scalar shape, so its `ticker.json` is unchanged
-/// byte for byte — the zero-change promise for the nine real projects.
+/// byte for byte outside the fields it already had — the zero-change promise
+/// for the nine real projects. A new field of the state has to be added here
+/// too, or it is silently dropped for exactly those projects (the audit did not
+/// run on them until it was).
 pub fn save_state(project: &Project, state: &State) -> Result<()> {
     let _lock = project.lock()?;
     let path = project.state_dir().join("ticker.json");
@@ -209,6 +260,8 @@ pub fn save_state(project: &Project, state: &State) -> Result<()> {
         tick_at: &'a str,
         held_reason: String,
         held_since: String,
+        audited: &'a BTreeMap<String, String>,
+        last_audit: &'a str,
     }
     project::write_json(
         &path,
@@ -231,6 +284,8 @@ pub fn save_state(project: &Project, state: &State) -> Result<()> {
             tick_at: &state.tick_at,
             held_reason: value(&state.held_reason),
             held_since: value(&state.held_since),
+            audited: &state.audited,
+            last_audit: &state.last_audit,
         },
     )
 }
@@ -432,6 +487,68 @@ pub fn write_thread_items(project: &Project, state: &mut State, transitions: &[T
         thread::update(project, &t.id, |t| t.last_review_item_hash = hash)?;
     }
     Ok(())
+}
+
+/// The ticker's own registry audit, every [`AUDIT_EVERY_SECS`]: the same
+/// [`crate::audit::findings_with`] the `thread audit` command prints, with the
+/// one difference that matters for a quiet project — a finding is written to
+/// the inbox instead of to a terminal nobody is watching.
+///
+/// One item per standing finding, and nothing else. No finding means no item,
+/// no counter and no prompt: the audit adds no noise to a healthy project, so
+/// it can run on a clock rather than on a routine that has gone quiet. The
+/// item is written in the thread's lane (a finding is about that thread) and
+/// is **not** one of [`inbox::THREAD_SUBJECT_KINDS`], so resolving the thread
+/// cannot archive away the finding that says it outlived its resolution.
+///
+/// `socket` is the local herdr session, for the agent's own progress record.
+/// `lists` decides which machines are looked at; a machine it does not list
+/// this run proves nothing about its threads, so their memory is kept. Returns
+/// the findings written this run (for the ticker's log).
+pub fn audit_items(
+    project: &Project,
+    state: &mut State,
+    socket: &str,
+    now: jiff::Timestamp,
+    lists: &mut dyn crate::audit::LiveLists,
+    notifier: &crate::notify::Notifier,
+) -> Result<Vec<crate::audit::Finding>> {
+    let Ok(last) = state.last_audit.parse::<jiff::Timestamp>() else {
+        // First sight, a brand-new project or the upgrade that added this step:
+        // only record the clock, like a routine's first `last_run`. Auditing
+        // ten existing projects in the same tick would write a burst of items
+        // for whatever the check has never looked at (threads mid-launch
+        // included); one period later each project is checked on its own.
+        state.last_audit = now.to_string();
+        return Ok(Vec::new());
+    };
+    if now.as_second() - last.as_second() < AUDIT_EVERY_SECS {
+        return Ok(Vec::new());
+    }
+    state.last_audit = now.to_string();
+    let run = crate::audit::findings_with(project, socket, now, lists);
+    let mut written = Vec::new();
+    for finding in &run.found {
+        if state.audited.get(&finding.thread).map(String::as_str) == Some(finding.kind) {
+            continue;
+        }
+        let label = thread::load(project, &finding.thread).map(|t| thread_label(&t)).unwrap_or_else(|_| finding.thread.clone());
+        let summary = format!(
+            "{label} {}. This is written once per finding and reported again only if it goes away and comes back; `thread audit {}` prints the same, and the check itself changes nothing.",
+            finding.detail, project.slug
+        );
+        inbox::write_in(project, &inbox::lane_of_thread(project, &finding.thread), AUDIT_KIND, &finding.thread, finding.event(), &summary, "")?;
+        state.audited.insert(finding.thread.clone(), finding.kind.to_string());
+        notifier.send(&finding.thread, &format!("audit · {}", finding.event()), crate::notify::Sound::Request, false);
+        written.push(finding.clone());
+    }
+    // Forget the findings that are gone, so one that comes back is news again.
+    // Only for threads the audit could look at: a thread on a machine it could
+    // not list this run was not judged clean.
+    state.audited.retain(|thread, kind| {
+        !run.examined.contains(thread) || run.found.iter().any(|f| &f.thread == thread && f.kind == kind.as_str())
+    });
+    Ok(written)
 }
 
 /// A thread left idle with a failed retry on its pane has lost its turn: its
@@ -1279,10 +1396,14 @@ pub fn auto_resolve(ctx: &Ctx, project: &Project, settings: &Settings, memory: &
 ///   without report`, `resolved`) are one person's reading task, not a reason
 ///   to interrupt that person with a sweep.
 ///
-/// Every other kind stays: `pr`, `thread-error`, `config-error`, `lane`,
-/// `session`, `outage`, `space` and `rename` are written once per distinct
-/// event by writers that dedupe, so each is a real change that needs a person
-/// and none of them churns.
+/// Every other kind stays: `pr`, `thread-error`, `thread-audit`,
+/// `config-error`, `lane`, `session`, `outage`, `space` and `rename` are
+/// written once per distinct event by writers that dedupe, so each is a real
+/// change that needs a person and none of them churns. `thread-audit` in
+/// particular must stay counted: a finding that a thread outlived its
+/// resolution (or claims to work with nothing written) is exactly the thing
+/// nobody else reports, and its writer holds one item per standing finding, so
+/// it cannot churn (§[`audit_items`]).
 const PROMPT_IGNORED_KINDS: [&str; 3] = ["routine", "routine-approval", "thread-state"];
 
 /// The unhandled items a prompt-only routine may have to act on, oldest
@@ -2203,3 +2324,4 @@ mod tests {
         assert_eq!(outage.record(true, "", at("2026-09-17T11:32:00Z"), 600), None);
     }
 }
+

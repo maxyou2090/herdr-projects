@@ -1116,6 +1116,24 @@ fn tick_slow(ctx: &Ctx, project: &Project, seen: &Seen, memory: &mut Memory, log
     errors.extend(steps::write_thread_items(project, &mut state, &transitions, seen.session_lost, &copy_notes, &notifier).err());
     errors.extend(steps::write_stuck_items(project, &mut state, &seen.stuck, &notifier).err());
     errors.extend(steps::write_idle_notes(project, &mut state, now).err());
+    // The registry audit, on its own clock (`steps::AUDIT_EVERY_SECS`) instead
+    // of on the sweep routine's: that prompt is suppressed while a project is
+    // quiet, which is exactly when a resolved thread that never stopped running
+    // goes unnoticed. It runs before the routines so a new finding is already
+    // in the inbox when this tick decides whether a sweep has news. The local
+    // lists are the ones this tick already made; a remote machine is polled at
+    // most once per audit through the same gate as the remote pass.
+    {
+        let mut lists = AuditLists { seen, herdr: &herdr, memory, machines: Default::default() };
+        match steps::audit_items(project, &mut state, &seen.socket, now, &mut lists, &notifier) {
+            Ok(written) if !written.is_empty() => {
+                let what: Vec<String> = written.iter().map(|f| format!("{} {}", f.thread, f.kind)).collect();
+                log.line(&format!("{}: audit wrote {} item(s): {}", project.slug, written.len(), what.join(", ")));
+            }
+            Ok(_) => {}
+            Err(error) => errors.push(error.context("audit")),
+        }
+    }
     // §7: an open lane with live threads and no live coordinator gets one
     // `lane` item, addressed to the default lane, deduplicated on its thread
     // count. A project without a registry has no lane that can be orphaned.
@@ -1153,6 +1171,32 @@ fn tick_slow(ctx: &Ctx, project: &Project, seen: &Seen, memory: &mut Memory, log
         errors.extend(steps::save_state(project, &state).err());
     }
     errors
+}
+
+/// The audit's live lists while the ticker runs. This session's agents and
+/// panes are the ones `tick_cheap` already listed, so a local run costs no
+/// call at all; another machine is listed at most once per
+/// `steps::REMOTE_EVERY_TICKS` through the same [`Memory`] gate the remote pass
+/// uses, and `None` when it is not its turn leaves those threads unexamined
+/// (their findings are then kept, not forgotten).
+struct AuditLists<'a> {
+    seen: &'a Seen,
+    herdr: &'a Herdr<'a>,
+    memory: &'a mut Memory,
+    machines: crate::audit::MachineLists,
+}
+
+impl crate::audit::LiveLists for AuditLists<'_> {
+    fn lists(&mut self, machine: &str) -> Option<(&[Agent], &[Pane])> {
+        if machine.is_empty() {
+            return Some((&self.seen.agents, &self.seen.panes));
+        }
+        if !self.machines.contains_key(machine) {
+            let lists = self.memory.machine_is_due(machine).then(|| crate::threads::machine_lists(self.herdr, machine).ok()).flatten();
+            self.machines.insert(machine.to_string(), lists);
+        }
+        self.machines.get(machine).and_then(Option::as_ref).map(|(agents, panes)| (agents.as_slice(), panes.as_slice()))
+    }
 }
 
 #[cfg(test)]

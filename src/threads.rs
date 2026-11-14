@@ -523,8 +523,15 @@ pub(crate) fn lists_for(view: &SessionView, record: &Thread) -> Result<(Vec<Agen
     if !record.is_remote() {
         return Ok((view.agents.clone(), view.panes.clone()));
     }
-    let herdr = view.herdr.on_machine(&record.machine);
-    let unreachable = |e: crate::herdr::HerdrError| anyhow::anyhow!("machine `{}` is unreachable: {e}", record.machine);
+    machine_lists(&view.herdr, &record.machine)
+}
+
+/// Agents and panes of one machine, named by `Thread::machine` (`""` is this
+/// session, which the caller already listed). One `agent list` and one
+/// `pane list` per call, so callers cache the result per machine.
+pub(crate) fn machine_lists(herdr: &Herdr, machine: &str) -> Result<(Vec<Agent>, Vec<Pane>)> {
+    let herdr = herdr.on_machine(machine);
+    let unreachable = |e: crate::herdr::HerdrError| anyhow::anyhow!("machine `{machine}` is unreachable: {e}");
     Ok((herdr.agent_list().map_err(unreachable)?, herdr.pane_list().map_err(unreachable)?))
 }
 
