@@ -179,7 +179,9 @@ sense to Herdr 1. The one-off migration (destructive, done once, by hand) was:
 - move `.state/ticker.json` and `.state/lock` (and the root `.ticker.lock`) into
   `.state.pre-core/`, so stale pane ids and nudge hashes never vote again.
 
-`.state.pre-core/` can be deleted whenever it stops being interesting.
+`scripts/migrate-from-herdr1-state.py` does exactly this and is safe to re-read
+before running it; `.state.pre-core/` can be deleted whenever it stops being
+interesting.
 
 ## 8. What is still open
 
