@@ -111,10 +111,6 @@ impl FakeCore {
         }
     }
 
-    pub fn labels(&self, name: &str) -> std::collections::BTreeMap<String, String> {
-        self.terminals.borrow().iter().find(|t| t.name == name || t.address == name).map(|t| t.labels.clone()).unwrap_or_default()
-    }
-
     fn find(&self, id: &str) -> Option<Terminal> {
         self.terminals.borrow().iter().find(|t| t.name == id || t.address == id).cloned()
     }
@@ -125,14 +121,9 @@ impl FakeCore {
         Some(std::cell::RefMut::map(terminals, move |all| &mut all[index]))
     }
 
-    /// The one call path: `hc [--on M] --json <command> <args...>`.
+    /// The one call path: `hc --json <command> <args...>`.
     fn dispatch(&self, args: &[String]) -> Result<Output> {
         let mut args: Vec<&str> = args.iter().map(String::as_str).collect();
-        let is_machine = args.first() == Some(&"--on");
-        if is_machine {
-            args.drain(..2);
-        }
-        let _ = is_machine;
         let json = !args.is_empty() && args[0] == "--json";
         if json {
             args.remove(0);

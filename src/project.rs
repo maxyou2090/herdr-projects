@@ -118,11 +118,11 @@ pub fn now() -> String {
         .unwrap_or_default()
 }
 
+/// A repository the project works in. `[[repos]]` in PROJECT.md; a line left
+/// by an older version may carry `machine = "..."`, which serde ignores.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct Repo {
     pub path: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub machine: Option<String>,
 }
 
 /// `PROJECT.md` front matter. `repos` is last so the TOML tables follow the
@@ -535,26 +535,6 @@ pub fn list_slugs(root: &Path) -> Vec<String> {
     slugs
 }
 
-/// `PATH[@MACHINE]` as given to `new --repo`.
-pub fn parse_repo_arg(arg: &str) -> Repo {
-    if let Some((path, machine)) = arg.rsplit_once('@') {
-        let label_like = !machine.is_empty()
-            && machine
-                .chars()
-                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'));
-        if label_like && !path.is_empty() {
-            return Repo {
-                path: path.to_string(),
-                machine: Some(machine.to_string()),
-            };
-        }
-    }
-    Repo {
-        path: arg.to_string(),
-        machine: None,
-    }
-}
-
 const TASKS_TEMPLATE: &str = "# Tasks\n\n## Backlog\n";
 
 const INSTRUCTIONS_TEMPLATE: &str = "\
@@ -727,16 +707,11 @@ pub fn create(root: &Path, name: &str, goal: &str, repos: Vec<Repo>) -> Result<P
     }
     let repos = repos
         .into_iter()
-        .map(|repo| match repo.machine {
-            // A remote path is stored as it is on its own machine.
-            Some(_) => repo,
-            None => Repo {
-                path: std::fs::canonicalize(&repo.path)
-                    .or_else(|_| std::path::absolute(&repo.path))
-                    .map(|p| p.to_string_lossy().into_owned())
-                    .unwrap_or(repo.path),
-                machine: None,
-            },
+        .map(|repo| Repo {
+            path: std::fs::canonicalize(&repo.path)
+                .or_else(|_| std::path::absolute(&repo.path))
+                .map(|p| p.to_string_lossy().into_owned())
+                .unwrap_or(repo.path),
         })
         .collect();
     let settings = Settings {
@@ -833,13 +808,7 @@ mod tests {
     fn create_writes_the_skeleton_and_refuses_a_second_time() {
         let root = tempfile::tempdir().unwrap();
         let root = root.path().join("root");
-        let project = create(
-            &root,
-            "Demo",
-            "Ship \"it\"",
-            vec![parse_repo_arg("/srv/app@box"), parse_repo_arg("/no/such/repo")],
-        )
-        .unwrap();
+        let project = create(&root, "Demo", "Ship \"it\"", vec![Repo { path: "/srv/app".into() }, Repo { path: "/no/such/repo".into() }]).unwrap();
         assert_eq!(project.slug, "demo");
         for sub in ["memory", "scratch", "routines", "threads", "inbox/done", "library", "uploads", ".state"] {
             assert!(project.dir().join(sub).is_dir(), "{sub}");
@@ -856,13 +825,7 @@ mod tests {
         assert!(project.dir().join(PR_FOLLOWUP).is_file());
         assert!(project.dir().join(COORDINATOR_SWEEP).is_file());
         assert!(crate::routine::load_all(&project).1.is_empty(), "the default routines parse");
-        assert_eq!(
-            settings.repos,
-            vec![
-                Repo { path: "/srv/app".into(), machine: Some("box".into()) },
-                Repo { path: "/no/such/repo".into(), machine: None },
-            ]
-        );
+        assert_eq!(settings.repos, vec![Repo { path: "/srv/app".into() }, Repo { path: "/no/such/repo".into() }]);
         assert!(body.starts_with("# Instructions"));
         assert_eq!(project.status(), Status::Active);
         assert!(create(&root, "demo", "", vec![]).is_err());
@@ -992,13 +955,11 @@ mod tests {
     }
 
     #[test]
-    fn repo_arg_parsing() {
-        assert_eq!(parse_repo_arg("/a/b").machine, None);
-        assert_eq!(parse_repo_arg("/a/b@m1").machine.as_deref(), Some("m1"));
-        assert_eq!(parse_repo_arg("/a/b@m1").path, "/a/b");
-        // An `@` inside a path is not a machine.
-        assert_eq!(parse_repo_arg("/a@b/c").machine, None);
-        assert_eq!(parse_repo_arg("/a@b/c").path, "/a@b/c");
+    fn a_project_file_left_with_a_machine_column_still_loads() {
+        // Written by a version that could place a repo on another machine.
+        let text = "+++\nname = \"Demo\"\n\n[[repos]]\npath = \"/srv/app\"\nmachine = \"box\"\n\n[[repos]]\npath = \"/home/me/lib\"\n+++\n\n# Instructions\nBody\n";
+        let (settings, _) = parse_project_md(text).unwrap();
+        assert_eq!(settings.repos, vec![Repo { path: "/srv/app".into() }, Repo { path: "/home/me/lib".into() }]);
     }
 
     #[test]

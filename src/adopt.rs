@@ -31,8 +31,8 @@ pub fn adoptable_agent_except(ctx: &Ctx, herdr: &Herdr, socket: &str, pane: &str
         .into_iter()
         .find(|a| a.pane_id == pane)
         .with_context(|| format!("no agent is detected in pane {pane} of the session at {socket}; only a running local agent pane can be adopted"))?;
-    // A pane is identified by (socket, machine, id): the same id in another
-    // session is another pane.
+    // A pane is identified by (socket, id): the same id in another session is
+    // another pane.
     for slug in project::list_slugs(&ctx.root) {
         let Ok(other) = Project::load(&ctx.root, &slug) else {
             continue;
@@ -46,7 +46,7 @@ pub fn adoptable_agent_except(ctx: &Ctx, herdr: &Herdr, socket: &str, pane: &str
         if own != Some(slug.as_str()) && coordinator::is_coordinator(&record, &agent) {
             bail!("pane {pane} is a coordinator of `{slug}` (its working directory is the project folder)");
         }
-        if let Some(t) = thread::list(&other).iter().find(|t| !t.is_remote() && t.status != Status::Resolved && t.pane_id == pane && thread::agent_matches(t, &agent)) {
+        if let Some(t) = thread::list(&other).iter().find(|t| t.status != Status::Resolved && t.pane_id == pane && thread::agent_matches(t, &agent)) {
             bail!("pane {pane} is already thread {} of `{slug}`", t.id);
         }
     }

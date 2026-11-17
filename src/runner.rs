@@ -63,6 +63,9 @@ impl Cmd {
         self
     }
 
+    /// Only tests feed a command's stdin: nothing the binary runs by itself
+    /// reads one any more.
+    #[cfg(test)]
     pub fn stdin(mut self, text: impl Into<String>) -> Self {
         self.stdin = Some(text.into());
         self
@@ -74,7 +77,7 @@ impl Cmd {
     }
 
     /// The command as one line; the scripted fake matches on it.
-    #[cfg_attr(not(test), allow(dead_code))]
+    #[cfg(test)]
     pub fn display(&self) -> String {
         let mut line = self.program.clone();
         for arg in &self.args {
@@ -121,7 +124,7 @@ pub trait Runner {
     /// One JSON line to a herdr socket, one line back. The single exception to
     /// "talk to herdr through its CLI" (client decision during the build):
     /// herdr 0.9.1 has no CLI command for `agent.view.set` / `agent.view.clear`.
-
+    ///
     /// Runs `cmd` on this process's terminal (an agent `open` starts in its own
     /// pane) and waits for it; `cmd.timeout` and `cmd.stdin` are ignored.
     /// While it runs, `poll` is called about twice a second until it returns
@@ -313,11 +316,14 @@ pub mod fake {
 
     type Matcher = Box<dyn Fn(&Cmd) -> bool>;
 
+    /// What a scripted runner answers one command with.
+    type Rule = Box<dyn Fn(&Cmd) -> Result<Output>>;
+
     /// A scripted runner: the first rule whose matcher accepts the command
     /// answers it. Every command is recorded, matched or not.
     #[derive(Default)]
     pub struct FakeRunner {
-        rules: RefCell<Vec<(Matcher, Box<dyn Fn(&Cmd) -> Result<Output>>)>>,
+        rules: RefCell<Vec<(Matcher, Rule)>>,
         pub calls: RefCell<Vec<Cmd>>,
     }
 
@@ -333,17 +339,6 @@ pub mod fake {
                 Box::new(move |cmd| cmd.display().contains(&needle)),
                 Box::new(move |_| Ok(output.clone())),
             ));
-            self
-        }
-
-        pub fn on_fn(
-            &self,
-            matcher: impl Fn(&Cmd) -> bool + 'static,
-            answer: impl Fn(&Cmd) -> Result<Output> + 'static,
-        ) -> &Self {
-            self.rules
-                .borrow_mut()
-                .push((Box::new(matcher), Box::new(answer)));
             self
         }
 
@@ -368,13 +363,6 @@ pub mod fake {
         Output {
             code: Some(code),
             stderr: stderr.to_string(),
-            ..Output::default()
-        }
-    }
-
-    pub fn timeout() -> Output {
-        Output {
-            timed_out: true,
             ..Output::default()
         }
     }

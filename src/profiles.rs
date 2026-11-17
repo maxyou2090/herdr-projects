@@ -562,8 +562,8 @@ pub fn write_project_defaults(project: &Project, thread: &str, coordinator: &str
 }
 
 /// `profile resolve [NAME]`: a profile's launch setup on this machine, as
-/// JSON, for another machine starting a thread here. Without a name, the
-/// `[defaults] thread_profile`. `~/` in arguments is this machine's home.
+/// JSON for scripts. Without a name, the `[defaults] thread_profile`. `~/` in
+/// arguments is this machine's home.
 pub fn resolve_json(ctx: &Ctx, name: Option<&str>) -> Result<String> {
     let config = load(&ctx.config_dir)?;
     let name = name.map(str::to_string).unwrap_or_else(|| config.new_project_default(Role::Thread));
@@ -699,7 +699,7 @@ mod tests {
     }
 
     #[test]
-    fn resolve_prints_this_machines_setup_for_another_machine() {
+    fn resolve_prints_a_profiles_launch_setup_as_json() {
         let home = tempfile::tempdir().unwrap();
         let env = crate::paths::Env::for_test(home.path(), &[]);
         let runner = crate::runner::fake::FakeRunner::new();

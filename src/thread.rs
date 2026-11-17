@@ -64,8 +64,7 @@ impl Kind {
     }
 }
 
-/// `threads/<id>.toml`. An empty string means "not set". Paths are stored as
-/// they are on the thread's own machine.
+/// `threads/<id>.toml`. An empty string means "not set".
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
 #[serde(default)]
 pub struct Thread {
@@ -95,7 +94,6 @@ pub struct Thread {
     pub origin: String,
     pub branch: String,
     pub base: String,
-    pub machine: String,
     pub worktree_path: String,
     pub thread_dir: String,
     pub workspace_id: String,
@@ -118,12 +116,6 @@ pub struct Thread {
     /// Before profiles: a model flag for the agent CLI (checked again by the
     /// ticker). New threads leave it empty.
     pub agent_args: Vec<String>,
-    /// A remote thread's profile as its own machine defines it: looked up
-    /// there at start or restart (`profile resolve`), launched with
-    /// `agent` plus these arguments. The name is still checked against this
-    /// project's allow-list at every launch.
-    pub remote_profile: bool,
-    pub profile_args: Vec<String>,
     pub agent_name: String,
     pub cwd: String,
     pub created: String,
@@ -164,10 +156,6 @@ pub struct Thread {
 }
 
 impl Thread {
-    pub fn is_remote(&self) -> bool {
-        !self.machine.is_empty()
-    }
-
     pub fn report_path(&self) -> String {
         format!("{}/report.md", self.thread_dir)
     }
@@ -422,9 +410,8 @@ pub struct BriefInput<'a> {
     pub slug: &'a str,
     pub goal: &'a str,
     pub repos: &'a [project::Repo],
-    /// The project's `uploads/` folder on the home machine.
+    /// The project's `uploads/` folder.
     pub uploads_path: &'a str,
-    pub remote: bool,
     pub instructions: &'a str,
     pub memory_index: &'a str,
     /// (file name, contents), in the order they should be inlined.
@@ -433,8 +420,7 @@ pub struct BriefInput<'a> {
     pub restart: bool,
     pub report_path: &'a str,
     pub library_path: &'a str,
-    /// `<binary> --root <root>` for `report`; empty for a remote thread,
-    /// whose machine has its own binary (or none).
+    /// `<binary> --root <root>` for `report`; empty when no binary is known.
     pub report_prefix: &'a str,
 }
 
@@ -449,14 +435,10 @@ fn brief_header(input: &BriefInput) -> String {
     } else {
         out.push_str("- Repos:\n");
         for repo in input.repos {
-            match &repo.machine {
-                Some(machine) => out.push_str(&format!("  - {} on machine `{machine}`\n", repo.path)),
-                None => out.push_str(&format!("  - {} (local)\n", repo.path)),
-            }
+            out.push_str(&format!("  - {}\n", repo.path));
         }
     }
-    let uploads_note = if input.remote { " (on the home machine; not copied to yours)" } else { "" };
-    out.push_str(&format!("- Uploads, files from the user: `{}`{uploads_note}\n", input.uploads_path));
+    out.push_str(&format!("- Uploads, files from the user: `{}`\n", input.uploads_path));
     out.push_str(&format!("- Library, files for the user: `{}`\n", input.library_path));
     out.push_str(&format!("- Report: `{}`\n", input.report_path));
     out
@@ -517,7 +499,7 @@ pub fn brief_for(project: &Project, thread: &Thread, task: &str, restart: bool) 
     let (settings, instructions) = project.read_project_md()?;
     let project_name = project::display_name(&settings.name, &project.slug);
     let uploads = project.dir().join("uploads").to_string_lossy().into_owned();
-    let prefix = if thread.is_remote() { String::new() } else { crate::coordinator::current_prefix(&project.root).unwrap_or_default() };
+    let prefix = crate::coordinator::current_prefix(&project.root).unwrap_or_default();
     let memory_index = std::fs::read_to_string(project.dir().join("MEMORY.md")).unwrap_or_default();
     let mut names: Vec<String> = std::fs::read_dir(project.dir().join("memory"))
         .map(|entries| {
@@ -544,7 +526,6 @@ pub fn brief_for(project: &Project, thread: &Thread, task: &str, restart: bool) 
         goal: &settings.goal,
         repos: &settings.repos,
         uploads_path: &uploads,
-        remote: thread.is_remote(),
         instructions: &instructions,
         memory_index: &memory_index,
         memory_files: &memory_files,
@@ -784,11 +765,10 @@ pub fn live_state(thread: &Thread, agents: &[Agent], panes: &[Pane], now: jiff::
 }
 
 /// `live_state` plus the agent's own report from `<root>/.progress/`, matched
-/// by pane id and terminal id. Remote threads have none (the record is written
-/// on the machine where the agent runs).
+/// by pane id and terminal id.
 pub fn live_with_report(thread: &Thread, agents: &[Agent], panes: &[Pane], now: jiff::Timestamp, root: &Path, socket: &str) -> Live {
     let mut live = live_state(thread, agents, panes, now);
-    if thread.is_remote() || !live.pane_exists {
+    if !live.pane_exists {
         return live;
     }
     let terminal = agents
@@ -911,71 +891,6 @@ pub fn copy_home_local(project: &Project, thread: &Thread, with_library: bool, r
         }
     }
 
-    let outcome = if notes.is_empty() { CopyOutcome::Complete } else { CopyOutcome::Partial(notes) };
-    Copied { outcome, report_hash }
-}
-
-/// The same copy for a thread on a saved machine: the report with `scp`, the
-/// library with rsync over ssh, after checking on the machine (without
-/// following links) what is a real directory and a regular file.
-pub fn copy_home_remote(project: &Project, thread: &Thread, with_library: bool, runner: &dyn Runner, target: &str) -> Copied {
-    use crate::remote;
-    let failed = |error: String| Copied { outcome: CopyOutcome::Failed(error), report_hash: None };
-    if thread.thread_dir.is_empty() {
-        return Copied { outcome: CopyOutcome::Complete, report_hash: None };
-    }
-    let found = match remote::layout(runner, target, &thread.thread_dir) {
-        Ok(found) => found,
-        Err(error) => return failed(format!("{error:#}")),
-    };
-    if found.absent {
-        return Copied { outcome: CopyOutcome::Complete, report_hash: None };
-    }
-    if !found.dir_ok {
-        return Copied { outcome: CopyOutcome::Partial(vec![format!("{} on {target} is a symbolic link; nothing was copied", thread.thread_dir)]), report_hash: None };
-    }
-    let mut notes = Vec::new();
-    let mut report_hash = None;
-    if found.report_ok {
-        let tmp = project.dir().join("threads").join(format!(".{}.fetch.{}.tmp", thread.id, std::process::id()));
-        let fetched = remote::fetch_file(runner, target, &thread.report_path(), &tmp).and_then(|()| Ok(std::fs::read(&tmp)?));
-        let _ = std::fs::remove_file(&tmp);
-        match fetched {
-            Ok(bytes) => {
-                let written = project.lock().and_then(|_lock| write_atomic(&home_report_path(project, &thread.id), &bytes));
-                if let Err(error) = written {
-                    return failed(format!("{error:#}"));
-                }
-                report_hash = Some(sha256_hex(&bytes));
-            }
-            Err(error) => return failed(format!("{error:#}")),
-        }
-    } else if found.report_is_other {
-        notes.push(format!("{} on {target} is not a regular file; it was not copied", thread.report_path()));
-    }
-
-    if with_library {
-        if found.library_is_link {
-            notes.push(format!("{} on {target} is a symbolic link; the library was not copied", thread.library_path()));
-        } else if found.library_ok && found.library_kb > LIBRARY_CAP_KB {
-            notes.push(format!("the library is {} MB, over the {} MB cap; nothing from it was copied", found.library_kb / 1024, LIBRARY_CAP_KB / 1024));
-        } else if found.library_ok {
-            notes.extend(found.symlinks.iter().map(|p| format!("{p} is a symbolic link; it was not copied")));
-            let target_dir = project.dir().join("library").join(&thread.id);
-            let made = project.lock().and_then(|_lock| {
-                if !target_dir.is_dir() {
-                    std::fs::create_dir(&target_dir)?;
-                }
-                Ok(())
-            });
-            if let Err(error) = made {
-                return Copied { outcome: CopyOutcome::Failed(format!("{error:#}")), report_hash };
-            }
-            if let Err(error) = remote::fetch_dir(runner, target, &thread.library_path(), &target_dir) {
-                return Copied { outcome: CopyOutcome::Failed(format!("{error:#}")), report_hash };
-            }
-        }
-    }
     let outcome = if notes.is_empty() { CopyOutcome::Complete } else { CopyOutcome::Partial(notes) };
     Copied { outcome, report_hash }
 }
@@ -1275,6 +1190,32 @@ mod tests {
     }
 
     #[test]
+    fn a_record_written_when_threads_could_live_on_another_machine_still_loads() {
+        let root = tempfile::tempdir().unwrap();
+        let project = project::create(root.path(), "demo", "", vec![]).unwrap();
+        // One empty field (the usual leftover) and one naming a machine: both
+        // are unknown to this version and must be ignored, not rejected.
+        for machine in ["\"\"", "\"box\""] {
+            let t = allocate(&project, |t| {
+                t.title = format!("Old {machine}");
+                t.repo = "/srv/app".into();
+            })
+            .unwrap();
+            let text = std::fs::read_to_string(record_path(&project, &t.id)).unwrap();
+            let with_machine = text.replacen("base = ", &format!("machine = {machine}\nbase = "), 1);
+            assert!(with_machine.contains(&format!("machine = {machine}")), "{with_machine}");
+            std::fs::write(record_path(&project, &t.id), &with_machine).unwrap();
+            let loaded = load(&project, &t.id).unwrap();
+            assert_eq!((loaded.title.as_str(), loaded.repo.as_str()), (format!("Old {machine}").as_str(), "/srv/app"));
+        }
+        assert_eq!(list(&project).len(), 2);
+        // `thread list` runs off these rows; with no session it still prints them.
+        let rows = crate::threads::rows_with_view(&project, None);
+        assert_eq!(rows.len(), 2);
+        assert!(rows.iter().all(|row| row.note == "session unreachable"));
+    }
+
+    #[test]
     fn an_index_only_memory_file_is_not_inlined_into_a_brief() {
         let root = tempfile::tempdir().unwrap();
         let project = project::create(root.path(), "demo", "", vec![]).unwrap();
@@ -1296,17 +1237,13 @@ mod tests {
             ("b.md".to_string(), "x".repeat(MEMORY_CAP_CHARS)),
             ("c.md".to_string(), "gamma fact".to_string()),
         ];
-        let repos = vec![
-            project::Repo { path: "/srv/app".into(), machine: Some("box".into()) },
-            project::Repo { path: "/home/me/lib".into(), machine: None },
-        ];
+        let repos = vec![project::Repo { path: "/srv/app".into() }, project::Repo { path: "/home/me/lib".into() }];
         let input = BriefInput {
             project_name: "Demo",
             slug: "demo",
             goal: "Ship it",
             repos: &repos,
             uploads_path: "/root/demo/uploads",
-            remote: false,
             instructions: "Always run the tests.",
             memory_index: "# Memory\n- a\n- b\n- c",
             memory_files: &files,
@@ -1318,9 +1255,9 @@ mod tests {
         };
         let brief = compose_brief(&input);
         let pos = |needle: &str| brief.find(needle).unwrap_or_else(|| panic!("missing {needle}"));
-        // The header comes first: name, goal, repos with machines, uploads, library, report.
+        // The header comes first: name, goal, repos, uploads, library, report.
         assert!(brief.starts_with("# Project\n\n- Project: Demo (`demo`)\n- Goal: Ship it\n"));
-        assert!(pos("/srv/app on machine `box`") < pos("/home/me/lib (local)"));
+        assert!(pos("- Repos:\n  - /srv/app\n  - /home/me/lib\n") < pos("- Uploads"));
         assert!(pos("Uploads, files from the user: `/root/demo/uploads`") < pos("# Thread brief"));
         assert!(pos("# Thread brief") < pos("previous attempt"));
         assert!(pos("previous attempt") < pos("Always run the tests."));
@@ -1337,10 +1274,10 @@ mod tests {
             assert!(!brief.contains(word), "{word}");
         }
 
-        let fresh = compose_brief(&BriefInput { goal: "", repos: &[], remote: true, instructions: "", memory_index: "", memory_files: &[], task: "t", restart: false, report_path: "r", library_path: "l", report_prefix: "", ..input });
+        let fresh = compose_brief(&BriefInput { goal: "", repos: &[], instructions: "", memory_index: "", memory_files: &[], task: "t", restart: false, report_path: "r", library_path: "l", report_prefix: "", ..input });
         assert!(!fresh.contains("previous attempt"));
         assert!(fresh.contains("- Goal: (none set)\n- Repos: (none)\n"));
-        assert!(fresh.contains("on the home machine; not copied"));
+        assert!(fresh.contains("if that command exists on this machine"), "no prefix: the note is the fallback");
     }
 
     #[test]

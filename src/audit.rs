@@ -10,11 +10,9 @@
 //! sweep that used to be this check's only caller: the routine prompt is
 //! suppressed when nothing needs a person, and a zombie thread that is already
 //! `resolved` needs nobody until someone notices it (the 2026-11-13 incident).
-//! The command and the ticker differ only in where their live lists come from
-//! ([`LiveLists`]) and in what they do with a finding: print it, or write one
-//! inbox item per finding.
+//! The command and the ticker differ only in what they do with a finding:
+//! print it, or write one inbox item per finding.
 
-use std::collections::{BTreeMap, BTreeSet};
 
 use anyhow::{Result, bail};
 use serde::Serialize;
@@ -23,7 +21,7 @@ use crate::herdr::{Agent, Pane};
 use crate::paths::Ctx;
 use crate::project::Project;
 use crate::thread::{self, Status, Thread};
-use crate::threads::{self, SessionView};
+use crate::threads;
 
 /// A record that says `resolved` while herdr still lists its agent (or a pane
 /// at its id).
@@ -49,30 +47,11 @@ pub const WORKING_BUT_STALE: &str = "working-but-stale";
 /// incident (22.5 h and 9.8M tokens in a loop).
 pub const WORKING_STALE_SECS: i64 = 3 * crate::steps::RE_NUDGE_EVERY_SECS;
 
-/// One machine's agents and panes, or `None` when that machine cannot be
-/// reached this run. Keyed by machine name (`""` is this session).
-pub(crate) type MachineLists = BTreeMap<String, Option<(Vec<Agent>, Vec<Pane>)>>;
-
-/// Where one audit run gets its live lists from. Keyed by the record's
-/// `machine`, so a remote thread costs one `herdr --machine` pair and a local
-/// one costs nothing: the caller already has this session's lists.
-///
-/// `None` means "not looked at this run" — an unreachable machine, or one the
-/// ticker does not poll on this tick — and its threads are then not audited
-/// **and not judged clean**: [`Findings::examined`] is what lets a caller keep
-/// the memory of a finding it could not re-check.
-pub trait LiveLists {
-    fn lists(&mut self, machine: &str) -> Option<(&[Agent], &[Pane])>;
-}
-
-/// What one run found, and which threads it could actually look at.
+/// What one run found.
 #[derive(Debug, Default)]
 pub struct Findings {
     /// Every mismatch, in thread-id order.
     pub found: Vec<Finding>,
-    /// The threads whose machine lists were available. Only these can be
-    /// called clean; a thread left out was not looked at.
-    pub examined: BTreeSet<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -97,22 +76,18 @@ impl Finding {
     }
 }
 
-/// Every mismatch in one project, in thread-id order. `socket` is the herdr
-/// session the local lists belong to, for the agent's own progress record.
-pub fn findings_with(project: &Project, socket: &str, now: jiff::Timestamp, lists: &mut dyn LiveLists) -> Findings {
+/// Every mismatch in one project, in thread-id order, from this session's
+/// lists. `socket` is the herdr session they belong to, for the agent's own
+/// progress record.
+pub fn findings_with(project: &Project, socket: &str, now: jiff::Timestamp, agents: &[Agent], panes: &[Pane]) -> Findings {
     let mut found = Vec::new();
-    let mut examined = BTreeSet::new();
     for t in thread::list(project) {
-        let Some((agents, panes)) = lists.lists(&t.machine) else {
-            continue;
-        };
-        examined.insert(t.id.clone());
         found.extend(thread_findings(&t, agents, panes, now, &project.root, socket));
     }
-    Findings { found, examined }
+    Findings { found }
 }
 
-/// The three checks for one thread, against its machine's lists.
+/// The three checks for one thread, against this session's lists.
 fn thread_findings(t: &Thread, agents: &[Agent], panes: &[Pane], now: jiff::Timestamp, root: &std::path::Path, socket: &str) -> Vec<Finding> {
     let mut found = Vec::new();
     let live = thread::live_with_report(t, agents, panes, now, root, socket);
@@ -182,37 +157,7 @@ pub fn findings(ctx: &Ctx, project: &Project) -> Result<Vec<Finding>> {
             project.slug
         )
     })?;
-    // One pair of lists per machine: a remote thread costs one ssh call, not
-    // one per thread.
-    let mut lists = ViewLists { view: &view, cache: BTreeMap::new() };
-    Ok(findings_with(project, &view.socket, jiff::Timestamp::now(), &mut lists).found)
-}
-
-/// [`LiveLists`] over one [`SessionView`], caching each machine's lists. A
-/// machine that cannot be reached yields `None` (with one warning on stderr)
-/// rather than an error: an unreachable laptop must not make a whole project's
-/// audit fail, and its threads are simply not audited this run.
-struct ViewLists<'a> {
-    view: &'a SessionView<'a>,
-    cache: MachineLists,
-}
-
-impl LiveLists for ViewLists<'_> {
-    fn lists(&mut self, machine: &str) -> Option<(&[Agent], &[Pane])> {
-        if !self.cache.contains_key(machine) {
-            let lists = if machine.is_empty() {
-                Some((self.view.agents.clone(), self.view.panes.clone()))
-            } else {
-                threads::machine_lists(&self.view.herdr, machine).ok()
-            };
-            if lists.is_none() {
-                let where_ = if machine.is_empty() { "this session" } else { machine };
-                eprintln!("warning: {where_} is unreachable; its threads are not audited");
-            }
-            self.cache.insert(machine.to_string(), lists);
-        }
-        self.cache.get(machine).and_then(Option::as_ref).map(|(agents, panes)| (agents.as_slice(), panes.as_slice()))
-    }
+    Ok(findings_with(project, &view.socket, jiff::Timestamp::now(), &view.agents, &view.panes).found)
 }
 
 /// The newest moment the agent is known to have done anything: the record's

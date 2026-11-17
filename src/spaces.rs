@@ -29,7 +29,7 @@ pub fn primary<'w>(workspaces: &'w [Workspace], repo: &str) -> Option<&'w Worksp
 }
 
 fn local_worktree(t: &Thread) -> bool {
-    t.kind == Kind::Worktree && !t.is_remote() && !t.repo.is_empty()
+    t.kind == Kind::Worktree && !t.repo.is_empty()
 }
 
 /// Records the primary Space on open local worktree threads that have none

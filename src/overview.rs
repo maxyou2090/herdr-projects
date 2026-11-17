@@ -34,7 +34,7 @@ pub fn project_for_workspace(ctx: &Ctx, workspace_id: &str, socket: &str) -> Opt
     let mut panes: Vec<crate::herdr::Pane> = herdr.pane_list().unwrap_or_default().into_iter().filter(|p| p.workspace_id == workspace_id).collect();
     let focused = ctx.env.var("HERDR_PANE_ID").unwrap_or("");
     panes.sort_by_key(|p| p.pane_id != focused);
-    let open_threads = |project: &Project| thread::list(project).into_iter().filter(|t| !t.is_remote() && t.status != thread::Status::Resolved).collect::<Vec<_>>();
+    let open_threads = |project: &Project| thread::list(project).into_iter().filter(|t| t.status != thread::Status::Resolved).collect::<Vec<_>>();
     for pane in &panes {
         for dir in [&pane.foreground_cwd, &pane.cwd].into_iter().filter(|d| !d.is_empty()) {
             let dir = Path::new(dir);
@@ -148,9 +148,7 @@ pub fn render(project: &Project, rows: &[Row]) -> String {
         let _ = writeln!(out, "\n{} ({})", group.label(), members.len());
         for row in members {
             let t = &row.thread;
-            let place = if !t.machine.is_empty() {
-                format!("{}@{}", t.branch, t.machine)
-            } else if !t.branch.is_empty() {
+            let place = if !t.branch.is_empty() {
                 t.branch.clone()
             } else if matches!(t.kind, thread::Kind::Tab | thread::Kind::Home) {
                 "tab".to_string()
@@ -159,11 +157,7 @@ pub fn render(project: &Project, rows: &[Row]) -> String {
             };
             let _ = writeln!(out, "  {}  {}  [{}]  {}", t.id, t.title, row.note, place);
             if group == Group::WaitingOnYou && !t.pane_id.is_empty() && row.note != "pane closed" {
-                if t.machine.is_empty() {
-                    let _ = writeln!(out, "          needs you in pane {}", t.pane_id);
-                } else {
-                    let _ = writeln!(out, "          needs you in pane {} on machine `{}`: select the machine in herdr's sidebar, or run `herdr --remote <ssh target>`", t.pane_id, t.machine);
-                }
+                let _ = writeln!(out, "          needs you in pane {}", t.pane_id);
             }
         }
     }
