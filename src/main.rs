@@ -15,7 +15,6 @@ mod inbox;
 mod lanes;
 mod lifecycle;
 mod names;
-mod notify;
 mod overview;
 mod paths;
 mod pr;

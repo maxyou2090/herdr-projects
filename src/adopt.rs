@@ -6,7 +6,7 @@ use std::time::Duration;
 use anyhow::{Context, Result, bail};
 
 use crate::herdr::{Agent, Herdr};
-use crate::paths::{self, Ctx, SessionFlags};
+use crate::paths::Ctx;
 use crate::project::{self, Project};
 use crate::runner::Cmd;
 use crate::thread::{self, Kind, Status, Thread};
@@ -14,8 +14,8 @@ use crate::{coordinator, threads, ticker};
 
 const DEFAULT_TASK: &str = "Continue the work you were already doing in this pane. It now belongs to the project described above: follow its instructions, and when you finish or stop to wait for the user, write the report.";
 
-/// The refusals shared by `thread adopt` and `adopt-workspace`, checked before
-/// anything is created. Returns the agent herdr detects in the pane.
+/// The refusals `thread adopt` makes before anything is created. Returns the
+/// agent herdr detects in the pane.
 pub fn adoptable_agent(ctx: &Ctx, herdr: &Herdr, socket: &str, pane: &str) -> Result<Agent> {
     adoptable_agent_except(ctx, herdr, socket, pane, None)
 }
@@ -141,46 +141,4 @@ pub fn adopt(ctx: &Ctx, slug: &str, pane: &str, title: &str, task: Option<String
     let adopted = thread::load(&project, &id)?;
     threads::report_thread_tokens(&herdr, &adopted, slug, thread::Group::Working);
     Ok(adopted)
-}
-
-pub struct AdoptWorkspace {
-    pub name: String,
-    pub goal: String,
-    pub pane: String,
-    pub workspace_cwd: String,
-    pub session: SessionFlags,
-}
-
-/// "Continue as a project": `new`, then `open`, then `thread adopt`. It
-/// refuses, before creating anything, under the same conditions as `thread adopt`.
-pub fn adopt_workspace(ctx: &Ctx, args: &AdoptWorkspace) -> Result<()> {
-    let session = paths::resolve_session(&args.session, ctx.env, ctx.runner)?;
-    let socket = session.socket.clone();
-    let herdr = Herdr::new(ctx.env.herdr_bin(), &session.socket, ctx.runner);
-    let agent = adoptable_agent(ctx, &herdr, &socket, &args.pane)?;
-    let slug = project::slug_from_name(&args.name)?;
-    if ctx.root.join(&slug).exists() {
-        bail!("`{slug}` already exists in {}", ctx.root.display());
-    }
-
-    // repo = the workspace's directory when that is a git repository.
-    let cwd = if args.workspace_cwd.is_empty() { agent.cwd.clone() } else { args.workspace_cwd.clone() };
-    let is_repo = ctx
-        .runner
-        .run(&Cmd::new("git", Duration::from_secs(5)).args(["-C", &cwd, "rev-parse", "--show-toplevel"]))
-        .ok()
-        .filter(|o| o.success())
-        .map(|o| o.stdout.trim().to_string())
-        .filter(|s| !s.is_empty());
-    let repos = is_repo.map(|path| vec![project::Repo { path, machine: None }]).unwrap_or_default();
-
-    let project = project::create_from(&ctx.root, &args.name, &args.goal, repos, "adopt")?;
-    let config = crate::profiles::load(&ctx.config_dir)?;
-    crate::profiles::write_project_defaults(&project, &config.new_project_default(crate::profiles::Role::Thread), &config.new_project_default(crate::profiles::Role::Coordinator))?;
-    project::write_priming(&project, &coordinator::current_prefix(&ctx.root)?, "adopt")?;
-    println!("created `{}` at {}", project.slug, project.dir().display());
-    coordinator::open(ctx, &project.slug, &coordinator::OpenOptions { session: SessionFlags { session: Some(session.socket.clone()), socket: None }, rebind: false, profile: None, new: false, here: false, person: true, lane: None, lane_name: None })?;
-    let adopted = adopt(ctx, &project.slug, &args.pane, &args.name, None)?;
-    println!("adopted pane {} as thread {} of `{}`", args.pane, adopted.id, project.slug);
-    Ok(())
 }
