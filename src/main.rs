@@ -1,4 +1,5 @@
 mod adopt;
+mod app;
 mod agents;
 mod assign;
 mod audit;

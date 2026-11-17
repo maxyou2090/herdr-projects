@@ -44,6 +44,12 @@ impl Env {
         self.vars.get(key).map(String::as_str).filter(|v| !v.is_empty())
     }
 
+    /// `HERDR_APP_BIN` when set, else `herdr-app` on `PATH`: the window that
+    /// shows a core's terminals in spaces and tabs.
+    pub fn herdr_app_bin(&self) -> String {
+        self.var("HERDR_APP_BIN").unwrap_or("herdr-app").to_string()
+    }
+
     /// The fixed user-level config directory, `~/.config/herdr-projects`.
     pub fn config_dir(&self) -> PathBuf {
         self.home.join(".config").join("herdr-projects")

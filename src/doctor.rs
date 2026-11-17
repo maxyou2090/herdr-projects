@@ -123,6 +123,13 @@ fn report(
         check(&mut out, None, "update", format!("a newer version is available ({latest}): run `herdr-projects update`"));
     }
 
+    let app = env.herdr_app_bin();
+    if crate::app::running(&app, runner) {
+        check(&mut out, Some(true), "app", format!("{app}: this project's terminals are shown in its spaces and tabs"));
+    } else {
+        check(&mut out, None, "app", format!("{app} is not running: terminals start in core and are reached with `hc attach`"));
+    }
+
     let bin = env.herdr_bin();
     match herdr::version(&bin, runner) {
         Ok(version) if version >= herdr::MIN_VERSION => {
