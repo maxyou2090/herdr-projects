@@ -107,7 +107,7 @@ enum Command {
     /// Print threads grouped by what needs you
     Overview {
         slug: Option<String>,
-        /// Wait for Enter before exiting (only when on a terminal; used by the popup)
+        /// Wait for Enter before exiting (only when on a terminal; for a person running it by hand)
         #[arg(long)]
         wait: bool,
     },
@@ -351,7 +351,7 @@ enum LaneCommand {
 
 #[derive(Subcommand)]
 enum CoordinatorCommand {
-    /// Send a sentence to the project's coordinator (the popup's task keys use this)
+    /// Send a sentence to the project's coordinator (a person or a script; `--lane` names the lane)
     Prompt {
         slug: String,
         /// The lane to send to (by id, name or label); default: the caller's own
@@ -727,8 +727,8 @@ pub fn run() -> Result<()> {
                     rebind,
                     profile,
                     new,
-                    // Only a person at a terminal gets the agent in place; the
-                    // popup and agents' shell tools run `open` without one.
+                    // Only a person at a terminal gets the agent in place; an
+                    // agent's shell tool or a script runs `open` without one.
                     here: !tab && person,
                     person,
                     lane,

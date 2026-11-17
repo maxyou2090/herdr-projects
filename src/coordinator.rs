@@ -285,9 +285,8 @@ pub struct OpenOptions {
     /// Start the agent in the terminal this command runs in, when no agent
     /// occupies it and it belongs to this session (false: a new tab).
     pub here: bool,
-    /// Whether a person ran this `open` — at a terminal or through the popup —
-    /// rather than an agent's shell or the ticker: a paused project is then
-    /// resumed, not only noted.
+    /// Whether a person ran this `open` at a terminal rather than an agent's
+    /// shell or a script: a paused project is then resumed, not only noted.
     pub person: bool,
     /// `--lane`: the lane to open or focus (§6.1). `None` is today's default
     /// lane, byte for byte.
@@ -653,8 +652,8 @@ pub fn open(ctx: &Ctx, slug: &str, options: &OpenOptions) -> Result<()> {
 
     // A coordinator is running: focus the most recently active one.
     // With an explicit profile, only the recorded coordinator is reused, and
-    // only when it runs that profile: choosing another profile in the popup
-    // starts one beside the others.
+    // only when it runs that profile: naming another profile starts one beside
+    // the others.
     //
     // Who is a coordinator is `lanes::classify_all` (§5.2), not the folder. A
     // coordinator's shell may sit anywhere: the recorded one works in
@@ -975,8 +974,8 @@ fn name_tab(herdr: &Core, tab_id: &str) {
     }
 }
 
-/// `coordinator prompt`: a sentence to a coordinator (the popup's task keys
-/// use it; the coordinator stays the only writer of TASKS.md).
+/// `coordinator prompt`: a sentence to a coordinator (a person or a script
+/// sends it; the coordinator stays the only writer of TASKS.md).
 ///
 /// With a lane registry the sentence goes to the caller's **own** lane (§12
 /// commit 3): the pane this command runs in resolves through §5.2, and only that
@@ -987,10 +986,11 @@ pub fn prompt(ctx: &Ctx, slug: &str, text: &str) -> Result<()> {
     prompt_to(ctx, slug, text, None)
 }
 
-/// [`prompt`] with an **explicit** lane: the popup's `d`/`m`/`D` keys name the
-/// task's lane, so a plugin pane that resolves to nothing still has exactly one
-/// honest destination (§9, §12 commit 6). The lane must exist and be open; an
-/// unknown or closed handle is an error, never a fallback to the default lane.
+/// [`prompt`] with an **explicit** lane: `hp task move|done|delete` and
+/// `hp coordinator prompt --lane` name a lane directly, so a caller that
+/// resolves to nothing still has exactly one honest destination (§9, §12
+/// commit 6). The lane must exist and be open; an unknown or closed handle is
+/// an error, never a fallback to the default lane.
 pub fn prompt_to(ctx: &Ctx, slug: &str, text: &str, lane: Option<&str>) -> Result<()> {
     let project = Project::load(&ctx.root, slug)?;
     let text = text.trim();

@@ -1539,7 +1539,7 @@ mod tests {
         assert!(placement(Some(Kind::Adopted), true).is_err());
         assert_eq!(Kind::parse("checkout").unwrap(), Kind::Checkout);
         assert_eq!(Kind::parse("home").unwrap(), Kind::Home);
-        assert!(Kind::parse("popup").is_err());
+        assert!(Kind::parse("nowhere").is_err());
     }
 
     #[test]

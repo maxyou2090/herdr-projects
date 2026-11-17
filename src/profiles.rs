@@ -5,7 +5,7 @@
 //!
 //! Every Herdr agent kind is also a built-in profile of the same name with no
 //! arguments; a user profile of that name replaces it. Built-ins are listed
-//! (in `profile list`, `context` and the popup) only when their CLI is
+//! (in `profile list` and `context`) only when their CLI is
 //! installed and looks signed in, but any of them can be named.
 
 use std::collections::BTreeMap;
@@ -95,7 +95,7 @@ impl Profile {
         args
     }
 
-    /// One line for `context`, `profile list` and the popup:
+    /// One line for `context` and `profile list`:
     /// `omp · model gpt-5.5 · effort high · 2 extra args — Cheap tier`.
     pub fn summary(&self) -> String {
         let e = &self.entry;
@@ -410,9 +410,9 @@ pub fn detect(env: &Env) -> Vec<String> {
 
 // ---------------------------------------------------------------- editing
 
-/// A change to the user's profile settings. Only a person makes one: at a
-/// terminal (`profile add`, `edit`, `remove`, `allow`, `default`) or in the
-/// popup, never an agent's shell tool.
+/// A change to the user's profile settings. Only a person makes one, at a
+/// terminal (`profile add`, `edit`, `remove`, `allow`, `default`), never an
+/// agent's shell tool.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Change {
     Add { name: String, entry: Entry },
@@ -425,7 +425,7 @@ pub enum Change {
 
 pub fn require_person() -> Result<()> {
     if !std::io::stdin().is_terminal() {
-        bail!("profiles and their allow-lists are the user's: this command must be run by a person at a terminal (or from the projects popup); standard input is not a terminal");
+        bail!("profiles and their allow-lists are the user's: this command must be run by a person at a terminal; standard input is not a terminal");
     }
     Ok(())
 }

@@ -8,8 +8,9 @@
 > **Port note (herdr-core).** The document was written against Herdr 1, so where
 > it names a module the port removed, read the lane model and skip the host
 > detail: `src/grouping.rs` (and `grouping::clear`, `grouping::apply`,
-> `ProjectPart`, the token TTL) does not exist here, and the labels this file
-> calls `sidebar::` live in `src/labels.rs` (formerly `src/sidebar.rs`). Panes are
+> `ProjectPart`, the token TTL) does not exist here. herdr-core draws nothing, so
+> where a sentence says a row or a label "shows", read the line `hp overview` and
+> `hp context` print; the strings live in `src/labels.rs`. Panes are
 > core terminals; a coordinator's own identity is `HC_TERMINAL_ID`, its session
 > `HC_SESSION` (`src/paths.rs::Env::this_terminal` / `this_session`), and the
 > `hp_lane`/`hp_project` tokens are ordinary core labels (`src/core.rs`). The
@@ -45,7 +46,7 @@ Two projects cost real money:
   against a stale list.
 - **Threads scatter.** `law` already holds 168 thread records; `law-live` holds
   16. `t-0012` in one project is a different thread than `t-0012` in the other,
-  the sidebar shows two groups for one body of work, and "what is open in this
+  `hp overview` shows two groups for one body of work, and "what is open in this
   area" is a question nobody can answer in one place.
 
 The abstract version of this is "the tool does not support multiple
@@ -173,8 +174,9 @@ of `lanes::resolve` returning the three-valued `LaneResolution`
 `inbox::seen`/`mark_seen` (`src/inbox.rs`) and the `steps::State` maps
 (`src/steps.rs`); lane-routed nudge, prompt and discovery
 (`coordinator::nudge_target`, `prompt`, `discover`, same file); TASKS.md lane
-headings and `hp task add/move/done/delete/thread` (`src/tasks.rs`); the sidebar lane label,
-key and lifecycle (`src/labels.rs`, `src/ticker.rs`, `src/lifecycle.rs`; the
+headings and `hp task add/move/done/delete/thread` (`src/tasks.rs`); the lane label on a
+coordinator's Space and tab and the lane's lifecycle (`src/labels.rs`,
+`src/ticker.rs`, `src/lifecycle.rs`; the
 Herdr 1 `src/grouping.rs` sort key is not part of the port); and the lane rules in
 `skill/COORDINATOR.md` with the ambiguous-pane warning in `hp doctor`
 (`src/doctor.rs`), both added by commit 7.
@@ -194,7 +196,7 @@ not only while one of its panes works in the folder.
 | `Thread.lane`, `inbox::Item::lane`, per-lane seen and `steps::State` maps | `src/thread.rs`, `src/inbox.rs`, `src/steps.rs` |
 | lane-routed nudge, prompt, discovery | `src/coordinator.rs` |
 | TASKS.md lane headings, `hp task add/move/done/delete/thread` | `src/tasks.rs` |
-| sidebar `· <lane label>`, lifecycle | `src/labels.rs`, `src/ticker.rs` |
+| coordinator label `· <lane label>`, lifecycle | `src/labels.rs`, `src/ticker.rs` |
 | skill lane rules, `doctor` ambiguous-pane warning | `skill/COORDINATOR.md`, `src/doctor.rs` |
 
 ## 4. Data model
@@ -210,7 +212,7 @@ default lane (§10).
     {
       "id": "c-1",                 // stable, never reused, never renumbered
       "name": "fix",               // CLI handle: `--lane fix`; unique per project
-      "label": "抢修",              // display name: sidebar, tab, workspace label
+      "label": "抢修",              // display name: Space and tab labels, hp_display
       "goal": "production incidents only",
       "profile": "pi-deepseek-flash-high",   // default profile for this lane
       "status": "open",            // "open" or "closed" (§6.4); closed is reversible
@@ -248,8 +250,9 @@ default lane (§10).
   only (the `id` never moves), and may optionally change `name` with an explicit
   `--name`.
 - `status` is `open` or `closed` (§6.4). A `closed` lane keeps its record, its
-  id and its history; it stops appearing in `context`, stops taking a sidebar
-  row and stops participating in nudges. Closing is not deleting.
+  id and its history; it stops appearing in `context`, its threads stop
+  appearing in `hp overview`, and it stops participating in nudges. Closing is
+  not deleting.
 - `pane_id` and `agent_session` are a *hint* for rule 2 of §5, refreshed by the
   ticker. They are not the identity.
 - The file is written only under `project.lock()`, with the same
@@ -611,8 +614,7 @@ means: "the pane I am running in is a coordinator of lane `<name>`".
 - Refuses when the pane already claims another lane (use `lane assign` to move
   it, and say so), when the agent does not work in the project home (that is a
   thread, `hp thread adopt` is the right command), and when the command runs
-  outside a core terminal (there is then no pane to adopt; Herdr 1 also refused
-  a plugin popup pane, which the port has no equivalent of).
+  outside a core terminal (there is then no pane to adopt).
 - On success: writes the lane's `pane_id`/`agent_session`, writes `hp_lane` into
   the pane immediately, and prints the prefix. If the project has exactly one
   lane and none of its rules fire, `adopt` also sets it as the default lane.
@@ -636,7 +638,7 @@ do.
 | `hp lane list <slug> [--json]` | Every lane with the rule each live pane matched, thread and inbox counts, `last_active`, and `closed` lanes. | 列出所有 lane，含每个 live pane 命中的解析规则、线程数与 inbox 数、`last_active`，以及已 closed 的 lane。 |
 | `hp lane assign <lane> <pane> [--project <slug>]` | The explicit handover: point the lane (and its threads) at another coordinator pane. The **only** thing that moves ownership. | 显式接手：把该 lane 及其线程交给另一个协调器 pane。这是**唯一**会转移归属的命令。 |
 | `hp lane rename <lane> <label> [--name <name>] [--project <slug>]` | Change the display label, and optionally the CLI handle. The `id` never changes, so thread and inbox ownership never move. | 改显示名（可选改命令里的 handle）。`id` 不变，所以线程与 inbox 的归属不变。 |
-| `hp lane close <lane> [--project <slug>]` | Retire a lane: refused while any of its threads is `open`/`starting`; otherwise `status = closed`. A closed lane gets no `context` section, sidebar row or nudge, and its record and id stay. The coordinator process is left alone (§6.4). | 收起来：该 lane 还有 open/starting 线程就拒绝并列出；全部 resolve 后 `status = closed`。closed 的 lane 不再有 context 分区/侧栏行/nudge，记录和 id 保留；**不杀协调器进程**（§6.4）。 |
+| `hp lane close <lane> [--project <slug>]` | Retire a lane: refused while any of its threads is `open`/`starting`; otherwise `status = closed`. A closed lane gets no `context` section, its threads leave `hp overview` and it gets no nudge, and its record and id stay. The coordinator process is left alone (§6.4). | 收起来：该 lane 还有 open/starting 线程就拒绝并列出；全部 resolve 后 `status = closed`。closed 的 lane 不再有 context 分区、其线程不再出现在 `hp overview`、也不再有 nudge，记录和 id 保留；**不杀协调器进程**（§6.4）。 |
 | `hp lane open <lane> [--project <slug>]` | Undo a close: `status = open` again, and nothing else — no agent is started and no session is resumed. The output names the next step. | 恢复一个 closed 的 lane：只改 `status = open`，**不启动代理、不续 session**，输出会给出下一步。 |
 
 `lane rename` changes only the registry. `TASKS.md` headings are attributed by a
@@ -661,7 +663,8 @@ close exists and `lane rm` does not.
 hp lane close <lane> [--project <slug>]
   - the lane has any open or starting thread  -> refuse, listing the live thread ids
   - all of its threads are resolved           -> status = closed, `closed` = now
-  - closed lane: no lane section in `context`, no sidebar row, no nudge, no items
+  - closed lane: no lane section in `context`, its threads out of `hp overview`,
+    no nudge, no items
     (a still-running pane of it still shows on the `Coordinators:` line, §5.4)
   - the registry record, its id and its history stay; ids are never reused
   - the coordinator process is not touched (see "Close does not stop the coordinator")
@@ -709,10 +712,11 @@ not also reach over and change process state. Both directions follow from that.
 something else, or the user may simply want the line out of the way. After a
 close, if that pane is still alive it is still that lane's coordinator — the
 registry keeps its `pane_id` and `agent_session`, and rule 2 of §5.2 still
-resolves it. What changes is reachability: the lane has no section in `context`, no
-sidebar row and no nudging, so **it receives no new events**. Its pane still
-appears on `context`'s `Coordinators:` line, marked `closed` (§5.4) — the one
-place where "put away but still running" stays visible.
+resolves it. What changes is reachability: the lane has no section in `context`,
+its threads are out of `hp overview` and it is not nudged, so **it receives no
+new events**. Its pane still appears on `context`'s `Coordinators:` line, marked
+`closed` (§5.4) — the one place where "put away but still running" stays
+visible.
 
 The combination has to be stated plainly, because it looks contradictory:
 
@@ -830,8 +834,9 @@ prevent.
 
 `TASKS.md` is a single file with `## <list>` headings; `tasks::parse()`
 (`tasks::parse`, `src/tasks.rs`) already builds `Task.list` from the heading,
-`tasks::compact` (same file) folds bodies for `context`, and the popup groups by
-list (`popup::parse_tasks`, `src/popup.rs`). **No file split is needed or wanted.**
+`tasks::compact` (same file) folds bodies for `context`, and a list is the only
+grouping a task has, so `hp context` and any rendering of tasks group by it.
+**No file split is needed or wanted.**
 
 The split is a naming convention:
 
@@ -851,13 +856,14 @@ The split is a naming convention:
   `name`) is that lane's. Everything else is shared.
 - `context` prints the shared lists plus **only its own lane's** lists; the
   lane's `TASKS.md` section is the one place its coordinator writes.
-- The popup's tasks section is the **user's** view: it shows shared lists plus
-  **every open lane's** lists with a lane heading per section. A closed lane's
-  lists stay out. `d`/`m`/`D` act on the task's own lane; a shared task asks
-  which lane should receive the sentence. `hp context` is the **coordinator's**
-  view and shows only shared lists plus the reader's own lane — the difference
-  is deliberate, because one coordinator reads its lane and the user supervises
-  all of them.
+- The **user's** view is the coordinator's answer in chat
+  (`skill/COORDINATOR.md`): shared lists plus **every open lane's** lists with a
+  lane heading per section, and a closed lane's lists stay out. `hp task
+  move|done|delete` act on the caller's lane, so a task in another lane goes
+  through that lane's coordinator, or `hp coordinator prompt --lane` names it.
+  `hp context` is the **coordinator's** view and shows only shared lists plus the
+  reader's own lane — the difference is deliberate, because one coordinator reads
+  its lane and the user supervises all of them.
 - No task moves between lists on its own. If the user wants to move work from
   one lane to another, that is an edit of the heading (or a sentence to a
   coordinator), not a migration.
@@ -893,16 +899,16 @@ the caller's lane: a task in another lane's section is refused, and `--lane`
 on `add` writes that lane's heading. A project without `lanes.json` keeps every
 list shared and
 `hp task` works there unchanged. The skill says "never edit `TASKS.md`
-directly; use `hp task`", and the popup's existing "send a sentence to the
-coordinator" actions in `src/popup.rs` keep working unchanged.
+directly; use `hp task`", and `hp coordinator prompt --lane` is how a sentence
+reaches a named lane's coordinator.
 
-## 9. Sidebar, grouping, lifecycle
+## 9. Labels, grouping, lifecycle
 
 > The port kept the lifecycle half of this section (`spaces::empty`,
 > `lanes::open_spaces`, `coordinator_display`) and dropped the grouping half:
 > `src/grouping.rs`, its sort key and its `ProjectPart` no longer exist. Read the
 > bullets below as the Herdr 1 design; what shipped is
-> `lanes::display_label` for the row suffix.
+> `lanes::display_label` for the label suffix.
 
 - **Display name.** `labels::coordinator_display()` (`src/labels.rs`)
   returns `"<project name>␣"` + `HEAD_MARK` for every coordinator, so two
@@ -912,7 +918,7 @@ coordinator" actions in `src/popup.rs` keep working unchanged.
   with `lanes.json` shows the ` · <lane label>` even when it has one lane —
   otherwise two lanes would again be two identical rows.
 - **Sort key.** Herdr 1's `grouping::coordinator_key()` (`src/grouping.rs`) is
-  gone with the module; the port has no sidebar ordering to change.
+  gone with the module; core draws nothing, so the port has no ordering to change.
 - **Home Space.** `ProjectPart.home` (`src/grouping.rs`, removed by the port)
   stays one Space:
   every lane's coordinator lives in the project home by decision 1. `part()`
@@ -930,13 +936,12 @@ coordinator" actions in `src/popup.rs` keep working unchanged.
   the lanes (`alive_panes`, same file) instead of `coordinator().workspace_id`.
   `archive` does not leave a lane's coordinator behind; `delete` is unchanged
   (whole project).
-- **Closed lanes leave the views.** `part()` (`src/ticker.rs`) filters a closed
-  lane's pane through `lanes::coordinator_visible` before it builds the sidebar
-  row, so the row disappears even when the coordinator process is still alive
-  (§6.4 allows that). The pane stays on the `Coordinators:` line and in
-  `lane list`. `spaces::empty` must not offer to close the home while an open
-  lane still lives in it, and `overview` / `needs-you` filter on
-  `status == open` when they iterate lanes.
+- **Closed lanes leave the views.** A closed lane's threads are filtered out of
+  `hp overview` (`overview::render`), so the lane disappears even when its
+  coordinator process is still alive (§6.4 allows that). The pane stays on the
+  `Coordinators:` line and in `lane list`. `spaces::empty` must not offer to
+  close the home while an open lane still lives in it, and `overview` /
+  `needs-you` filter on `status == open` when they iterate lanes.
 - **`hp context` is lane-aware**, and its header carries the identity line
   from §5.4 on **every** run. It prints the whole digest (`digest()`,
   `src/coordinator.rs`), but the first lines are `Commands:`, `Project:`,
@@ -964,7 +969,7 @@ coordinator" actions in `src/popup.rs` keep working unchanged.
   `{"lanes":[{"id":"c-1","name":"default","label":"<project name>","status":"open",…}],"default":"c-1","next":2}`
   from the existing `coordinator.json` (`pane_id`, `agent_session`, `profile`).
   Nothing to run, nothing to migrate, nothing that can half-finish.
-- **The old CLI is unchanged.** `open`, `context`, `thread`, `inbox`, `popup`,
+- **The old CLI is unchanged.** `open`, `context`, `thread`, `inbox`,
   `needs-you`, `overview`, `archive`, `rename`, `doctor` all keep their
   behaviour for single-lane projects.
 - **`rename <slug> <new-slug>`** keeps working: it rewrites `coordinator.json`
@@ -995,10 +1000,10 @@ Explicitly out of scope for plan B:
   field; every routine fires for the project. A `pr-followup` for one lane's
   threads is a reasonable want; it is a separate change (routine state
   `States`, `routine::load_all`, the `pr` trigger's thread filter).
-- **A popup view per lane.** The tasks section now shows shared lists plus
-  every open lane's lists, with a heading per lane (§8), but there is no way to
-  scope the whole popup to one lane. That would need a lane scope like the
-  existing project scope.
+- **A lane-scoped view.** Tasks show shared lists plus every open lane's lists,
+  with a heading per lane (§8), but no command scopes a whole view to one lane:
+  `hp context` is already its reader's lane and `hp overview` is the whole
+  project. A user-side lane scope would need a flag of its own.
 - **Per-lane Spaces.** Decision 1 keeps every coordinator in the project home.
   `--kind tab` style escape hatches for a coordinator would be a new placement
   mode, not part of this.
@@ -1029,7 +1034,7 @@ itself, and it was found a week later only because the user asked why.
 The standing-failure shape is what makes this dangerous: there is no transition
 to catch, so a mitigation that fires "when the state changes" fires never.
 Under lanes the same shape returns with more ways in — two coordinators can both
-degrade to the default lane and the sidebar looks calm.
+degrade to the default lane and `hp overview` looks calm.
 
 Mitigation, all of it in §5.4 and none of it optional: `hp context` prints the
 `Coordinators:` line **every turn** with the matched rule, the lane and (for an
@@ -1083,9 +1088,9 @@ cleanup at the end.
    default-lane election, because a closed default leaves the registry with no
    default until one is chosen.
 5. **TASKS.md split + `hp task`.** The heading convention first (read-only,
-   `context`/popup honour it), then the locked write commands (§8). Highest
+   `context` honours it), then the locked write commands (§8). Highest
    risk; no other commit in the same PR.
-6. **Sidebar, lifecycle.** `coordinator_display`, `spaces::empty`,
+6. **Labels, lifecycle.** `coordinator_display`, `spaces::empty`,
    `lifecycle::close_workspaces`, `overview` (Herdr 1's `grouping::coordinator_key`
    came along here and was dropped by the port).
 7. **Docs, skill and the doctor check.** `skill/COORDINATOR.md`,

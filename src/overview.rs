@@ -217,7 +217,7 @@ pub fn run(ctx: &Ctx, slug: Option<&str>, wait: bool) -> Result<()> {
         }
         print!("{}", render(&project, &threads::rows(ctx, &project)));
     }
-    // Only a popup wants to be held open; an agent calling this never waits.
+    // `--wait` is for a person reading it; an agent calling this never waits.
     if wait && std::io::stdout().is_terminal() && std::io::stdin().is_terminal() {
         print!("\nPress Enter to close ");
         std::io::stdout().flush()?;

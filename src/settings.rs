@@ -1,5 +1,5 @@
-//! `set`, `routine toggle` and `open-file`: the small edits the popup's keys
-//! make, each a CLI command. Front matter is edited with toml_edit, so the
+//! `set`, `routine toggle` and `open-file`: the small edits a person makes by
+//! hand, each a CLI command. Front matter is edited with toml_edit, so the
 //! rest of the file keeps its formatting.
 
 use std::path::Path;

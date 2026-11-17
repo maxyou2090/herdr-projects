@@ -599,7 +599,7 @@ impl Group {
         .find(|g| g.token() == token)
     }
 
-    /// Needs-you first: the sidebar sort, the popup and the overview agree.
+    /// Needs-you first: `hp overview` and the `hp context` digest agree.
     pub const DISPLAY_ORDER: [Group; 6] = [
         Group::WaitingOnYou,
         Group::ReadyForReview,
