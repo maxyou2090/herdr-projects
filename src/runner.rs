@@ -72,9 +72,10 @@ impl Cmd {
     }
 
     /// Spawn in its own process group and kill the whole group on timeout.
-    /// No production caller sets it since command routines went (t-0039); the
-    /// runner's group kill is still exercised by its own test.
-    #[cfg_attr(not(test), allow(dead_code))]
+    /// No production caller sets it since command routines went (t-0039): the
+    /// group kill is kept, and exercised, by `group_kill_reaches_grandchildren`
+    /// alone, so that a future `sh -c` caller need not reinvent it.
+    #[cfg(test)]
     pub fn own_group(mut self) -> Self {
         self.own_group = true;
         self

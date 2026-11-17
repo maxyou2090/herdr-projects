@@ -315,10 +315,10 @@ impl<'a> Herdr<'a> {
         }
     }
 
-    /// The core this call reaches. Herdr 1's variables are removed so an
-    /// inherited value can never compete with the session this project recorded.
+    /// The core this call reaches: `HC_SESSION` is either set to the session
+    /// this project recorded or removed, so the caller's value never competes.
     pub fn cmd(&self, timeout: Duration) -> Cmd {
-        let mut cmd = Cmd::new(&self.bin, timeout).env_remove("HERDR_SOCKET_PATH").env_remove("HERDR_SESSION");
+        let mut cmd = Cmd::new(&self.bin, timeout);
         cmd = if self.session.is_empty() {
             cmd.env_remove("HC_SESSION")
         } else {
