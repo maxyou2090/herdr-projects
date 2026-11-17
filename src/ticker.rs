@@ -902,7 +902,7 @@ fn thread_pass(project: &Project, herdr: &Herdr, socket: &str, threads: &[thread
         // answer it: hold the brief and count the thread as blocked.
         let brief_due = t.prompt_pending && live.agent_state.as_deref().is_some_and(crate::herdr::ready_state);
         // An unreadable screen holds the brief too, without calling it blocked.
-        let screen = brief_due.then(|| crate::trust_screen::showing(herdr, &t.pane_id, &t.agent));
+        let screen = brief_due.then(|| herdr.trust_screen(&t.pane_id, &t.agent));
         let hold_brief = !matches!(screen, None | Some(Ok(None)));
         if matches!(screen, Some(Ok(Some(_)))) {
             live.agent_state = Some("blocked".into());

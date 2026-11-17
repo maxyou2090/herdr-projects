@@ -883,6 +883,12 @@ impl<'a> Herdr<'a> {
         Ok(result["text"].as_str().unwrap_or_default().to_string())
     }
 
+    /// The trust-screen line on the pane's screen now, read right before typing
+    /// there. A screen that cannot be read is an error: the caller does not type.
+    pub fn trust_screen(&self, target: &str, kind: &str) -> Result<Option<&'static str>, HerdrError> {
+        Ok(crate::trust_screen::detect(kind, &self.agent_screen(target)?))
+    }
+
     pub fn agent_send_keys(&self, target: &str, keys: &[String]) -> Result<(), HerdrError> {
         let keys: Vec<String> = keys.iter().map(|k| key_name(k)).collect();
         let mut args: Vec<&str> = vec!["keys", target];

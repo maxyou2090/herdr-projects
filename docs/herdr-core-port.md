@@ -23,7 +23,7 @@ about the port itself.
 | `worktree create/open/remove`, Spaces grouped under a repository | nothing | plain `git worktree add/remove` under `~/.herdr/worktrees/<repo>/<branch>`, the path Herdr 1 used |
 | Sessions with socket files (`session list --json`, `HERDR_SOCKET_PATH`) | one core per `HC_SESSION`, no registry | a session is a name; a socket path recorded by Herdr 1 reads as the default session |
 | `notification show` | nothing | desktop notifications were removed; an inbox item is the record |
-| Harness hooks (Claude Code, Codex, Droid, Gemini, Copilot) injecting progress | nothing: status is only OSC 7501 | `hp report --activity … [--done]`, run by the agent, plus the ticker's own screen reading; no hook code is left |
+| Harness hooks (Claude Code, Codex, Droid, Gemini, Copilot) injecting progress | nothing: a program's status is only what it prints as OSC 7501 | `hp report --activity … [--done]`, run by the agent, plus `hp-agent`'s own reading of the pane for the harnesses that print no status; no hook code is left |
 
 The binary keeps the *engine* (projects, lanes, threads, tasks, inbox, briefs,
 routines, pull requests, safety settings, the ticker) and replaces the *host*.
@@ -45,7 +45,7 @@ Two binaries and one process:
 | Piece | What it is | Talks to core by |
 | --- | --- | --- |
 | `hp` | the command line; everything the old plugin's commands, actions, popup and sidebar did | `hc` subcommands only |
-| `hp-agent` | a wrapper core runs around an agent: reports `idle` on start and `done`/`error` on exit as OSC 7501 | writing `ESC ] 7501 ; … ST` to its own stdout |
+| `hp-agent` | a wrapper core runs around an agent: reports `idle` on start, `done`/`error` on exit, and — for a harness that prints no status of its own — `working`/`blocked`/`idle` read from the agent's own screen | writing `ESC ] 7501 ; … ST` to its own stdout |
 | the ticker | `hp ticker run`, one loop per projects root, kept alive by launchd | the same `hc` calls |
 
 There are exactly **three contact points** with core, and all of them are public
@@ -149,7 +149,9 @@ Each of these was run for real on a machine with core 0.1.21 and the app 0.1.16:
 | `hp ticker start/stop/status` | a LaunchAgent is written, bootstrapped and booted out; `status` reports the running version |
 | rename, sweep | `rename --dry-run`, a real rename, a rename deferred to the ticker, `sweep --dry-run` and a real sweep |
 | the app shows it | `herdr-app ls` shows a Space named after the project with `coordinator` and thread-title tabs |
-| `cargo test` | 262 unit tests, 7 CLI tests, 5 adapter tests against the fake core |
+| `cargo test` | 275 unit tests, 18 more in `hp-agent`, 7 CLI tests, plus the adapter tests against the fake core |
+| `hp-agent` reports the middle of a turn | a script drawing claude-shaped screens under the real `hp-agent`, read back with `hc get`: `idle` → `working` → `blocked` → `working` → `idle` → the terminal `finished` |
+| a harness that reports itself is not double-reported | every pi pane in `hc ls` shows pi's own `working`; `hp-agent` stays silent for `pi` (`watch_kind`) |
 
 ## 6. The traps, in the order they bit
 
@@ -209,13 +211,43 @@ interesting.
 
 Ordered by what a user would notice first:
 
-1. **`hp-agent` reports only its own life** (`idle` at start, `done`/`error` at
-   exit). A long turn therefore reads as `idle` in core, and `blocked` (a
-   permission prompt) is only visible through the ticker's screen reading and
-   the agent's own `hp report`. The fix is a PTY relay in `hp-agent` that parses
-   the agent's screen and reports `working`/`blocked` as 7501, or a pi extension
-   doing the same from inside the harness. `prompt_box`'s styling loss (§6.6)
-   disappears with it.
+1. **`hp-agent` reports what a pane's screen can prove, not the whole turn.**
+   Fixed for the harnesses that report, and partial for the rest:
+   - **A harness that reports itself needs nothing.** pi prints the Program
+     Status Protocol's own records — `working` during a run, `blocked` for its
+     own dialogs and logins, `done`/`error`/`idle` around them — and core shows
+     them as they arrive: every pi pane on this machine reads `working`
+     mid-turn today. A wrapper that spoke for the same terminal would fight it,
+     so pi is listed in `SELF_REPORTING` in `src/hp_agent.rs` and left alone.
+   - **A harness that prints nothing is watched from outside.** For the kinds
+     this binary can read a screen for (`claude`, `codex`, `cursor`, `gemini`,
+     `opencode`) `hp-agent` polls its own pane with `hc read` every two seconds
+     and reports what `src/agent_state.rs` can prove: `blocked` on a trust or
+     review screen (its phrase, on a screen whose input box is not empty, on
+     two reads in a row), `working` while the screen is changing, `idle` once an
+     empty input box has sat still for three reads (six seconds). The wrapper's
+     own words are unchanged: `idle` at start, `done`/`error` at exit.
+     `HP_AGENT_WATCH=0` turns the polling off.
+   - **What is still missing.** A kind whose layout `prompt_box` cannot read
+     (`kimi`, `qwen`, the one-off agent CLIs) reports nothing but
+     `idle`/`done`/`error`: there is no honest `blocked` for a screen this
+     binary cannot parse. A turn that prints nothing *and* redraws no
+     elapsed-time line for six seconds reads as `idle`; a false `idle` can
+     delay a brief by a tick but never types into a busy pane, because
+     `brief::deliver` re-reads the box before sending. `prompt_box`'s styling
+     loss (§6.6) stays: `hc read` gives plain text, so a dim placeholder counts
+     as a draft. And the ticker still reads screens itself for the
+     trust-screen check before a brief: redundant for watched kinds, the only
+     cover for the rest.
+   - **Why not the PTY relay this port first planned.** A relay would have to
+     own the terminal: `openpty`, raw mode, window-size and `SIGWINCH`
+     forwarding, and a VT screen model to keep `prompt_box`'s geometry — all of
+     it to reconstruct information core already keeps and this process can read
+     with one `hc` call. Its failure mode is the agent's interactive experience,
+     the one thing this wrapper must never break, and it would cost a
+     terminal-emulator dependency. Reading the pane gets the same states with no
+     terminal access at all; `src/agent_state.rs` holds that state machine and
+     §5's last rows are the evidence.
 2. **`docs/lanes.md` still carries its Herdr 1 wording** (sidebar, popup,
    `grouping`). A port note at the top says which modules no longer exist, and
    the lane identity is documented in `HC_TERMINAL_ID` / `HC_SESSION` terms, but
@@ -234,12 +266,13 @@ Ordered by what a user would notice first:
    move it (`git pull`, `cargo build --release --locked`, `ticker stop && ticker
    start`), and `--check` says the same without changing anything. There is no
    feed to add until this build is published somewhere.
-6. **Test coverage is thinner than the old suite.** 273 unit tests (5 of them
-   the fake core's own), 7 CLI tests and 5 adapter tests against
-   `src/fake_hc.rs` (a fake core that answers the `hc` commands this binary
-   runs). The fake models terminals, labels, status, `send`, `read`, `kill`; it
-   does not model worktrees, the app, or waiting. Growing it is the cheapest way
-   to buy coverage back.
+6. **Test coverage is thinner than the old suite.** 275 unit tests (5 of them
+   the fake core's own), 18 more compiled into `hp-agent` (which shares
+   `prompt_box`, `trust_screen` and `agent_state` with it), 7 CLI tests and 5
+   adapter tests against `src/fake_hc.rs` (a fake core that answers the `hc`
+   commands this binary runs). The fake models terminals, labels, status,
+   `send`, `read`, `kill`; it does not model worktrees, the app, or waiting.
+   Growing it is the cheapest way to buy coverage back.
 7. **[closed] The branch has landed.** `port/herdr-core` is the fork's default
    branch (`origin/port/herdr-core`), and PRs #26–#30 are merged into it: the
    remote-machine deletion and dead code (#27), the three always-false checks
@@ -253,7 +286,8 @@ Ordered by what a user would notice first:
 | --- | --- |
 | `src/herdr.rs` | the whole adapter: shapes, ids, labels, status, worktrees, app-vs-core creation |
 | `src/app.rs` | the desktop window: `status`, `space.new`, `tab.new`, `ls`, `tab.rename`, `tab.close`, `space.close`, with retries |
-| `src/hp_agent.rs` | the OSC 7501 wrapper |
+| `src/hp_agent.rs` | the OSC 7501 wrapper: `idle` at start, `done`/`error` at exit, and a two-second screen read for the harnesses that print no status |
+| `src/agent_state.rs` | the states a pane's screen proves (`working`, `blocked`, back to `idle`); compiled into `hp-agent` alone |
 | `src/fake_hc.rs` | a fake core for tests (a `Runner`, so the real adapter is exercised) |
 | `src/ticker.rs` | the loop, the LaunchAgent, the launch/brief/nudge passes |
 | `src/coordinator.rs` | `open`: lanes, reuse, priming, `context` |
@@ -266,7 +300,7 @@ Ordered by what a user would notice first:
 
 ```bash
 cd ~/repos/herdr-projects
-cargo test --locked                 # 273 + 7
+cargo test --locked                 # 275 + 18 + 7
 cargo build --release --locked
 hp ticker stop && hp ticker start   # the ticker is a daemon: a rebuild does not reach it
 hp doctor
