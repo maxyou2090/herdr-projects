@@ -214,9 +214,6 @@ impl Sent {
     }
 }
 
-/// Herdr takes at most 16 tokens per report.
-const PER_REPORT: usize = 16;
-
 pub fn report(herdr: &Herdr, _kind: &str, id: &str, tokens: &Tokens) {
     if id.is_empty() {
         return;

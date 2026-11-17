@@ -1,7 +1,7 @@
 //! Every external command (herdr, git, gh, ssh, scp, rsync, sh) goes through `Runner`.
 
 use std::io::{Read, Write};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
@@ -121,7 +121,6 @@ pub trait Runner {
     /// One JSON line to a herdr socket, one line back. The single exception to
     /// "talk to herdr through its CLI" (client decision during the build):
     /// herdr 0.9.1 has no CLI command for `agent.view.set` / `agent.view.clear`.
-    fn socket_request(&self, socket: &Path, line: &str, timeout: Duration) -> Result<String>;
 
     /// Runs `cmd` on this process's terminal (an agent `open` starts in its own
     /// pane) and waits for it; `cmd.timeout` and `cmd.stdin` are ignored.
@@ -207,9 +206,6 @@ impl Runner for RealRunner {
         })
     }
 
-    fn socket_request(&self, socket: &Path, line: &str, timeout: Duration) -> Result<String> {
-        socket_round_trip(socket, line, timeout)
-    }
 
     fn run_foreground(&self, cmd: &Cmd, poll: &mut dyn FnMut() -> bool) -> Result<Option<i32>> {
         let mut command = Command::new(&cmd.program);
@@ -276,19 +272,6 @@ impl Drop for IgnoreInterrupts {
     }
 }
 
-fn socket_round_trip(socket: &Path, line: &str, timeout: Duration) -> Result<String> {
-    use std::io::{BufRead, BufReader};
-    use std::os::unix::net::UnixStream;
-    let mut stream = UnixStream::connect(socket)
-        .with_context(|| format!("could not connect to {}", socket.display()))?;
-    stream.set_read_timeout(Some(timeout))?;
-    stream.set_write_timeout(Some(timeout))?;
-    stream.write_all(line.as_bytes())?;
-    stream.write_all(b"\n")?;
-    let mut reply = String::new();
-    BufReader::new(stream).read_line(&mut reply)?;
-    Ok(reply)
-}
 
 fn read_all<R: Read + Send + 'static>(mut pipe: R) -> std::thread::JoinHandle<Vec<u8>> {
     std::thread::spawn(move || {
@@ -336,8 +319,6 @@ pub mod fake {
     pub struct FakeRunner {
         rules: RefCell<Vec<(Matcher, Box<dyn Fn(&Cmd) -> Result<Output>>)>>,
         pub calls: RefCell<Vec<Cmd>>,
-        /// (socket, request line) of every socket request.
-        pub socket_requests: RefCell<Vec<(PathBuf, String)>>,
     }
 
     impl FakeRunner {
@@ -409,10 +390,6 @@ pub mod fake {
             anyhow::bail!("FakeRunner: no rule for `{}`", cmd.display())
         }
 
-        fn socket_request(&self, socket: &Path, line: &str, _timeout: Duration) -> Result<String> {
-            self.socket_requests.borrow_mut().push((socket.to_path_buf(), line.to_string()));
-            Ok(r#"{"id":"hp","result":{"type":"agent_view","active":true}}"#.to_string())
-        }
 
         /// The first matching rule answers (it may change what later calls
         /// see, as a starting agent does), then `poll` runs once and the

@@ -4,6 +4,9 @@
 //! the pane id Herdr hands every pane shell; there is nothing to mint and no
 //! daemon. Outside a Herdr pane both commands do nothing.
 
+//! herdr-core agents report through `hp report`; Herdr 1's per-harness hook
+//! normalization is gone, and what is left of that path is dead until pruned.
+#![allow(dead_code)]
 use std::path::{Path, PathBuf};
 
 use anyhow::{Result, bail};

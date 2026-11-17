@@ -597,7 +597,7 @@ fn mark_paused(ctx: &Ctx, project: &Project, sessions: &mut Sessions) {
     let Some(record) = project.coordinator() else {
         return;
     };
-    if record.socket.is_empty() || !Path::new(&record.socket).exists() {
+    if !crate::herdr::session_alive(&ctx.env.herdr_bin(), &record.socket, ctx.runner) {
         return;
     }
     let part = part(ctx, project, &record, &coordinator::live(project), &[], true);
@@ -966,7 +966,7 @@ fn tick_cheap(ctx: &Ctx, project: &Project, sessions: &mut Sessions) -> Result<O
 /// no record and no agent works in its folder: then no state is read, so
 /// nothing is ever reported as gone.
 fn tick_cheap_body(ctx: &Ctx, project: &Project, sessions: &mut Sessions, state: &mut steps::State) -> Result<Option<Seen>> {
-    let recorded = project.coordinator().filter(|r| !r.socket.is_empty() && Path::new(&r.socket).exists());
+    let recorded = project.coordinator();
     let record = match recorded {
         Some(record) => record,
         None => match discover_record(ctx, project, sessions)? {

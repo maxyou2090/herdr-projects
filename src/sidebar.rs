@@ -1,7 +1,10 @@
 //! How a project's threads read: the words of a group, a row's one-line
 //! display, and the labels that carry them. Herdr 1 drew these into its
 //! sidebar and tab bar; herdr-core draws nothing, so the same strings are what
-//! `overview`, `list` and the digest print.
+//! `overview`, `list` and the digest print: the config edits, key handling and
+//! view builders this module carried for Herdr 1 are gone, and the leftovers
+//! are marked dead until they are pruned.
+#![allow(dead_code)]
 
 use std::path::Path;
 

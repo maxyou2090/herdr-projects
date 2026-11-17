@@ -368,6 +368,7 @@ impl<'a> Herdr<'a> {
         Err(HerdrError { code: "failed".into(), message: format!("`hc {}`: {}", args.join(" "), out.error_text()) })
     }
 
+    #[allow(dead_code)] // used by the unit tests of the modules that report tokens
     pub fn call(&self, args: &[&str], timeout: Duration) -> Result<serde_json::Value, HerdrError> {
         self.json(args, timeout)
     }
@@ -696,23 +697,6 @@ impl<'a> Herdr<'a> {
     fn end(&self, pane: &str) -> Result<(), HerdrError> {
         let _ = self.json(&["kill", pane], CALL_TIMEOUT);
         let _ = self.json(&["rm", pane], CALL_TIMEOUT);
-        Ok(())
-    }
-
-    /// The pane this process runs in, from core's own `HC_TERMINAL_ID`, as the
-    /// name the rest of the binary stores. None outside a core terminal.
-    pub fn pane_current(&self) -> Option<String> {
-        let address = std::env::var("HC_TERMINAL_ID").ok().filter(|id| !id.is_empty())?;
-        self.term(&address).ok().map(|term| term.pane_id())
-    }
-
-    /// Types a line into a pane's shell and submits it.
-    pub fn pane_run(&self, pane: &str, command: &str) -> Result<(), HerdrError> {
-        self.json(&["send", pane, command], CALL_TIMEOUT).map(|_| ())
-    }
-
-    /// core reloads its config by itself; there is nothing to ask.
-    pub fn reload_config(&self) -> Result<(), HerdrError> {
         Ok(())
     }
 

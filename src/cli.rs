@@ -694,20 +694,6 @@ fn profile_change(ctx: &Ctx, command: ProfileCommand) -> Result<crate::profiles:
     })
 }
 
-/// A `profile ...` command line the popup builds, applied in this process:
-/// the popup is a person's own screen, so it needs no terminal check.
-pub fn apply_profile_args(ctx: &Ctx, args: &[String]) -> Result<String> {
-    #[derive(Parser)]
-    #[command(name = "profile")]
-    struct ProfileCli {
-        #[command(subcommand)]
-        command: ProfileCommand,
-    }
-    let parsed = ProfileCli::try_parse_from(args).map_err(|e| anyhow::anyhow!("{}", e.to_string().lines().next().unwrap_or("bad arguments")))?;
-    let change = profile_change(ctx, parsed.command)?;
-    crate::profiles::apply(&ctx.config_dir, &change)
-}
-
 /// The lane `hp task move` / `hp task done` run as, for the cross-lane guard.
 /// A project without a registry has no lanes, so there is nothing to guard; a
 /// pane that resolves to no lane reads as the default lane (§10).
