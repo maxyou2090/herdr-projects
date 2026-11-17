@@ -24,20 +24,14 @@ struct Cli {
 
 #[derive(Args, Clone, Default)]
 pub struct SessionArgs {
-    /// herdr session name
-    #[arg(long, value_name = "NAME", conflicts_with = "socket")]
+    /// herdr session name (default: `HC_SESSION`, else the default core)
+    #[arg(long, value_name = "NAME")]
     session: Option<String>,
-    /// herdr socket path
-    #[arg(long, value_name = "PATH")]
-    socket: Option<PathBuf>,
 }
 
 impl From<SessionArgs> for SessionFlags {
     fn from(args: SessionArgs) -> Self {
-        SessionFlags {
-            session: args.session,
-            socket: args.socket,
-        }
+        SessionFlags { session: args.session }
     }
 }
 
@@ -60,8 +54,7 @@ enum Command {
     },
     /// List projects, archived ones marked `archived`
     List,
-    /// Open a project: start a coordinator agent in its folder, in this terminal
-    /// when run from one, else in a new terminal of the project's Space
+    /// Open a project: start a coordinator agent in its folder — in this terminal when no agent runs there, else in a new terminal of the project's Space
     Open {
         slug: String,
         /// The coordinator's profile, one the project allows (default: coordinator_profile in PROJECT.md); `profile list` shows them
@@ -70,11 +63,11 @@ enum Command {
         /// Start another coordinator even though one is running
         #[arg(long)]
         new: bool,
-        /// Start the coordinator in a new tab even when run from a shell pane
-        /// inside a core terminal (by default it starts in that terminal)
+        /// Start the coordinator in a new tab even when run from a free core
+        /// terminal (by default it starts in that terminal)
         #[arg(long)]
         tab: bool,
-        /// Move the project to this session when its recorded socket no longer exists
+        /// Move the project to this session when the session it was opened in no longer runs
         #[arg(long)]
         rebind: bool,
         /// Open or focus this lane's coordinator (default: the default lane).
@@ -229,9 +222,9 @@ enum Command {
         #[arg(long, value_name = "ID")]
         pane: Option<String>,
     },
-    /// Update the plugin to the newest release: fetch, rebuild, `doctor --fix`, restart the ticker
+    /// Say what this build is and how to move it (it comes from a checkout; there is no release feed)
     Update {
-        /// Print the installed and the newest version and change nothing
+        /// Print this build's version and how to rebuild it; change nothing
         #[arg(long)]
         check: bool,
     },

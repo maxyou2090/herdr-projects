@@ -62,7 +62,7 @@ Every thread works from `<its working directory>/.herdr-project/<project>-<id>/`
 | Command | What it does |
 | --- | --- |
 | `new <name> [--goal] [--repo PATH[@MACHINE]]... [--thread-profile P] [--coordinator-profile P]` | Create a project folder. The profiles default to `[defaults]` in config.toml, else `claude`. |
-| `open <project> [--profile P] [--new] [--lane NAME] [--lane-name LABEL] [--session N \| --socket P] [--rebind]` | A coordinator agent in a terminal of the project's own Space, in the current one when run from a core terminal; a running coordinator is focused instead. `--lane` opens or focuses that lane's coordinator and creates the lane when it does not exist; `--lane-name` sets a new lane's label. |
+| `open <project> [--profile P] [--new] [--lane NAME] [--lane-name LABEL] [--session N] [--tab] [--rebind]` | A coordinator agent in a terminal of the project's own Space. Run it from a shell in one of the session's core terminals and no agent occupies that terminal, the coordinator starts **in that terminal**; `--tab` forces a new tab instead. A running coordinator is focused instead. `--lane` opens or focuses that lane's coordinator and creates the lane when it does not exist; `--lane-name` sets a new lane's label. |
 | `context <project> [--peek]` | The digest the coordinator reads every turn; with lanes, the shared part plus the reader's own lane. |
 | `task add <project> <list> "<title>" [--owner O] [--lane L] [--notes T]`, `task move <project> "<title>" <list>`, `task done <project> "<title>"`, `task delete <project> "<title>"`, `task thread <project> "<title>" <thread-id> [--owner O]` (or `--clear` to remove the id) | Safe `TASKS.md` writers: one locked read-modify-write, every byte outside the changed task preserved. `--lane` writes `## <lane>/<list>`; without it the list is shared. `task delete` removes the line and its notes, keeping an empty heading; `task thread` records the owner and thread id on that one line. |
 | `assignable <project> [--refresh] [--check OWNER]` | Who TASKS.md tasks may be assigned to (see [Task owners](#task-owners)); `--check` refuses an owner that is not valid. |
@@ -82,7 +82,7 @@ Every thread works from `<its working directory>/.herdr-project/<project>-<id>/`
 | `report --activity TEXT [--done]`, `progress [--pane ID]` | An agent's own word on what it is doing, and the record of it. The bundled `autoproject` skill is linked once by hand in `~/.agents/skills/`. |
 | `open-file <path>`, `open-url <url>` | Open a text file in this terminal's `$EDITOR`, or a PR in the browser. |
 | `ticker start \| run \| stop \| status`, `doctor [--fix]`, `skill` | Housekeeping. `ticker start` installs a LaunchAgent so the loop survives a reboot. `doctor --fix` also relinks `~/.local/bin/hp` and repairs priming files; a file or another link is left alone. | |
-| `update` | Nothing to fetch: this binary is built from a checkout, so rebuild with `cargo build --release --locked` and restart the ticker. |
+| `update [--check]` | Nothing to fetch: this binary is built from a checkout. Prints the build's version and checkout, then `git pull`, `cargo build --release --locked`, `ticker stop && ticker start`; `--check` prints the same and changes nothing. |
 
 ## Lanes
 
@@ -296,4 +296,4 @@ scripts/dev-herdr <args>         # herdr against that session
 HOME=<scratch> XDG_CONFIG_HOME=<scratch> ...  # a whole scratch config dir
 ```
 
-Never develop against your default session, `~/.herdr-projects` or your real `config.toml`: `doctor --fix` writes the binary's own link, priming files and the skill link for the harnesses it finds, and it does so for the binary and root it runs as. [`herdr-notes.md`](herdr-notes.md) records what was verified about Herdr, and [`manual-test.md`](manual-test.md) lists the acceptance checks, including the visual ones only a person can confirm.
+Never develop against your default session, `~/.herdr-projects` or your real `config.toml`: `doctor --fix` writes the binary's own link, priming files and the skill link for the harnesses it finds, and it does so for the binary and root it runs as. [`history/herdr-notes-herdr1.md`](history/herdr-notes-herdr1.md) records what was verified about Herdr 1, and [`history/manual-test-herdr1.md`](history/manual-test-herdr1.md) lists its acceptance checks, including the visual ones only a person can confirm.

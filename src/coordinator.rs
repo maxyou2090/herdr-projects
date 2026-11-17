@@ -261,8 +261,8 @@ pub struct OpenOptions {
     pub profile: Option<String>,
     /// Start another coordinator although one is running.
     pub new: bool,
-    /// Start the agent in the pane this command runs in, when that is a shell
-    /// pane of the session (false: a new tab, as the popup and actions do).
+    /// Start the agent in the terminal this command runs in, when no agent
+    /// occupies it and it belongs to this session (false: a new tab).
     pub here: bool,
     /// Whether a person ran this `open` — at a terminal or through the popup —
     /// rather than an agent's shell or the ticker: a paused project is then
@@ -276,15 +276,18 @@ pub struct OpenOptions {
     pub lane_name: Option<String>,
 }
 
-/// The pane `open` runs in, when the coordinator can start right there: the
-/// command runs in a Herdr pane of this session that no agent occupies, and
-/// not in a plugin pane or action (the popup must never become the coordinator).
+/// The terminal `open` runs in, when the coordinator can start right there:
+/// the command runs in a core terminal of this session that no agent occupies,
+/// and `--tab` was not passed. The answer is the terminal address
+/// (`HC_TERMINAL_ID`), which is what core tells a process about itself; Herdr 1's
+/// pane and plugin variables are not set by herdr-core, so reading them made
+/// this always `None`.
 fn here_pane(ctx: &Ctx, options: &OpenOptions, socket: &str, agents: &[Agent]) -> Option<String> {
-    if !options.here || ctx.env.var("HERDR_PLUGIN_STATE_DIR").is_some() || ctx.env.var("HERDR_SOCKET_PATH") != Some(socket) {
+    if !options.here || !crate::herdr::same_session(ctx.env.this_session(), socket) {
         return None;
     }
-    let pane = ctx.env.var("HERDR_PANE_ID")?;
-    (!agents.iter().any(|a| a.pane_id == pane)).then(|| pane.to_string())
+    let terminal = ctx.env.this_terminal()?;
+    (!agents.iter().any(|agent| agent.in_terminal(terminal))).then(|| terminal.to_string())
 }
 
 /// The agent kind a recorded coordinator ran. With lanes, `coordinator.json`
@@ -714,8 +717,8 @@ pub fn open(ctx: &Ctx, slug: &str, options: &OpenOptions) -> Result<()> {
     let reusable = previous.as_ref().filter(|record| {
         !options.new && panes.iter().any(|p| pane_matches(record, p)) && !agents.iter().any(|a| a.pane_id == record.pane_id)
     });
-    let (workspace_id, tab_id, pane_id) = if let Some(pane) = &here {
-        let pane = panes.iter().find(|p| &p.pane_id == pane).with_context(|| format!("pane {pane} is not listed by the herdr session at {socket}"))?;
+    let (workspace_id, tab_id, pane_id) = if let Some(terminal) = &here {
+        let pane = panes.iter().find(|p| &p.terminal_id == terminal).with_context(|| format!("the terminal {terminal} is not listed by the herdr session at {socket}"))?;
         // This pane's Space becomes the project's recorded home: its label
         // follows, like every other path that adopts or creates one.
         sync_label(&herdr, &pane.workspace_id, &label);
@@ -1019,14 +1022,14 @@ pub fn prompt_to(ctx: &Ctx, slug: &str, text: &str, lane: Option<&str>) -> Resul
 }
 
 /// The lane a prompt goes to (§5.2, §12 commit 3): the caller's own, resolved
-/// from `HERDR_PANE_ID` through the same five rules.
+/// from `HC_TERMINAL_ID` through the same five rules.
 ///
 /// `Ok(None)` means "no lane routing at all": a project without a registry keeps
-/// the old single-record pick. A caller that resolves to **no** lane — the popup
-/// runs in a plugin pane, which is nobody's coordinator — goes to the default
-/// lane when the project has exactly one open lane, the same way rule 3 falls
-/// back to it for a single-lane project. With several lanes there is nothing
-/// honest to guess, so it refuses and names `hp lane list`.
+/// the old single-record pick. A caller that resolves to **no** lane — a shell,
+/// or a pane no rule can name — goes to the default lane when the project has
+/// exactly one open lane, the same way rule 3 falls back to it for a
+/// single-lane project. With several lanes there is nothing honest to guess, so
+/// it refuses and names `hp lane list`.
 fn prompt_lane(ctx: &Ctx, project: &Project, record: &Coordinator, agents: &[Agent]) -> Result<Option<String>> {
     use crate::lanes::LaneResolution as Answer;
     if !crate::lanes::split_in_use(project) {
@@ -1034,8 +1037,8 @@ fn prompt_lane(ctx: &Ctx, project: &Project, record: &Coordinator, agents: &[Age
     }
     let slug = &project.slug;
     let registry = crate::lanes::Registry::for_project(project);
-    let this = ctx.env.var("HERDR_PANE_ID").unwrap_or_default();
-    let caller = agents.iter().find(|a| !this.is_empty() && a.pane_id == this && crate::lanes::ours(a, slug));
+    let terminal = ctx.env.this_terminal().unwrap_or_default();
+    let caller = agents.iter().find(|a| a.in_terminal(terminal) && crate::lanes::ours(a, slug));
     match caller.map(|a| crate::lanes::classify(project, record, a)) {
         Some(Answer::Known { lane, .. }) => Ok(Some(lane)),
         Some(Answer::Ambiguous { reason }) => bail!("this pane is no lane's coordinator of `{slug}`: {reason}; `hp lane list {slug}` shows the lanes"),
@@ -1483,5 +1486,36 @@ mod tests {
         // An `Ambiguous` pane has no lane and is never a target, however idle.
         let ambiguous = vec![pane("w9:p9", "", "idle", 99)];
         assert!(nudge_target(&project, &ambiguous, now).is_empty(), "no lane, no nudge");
+    }
+}
+
+#[cfg(test)]
+mod here_tests {
+    use super::*;
+
+    fn ctx<'a>(home: &std::path::Path, runner: &'a crate::runner::fake::FakeRunner, terminal: &str) -> Ctx<'a> {
+        let env = crate::paths::Env::for_test(home, &[("HC_TERMINAL_ID", terminal)]);
+        let env: &'static crate::paths::Env = Box::leak(Box::new(env));
+        Ctx { env, root: home.join("root"), config_dir: home.join("cfg"), runner, detached_ticker: false }
+    }
+
+    #[test]
+    fn open_starts_the_coordinator_in_the_terminal_it_runs_in_when_that_is_free() {
+        let home = tempfile::tempdir().unwrap();
+        let runner = crate::runner::fake::FakeRunner::new();
+        let options = OpenOptions { here: true, ..OpenOptions::default() };
+        let occupied = Agent { terminal_id: "t7".into(), ..Agent::default() };
+        // A free terminal of this session: the coordinator starts right here.
+        assert_eq!(
+            here_pane(&ctx(home.path(), &runner, "t9"), &options, "", std::slice::from_ref(&occupied)),
+            Some("t9".into())
+        );
+        // An agent already occupies the terminal: a new tab instead.
+        assert_eq!(here_pane(&ctx(home.path(), &runner, "t7"), &options, "", &[occupied]), None);
+        // `--tab` turns it off, and another session is not this project's.
+        assert_eq!(here_pane(&ctx(home.path(), &runner, "t9"), &OpenOptions::default(), "", &[]), None);
+        assert_eq!(here_pane(&ctx(home.path(), &runner, "t9"), &options, "hp-dev", &[]), None);
+        // Outside a core terminal there is no address to start in.
+        assert_eq!(here_pane(&ctx(home.path(), &runner, ""), &options, "", &[]), None);
     }
 }

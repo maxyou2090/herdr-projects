@@ -89,7 +89,19 @@ Rules that follow from this, worth keeping:
 - **A recorded session is a name, not a path.** `Session { socket }` holds the
   `HC_SESSION` value; a Herdr 1 socket path (`/…/herdr.sock`) reads as the
   default session (`herdr::session_key`). This compatibility shim is what made
-  the restored backup usable without rewriting a thousand records.
+  the restored backup usable without rewriting a thousand records. `--socket`
+  and `HERDR_SESSION` are gone: core never sets either, so the only sources are
+  `--session` and `HC_SESSION` (`paths::resolve_session`).
+- **"Which pane am I?" is `HC_TERMINAL_ID`, and nothing else.** Core hands a
+  process the *address* of its terminal; records store the *name*. The two are
+  tied by the live list (`herdr::pane_of_terminal`, `herdr::Agent::in_terminal`),
+  and `paths::Env::this_terminal` / `this_session` are the only readers. Herdr 1
+  exported `HERDR_PANE_ID`, `HERDR_TAB_ID`, `HERDR_WORKSPACE_ID`,
+  `HERDR_SOCKET_PATH`, `HERDR_SESSION` and `HERDR_PLUGIN_STATE_DIR`; core sets
+  none of them, so every check that read them was permanently false — `open`'s
+  "start in this terminal", the lane a `context` reads, `lane adopt`, and
+  `thread resolve`'s coordinator test all silently stopped working. Nothing in
+  `src/` reads a `HERDR_*` variable for identity any more.
 - **"Is the session alive" is a call, not a file test.** Every `Path::new(&record.socket).exists()`
   left in the code was a bug (see §6).
 
@@ -112,8 +124,10 @@ Rules that follow from this, worth keeping:
 | `src/notify.rs` (`Notifier`, `Sound`) and `Herdr::notification_show` | the user does not want desktop notifications; inbox items are the record |
 | `mute` in `PROJECT.md` | it only silenced notifications; a leftover line in an older project reads as ignored |
 
-`docs/manual-test.md` is kept with a note: it is the Herdr 1 acceptance script,
-useful as a record of what was verified then, not as a current checklist.
+`docs/manual-test.md` is now a pointer: the Herdr 1 acceptance script itself is
+in `docs/history/manual-test-herdr1.md`, together with
+`docs/history/herdr-notes-herdr1.md`. They are a record of what was verified on
+that host, not a checklist for this one.
 
 ## 5. What the port verified, and how
 
@@ -197,9 +211,10 @@ Ordered by what a user would notice first:
    the agent's screen and reports `working`/`blocked` as 7501, or a pi extension
    doing the same from inside the harness. `prompt_box`'s styling loss (§6.6)
    disappears with it.
-2. **`docs/lanes.md` still describes the Herdr 1 host** (sidebar, popup,
-   `herdr-projects` as the command name). The lane model itself is unchanged and
-   correct; the wording is not.
+2. **`docs/lanes.md` still carries its Herdr 1 wording** (sidebar, popup,
+   `grouping`). A port note at the top says which modules no longer exist, and
+   the lane identity is documented in `HC_TERMINAL_ID` / `HC_SESSION` terms, but
+   §9's ordering and token-lease paragraphs are still the old host's design.
 3. **Tab order in the app is creation order.** Putting "needs you" first means
    `herdr-app do tab.move`, which is not implemented.
 4. **Remote machines are deleted, not ported.** `hc --on <machine>` was the
@@ -210,9 +225,11 @@ Ordered by what a user would notice first:
    per-machine outage memory and `profile@machine` owners are gone. A record or
    a `TASKS.md` line written when it existed still loads; an `@machine` owner is
    refused with a clear error.
-5. **`hp update` is a stub** that says to rebuild the checkout; there is no
-   release feed for this build.
-6. **Test coverage is thinner than the old suite.** 262 unit tests, 7 CLI tests
+5. **`hp update` has no release feed.** It says which build this is and how to
+   move it (`git pull`, `cargo build --release --locked`, `ticker stop && ticker
+   start`), and `--check` says the same without changing anything. There is no
+   feed to add until this build is published somewhere.
+6. **Test coverage is thinner than the old suite.** 259 unit tests, 7 CLI tests
    and 5 adapter tests against `src/fake_hc.rs` (a fake core that answers the
    `hc` commands this binary runs). The fake models terminals, labels, status,
    `send`, `read`, `kill`; it does not model worktrees, the app, or waiting.

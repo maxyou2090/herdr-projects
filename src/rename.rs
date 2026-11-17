@@ -489,9 +489,11 @@ fn advance(ctx: &Ctx, pending: &Pending) -> Result<Option<Next>> {
     }
     let mut reopened = None;
     if pending.reopen {
-        let socket = project.coordinator().map(|c| c.socket).filter(|s| !s.is_empty());
+        // The session the project was opened in, as a name `--session` accepts:
+        // a Herdr 1 socket path in an old record means the default session.
+        let session = project.coordinator().map(|c| crate::herdr::session_key(&c.socket)).filter(|s| !s.is_empty());
         let options = crate::coordinator::OpenOptions {
-            session: crate::paths::SessionFlags { session: None, socket: socket.map(PathBuf::from) },
+            session: crate::paths::SessionFlags { session },
             rebind: false,
             profile: None,
             new: false,

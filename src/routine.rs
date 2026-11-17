@@ -226,16 +226,14 @@ pub fn journal_path(project: &Project) -> std::path::PathBuf {
     project.state_dir().join("routine-journal.log")
 }
 
-/// Where a `routine toggle` came from: the popup, a Herdr pane, or a plain
-/// terminal. A file that changed on its own can be traced to the kind of
-/// caller that changed it.
+/// Where a `routine toggle` came from: a core terminal, or a plain one (the
+/// ticker, a script). A file that changed on its own can be traced to the kind
+/// of caller that changed it; the terminal address names the pane, which a pane
+/// id cannot (core renames panes).
 pub fn journal_source(env: &crate::paths::Env) -> String {
-    if env.var("HERDR_PLUGIN_STATE_DIR").is_some() {
-        "popup".to_string()
-    } else if let Some(pane) = env.var("HERDR_PANE_ID") {
-        format!("pane:{pane}")
-    } else {
-        "terminal".to_string()
+    match env.this_terminal() {
+        Some(terminal) => format!("core-terminal:{terminal}"),
+        None => "terminal".to_string(),
     }
 }
 

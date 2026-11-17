@@ -889,14 +889,32 @@ pub fn report_stray(project: &Project, id: &str, record: &Thread, stray: Option<
 
 /// A coordinator already knows the result of a resolve it initiated, so keep
 /// its audit event without putting a redundant item back in its own inbox.
+///
+/// "It is this coordinator" means the reader's core terminal (`HC_TERMINAL_ID`)
+/// runs an agent in the project's session whose pane is a coordinator's — the
+/// recorded one, or any lane's. Herdr 1 compared its own pane/tab/workspace
+/// variables against the record; herdr-core never sets those, so the answer was
+/// always "no" and every resolve left one extra item behind.
 fn called_from_coordinator(ctx: &Ctx, project: &Project) -> bool {
+    let Some(terminal) = ctx.env.this_terminal() else {
+        return false;
+    };
     let Some(record) = project.coordinator() else {
         return false;
     };
-    ctx.env.var("HERDR_SOCKET_PATH") == Some(record.socket.as_str())
-        && ctx.env.var("HERDR_WORKSPACE_ID") == Some(record.workspace_id.as_str())
-        && ctx.env.var("HERDR_TAB_ID") == Some(record.tab_id.as_str())
-        && ctx.env.var("HERDR_PANE_ID") == Some(record.pane_id.as_str())
+    if !crate::herdr::same_session(ctx.env.this_session(), &record.socket) {
+        return false;
+    }
+    let agent = crate::herdr::Herdr::new(ctx.env.herdr_bin(), &record.socket, ctx.runner)
+        .agent_list()
+        .unwrap_or_default()
+        .into_iter()
+        .find(|agent| agent.in_terminal(terminal));
+    let Some(agent) = agent else {
+        return false;
+    };
+    agent.pane_id == record.pane_id
+        || crate::lanes::Registry::for_project(project).lanes.iter().any(|lane| !lane.pane_id.is_empty() && lane.pane_id == agent.pane_id)
 }
 
 pub struct Clean {
@@ -1488,5 +1506,75 @@ mod tests {
         let status = String::from_utf8_lossy(&out.stdout);
         assert!(status.contains("?? unfinished.txt"), "{status}");
         assert!(!status.contains(".agents"), "only the link is excluded: {status}");
+    }
+}
+
+#[cfg(test)]
+mod coordinator_caller_tests {
+    use super::*;
+
+    /// A project whose recorded coordinator is pane `w1:p1`, and a fake core
+    /// where that pane is terminal `t44`. `/r/demo` is only a label: nothing
+    /// here reads a directory.
+    fn setup<'a>(home: &std::path::Path, runner: &'a crate::runner::fake::FakeRunner, terminal: &str) -> (Ctx<'a>, Project) {
+        let root = &home.join("root");
+        let project = crate::project::Project::load(root, "demo")
+            .or_else(|_| crate::project::create(root, "demo", "", vec![]))
+            .unwrap();
+        project
+            .update_coordinator(|c| {
+                c.pane_id = "w1:p1".into();
+                c.workspace_id = "w1".into();
+                c.tab_id = "w1:t1".into();
+            })
+            .unwrap();
+        let env = crate::paths::Env::for_test(home, &[("HC_TERMINAL_ID", terminal)]);
+        let env: &'static crate::paths::Env = Box::leak(Box::new(env));
+        let ctx = Ctx { env, root: home.join("root"), config_dir: home.join("cfg"), runner, detached_ticker: false };
+        (ctx, project)
+    }
+
+    fn core(runner: &crate::runner::fake::FakeRunner) {
+        runner.on(
+            "--json ls",
+            crate::runner::fake::ok(r#"{"terminals":[{"name":"w1:p1","address":"t44","cwd":"/r/demo","state":"live"}]}"#),
+        );
+        runner.on(
+            "--json get",
+            crate::runner::fake::ok(r#"{"address":"t44","name":"w1:p1","labels":{"hp_agent":"hpc-demo"},"cwd":"/r/demo","state":"live"}"#),
+        );
+    }
+
+    #[test]
+    fn a_resolve_in_the_coordinator_s_terminal_leaves_no_item_for_itself() {
+        let home = tempfile::tempdir().unwrap();
+        let runner = crate::runner::fake::FakeRunner::new();
+        core(&runner);
+        // The coordinator's own terminal: the event it wrote is already known to
+        // it, so `resolve` archives it instead of leaving one more item.
+        let (ctx, project) = setup(home.path(), &runner, "t44");
+        assert!(called_from_coordinator(&ctx, &project));
+        // Another terminal, and no terminal at all (the ticker, a script).
+        let (elsewhere, _) = setup(home.path(), &runner, "t45");
+        assert!(!called_from_coordinator(&elsewhere, &project));
+        let (outside, _) = setup(home.path(), &runner, "");
+        assert!(!called_from_coordinator(&outside, &project));
+    }
+
+    #[test]
+    fn a_terminal_that_runs_an_agent_of_another_project_is_not_the_coordinator() {
+        let home = tempfile::tempdir().unwrap();
+        let runner = crate::runner::fake::FakeRunner::new();
+        // The same terminal address, but its pane is not this project's pane.
+        runner.on(
+            "--json ls",
+            crate::runner::fake::ok(r#"{"terminals":[{"name":"w9:p9","address":"t44","cwd":"/r/other","state":"live"}]}"#),
+        );
+        runner.on(
+            "--json get",
+            crate::runner::fake::ok(r#"{"address":"t44","name":"w9:p9","labels":{"hp_agent":"hpc-other"},"cwd":"/r/other","state":"live"}"#),
+        );
+        let (ctx, project) = setup(home.path(), &runner, "t44");
+        assert!(!called_from_coordinator(&ctx, &project));
     }
 }
