@@ -21,8 +21,29 @@ use crate::shell::quote;
 use crate::{inbox, names, ticker};
 
 /// A coordinator counts as idle for a nudge once its `(agent_status,
-/// state_change_seq)` pair has been `idle` this long (four ticks).
-pub const NUDGE_IDLE_SECS: i64 = 60;
+/// state_change_seq)` pair has been `idle` this long (one tick).
+///
+/// Kept at a quarter minute on purpose: an item that lands while the
+/// coordinator sits between turns should be announced on the next tick, not a
+/// minute later — that minute was the whole cost of being told about a thread
+/// that finished right after the coordinator stopped talking.
+///
+/// A shorter window does **not** shorten the typing safety margin by itself.
+/// What keeps a prompt out of a half-typed line is
+/// [`crate::steps::NUDGE_QUIET_SECS`] — the input box, read from the pane's
+/// screen, has to have looked empty for ten seconds — plus `prompt_box`
+/// refusing to type into a box it cannot read as empty. Neither wait depends on
+/// this number, so dropping this one cannot make the nudge merge with a draft.
+///
+/// The risk it does carry is the other one: `idle` here means the agent's
+/// reported state has not changed, and an agent in the middle of a turn that
+/// prints nothing (a long tool call, a subagent, a command that is just slow)
+/// can look `idle` for a while. A shorter window catches more of those pauses,
+/// so the prompt lands while the coordinator is in fact still working. That
+/// costs a cue, never an item: an announcement that arrives mid-turn is read
+/// when the turn ends, and the item stays in the inbox — and in `context` —
+/// until it is handled. Raise this back if that turns out to be the common case.
+pub const NUDGE_IDLE_SECS: i64 = 15;
 
 /// `<binary> --root <root>`: the fixed shape every printed command starts
 /// with, so allow-list patterns can match on it. Values with spaces are quoted.
@@ -1432,20 +1453,29 @@ mod tests {
     }
 
     #[test]
-    fn nudge_goes_to_the_most_recently_changed_coordinator_idle_for_a_minute() {
+    fn nudge_goes_to_the_most_recently_changed_coordinator_idle_for_the_window() {
         let (_root, project) = project();
         let now: jiff::Timestamp = "2026-09-23T10:02:00Z".parse().unwrap();
         let pane = |id: &str, status: &str, seq: u64, since: &str| LivePane { pane_id: id.into(), agent_status: status.into(), state_change_seq: seq, pair_since: since.into(), ..LivePane::default() };
         let panes = vec![
-            pane("w1:p1", "idle", 3, "2026-09-23T10:00:30Z"),
-            pane("w1:p2", "done", 7, "2026-09-23T10:00:00Z"),
-            pane("w1:p3", "idle", 9, "2026-09-23T10:01:30Z"),
+            pane("w1:p1", "idle", 3, "2026-09-23T10:00:30Z"),  // idle 90s
+            pane("w1:p2", "done", 7, "2026-09-23T10:00:00Z"),  // idle 120s, `done` counts
+            pane("w1:p3", "idle", 9, "2026-09-23T10:01:30Z"),  // idle 30s: enough, newest
             pane("w1:p4", "working", 12, "2026-09-23T09:00:00Z"),
+            pane("w1:p5", "idle", 20, "2026-09-23T10:01:46Z"), // idle 14s: one short
         ];
         let targets = nudge_target(&project, &panes, now);
         assert_eq!(targets.len(), 1, "one lane, one target: {targets:?}");
-        assert_eq!(targets["c-1"].pane_id, "w1:p2");
-        assert!(nudge_target(&project, &panes[2..], now).is_empty());
+        assert_eq!(targets["c-1"].pane_id, "w1:p3", "the most recently changed pane that has been idle long enough");
+        // The window is exact, and `done` counts as idle the way `idle` does.
+        assert_eq!(NUDGE_IDLE_SECS, 15, "the idle window is a quarter minute");
+        assert_eq!(nudge_target(&project, &panes[1..2], now)["c-1"].pane_id, "w1:p2", "`done` is idle too");
+        assert!(nudge_target(&project, &panes[4..], now).is_empty(), "14s idle and then working is not idle enough");
+        // Exactly on the boundary.
+        let at_bound = vec![pane("w1:p1", "idle", 3, "2026-09-23T10:01:45Z")];
+        assert_eq!(nudge_target(&project, &at_bound, now)["c-1"].pane_id, "w1:p1");
+        let below = vec![pane("w1:p1", "idle", 3, "2026-09-23T10:01:46Z")];
+        assert!(nudge_target(&project, &below, now).is_empty(), "one second short of the window is not a target");
     }
 
     #[test]
