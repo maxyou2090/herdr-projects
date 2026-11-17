@@ -105,3 +105,48 @@ mod tests {
         assert!(placed(&serde_json::json!({"error": "no space shown"})).is_none());
     }
 }
+
+/// Every space, tab and terminal the window shows (`herdr-app ls`).
+pub fn ls(runner: &dyn Runner) -> Option<serde_json::Value> {
+    let out = runner.run(&Cmd::new(bin(), Duration::from_secs(10)).arg("ls")).ok()?;
+    if !out.success() {
+        return None;
+    }
+    serde_json::from_str(out.stdout.trim()).ok()
+}
+
+/// The tab the window put a terminal in: the app makes one when a terminal
+/// carries `herdr.space`, and its name is ours to set.
+pub fn tab_of(runner: &dyn Runner, terminal: &str) -> Option<String> {
+    let spaces = ls(runner)?;
+    for space in spaces["spaces"].as_array()? {
+        for tab in space["tabs"].as_array()? {
+            if tab["terminals"].as_array()?.iter().any(|t| t["terminal"] == terminal) {
+                return tab["id"].as_str().map(str::to_string);
+            }
+        }
+    }
+    None
+}
+
+/// A fresh space or tab is not in `ls` yet: the app materialises it a moment
+/// after the reply, so both the close and the rename retry briefly.
+pub fn retry(mut attempt: impl FnMut() -> bool) -> bool {
+    for _ in 0..30 {
+        if attempt() {
+            return true;
+        }
+        std::thread::sleep(Duration::from_millis(60));
+    }
+    false
+}
+
+pub fn tab_rename(runner: &dyn Runner, tab: &str, name: &str) -> bool {
+    let args = vec!["--id".to_string(), tab.to_string(), "--name".to_string(), name.to_string()];
+    call(runner, "tab.rename", &args).is_some()
+}
+
+pub fn tab_close(runner: &dyn Runner, tab: &str) -> bool {
+    let args = vec!["--id".to_string(), tab.to_string()];
+    call(runner, "tab.close", &args).is_some()
+}

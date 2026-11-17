@@ -556,12 +556,36 @@ impl<'a> Herdr<'a> {
 
     pub fn workspace_create(&self, cwd: &Path, label: &str, _focus: bool) -> Result<Created, HerdrError> {
         let dir = cwd.to_string_lossy().into_owned();
-        // The app shows what it made: a Space per project, so `hp open` and
-        // `hp thread start` land in the window a person is looking at. Without
-        // the app a Space is only labels, and `hc attach` reaches the pane.
-        if let Some(placed) = crate::app::running(self.runner).then(|| crate::app::space_new(self.runner, label, &dir)).flatten() {
-            self.label(&placed.terminal, &[(L_WS, placed.space.as_str()), (L_WS_LABEL, label), (L_TAB, placed.tab.as_str()), (L_TAB_LABEL, "root")])?;
-            return Ok(Created { workspace_id: placed.space, tab_id: placed.tab, pane_id: placed.terminal });
+        // A person who works in the Herdr app has to see the project: the app
+        // makes the Space, and the terminal inside it is ours — named by us, so
+        // a record keeps working across restarts, and carrying
+        // `herdr.space` so the window keeps showing it.
+        if crate::app::running(self.runner)
+            && let Some(placed) = crate::app::space_new(self.runner, label, &dir)
+        {
+            let tab = format!("{}-{}", placed.space, suffix());
+            let name = self.next_name(label)?;
+            let term = self.start(
+                &name,
+                cwd,
+                &[
+                    (L_WS, placed.space.as_str()),
+                    (L_WS_LABEL, label),
+                    (L_TAB, tab.as_str()),
+                    (L_TAB_LABEL, "coordinator"),
+                    ("herdr.space", placed.space.as_str()),
+                ],
+                &Vec::new(),
+            )?;
+            // The space's own first tab is a placeholder shell: close it once
+            // ours is there (the app will not leave a space without a tab).
+            let _ = crate::app::retry(|| crate::app::tab_close(self.runner, &placed.tab));
+            let address = term.address.clone();
+            let _ = crate::app::retry(|| {
+                crate::app::tab_of(self.runner, &address)
+                    .is_some_and(|tab| crate::app::tab_rename(self.runner, &tab, "coordinator"))
+            });
+            return Ok(self.created(&term));
         }
         let ws = self.next_id("hpw", label)?;
         let tab = format!("{ws}-t");
@@ -578,11 +602,26 @@ impl<'a> Herdr<'a> {
 
     pub fn tab_create(&self, workspace: &str, cwd: &Path, label: &str, _focus: bool) -> Result<Created, HerdrError> {
         let dir = cwd.to_string_lossy().into_owned();
-        if workspace.starts_with("sp")
-            && let Some(placed) = crate::app::running(self.runner).then(|| crate::app::tab_new(self.runner, workspace, label, &dir)).flatten()
-        {
-            self.label(&placed.terminal, &[(L_WS, workspace), (L_TAB, placed.tab.as_str()), (L_TAB_LABEL, label)])?;
-            return Ok(Created { workspace_id: workspace.to_string(), tab_id: placed.tab, pane_id: placed.terminal });
+        if workspace.starts_with("sp") && crate::app::running(self.runner) {
+            let tab = format!("{}-{}", workspace, suffix());
+            let name = self.next_name(label)?;
+            let term = self.start(
+                &name,
+                cwd,
+                &[
+                    (L_WS, workspace),
+                    (L_TAB, tab.as_str()),
+                    (L_TAB_LABEL, label),
+                    ("herdr.space", workspace),
+                ],
+                &Vec::new(),
+            )?;
+            let address = term.address.clone();
+            let _ = crate::app::retry(|| {
+                crate::app::tab_of(self.runner, &address)
+                    .is_some_and(|tab| crate::app::tab_rename(self.runner, &tab, label))
+            });
+            return Ok(self.created(&term));
         }
         let existing = self.terminals()?;
         let ws_label = existing
