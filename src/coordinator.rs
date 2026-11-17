@@ -298,6 +298,14 @@ fn recorded_kind(config: &crate::profiles::Config, record: &Coordinator) -> Stri
     }
 }
 
+/// The folder a coordinator records, for the adoption check above. Not
+/// canonical: core reports the terminal's physical folder as recorded, and on a
+/// symlinked root (`/tmp` is `/private/tmp` on macOS) canonicalizing breaks the
+/// comparison.
+fn dir_text_for_adopt(project: &Project) -> String {
+    project.dir().to_string_lossy().into_owned()
+}
+
 /// The lane `open` acts on: the one `--lane` names (created on the spot when it
 /// does not exist, or picked for it when the flag has no value), else the
 /// registry's default lane. The registry is written first when the project has
@@ -357,6 +365,16 @@ fn auto_lane(project: &Project, options: &OpenOptions, agents: &[Agent]) -> Resu
     let _lock = project.lock()?;
     let mut registry = crate::lanes::Registry::load(project)
         .with_context(|| format!("could not read {}", crate::lanes::registry_path(project).display()))?;
+    // A bare `--lane` on a project whose default line already runs its
+    // coordinator is plain `open`: focus it, never start a second one beside it.
+    if !options.new
+        && let Some(lane) = registry.get(&registry.default).cloned()
+        && agents.iter().any(|agent| {
+            crate::lanes::resolve(&registry, agent, &crate::lanes::project_home(project), &project.slug).lane_id() == Some(lane.id.as_str())
+        })
+    {
+        return Ok((registry, lane));
+    }
     if let Some(lane) = reusable_lane(&registry, project, agents).cloned() {
         return Ok((registry, lane));
     }
@@ -587,6 +605,30 @@ pub fn open(ctx: &Ctx, slug: &str, options: &OpenOptions) -> Result<()> {
     }
 
     let agents = listed.with_context(|| format!("the herdr session at {socket} is not reachable"))?;
+
+    // `--lane` on a project whose registry is new (written by this very `open`)
+    // and which already has its coordinator running: that pane is the default
+    // lane's, not a second coordinator's. Seeds the lane from the record, so
+    // `classify_all` below recognises the pane and focuses it.
+    if options.lane.is_some()
+        && target_lane.pane_id.is_empty()
+        && let Some(record) = &previous
+        && !record.pane_id.is_empty()
+        && agents.iter().any(|agent| agent.pane_id == record.pane_id)
+    {
+        let pane = record.pane_id.clone();
+        let session_id = record.agent_session.clone();
+        let lane_id = target_lane.id.clone();
+        crate::lanes::Registry::update(&project, |registry| {
+            if let Some(lane) = registry.lanes.iter_mut().find(|lane| lane.id == lane_id) {
+                lane.pane_id = pane.clone();
+                lane.agent_session = session_id.clone();
+            }
+        })?;
+        if let Some(lane) = crate::lanes::Registry::load(&project).and_then(|registry| registry.get(&target_lane.id).cloned()) {
+            report_tokens(&herdr, &project, &lane.pane_id);
+        }
+    }
     let label = crate::project::home_label(&settings.name, slug);
     // Canonical, because herdr reports a pane's physical working directory and
     // the identity check compares against it.
