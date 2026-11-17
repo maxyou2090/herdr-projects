@@ -564,7 +564,8 @@ impl<'a> Core<'a> {
 
     /// A Space in `cwd`: named `label`, and its tab named `tab_label` — a
     /// project's Space holds the `coordinator` tab, a thread's Space the
-    /// thread's title — so the core label and the app's tab agree.
+    /// thread's id (`labels::thread_tab_label`) — so the core label and the
+    /// app's tab agree.
     pub fn workspace_create(&self, cwd: &Path, label: &str, tab_label: &str, _focus: bool) -> Result<Created, CoreError> {
         let dir = cwd.to_string_lossy().into_owned();
         // A person who works in the Herdr app has to see the project: the app
@@ -653,7 +654,7 @@ impl<'a> Core<'a> {
 
     /// Creates a real git worktree under `~/.herdr/worktrees/<repo>/<branch>`,
     /// the path Herdr 1 used, so a restored thread record still names it.
-    pub fn worktree_create(&self, repo: &str, branch: &str, base: &str, label: &str) -> Result<(Created, String, String), CoreError> {
+    pub fn worktree_create(&self, repo: &str, branch: &str, base: &str, label: &str, tab_label: &str) -> Result<(Created, String, String), CoreError> {
         let path = worktree_path(repo, branch)?;
         if let Some(parent) = path.parent() {
             let _ = std::fs::create_dir_all(parent);
@@ -674,18 +675,18 @@ impl<'a> Core<'a> {
             // The branch may already exist: reuse it instead of failing.
             git(&["worktree", "add", &path_text, branch])?;
         }
-        let created = self.workspace_create(&path, label, label, false)?;
+        let created = self.workspace_create(&path, label, tab_label, false)?;
         let term = self.term(&created.pane_id)?;
         self.label(&term.pane_id(), &[(L_WORKTREE, path_text.as_str())])?;
         Ok((created, path_text.clone(), term.cwd()))
     }
 
-    pub fn worktree_open(&self, _repo: &str, path: &str, label: &str) -> Result<(Created, String, String), CoreError> {
+    pub fn worktree_open(&self, _repo: &str, path: &str, label: &str, tab_label: &str) -> Result<(Created, String, String), CoreError> {
         let path = PathBuf::from(path);
         if !path.is_dir() {
             return Err(CoreError { code: "worktree_not_found".into(), message: format!("{path:?} is not a folder") });
         }
-        let created = self.workspace_create(&path, label, label, false)?;
+        let created = self.workspace_create(&path, label, tab_label, false)?;
         let term = self.term(&created.pane_id)?;
         self.label(&term.pane_id(), &[(L_WORKTREE, path.to_string_lossy().as_ref())])?;
         Ok((created, path.to_string_lossy().into_owned(), term.cwd()))

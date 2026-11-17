@@ -417,17 +417,18 @@ mod tests {
     }
 
     #[test]
-    fn a_thread_space_names_its_tab_after_the_thread() {
+    fn a_thread_space_keeps_its_title_and_names_its_tab_after_the_id() {
         let (home, child) = core();
         let fake = FakeApp::new(&child);
         let herdr = Core::new("hc", "", &fake);
-        let title = "t-0042 own group";
-        let created = herdr.workspace_create(home.path(), title, title, false).unwrap();
-        assert_eq!(fake.spaces.borrow()[0].1, title, "the Space carries the thread's title");
+        let title = "线程命名 tab 用 id";
+        let tab = crate::labels::thread_tab_label("t-0047");
+        let created = herdr.workspace_create(home.path(), crate::labels::thread_space_label(title), &tab, false).unwrap();
+        assert_eq!(fake.spaces.borrow()[0].1, title, "the Space carries the thread's title, not its id");
         let address = &child.terminals.borrow()[0].address;
-        assert_eq!(fake.renamed.borrow().last(), Some(&(FakeApp::tab_for(address), title.to_string())), "the app's tab carries it too");
+        assert_eq!(fake.renamed.borrow().last(), Some(&(FakeApp::tab_for(address), tab.clone())), "the app's tab carries the id too");
         let label = child.terminals.borrow()[0].labels.get(L_TAB_LABEL).cloned();
-        assert_eq!(label.as_deref(), Some(title), "the core label says the same, so there is one name");
+        assert_eq!(label.as_deref(), Some("t-0047"), "the core label says the same, so there is one name");
         assert!(!created.pane_id.is_empty() && !created.tab_id.is_empty());
     }
 

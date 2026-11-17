@@ -66,9 +66,24 @@ pub fn state_line(group: Group, thread: &Thread, live: &Live, now: jiff::Timesta
     }
 }
 
-/// Row 1 of a thread: its id and title.
+/// A thread's tab name: the id alone. The app shows a row as `<tab> <Space>`,
+/// so the title belongs to the Space ([`thread_space_label`]) and lives there
+/// once; the tab says which thread it is, without repeating the title.
+pub fn thread_tab_label(id: &str) -> String {
+    id.to_string()
+}
+
+/// A thread's Space name: its title, unchanged by the tab/display rework. A
+/// restart recognises a thread's own Space by this label (`thread::recorded_own_space`,
+/// `threads::place_tab`, `spaces::empty`), so it stays the title on purpose.
+pub fn thread_space_label(title: &str) -> &str {
+    title
+}
+
+/// Row 1 of a thread, as `hp_display` carries it: its id and its title, one
+/// space between (no `·`: a person reads `t-0047 线程命名 tab 用 id`).
 pub fn thread_display(thread: &Thread) -> String {
-    format!("{} · {}", thread.id, thread.title)
+    format!("{} {}", thread.id, thread.title)
 }
 
 /// A coordinator's row name: the project's name, plus ` · <lane label>` when
@@ -117,3 +132,26 @@ pub fn clear_pane(herdr: &Core, pane: &str) {
 /// A Space is a group of terminals by label; closing its terminals is what
 /// removes it, so there is nothing left to clear.
 pub fn clear_workspace(_herdr: &Core, _workspace: &str) {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_threads_three_names_say_the_id_once_and_the_title_once() {
+        let thread = Thread { id: "t-0047".into(), title: "线程命名 tab 用 id".into(), ..Thread::default() };
+        assert_eq!(thread_tab_label(&thread.id), "t-0047", "the tab is the id alone");
+        assert_eq!(thread_space_label(&thread.title), "线程命名 tab 用 id", "the Space keeps the title, so a restart still recognises it");
+        assert_eq!(thread_display(&thread), "t-0047 线程命名 tab 用 id", "the display is id, one space, title");
+        assert!(!thread_display(&thread).contains('·'), "the separator is a space, never `·`");
+    }
+
+    #[test]
+    fn a_coordinators_row_still_reads_project_dot_lane() {
+        // The thread rework left the coordinator's names alone: its row is the
+        // project's display name, joined to a lane label with ` · `.
+        let root = tempfile::tempdir().unwrap();
+        let project = crate::project::create(&root.path().join("root"), "demo", "", vec![]).unwrap();
+        assert_eq!(coordinator_display(&project, None), "Demo", "a project with no lane registry reads as before");
+    }
+}
