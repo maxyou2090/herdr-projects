@@ -11,12 +11,11 @@ use crate::paths::Ctx;
 use crate::project::{self, Project, Settings};
 
 /// The keys `set` accepts, with what they hold.
-pub const KEYS: [(&str, &str); 9] = [
+pub const KEYS: [(&str, &str); 8] = [
     ("name", "text"),
     ("goal", "text"),
     ("coordinator_profile", "profile name"),
     ("thread_profile", "profile name"),
-    ("max_parallel_threads", "number"),
     ("auto_resolve_days", "number (0 = never)"),
     ("nudge", "true/false"),
     ("repos.add", "PATH or PATH@MACHINE"),
@@ -88,11 +87,8 @@ pub fn set_in(text: &str, key: &str, value: &str) -> Result<String> {
             doc.remove(&format!("{role}_agent"));
             doc[&format!("{role}_profile")] = toml_edit::value(value);
         }
-        "max_parallel_threads" | "auto_resolve_days" => {
+        "auto_resolve_days" => {
             let n: i64 = value.parse().ok().filter(|n: &i64| *n >= 0 && *n <= 1000).with_context(|| format!("`{value}` is not a number from 0 to 1000"))?;
-            if key == "max_parallel_threads" && n == 0 {
-                bail!("max_parallel_threads must be at least 1");
-            }
             doc[key] = toml_edit::value(n);
         }
         "nudge" => doc[key] = toml_edit::value(parse_bool(value)?),
@@ -223,20 +219,23 @@ pub fn system_open(ctx: &Ctx, target: &str) -> Result<()> {
 mod tests {
     use super::*;
 
-    const MD: &str = "+++\nname = \"Demo\" # the label\ngoal = \"\"\nmax_parallel_threads = 3\nnudge = false\n\n[[repos]]\npath = \"/srv/app\"\n+++\n\n# Instructions\nBody with +++ inside\n";
+    // A file an older `hp` wrote: `max_parallel_threads` was a setting then and is
+    // not one any more, so a leftover line has to read as ignored.
+    const MD: &str = "+++\nname = \"Demo\" # the label\ngoal = \"\"\nauto_resolve_days = 3\nmax_parallel_threads = 1000\nnudge = false\n\n[[repos]]\npath = \"/srv/app\"\n+++\n\n# Instructions\nBody with +++ inside\n";
 
     #[test]
     fn settings_are_edited_in_place_and_validated() {
-        let edited = set_in(MD, "max_parallel_threads", "5").unwrap();
-        assert!(edited.contains("max_parallel_threads = 5"));
+        let edited = set_in(MD, "auto_resolve_days", "5").unwrap();
+        assert!(edited.contains("auto_resolve_days = 5"));
         assert!(edited.contains("# the label"), "comments survive");
         assert!(edited.ends_with("\n# Instructions\nBody with +++ inside\n"));
         let (settings, body) = project::parse_project_md(&edited).unwrap();
-        assert_eq!(settings.max_parallel_threads, 5);
+        assert_eq!(settings.auto_resolve_days, 5);
         assert!(body.starts_with("# Instructions"));
 
-        assert!(set_in(MD, "max_parallel_threads", "0").is_err());
-        assert!(set_in(MD, "max_parallel_threads", "many").is_err());
+        assert_eq!(project::parse_project_md(&set_in(MD, "auto_resolve_days", "0").unwrap()).unwrap().0.auto_resolve_days, 0, "0 = never");
+        assert!(set_in(MD, "auto_resolve_days", "many").is_err());
+        assert!(set_in(MD, "max_parallel_threads", "5").is_err(), "the setting is gone");
         assert!(set_in(MD, "thread_profile", "not a name").is_err());
         // The old key is replaced by the new one, never duplicated.
         let old = set_in("+++\nthread_agent = \"claude\"\n+++\n", "thread_agent", "luna").unwrap();
@@ -245,6 +244,19 @@ mod tests {
         assert!(set_in(MD, "whatever", "x").is_err());
         let goal = set_in(MD, "goal", "Ship \"it\"").unwrap();
         assert_eq!(project::parse_project_md(&goal).unwrap().0.goal, "Ship \"it\"");
+    }
+
+    #[test]
+    fn a_project_left_with_max_parallel_threads_still_reads_and_sets() {
+        // The line is not a setting any more: it must not fail the parse…
+        let (settings, body) = project::parse_project_md(MD).unwrap();
+        assert_eq!((settings.name.as_str(), settings.auto_resolve_days), ("Demo", 3));
+        assert_eq!(body, "# Instructions\nBody with +++ inside\n");
+        // …nor `hp set`, which leaves the dead line where it is.
+        let goal = set_in(MD, "goal", "Ship it").unwrap();
+        assert!(goal.contains("max_parallel_threads = 1000"));
+        let (settings, _) = project::parse_project_md(&goal).unwrap();
+        assert_eq!(settings.goal, "Ship it");
     }
 
     #[test]
