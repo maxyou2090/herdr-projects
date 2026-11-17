@@ -454,7 +454,7 @@ enum ThreadCommand {
     },
     /// Cross-check thread records against herdr's agents and panes (read only)
     Audit {
-        /// The project; default: the project of the current herdr workspace
+        /// The project; default: the project of the terminal this runs in
         slug: Option<String>,
         /// Machine-readable findings
         #[arg(long)]
