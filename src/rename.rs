@@ -383,7 +383,7 @@ pub fn run(ctx: &Ctx, args: &Args) -> Result<Outcome> {
     // 4. Herdr: the home Space's label (best effort; `open` also fixes it).
     if old_label != new_label && !record.workspace_id.is_empty() {
         let herdr = crate::herdr::Herdr::new(&ctx.env.herdr_bin(), &record.socket, ctx.runner);
-        if Path::new(&record.socket).exists()
+        if !record.socket.is_empty() && crate::herdr::session_alive(&ctx.env.herdr_bin(), &record.socket, ctx.runner)
             && let Err(error) = herdr.workspace_rename(&record.workspace_id, &new_label)
             // Closed with the coordinator's pane: `open` makes a new one.
             && error.code != "workspace_not_found"

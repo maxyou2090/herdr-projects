@@ -515,9 +515,8 @@ impl Sessions {
         self.lists
             .entry(socket.to_string())
             .or_insert_with(|| {
-                if socket.is_empty() || !Path::new(socket).exists() {
-                    return None;
-                }
+                // A session is a core session name, empty for the default core;
+                // the two calls below are what say whether it answers.
                 let herdr = Herdr::new(ctx.env.herdr_bin(), socket, ctx.runner);
                 Some((herdr.agent_list().ok()?, herdr.pane_list().ok()?))
             })
