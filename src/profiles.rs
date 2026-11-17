@@ -190,10 +190,29 @@ pub fn validate_name(name: &str) -> Result<()> {
     Ok(())
 }
 
+/// The error for an agent kind this binary does not know. The person who
+/// typed it is told what this machine actually has: the 24 kinds in
+/// [`crate::agents::KINDS`] are almost none of them, and printing the whole
+/// list made a typo read like a wall of possibilities (t-0039). With nothing
+/// installed, the full list comes back and says it is the full list.
+pub fn unknown_kind(kind: &str, detected: &[String]) -> String {
+    if detected.is_empty() {
+        format!("unknown harness kind `{kind}`; known kinds: {}", crate::agents::KINDS.join(", "))
+    } else {
+        format!("unknown harness kind `{kind}`; available here: {}", detected.join(", "))
+    }
+}
+
+/// The kinds this machine has, read from the process environment. Only the
+/// error path calls it, so a valid kind costs nothing.
+fn detected_kinds() -> Vec<String> {
+    Env::from_process().map(|env| detect(&env)).unwrap_or_default()
+}
+
 fn validate(name: &str, entry: &Entry) -> Result<()> {
     validate_name(name)?;
     if !crate::agents::is_kind(&entry.agent) {
-        bail!("agent `{}` is not a Herdr agent kind ({})", entry.agent, crate::agents::KINDS.join(", "));
+        bail!("{}", unknown_kind(&entry.agent, &detected_kinds()));
     }
     typed_args(&entry.agent, &entry.model, &entry.effort)?;
     Ok(())
@@ -783,6 +802,20 @@ mod tests {
         let config: Config = toml::from_str(CONFIG).unwrap();
         let names: Vec<String> = config.listed(&detect(&env)).into_iter().map(|p| p.name).collect();
         assert_eq!(names, strings(&["claude", "deep", "luna", "codex", "cursor", "omp"]));
+    }
+
+    /// A wrong `--agent` kind used to print all 24 kinds this binary knows,
+    /// which is not what the machine has. It now names the installed ones, and
+    /// falls back to the full list only when nothing was detected (t-0039).
+    #[test]
+    fn an_unknown_kind_names_only_the_kinds_this_machine_has() {
+        let installed = strings(&["claude", "pi"]);
+        let message = unknown_kind("chagpt", &installed);
+        assert!(message.starts_with("unknown harness kind `chagpt`; available here: claude, pi"), "{message}");
+        assert!(!message.contains("codex"), "the whole list leaked: {message}");
+        let fallback = unknown_kind("chagpt", &[]);
+        assert!(fallback.starts_with("unknown harness kind `chagpt`; known kinds: pi, claude"), "{fallback}");
+        assert!(fallback.contains("muse"), "the fallback names every known kind: {fallback}");
     }
 
     #[test]

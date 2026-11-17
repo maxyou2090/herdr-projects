@@ -10,7 +10,7 @@
 //! The folder moves with one `rename(2)` under the project lock; everything
 //! else that names the old slug or path is rewritten after it: the resolved
 //! thread records, the coordinator record, `AGENTS.md`, the `[safety]` table
-//! in config.toml (yolo and the profile allow-lists), routine approvals and
+//! in config.toml (yolo and the profile allow-lists) and
 //! the home Space's label. Branches and worktrees keep their `hp/<old>/`
 //! names; the old slug is recorded so `sweep` still finds them. Running the
 //! same command again after a failure finishes what is left.
@@ -245,8 +245,6 @@ pub fn run(ctx: &Ctx, args: &Args) -> Result<Outcome> {
     let stale_table = moved_config.is_none()
         && !resuming
         && config_text.as_deref().is_some_and(|t| project::load_safety_layers_from(t, "config.toml", &canonical_new).is_ok_and(|(_, own)| own != Default::default()));
-    let approvals = crate::routine::approvals(&ctx.config_dir);
-    let approvals_to_move = approvals.iter().filter(|a| a.project == old_key).count();
 
     let mut out = Outcome { new_dir: new_dir.clone(), closing: live.iter().map(|l| l.label.clone()).collect(), ..Outcome::default() };
     let step = |out: &mut Outcome, text: String| out.steps.push(text);
@@ -278,9 +276,6 @@ pub fn run(ctx: &Ctx, args: &Args) -> Result<Outcome> {
     }
     if moved_config.is_some() {
         step(&mut out, format!("move [safety.\"{old_key}\"] to [safety.\"{new_key}\"] in {}", config_path.display()));
-    }
-    if approvals_to_move > 0 {
-        step(&mut out, format!("move {approvals_to_move} routine approval(s) to the new path"));
     }
     if old_label != new_label && !record.workspace_id.is_empty() {
         step(&mut out, format!("rename the home Space {} to `{}`", record.workspace_id, new_label));
@@ -373,9 +368,6 @@ pub fn run(ctx: &Ctx, args: &Args) -> Result<Outcome> {
     // 3. The user's config directory.
     if let Some(text) = moved_config {
         write_atomic(&config_path, text.as_bytes()).with_context(|| finish.clone())?;
-    }
-    if approvals_to_move > 0 {
-        crate::routine::move_approvals(&ctx.config_dir, &old_key, &new_key).with_context(|| finish.clone())?;
     }
 
     // 4. Herdr: the home Space's label (best effort; `open` also fixes it).
@@ -473,7 +465,7 @@ fn advance(ctx: &Ctx, pending: &Pending) -> Result<Option<Next>> {
                 return Ok(None);
             }
             for l in &live {
-                crate::sidebar::clear_pane(&view.herdr, &l.pane);
+                crate::labels::clear_pane(&view.herdr, &l.pane);
                 let _ = view.herdr.pane_close(&l.pane);
             }
             // The next tick sees them gone.

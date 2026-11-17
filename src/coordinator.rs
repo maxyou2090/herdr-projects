@@ -490,7 +490,7 @@ fn unclaimed(project: &Project, home: &Path, agents: &[Agent], identity: &[crate
 ///   which is exactly the drift §1.6 is about;
 /// - last and weakest, `hp_project=<slug>` with no `hp_lane` — but a thread
 ///   pane carries `hp_project` and no `hp_lane` by design
-///   (`sidebar::report_pane` writes one without the other), so the name must
+///   (`labels::report_pane` writes one without the other), so the name must
 ///   not be a thread's. That is why the token alone is never enough.
 ///
 /// An [`crate::lanes::LaneResolution::Ambiguous`] pane **without** a token is
@@ -521,7 +521,7 @@ fn stray_signal(project: &Project, home: &Path, agent: &Agent, resolution: &crat
     if crate::names::is_coordinator_name(&project.slug, &agent.name) {
         return Some(format!("its name `{}` is one `open` gives this project's coordinators", agent.name));
     }
-    let project_token = agent.tokens.get(crate::sidebar::PROJECT_TOKEN).map(String::as_str);
+    let project_token = agent.tokens.get(crate::labels::PROJECT_TOKEN).map(String::as_str);
     if project_token == Some(project.slug.as_str()) && lane_token.is_none() && !crate::names::is_thread_name(&project.slug, &agent.name) {
         return Some(format!("it carries `hp_project={}` and no `hp_lane`", project.slug));
     }
@@ -921,8 +921,8 @@ pub fn row_state(pane: &LivePane, report: Option<&crate::progress::Record>) -> (
 /// read exactly as they did before lanes.
 pub fn report_tokens(herdr: &Herdr, project: &Project, pane_id: &str) {
     let lane = crate::lanes::token_for_pane(project, pane_id);
-    let display = crate::sidebar::coordinator_display(project, lane.as_deref());
-    crate::sidebar::report_pane(herdr, pane_id, &display, &project.slug, crate::thread::Group::Idle, lane.as_deref());
+    let display = crate::labels::coordinator_display(project, lane.as_deref());
+    crate::labels::report_pane(herdr, pane_id, &display, &project.slug, crate::thread::Group::Idle, lane.as_deref());
 }
 
 /// Renames a workspace whose label is not the project's display name — the
@@ -1109,8 +1109,8 @@ fn digest_for(ctx: &Ctx, project: &Project, prefix: &str) -> Result<(String, Vec
         Ok(safety) => {
             let _ = writeln!(
                 out,
-                "Safety: yolo={} start_threads={} trust_screens={} routine_commands={} thread_agent_args={:?} coordinator_agent_args={:?}",
-                if safety.yolo { "on" } else { "off" }, safety.start_threads, safety.trust_screens, safety.routine_commands, safety.thread_agent_args, safety.coordinator_agent_args
+                "Safety: yolo={} start_threads={} trust_screens={} thread_agent_args={:?} coordinator_agent_args={:?}",
+                if safety.yolo { "on" } else { "off" }, safety.start_threads, safety.trust_screens, safety.thread_agent_args, safety.coordinator_agent_args
             );
         }
         Err(error) => {
@@ -1178,18 +1178,10 @@ fn digest_for(ctx: &Ctx, project: &Project, prefix: &str) -> Result<(String, Vec
     let _ = writeln!(out, "{}", memory.trim());
 
     let (routines, broken) = crate::routine::load_all(project);
-    let commands_on = project.safety(&ctx.config_dir).map(|s| s.routine_commands).unwrap_or(false);
     let _ = writeln!(out, "\n## Routines ({})", routines.len());
     for r in &routines {
-        let kind = if r.command.is_empty() {
-            "prompt only"
-        } else if !commands_on {
-            "command, will not run: routine_commands is false"
-        } else if crate::routine::is_approved(&ctx.config_dir, project, r) {
-            "command, approved"
-        } else {
-            "command, needs `routine approve` by the user"
-        };
+        // A routine never runs a command any more; a leftover line is said so.
+        let kind = if r.command.is_empty() { "prompt only" } else { "prompt only; its `command` is ignored (command routines were removed)" };
         let _ = writeln!(out, "- {} ({}, {}) {kind}", r.name, r.schedule_text, if r.enabled { "enabled" } else { "disabled" });
     }
     for b in &broken {

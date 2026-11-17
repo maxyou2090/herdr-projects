@@ -18,13 +18,12 @@ use crate::project::{self, Project, SafetyLayer};
 pub const DEFAULT_TABLE: &str = "default";
 
 /// The keys `safety set` accepts, with what they hold.
-pub const KEYS: [(&str, &str); 6] = [
+pub const KEYS: [(&str, &str); 5] = [
     ("yolo", "on/off"),
     ("start_threads", "propose/auto"),
     ("trust_screens", "coordinator/user"),
     ("coordinator_agent_args", "arguments"),
     ("thread_agent_args", "arguments"),
-    ("routine_commands", "on/off"),
 ];
 
 /// What the popup and the CLI say after a change.
@@ -111,7 +110,7 @@ fn value_item(key: &str, words: &[String]) -> Result<Option<Item>> {
         }
     };
     Ok(Some(match key {
-        "yolo" | "routine_commands" => toml_edit::value(parse_on_off(one()?)?),
+        "yolo" => toml_edit::value(parse_on_off(one()?)?),
         "start_threads" => match one()? {
             value @ ("propose" | "auto") => toml_edit::value(value),
             other => bail!("start_threads is propose or auto, not `{other}`"),
@@ -257,7 +256,6 @@ pub fn rows(config_dir: &Path, target: &Target) -> Result<Vec<SafetyRow>> {
     let (trust, trust_source) = pick(&own.trust_screens, &default.trust_screens, own_source, project::default_trust_screens(yolo).to_string());
     let (coordinator, coordinator_source) = pick(&own.coordinator_agent_args, &default.coordinator_agent_args, own_source, Vec::new());
     let (thread, thread_source) = pick(&own.thread_agent_args, &default.thread_agent_args, own_source, Vec::new());
-    let (commands, commands_source) = pick(&own.routine_commands, &default.routine_commands, own_source, false);
     Ok(vec![
         SafetyRow { key: "yolo", value: on_off(yolo).into(), source: yolo_source, note: String::new() },
         SafetyRow {
@@ -274,7 +272,6 @@ pub fn rows(config_dir: &Path, target: &Target) -> Result<Vec<SafetyRow>> {
         },
         SafetyRow { key: "coordinator_agent_args", value: args(coordinator), source: coordinator_source, note: String::new() },
         SafetyRow { key: "thread_agent_args", value: args(thread), source: thread_source, note: String::new() },
-        SafetyRow { key: "routine_commands", value: on_off(commands).into(), source: commands_source, note: String::new() },
     ])
 }
 
@@ -314,7 +311,6 @@ pub fn show_text(ctx: &Ctx, target: &Target) -> Result<String> {
     let kinds: Vec<&str> = kinds.iter().map(String::as_str).collect();
     out.push_str(&format!("\nYolo starts threads without asking and adds each harness's flag ({}).\n", flags_text(&kinds).join("; ")));
     out.push_str("Trust screens (a folder, restricted-folder or hooks trust dialog in a thread's pane) are answered by the coordinator or left to you; unset, the coordinator answers them only in yolo mode. Nothing is ever typed into one by a brief or prompt.\n");
-    out.push_str("Routine commands are not part of yolo: they stay off until you turn them on and approve each one.\n");
     if let Target::Project(project) = target {
         let safety = project.safety(&ctx.config_dir)?;
         let config = crate::profiles::load(&ctx.config_dir)?;

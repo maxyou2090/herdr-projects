@@ -63,11 +63,11 @@ fn git(runner: &dyn Runner, repo: &str, args: &[&str], timeout: Duration) -> Res
 }
 
 pub fn report_thread_tokens(herdr: &Herdr, thread: &Thread, slug: &str, group: Group) {
-    crate::sidebar::report_pane(herdr, &thread.pane_id, &crate::sidebar::thread_display(thread), slug, group, None);
+    crate::labels::report_pane(herdr, &thread.pane_id, &crate::labels::thread_display(thread), slug, group, None);
 }
 
 fn clear_thread_tokens(herdr: &Herdr, thread: &Thread) {
-    crate::sidebar::clear_pane(herdr, &thread.pane_id);
+    crate::labels::clear_pane(herdr, &thread.pane_id);
 }
 
 pub struct StartArgs {

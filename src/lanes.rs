@@ -493,7 +493,7 @@ pub(crate) fn read_coordinator(project: &Project) -> Option<Coordinator> {
 }
 
 /// The label the synthesized lane shows: the project's display name, the same
-/// one `sidebar::coordinator_display` and the home Space label use.
+/// one `labels::coordinator_display` and the home Space label use.
 fn project_label(project: &Project) -> String {
     project
         .read_project_md()
@@ -590,7 +590,7 @@ fn token_of(agent: &Agent) -> Option<&str> {
 pub(crate) fn ours(agent: &Agent, slug: &str) -> bool {
     agent
         .tokens
-        .get(crate::sidebar::PROJECT_TOKEN)
+        .get(crate::labels::PROJECT_TOKEN)
         .is_none_or(|owner| owner == slug)
 }
 
@@ -1507,7 +1507,7 @@ pub fn lane_adopt(ctx: &Ctx, project: Option<&str>, handle: &str) -> Result<()> 
             updated: String::new(),
         }
     })?;
-    crate::sidebar::report_pane(&herdr, &pane, &crate::sidebar::coordinator_display(&project, Some(&lane.id)), &project.slug, crate::thread::Group::Idle, Some(&lane.id));
+    crate::labels::report_pane(&herdr, &pane, &crate::labels::coordinator_display(&project, Some(&lane.id)), &project.slug, crate::thread::Group::Idle, Some(&lane.id));
     let prefix = crate::coordinator::current_prefix(&ctx.root)?;
     println!("lane `{}` ({}) is coordinated by pane {pane}", lane.label, lane.id);
     println!("Commands: {prefix}");
@@ -1552,7 +1552,7 @@ pub fn lane_assign(ctx: &Ctx, project: &Project, handle: &str, pane: &str) -> Re
     let session = crate::threads::session_view(ctx, project).with_context(|| format!("the session of `{}` is not reachable; run `open {}` first", project.slug, project.slug))?;
     let agent = session.agents.iter().find(|agent| agent.pane_id == pane).cloned().with_context(|| format!("no live agent in pane {pane} of the session at {}", session.socket))?;
     if !ours(&agent, &project.slug) {
-        let owner = agent.tokens.get(crate::sidebar::PROJECT_TOKEN).map(String::as_str).unwrap_or("");
+        let owner = agent.tokens.get(crate::labels::PROJECT_TOKEN).map(String::as_str).unwrap_or("");
         bail!("pane {pane} belongs to another project (`{owner}`), not `{}`", project.slug);
     }
     match resolve(&registry, &agent, &project_home(project), &project.slug) {
@@ -1573,7 +1573,7 @@ pub fn lane_assign(ctx: &Ctx, project: &Project, handle: &str, pane: &str) -> Re
             record.last_active = now.clone();
         }
     })?;
-    crate::sidebar::report_pane(&session.herdr, pane, &crate::sidebar::coordinator_display(project, Some(&lane.id)), &project.slug, crate::thread::Group::Idle, Some(&lane.id));
+    crate::labels::report_pane(&session.herdr, pane, &crate::labels::coordinator_display(project, Some(&lane.id)), &project.slug, crate::thread::Group::Idle, Some(&lane.id));
     if !old_pane.is_empty() && old_pane != pane {
         // Clear only the lane claim: the old pane may still be a shell or an
         // agent the user is using for something else. It must not keep saying
@@ -2435,7 +2435,7 @@ mod tests {
         // project's first lane is `c-1`. All of this is one Herdr session.
         let registry = reg(vec![lane("c-1", "default")], "c-1", 2);
         let mut mine = agent("w1:p1", "/elsewhere");
-        mine.tokens.insert(crate::sidebar::PROJECT_TOKEN.into(), "demo".into());
+        mine.tokens.insert(crate::labels::PROJECT_TOKEN.into(), "demo".into());
         mine.tokens.insert(TOKEN.into(), "c-1".into());
         assert_eq!(
             resolve(&registry, &mine, HOME, "demo"),
@@ -2480,7 +2480,7 @@ mod tests {
         assert_eq!(matched, "Coordinators: w1D3:p1 (record, lane c-1, this pane) · default lane c-1\n");
         // Another project's pane is not this project's degraded lane either.
         let mut theirs = with_session("w1D3:p1", "/Users/maxyou", "new-session");
-        theirs.tokens.insert(crate::sidebar::PROJECT_TOKEN.into(), "other".into());
+        theirs.tokens.insert(crate::labels::PROJECT_TOKEN.into(), "other".into());
         let line = identity_line(&view(&registry, vec![theirs], "w1D3:p1", true));
         assert!(!line.contains("degraded"), "{line}");
         assert!(line.contains("this pane w1D3:p1 is no lane's coordinator"), "{line}");
@@ -2565,7 +2565,7 @@ mod tests {
         assert_eq!(registry.find("c-2").unwrap().name, "books");
         assert_eq!(registry.find("fix").unwrap().id, "c-1");
         // A display label works too, which is what a coordinator quoting the
-        // sidebar typed.
+        // coordinator label typed.
         assert_eq!(registry.find("收藏").unwrap().id, "c-2");
         assert_eq!(registry.find("c-9"), None);
         assert_eq!(registry.find(""), None);
@@ -2738,7 +2738,7 @@ mod tests {
         assert_eq!(TOKEN, "hp_lane");
         // `OLD_TOKENS` is the `--clear-token` list of *every* report: a token
         // that joins it is erased as fast as it is written (§5.1).
-        assert!(!crate::sidebar::OLD_TOKENS.contains(&TOKEN), "{TOKEN} would be cleared on every report");
+        assert!(!crate::labels::OLD_TOKENS.contains(&TOKEN), "{TOKEN} would be cleared on every report");
         // Releasing a pane clears the claim, through labels now.
         let (_world, project) = temp_project("demo");
         Registry::ensure_written(&project).unwrap();
@@ -2749,7 +2749,7 @@ mod tests {
         let calls: Vec<String> = runner.calls.borrow().iter().map(|c| c.display()).collect();
         assert!(calls.iter().any(|t| t.contains(&format!("{TOKEN}=c-1"))), "{calls:?}");
         runner.calls.borrow_mut().clear();
-        crate::sidebar::clear_pane(&herdr, "w1:p1");
+        crate::labels::clear_pane(&herdr, "w1:p1");
         let cleared: Vec<String> = runner.calls.borrow().iter().map(|c| c.display()).collect();
         assert!(cleared.iter().any(|t| t.contains(&format!("{TOKEN}="))), "{cleared:?}");
         assert_eq!(lane("c-1", "default").token_value(), Some("c-1"));

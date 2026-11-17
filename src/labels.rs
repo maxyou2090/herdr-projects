@@ -1,7 +1,9 @@
 //! How a project's threads read: the words of a group, a row's one-line
-//! display, and the labels that carry them. Herdr 1 drew these into its
-//! sidebar and tab bar; herdr-core draws nothing, so the same strings are what
-//! `overview`, `list` and the digest print.
+//! display, and the labels (`hc label`) that carry them. Herdr 1 drew these
+//! into its sidebar and tab bar; herdr-core draws nothing, so the same strings
+//! are what `overview`, `list` and the digest print, and the rest are pane
+//! labels. This module was `sidebar.rs` until t-0039: nothing here draws a
+//! sidebar any more, only labels.
 
 use crate::herdr::Herdr;
 use crate::project::{self, Project};

@@ -7,8 +7,9 @@
 >
 > **Port note (herdr-core).** The document was written against Herdr 1, so where
 > it names a module the port removed, read the lane model and skip the host
-> detail: `src/sidebar.rs` and `src/grouping.rs` (and `grouping::clear`,
-> `grouping::apply`, `ProjectPart`, the token TTL) do not exist here. Panes are
+> detail: `src/grouping.rs` (and `grouping::clear`, `grouping::apply`,
+> `ProjectPart`, the token TTL) does not exist here, and the labels this file
+> calls `sidebar::` live in `src/labels.rs` (formerly `src/sidebar.rs`). Panes are
 > core terminals; a coordinator's own identity is `HC_TERMINAL_ID`, its session
 > `HC_SESSION` (`src/paths.rs::Env::this_terminal` / `this_session`), and the
 > `hp_lane`/`hp_project` tokens are ordinary core labels (`src/herdr.rs`). The
@@ -164,8 +165,8 @@ of `lanes::resolve` returning the three-valued `LaneResolution`
 `hp lane list [--json]` and `hp lane adopt/assign/rename/close/open` (the
 `LaneCommand` variants in `src/cli.rs`); `hp open --lane` and `--lane-name`
 (`coordinator::open`, `src/coordinator.rs`); the `hp_lane` token write
-(`sidebar::report_pane`, `src/sidebar.rs`) and its clear
-(`sidebar::clear_pane`, same file; the Herdr 1 `grouping::clear` is gone with
+(`labels::report_pane`, `src/labels.rs`) and its clear
+(`labels::clear_pane`, same file; the Herdr 1 `grouping::clear` is gone with
 `src/grouping.rs`);
 `Agent.tokens` (`src/herdr.rs`); `Thread.lane` (`src/thread.rs`) and
 `inbox::Item::lane` (`src/inbox.rs`) written by their creators; per-lane
@@ -173,7 +174,7 @@ of `lanes::resolve` returning the three-valued `LaneResolution`
 (`src/steps.rs`); lane-routed nudge, prompt and discovery
 (`coordinator::nudge_target`, `prompt`, `discover`, same file); TASKS.md lane
 headings and `hp task add/move/done/delete/thread` (`src/tasks.rs`); the sidebar lane label,
-key and lifecycle (`src/sidebar.rs`, `src/ticker.rs`, `src/lifecycle.rs`; the
+key and lifecycle (`src/labels.rs`, `src/ticker.rs`, `src/lifecycle.rs`; the
 Herdr 1 `src/grouping.rs` sort key is not part of the port); and the lane rules in
 `skill/COORDINATOR.md` with the ambiguous-pane warning in `hp doctor`
 (`src/doctor.rs`), both added by commit 7.
@@ -189,11 +190,11 @@ not only while one of its panes works in the folder.
 |---|---|
 | `context`'s `Coordinators:` line, every turn | `lanes::identity_line` |
 | `hp lane list [--json]`, `lane adopt/assign/rename/close/open` | `src/lanes.rs`, `src/cli.rs` |
-| `hp open --lane`, `--lane-name`; the `hp_lane` token | `src/coordinator.rs`, `src/sidebar.rs` |
+| `hp open --lane`, `--lane-name`; the `hp_lane` token | `src/coordinator.rs`, `src/labels.rs` |
 | `Thread.lane`, `inbox::Item::lane`, per-lane seen and `steps::State` maps | `src/thread.rs`, `src/inbox.rs`, `src/steps.rs` |
 | lane-routed nudge, prompt, discovery | `src/coordinator.rs` |
 | TASKS.md lane headings, `hp task add/move/done/delete/thread` | `src/tasks.rs` |
-| sidebar `· <lane label>`, lifecycle | `src/sidebar.rs`, `src/ticker.rs` |
+| sidebar `· <lane label>`, lifecycle | `src/labels.rs`, `src/ticker.rs` |
 | skill lane rules, `doctor` ambiguous-pane warning | `skill/COORDINATOR.md`, `src/doctor.rs` |
 
 ## 4. Data model
@@ -323,7 +324,7 @@ So identity is **declared**, not inferred.
 ### 5.1 The self-report: an `hp_lane` pane token
 
 Herdr lets a pane carry tokens, and the plugin already uses that channel.
-`sidebar::report_pane()` (`src/sidebar.rs`) calls
+`labels::report_pane()` (`src/labels.rs`) calls
 `herdr pane report-metadata <pane> --source herdr-projects --token k=v` with a
 TTL of `TOKEN_TTL_MS = 300_000` (same file). Live panes show it:
 
@@ -347,9 +348,9 @@ Semantics, spelled out, because two places now write pane metadata:
   (Herdr 1 did this through `grouping::apply` in `src/grouping.rs`, which the
   port removed; core labels have no TTL, so the refresh is a repair, not a
   lease).
-- **`hp_lane` never clears `hp_group`**: `sidebar::report_pane` sends
-  `--clear-token` for `OLD_TOKENS` (`src/sidebar.rs`), and `hp_lane` must not
-  join that list; `sidebar::clear_pane` (same file) must clear it too
+- **`hp_lane` never clears `hp_group`**: `labels::report_pane` sends
+  `--clear-token` for `OLD_TOKENS` (`src/labels.rs`), and `hp_lane` must not
+  join that list; `labels::clear_pane` (same file) must clear it too
   (Herdr 1's `grouping::clear` in `src/grouping.rs` is gone).
 - The token value is the lane **id**, so a rename cannot make a token lie.
 - **A lane id is unique inside one project, not across projects.** Every
@@ -903,7 +904,7 @@ coordinator" actions in `src/popup.rs` keep working unchanged.
 > bullets below as the Herdr 1 design; what shipped is
 > `lanes::display_label` for the row suffix.
 
-- **Display name.** `sidebar::coordinator_display()` (`src/sidebar.rs`)
+- **Display name.** `labels::coordinator_display()` (`src/labels.rs`)
   returns `"<project name>␣"` + `HEAD_MARK` for every coordinator, so two
   coordinators are two identical rows. It becomes `"<project> · <lane label>"` +
   `HEAD_MARK`. The gate is whether the project has a registry, not how many
@@ -1065,7 +1066,7 @@ cleanup at the end.
    `inbox::Item.lane`, the §5.2 resolver as one function
    (`resolve_lane(project, agent) -> LaneResolution`, three-valued), the
    `Coordinators:` header line in `context` (§5.4), `hp_lane` token writes in
-   `sidebar::report_pane`, `lane list`. `Project::coordinator()` delegates to the
+   `labels::report_pane`, `lane list`. `Project::coordinator()` delegates to the
    default lane. No behaviour change for single-lane projects; the scenario
    suite is adapted here. The header line belongs in **this** commit, not in the
    docs one: it is the only mitigation that would have caught the week-long
@@ -1119,7 +1120,7 @@ the lane series moves them. `rg` the symbol to find it.
 | `coordinator::open()`'s reuse branch (`src/coordinator.rs`) | newest of the `running` set | the target lane's live pane only |
 | `coordinator::open()`'s record write (`src/coordinator.rs`) | `*c = Coordinator{…}` replaces the record | write that lane's entry in `lanes.json` |
 | `spaces::empty()` (`src/spaces.rs`) | excludes `coordinator().workspace_id` | excludes every lane's Space |
-| `sidebar::coordinator_display()` (`src/sidebar.rs`) | project name for every coordinator | `<project> · <lane>` |
+| `labels::coordinator_display()` (`src/labels.rs`) | project name for every coordinator | `<project> · <lane>` |
 | `grouping::coordinator_key()` (`src/grouping.rs`) | `<slug>!0!<pane>` | dropped by the port (`src/grouping.rs` is gone) |
 | `coordinator::digest()` (`src/coordinator.rs`), reached through `coordinator::context()` | prints state, never says who the coordinator is | first line is the §5.4 `Coordinators:` line, every turn |
 | `tick_cheap()`'s `coordinator_missing` (`src/ticker.rs`) | a missing coordinator only feeds `session_lost`; nothing is logged or written | an ambiguous pane is logged as a held reason and written as one `lane` item |
