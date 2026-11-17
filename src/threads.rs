@@ -152,14 +152,6 @@ pub fn start(ctx: &Ctx, slug: &str, args: StartArgs) -> Result<Thread> {
         }
     };
 
-    let open_count = thread::list(&project).iter().filter(|t| t.status == Status::Open || t.status == Status::Starting).count();
-    if open_count as u32 >= settings.max_parallel_threads {
-        eprintln!(
-            "warning: {open_count} threads are already open; max_parallel_threads is {}",
-            settings.max_parallel_threads
-        );
-    }
-
     let profile = thread_profile(ctx, &project, args.profile.as_deref())?;
     let kind = placement(args.kind, !repo.is_empty())?;
     // Ownership is written once, at creation, from the lane the initiating

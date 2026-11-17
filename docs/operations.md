@@ -54,7 +54,7 @@ and what is still open.
 
 Every thread works from `<its working directory>/.herdr-project/<project>-<id>/`: `brief.md` (written by the binary), `report.md` and `library/` (written by the agent). In a git repository that folder is in `info/exclude`, so nothing in it is committed. Git therefore treats it as clean and removing a worktree deletes it, which is why a resolve keeps the worktree when the final copy home was partial.
 
-`PROJECT.md` settings, all changeable from chat or with `hp set <project> <key> <value>`: `name` (the workspace label), `goal`, `repos` (`repos.add PATH`, `repos.remove PATH`), `coordinator_profile` and `thread_profile` (the default [profiles](#agent-profiles); the old names `coordinator_agent` and `thread_agent` still read), `max_parallel_threads` (1000, no practical cap), `auto_resolve_days` (7), `nudge` (`true`).
+`PROJECT.md` settings, all changeable from chat or with `hp set <project> <key> <value>`: `name` (the workspace label), `goal`, `repos` (`repos.add PATH`, `repos.remove PATH`), `coordinator_profile` and `thread_profile` (the default [profiles](#agent-profiles); the old names `coordinator_agent` and `thread_agent` still read), `auto_resolve_days` (7), `nudge` (`true`). Nothing here caps how many threads may be open at once; a `max_parallel_threads` line left by an older `hp` is ignored.
 
 ## Commands
 
@@ -297,4 +297,4 @@ scripts/dev-herdr <args>         # herdr against that session
 HOME=<scratch> XDG_CONFIG_HOME=<scratch> ...  # a whole scratch config dir
 ```
 
-Never develop against your default session, `~/.herdr-projects` or your real `config.toml`: `doctor --fix` writes the binary's own link, priming files and the skill link for the harnesses it finds, and it does so for the binary and root it runs as. [`history/herdr-notes-herdr1.md`](history/herdr-notes-herdr1.md) records what was verified about Herdr 1, and [`history/manual-test-herdr1.md`](history/manual-test-herdr1.md) lists its acceptance checks, including the visual ones only a person can confirm.
+Never develop against your default session, `~/.herdr-projects` or your real `config.toml`: `doctor --fix` writes the binary's own link, priming files and the skill link for the harnesses it finds, and it does so for the binary and root it runs as. [`history/herdr-notes-herdr1.md`](history/herdr-notes-herdr1.md) records what was verified about Herdr 1, and [`history/manual-test-herdr1.md`](history/manual-test-herdr1.md) lists its acceptance checks, including the visual ones only a person can confirm (both indexed in [`history/README.md`](history/README.md)).

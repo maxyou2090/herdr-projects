@@ -129,10 +129,10 @@ Rules that follow from this, worth keeping:
 | `src/notify.rs` (`Notifier`, `Sound`) and `Herdr::notification_show` | the user does not want desktop notifications; inbox items are the record |
 | `mute` in `PROJECT.md` | it only silenced notifications; a leftover line in an older project reads as ignored |
 
-`docs/manual-test.md` is now a pointer: the Herdr 1 acceptance script itself is
-in `docs/history/manual-test-herdr1.md`, together with
-`docs/history/herdr-notes-herdr1.md`. They are a record of what was verified on
-that host, not a checklist for this one.
+`docs/history/manual-test-herdr1.md` holds the Herdr 1 acceptance script
+itself, together with `docs/history/herdr-notes-herdr1.md` (both indexed in
+`docs/history/README.md`). They are a record of what was verified on that host,
+not a checklist for this one.
 
 ## 5. What the port verified, and how
 

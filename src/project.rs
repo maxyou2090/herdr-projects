@@ -139,7 +139,6 @@ pub struct Settings {
     /// The profile a thread starts with when none is chosen.
     #[serde(alias = "thread_agent")]
     pub thread_profile: String,
-    pub max_parallel_threads: u32,
     pub auto_resolve_days: u32,
     pub nudge: bool,
     pub repos: Vec<Repo>,
@@ -152,15 +151,11 @@ impl Default for Settings {
             goal: String::new(),
             coordinator_profile: "claude".into(),
             thread_profile: "claude".into(),
-            // No cap by default (user, 2026-10-25): the validation ceiling of 1000 is
-            // "unlimited" for a person-driven queue, so a new project never blocks a start
-            // on a count. The setting stays, for a project that wants a real limit.
-            max_parallel_threads: 1000,
             auto_resolve_days: 7,
             // On by default (W15): the ticker prompts only a coordinator that
             // has been idle for a quarter minute and whose input box has looked
             // empty for ten seconds, because on herdr 0.9.1 a prompt merges with
-            // half-typed text (docs/herdr-notes.md, stage 2).
+            // half-typed text (docs/history/herdr-notes-herdr1.md, stage 2).
             nudge: true,
             repos: Vec::new(),
         }
@@ -816,7 +811,6 @@ mod tests {
         assert_eq!(settings.name, "Demo");
         assert_eq!(settings.goal, "Ship \"it\"");
         assert_eq!(settings.coordinator_profile, "claude");
-        assert_eq!(settings.max_parallel_threads, 1000);
         assert_eq!(settings.auto_resolve_days, 7);
         assert!(settings.nudge);
         assert!(project.dir().join(PR_FOLLOWUP).is_file());
