@@ -27,7 +27,9 @@ pub struct SessionView<'a> {
 /// `None` when the project's session is unreachable, or it has no usable
 /// record and no agent works in its folder in the current session.
 pub fn session_view<'a>(ctx: &'a Ctx, project: &Project) -> Option<SessionView<'a>> {
-    let record = match project.coordinator().filter(|r| !r.socket.is_empty() && Path::new(&r.socket).exists()) {
+    // A record is the session it names, empty for the default core; whether that
+    // core answers is the two calls below, not a path on disk.
+    let record = match project.coordinator() {
         Some(record) => record,
         None => {
             let session = crate::paths::resolve_session(&Default::default(), ctx.env, ctx.runner).ok()?;
@@ -46,7 +48,7 @@ pub fn session_view<'a>(ctx: &'a Ctx, project: &Project) -> Option<SessionView<'
 fn require_session<'a>(ctx: &'a Ctx, project: &Project) -> Result<SessionView<'a>> {
     session_view(ctx, project).with_context(|| {
         format!(
-            "the herdr session of `{}` is not reachable; run `open {}` first",
+            "the session of `{}` is not reachable; run `open {}` first",
             project.slug, project.slug
         )
     })

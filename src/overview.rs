@@ -207,7 +207,7 @@ pub fn focus(ctx: &Ctx, slug: Option<&str>) -> Result<()> {
     let slug = require_slug(ctx, slug)?;
     let project = Project::load(&ctx.root, &slug)?;
     let view = threads::session_view(ctx, &project)
-        .ok_or_else(|| anyhow::anyhow!("the herdr session of `{slug}` is not reachable; run `open {slug}` first"))?;
+        .ok_or_else(|| anyhow::anyhow!("the session of `{slug}` is not reachable; run `open {slug}` first"))?;
     view.herdr.agent_view_set(crate::sidebar::project_view(&slug)).map_err(|e| anyhow::anyhow!("{e}"))?;
     println!("sidebar focused on `{slug}`; `unfocus` restores the by-need order (this replaced any view another tool had set)");
     Ok(())

@@ -940,7 +940,7 @@ pub fn prompt_to(ctx: &Ctx, slug: &str, text: &str, lane: Option<&str>) -> Resul
     if text.is_empty() {
         bail!("the text is empty");
     }
-    let view = crate::threads::session_view(ctx, &project).with_context(|| format!("the herdr session of `{slug}` is not reachable; run `open {slug}` first"))?;
+    let view = crate::threads::session_view(ctx, &project).with_context(|| format!("the session of `{slug}` is not reachable; run `open {slug}` first"))?;
     let record = project.coordinator().unwrap_or_default();
     let ready = |a: &&Agent| a.agent_status != "blocked" && a.agent_status != "unknown";
     let lane = match lane {

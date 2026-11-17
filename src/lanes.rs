@@ -1562,7 +1562,7 @@ fn project_for_pane(ctx: &Ctx, socket: &str, pane: &str) -> Result<Project> {
 pub fn lane_assign(ctx: &Ctx, project: &Project, handle: &str, pane: &str) -> Result<()> {
     let registry = require_registry(project)?;
     let lane = require_lane(&registry, handle)?;
-    let session = crate::threads::session_view(ctx, project).with_context(|| format!("the herdr session of `{}` is not reachable; run `open {}` first", project.slug, project.slug))?;
+    let session = crate::threads::session_view(ctx, project).with_context(|| format!("the session of `{}` is not reachable; run `open {}` first", project.slug, project.slug))?;
     let agent = session.agents.iter().find(|agent| agent.pane_id == pane).cloned().with_context(|| format!("no live agent in pane {pane} of the session at {}", session.socket))?;
     if !ours(&agent, &project.slug) {
         let owner = agent.tokens.get(crate::sidebar::PROJECT_TOKEN).map(String::as_str).unwrap_or("");

@@ -177,7 +177,7 @@ fn thread_findings(t: &Thread, agents: &[Agent], panes: &[Pane], now: jiff::Time
 pub fn findings(ctx: &Ctx, project: &Project) -> Result<Vec<Finding>> {
     let view = threads::session_view(ctx, project).ok_or_else(|| {
         anyhow::anyhow!(
-            "the herdr session of `{}` is not reachable; run `open {}` first (auditing compares its record with herdr's agents and panes)",
+            "the session of `{}` is not reachable; run `open {}` first (auditing compares its record with core's agents and terminals)",
             project.slug,
             project.slug
         )
