@@ -537,8 +537,8 @@ from the project's memory. Replace this paragraph with how you want work done:
 conventions, what to check before finishing, what never to do. Ask the
 coordinator to change it, or edit it here.
 
-The settings above, between the `+++` lines, are changed from the projects
-popup or by asking the coordinator.
+The settings above, between the `+++` lines, are changed with `hp set` or by
+asking the coordinator.
 ";
 
 /// The folders every project has. `uploads/` is yours (files for threads),
@@ -584,7 +584,7 @@ const COORDINATOR_SWEEP_TEMPLATE: &str = "+++\nschedule = \"every 20m\"\nenabled
 
 /// Every ready-made routine, as `(file, text)`: `pr-followup` (on a pull
 /// request) and `coordinator-sweep` (every twenty minutes). Both are enabled by
-/// default; the popup or the coordinator turns one off.
+/// default; `hp routine toggle` or the coordinator turns one off.
 const DEFAULT_ROUTINES: [(&str, &str); 2] = [(PR_FOLLOWUP, PR_FOLLOWUP_TEMPLATE), (COORDINATOR_SWEEP, COORDINATOR_SWEEP_TEMPLATE)];
 
 /// Writes the ready-made routines a project is missing, recording each one in

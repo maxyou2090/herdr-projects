@@ -161,7 +161,7 @@ pub fn parse_with(text: &str, registry: Option<&Registry>) -> Vec<Task> {
                 Some(registry) => {
                     let (resolved, list_name) = heading_owner(heading, Some(registry));
                     // Keep the heading as written for display (`## 抢修/Backlog`
-                    // is a different popup group from a shared `## Backlog`),
+                    // is a different list from a shared `## Backlog`),
                     // while `lanes` write path uses the bare list name.
                     list = if resolved.is_some() { strip_trailing_comment(heading) } else { list_name };
                     lane = resolved;

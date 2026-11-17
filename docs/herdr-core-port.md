@@ -258,10 +258,11 @@ Ordered by what a user would notice first:
      terminal-emulator dependency. Reading the pane gets the same states with no
      terminal access at all; `src/agent_state.rs` holds that state machine and
      §5's last rows are the evidence.
-2. **`docs/lanes.md` still carries its Herdr 1 wording** (sidebar, popup,
-   `grouping`). A port note at the top says which modules no longer exist, and
-   the lane identity is documented in `HC_TERMINAL_ID` / `HC_SESSION` terms, but
-   §9's ordering and token-lease paragraphs are still the old host's design.
+2. **[closed] `docs/lanes.md` carried its Herdr 1 wording** (sidebar, popup,
+   action menu). Closed by t-0049: those sentences now name a core term (Space,
+   tab, terminal, label) or a command (`hp overview`, `hp context`, `hp lane
+   list`), §9 is "Labels, grouping, lifecycle", and the port note at the top says
+   the same. The lane model is untouched — only the words for what draws it.
 3. **Tab order in the app is creation order.** Putting "needs you" first means
    `herdr-app do tab.move`, which is not implemented.
 4. **[closed] Remote machines are deleted, not ported.** `hc --on <machine>` was the
@@ -272,10 +273,13 @@ Ordered by what a user would notice first:
    a `TASKS.md` line written when it existed still loads; an `@machine` owner is
    refused with a clear error. Nothing on a remote is untested: there is no
    remote path left.
-5. **`hp update` has no release feed.** It says which build this is and how to
-   move it (`git pull`, `cargo build --release --locked`, `ticker stop && ticker
-   start`), and `--check` says the same without changing anything. There is no
-   feed to add until this build is published somewhere.
+5. **[closed] `hp update` has no release feed, and is not meant to get one.**
+   It says which build this is and how to move it (`git pull`, `cargo build
+   --release --locked`, `ticker stop && ticker start`), and `--check` says the
+   same without changing anything. Decided on 2026-11-17: nothing is published,
+   install is from a checkout ([`going-public.md`](going-public.md), `## Done`,
+   "No prebuilt binaries"), so there is no feed to invent. It reopens only if
+   publishing is decided.
 6. **Test coverage is thinner than the old suite.** 275 unit tests (5 of them
    the fake core's own), 18 more compiled into `hp-agent` (which shares
    `prompt_box`, `trust_screen` and `agent_state` with it), 7 CLI tests and 5
