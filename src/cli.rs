@@ -199,10 +199,10 @@ enum Command {
     },
     /// Change one setting in PROJECT.md (name, goal, coordinator_profile, thread_profile, max_parallel_threads, auto_resolve_days, nudge, repos.add, repos.remove)
     Set { slug: String, key: String, value: String },
-    /// Open a file: text in a new Herdr tab running $EDITOR, anything else with the system opener
+    /// Open a file: a text file in an editor in this terminal ($VISUAL, else $EDITOR), anything else with the system opener
     OpenFile {
         path: PathBuf,
-        /// The workspace to add the tab to (default: the current one)
+        /// Ignored: no tab is opened, so there is nothing to add one to
         #[arg(long, value_name = "ID")]
         workspace: Option<String>,
     },
@@ -552,7 +552,7 @@ enum ProfileCommand {
     /// Add a profile (a person at a terminal only)
     Add {
         name: String,
-        /// The harness: a Herdr agent kind (claude, codex, cursor, gemini, opencode, copilot, omp, pi, ...)
+        /// The harness: an agent kind (claude, codex, cursor, gemini, opencode, copilot, omp, pi, ...)
         #[arg(long, value_name = "KIND")]
         agent: String,
         #[command(flatten)]
