@@ -124,7 +124,7 @@ fn report(
     }
 
     let app = env.herdr_app_bin();
-    if crate::app::running(&app, runner) {
+    if crate::app::running(runner) {
         check(&mut out, Some(true), "app", format!("{app}: this project's terminals are shown in its spaces and tabs"));
     } else {
         check(&mut out, None, "app", format!("{app} is not running: terminals start in core and are reached with `hc attach`"));

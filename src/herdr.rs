@@ -555,6 +555,14 @@ impl<'a> Herdr<'a> {
     }
 
     pub fn workspace_create(&self, cwd: &Path, label: &str, _focus: bool) -> Result<Created, HerdrError> {
+        let dir = cwd.to_string_lossy().into_owned();
+        // The app shows what it made: a Space per project, so `hp open` and
+        // `hp thread start` land in the window a person is looking at. Without
+        // the app a Space is only labels, and `hc attach` reaches the pane.
+        if let Some(placed) = crate::app::running(self.runner).then(|| crate::app::space_new(self.runner, label, &dir)).flatten() {
+            self.label(&placed.terminal, &[(L_WS, placed.space.as_str()), (L_WS_LABEL, label), (L_TAB, placed.tab.as_str()), (L_TAB_LABEL, "root")])?;
+            return Ok(Created { workspace_id: placed.space, tab_id: placed.tab, pane_id: placed.terminal });
+        }
         let ws = self.next_id("hpw", label)?;
         let tab = format!("{ws}-t");
         let name = self.next_name(label)?;
@@ -569,6 +577,13 @@ impl<'a> Herdr<'a> {
     }
 
     pub fn tab_create(&self, workspace: &str, cwd: &Path, label: &str, _focus: bool) -> Result<Created, HerdrError> {
+        let dir = cwd.to_string_lossy().into_owned();
+        if workspace.starts_with("sp")
+            && let Some(placed) = crate::app::running(self.runner).then(|| crate::app::tab_new(self.runner, workspace, label, &dir)).flatten()
+        {
+            self.label(&placed.terminal, &[(L_WS, workspace), (L_TAB, placed.tab.as_str()), (L_TAB_LABEL, label)])?;
+            return Ok(Created { workspace_id: workspace.to_string(), tab_id: placed.tab, pane_id: placed.terminal });
+        }
         let existing = self.terminals()?;
         let ws_label = existing
             .iter()
@@ -673,6 +688,9 @@ impl<'a> Herdr<'a> {
 
     /// Ends every terminal of a Space.
     pub fn workspace_close(&self, workspace: &str) -> Result<(), HerdrError> {
+        if workspace.starts_with("sp") && crate::app::running(self.runner) && crate::app::space_close(self.runner, workspace) {
+            return Ok(());
+        }
         for term in self.terminals()?.into_iter().filter(|t| t.label(L_WS) == workspace) {
             self.end(&term.pane_id())?;
         }
