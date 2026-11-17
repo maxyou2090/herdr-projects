@@ -66,44 +66,10 @@ pub fn space_new(runner: &dyn Runner, name: &str, folder: &str) -> Option<Placed
     placed(&call(runner, "space.new", &args)?)
 }
 
-/// A tab in an existing Space, on a shell in `folder` (the agent is typed into
-/// it afterwards, so the tab and the agent are one thing).
-pub fn tab_new(runner: &dyn Runner, space: &str, name: &str, folder: &str) -> Option<Placed> {
-    let args = vec![
-        "--space".to_string(),
-        space.to_string(),
-        "--name".to_string(),
-        name.to_string(),
-        "--folder".to_string(),
-        folder.to_string(),
-        "--focus".to_string(),
-        "false".to_string(),
-    ];
-    placed(&call(runner, "tab.new", &args)?)
-}
-
 /// Ends every terminal of a Space, as `hp` means it.
 pub fn space_close(runner: &dyn Runner, space: &str) -> bool {
     let args = vec!["--id".to_string(), space.to_string(), "--confirmed".to_string(), "true".to_string()];
     call(runner, "space.close", &args).is_some()
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn a_placed_reply_names_the_space_tab_and_terminal() {
-        let reply = serde_json::json!({
-            "space": "spf737521ee96965d6e315bb526093f20b",
-            "tab": "tbe937c8bd031987e8026dadab938edeb0",
-            "terminal": "t32"
-        });
-        let ids = placed(&reply).unwrap();
-        assert_eq!(ids.space, "spf737521ee96965d6e315bb526093f20b");
-        assert_eq!(ids.terminal, "t32");
-        assert!(placed(&serde_json::json!({"error": "no space shown"})).is_none());
-    }
 }
 
 /// Every space, tab and terminal the window shows (`herdr-app ls`).
@@ -149,4 +115,22 @@ pub fn tab_rename(runner: &dyn Runner, tab: &str, name: &str) -> bool {
 pub fn tab_close(runner: &dyn Runner, tab: &str) -> bool {
     let args = vec!["--id".to_string(), tab.to_string()];
     call(runner, "tab.close", &args).is_some()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_placed_reply_names_the_space_tab_and_terminal() {
+        let reply = serde_json::json!({
+            "space": "spf737521ee96965d6e315bb526093f20b",
+            "tab": "tbe937c8bd031987e8026dadab938edeb0",
+            "terminal": "t32"
+        });
+        let ids = placed(&reply).unwrap();
+        assert_eq!(ids.space, "spf737521ee96965d6e315bb526093f20b");
+        assert_eq!(ids.terminal, "t32");
+        assert!(placed(&serde_json::json!({"error": "no space shown"})).is_none());
+    }
 }

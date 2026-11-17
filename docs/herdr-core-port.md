@@ -202,16 +202,21 @@ Ordered by what a user would notice first:
    correct; the wording is not.
 3. **Tab order in the app is creation order.** Putting "needs you" first means
    `herdr-app do tab.move`, which is not implemented.
-4. **Remote machines are untested** in this shape: `Herdr::on_machine` maps to
-   `hc --on <machine>`, and `remote.rs` still reads Herdr 1's machine list. A
-   thread on another machine is the least verified path.
+4. **Remote machines are deleted, not ported.** `hc --on <machine>` was the
+   only mapping `Herdr::on_machine` had, `remote.rs` still read Herdr 1's
+   machine list (a program that no longer exists), and `hp assignable` printed
+   `Machines: none` on a real machine, so the client dropped the feature:
+   `remote.rs`, `--machine`, `Thread::machine`, the SSH/scp/rsync copies, the
+   per-machine outage memory and `profile@machine` owners are gone. A record or
+   a `TASKS.md` line written when it existed still loads; an `@machine` owner is
+   refused with a clear error.
 5. **`hp update` is a stub** that says to rebuild the checkout; there is no
    release feed for this build.
 6. **Test coverage is thinner than the old suite.** 262 unit tests, 7 CLI tests
    and 5 adapter tests against `src/fake_hc.rs` (a fake core that answers the
    `hc` commands this binary runs). The fake models terminals, labels, status,
-   `send`, `read`, `kill`; it does not model worktrees, machines, the app, or
-   waiting. Growing it is the cheapest way to buy coverage back.
+   `send`, `read`, `kill`; it does not model worktrees, the app, or waiting.
+   Growing it is the cheapest way to buy coverage back.
 7. **The branch is `port/herdr-core`** in the same clone; `main` still holds the
    Herdr 1 plugin. Nothing is merged or published.
 

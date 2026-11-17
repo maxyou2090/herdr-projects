@@ -97,34 +97,27 @@ pub fn set_in(text: &str, key: &str, value: &str) -> Result<String> {
         }
         "nudge" => doc[key] = toml_edit::value(parse_bool(value)?),
         "repos.add" => {
-            let repo = project::parse_repo_arg(value);
-            if repo.path.is_empty() {
+            if value.is_empty() {
                 bail!("give a repository path");
             }
-            let path = match repo.machine {
-                Some(_) => repo.path.clone(),
-                None => std::fs::canonicalize(&repo.path).map(|p| p.to_string_lossy().into_owned()).unwrap_or(repo.path.clone()),
-            };
+            let path = std::fs::canonicalize(value).map(|p| p.to_string_lossy().into_owned()).unwrap_or_else(|_| value.to_string());
             normalize_repos(&mut doc)?;
             let repos = doc["repos"].as_array_of_tables_mut().context("`repos` must be [[repos]] tables")?;
-            if repos.iter().any(|t| t.get("path").and_then(Item::as_str) == Some(path.as_str()) && t.get("machine").and_then(Item::as_str) == repo.machine.as_deref()) {
+            if repos.iter().any(|t| t.get("path").and_then(Item::as_str) == Some(path.as_str())) {
                 bail!("{value} is already listed");
             }
             let mut table = Table::new();
             table["path"] = toml_edit::value(path);
-            if let Some(machine) = repo.machine {
-                table["machine"] = toml_edit::value(machine);
-            }
             repos.push(table);
         }
         "repos.remove" => {
             normalize_repos(&mut doc)?;
             let repos = doc.get_mut("repos").and_then(Item::as_array_of_tables_mut).context("no repos are listed")?;
             let before = repos.len();
-            let wanted = project::parse_repo_arg(value);
+            let canonical = std::fs::canonicalize(value).map(|p| p.to_string_lossy().into_owned()).unwrap_or_else(|_| value.to_string());
             repos.retain(|t| {
                 let path = t.get("path").and_then(Item::as_str).unwrap_or("");
-                !(path == value || (path == wanted.path && t.get("machine").and_then(Item::as_str) == wanted.machine.as_deref()))
+                !(path == value || path == canonical)
             });
             if repos.len() == before {
                 bail!("{value} is not listed");
@@ -229,7 +222,7 @@ pub fn system_open(ctx: &Ctx, target: &str) -> Result<()> {
 mod tests {
     use super::*;
 
-    const MD: &str = "+++\nname = \"Demo\" # the label\ngoal = \"\"\nmax_parallel_threads = 3\nnudge = false\n\n[[repos]]\npath = \"/srv/app\"\nmachine = \"box\"\n+++\n\n# Instructions\nBody with +++ inside\n";
+    const MD: &str = "+++\nname = \"Demo\" # the label\ngoal = \"\"\nmax_parallel_threads = 3\nnudge = false\n\n[[repos]]\npath = \"/srv/app\"\n+++\n\n# Instructions\nBody with +++ inside\n";
 
     #[test]
     fn settings_are_edited_in_place_and_validated() {
@@ -255,23 +248,23 @@ mod tests {
 
     #[test]
     fn repos_are_added_and_removed() {
-        let added = set_in(MD, "repos.add", "/srv/lib@box").unwrap();
+        let added = set_in(MD, "repos.add", "/srv/lib").unwrap();
         let (settings, _) = project::parse_project_md(&added).unwrap();
         assert_eq!(settings.repos.len(), 2);
-        assert!(set_in(&added, "repos.add", "/srv/lib@box").is_err());
-        let removed = set_in(&added, "repos.remove", "/srv/app@box").unwrap();
+        assert!(set_in(&added, "repos.add", "/srv/lib").is_err());
+        let removed = set_in(&added, "repos.remove", "/srv/app").unwrap();
         let (settings, _) = project::parse_project_md(&removed).unwrap();
         assert_eq!(settings.repos.len(), 1);
         assert_eq!(settings.repos[0].path, "/srv/lib");
         assert!(set_in(&removed, "repos.remove", "/nope").is_err());
         // What `new` writes: an empty inline array, then more keys.
         let fresh = "+++\nname = \"X\"\nrepos = []\nnudge = false\n+++\nBody\n";
-        let added = set_in(fresh, "repos.add", "/x@m").unwrap();
+        let added = set_in(fresh, "repos.add", "/x").unwrap();
         let (settings, body) = project::parse_project_md(&added).unwrap();
         assert_eq!((settings.repos.len(), settings.nudge, body.as_str()), (1, false, "Body\n"));
         // A file with no repos yet.
         let bare = "+++\nname = \"X\"\n+++\n";
-        let added = set_in(bare, "repos.add", "/x@m").unwrap();
+        let added = set_in(bare, "repos.add", "/x").unwrap();
         assert_eq!(project::parse_project_md(&added).unwrap().0.repos.len(), 1);
     }
 

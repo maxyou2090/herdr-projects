@@ -27,10 +27,13 @@ pub enum Owner {
     Unassigned,
     /// `(me)`: the user.
     Me,
-    /// `(codex-fast)` on this machine, `(@m1)` for whatever profile m1's
-    /// coordinator picks, or `(codex-fast@m1)`. Neither set is an old
-    /// `(agent → t-0007)`: this machine's default thread profile.
-    Agent { profile: Option<String>, machine: Option<String> },
+    /// `(codex-fast)`, a profile here; `None` is an old `(agent → t-0007)`:
+    /// this machine's default thread profile.
+    Agent { profile: Option<String> },
+    /// `(@m1)` or `(codex-fast@m1)`: an owner that named another machine.
+    /// Threads only start on this machine now, so it is kept as written and
+    /// refused with a clear error, never read as a person's name.
+    Machine(String),
     /// Free text that is not name-shaped, such as `Priya Rao`: a person the
     /// user named. A name-shaped owner that is no profile here (`Priya`)
     /// parses as `Agent` and is told apart by `is_person`.
@@ -45,31 +48,26 @@ impl Owner {
             "me" => return Owner::Me,
             _ => {}
         }
-        let (profile, machine) = match text.split_once('@') {
-            Some((profile, machine)) => (profile, Some(machine)),
-            None => (text, None),
-        };
-        let profile_ok = profile.is_empty() && machine.is_some() || crate::profiles::validate_name(profile).is_ok();
-        if !profile_ok || machine.is_some_and(|m| !is_machine_name(m)) {
-            return Owner::Person(text.to_string());
+        if let Some((profile, machine)) = text.split_once('@') {
+            let profile_ok = profile.is_empty() || crate::profiles::validate_name(profile).is_ok();
+            return if profile_ok && is_machine_name(machine) { Owner::Machine(text.to_string()) } else { Owner::Person(text.to_string()) };
         }
-        Owner::Agent { profile: (!profile.is_empty()).then(|| profile.to_string()), machine: machine.map(str::to_string) }
+        if crate::profiles::validate_name(text).is_ok() { Owner::Agent { profile: Some(text.to_string()) } } else { Owner::Person(text.to_string()) }
     }
 
     /// Whether this owner is a person: free text, or a bare name that
-    /// `is_profile` does not know. `profile@machine` and `@machine` are
-    /// always agents.
+    /// `is_profile` does not know. An `@machine` owner is not a person.
     pub fn is_person(&self, is_profile: impl Fn(&str) -> bool) -> bool {
         match self {
             Owner::Person(_) => true,
-            Owner::Agent { profile: Some(profile), machine: None } => !is_profile(profile),
+            Owner::Agent { profile: Some(profile) } => !is_profile(profile),
             _ => false,
         }
     }
 }
 
-/// A machine label as Herdr and config.toml name one: letters, digits, `.`,
-/// `_` and `-`.
+/// A machine label as an old TASKS.md line could name one: letters, digits,
+/// `.`, `_` and `-`. Only used to recognise such an owner, never to reach one.
 pub fn is_machine_name(name: &str) -> bool {
     !name.is_empty() && !name.starts_with('-') && name.chars().all(|c| c.is_ascii_alphanumeric() || "._-".contains(c))
 }
@@ -79,14 +77,9 @@ impl fmt::Display for Owner {
         match self {
             Owner::Unassigned => Ok(()),
             Owner::Me => f.write_str("me"),
-            Owner::Agent { profile: None, machine: None } => f.write_str("default profile"),
-            Owner::Agent { profile, machine } => {
-                f.write_str(profile.as_deref().unwrap_or(""))?;
-                match machine {
-                    Some(m) => write!(f, "@{m}"),
-                    None => Ok(()),
-                }
-            }
+            Owner::Agent { profile: None } => f.write_str("default profile"),
+            Owner::Agent { profile: Some(profile) } => f.write_str(profile),
+            Owner::Machine(text) => f.write_str(text),
             Owner::Person(text) => f.write_str(text),
         }
     }
@@ -249,7 +242,7 @@ fn split_line(rest: &str) -> (String, Owner, Option<String>) {
         Some((who, id)) if is_thread_id(id.trim()) => {
             thread = thread.or_else(|| Some(id.trim().to_string()));
             match who.trim() {
-                "agent" => Owner::Agent { profile: None, machine: None },
+                "agent" => Owner::Agent { profile: None },
                 who => Owner::parse(who),
             }
         }
@@ -373,26 +366,23 @@ pub fn find_in(tasks_md: &str, title: &str, registry: Option<&Registry>, lane: O
     }
 }
 
-/// The `--profile` and `--machine` a delegated task starts with: its owner's,
-/// unless the command line gives its own. A flag that contradicts the owner is
-/// refused, so the task line and the thread never disagree.
-pub fn launch_for(task: &Task, profile: Option<String>, machine: Option<String>) -> Result<(Option<String>, Option<String>)> {
+/// The `--profile` a delegated task starts with: its owner's, unless the
+/// command line gives its own. A flag that contradicts the owner is refused,
+/// so the task line and the thread never disagree.
+pub fn launch_for(task: &Task, profile: Option<String>) -> Result<Option<String>> {
     let title = &task.title;
     match &task.owner {
-        Owner::Unassigned => Ok((profile, machine)),
+        Owner::Unassigned => Ok(profile),
         Owner::Me => bail!("\"{title}\" is the user's own task (me); change its owner in TASKS.md before delegating it"),
         Owner::Person(text) => bail!("\"{title}\" belongs to {text}, a person; people's tasks are never delegated. Change its owner in TASKS.md first if the user asks"),
-        Owner::Agent { profile: owned_profile, machine: owned_machine } => {
+        Owner::Machine(text) => bail!("\"{title}\" is assigned to `{text}`, a machine; threads only start on this machine now. Change its owner to a profile here (or `me`) in TASKS.md first"),
+        Owner::Agent { profile: owned_profile } => {
             if let (Some(flag), Some(owned)) = (&profile, owned_profile)
                 && flag != owned
             {
                 bail!("\"{title}\" is assigned to profile `{owned}`, not `{flag}`; change its owner in TASKS.md first, or leave out --profile");
             }
-            if machine != *owned_machine && machine.is_some() {
-                let owned = owned_machine.as_deref().map_or("this machine".to_string(), |m| format!("machine `{m}`"));
-                bail!("\"{title}\" is assigned to {owned}, not `{}`; change its owner in TASKS.md first, or leave out --machine", machine.unwrap_or_default());
-            }
-            Ok((profile.or_else(|| owned_profile.clone()), owned_machine.clone()))
+            Ok(profile.or_else(|| owned_profile.clone()))
         }
     }
 }
@@ -1327,8 +1317,8 @@ mod tests {
 
     const TEXT: &str = "# Tasks\n\n## Backlog\n- [ ] Write the docs (me)\n- [ ] Fix login (agent → t-0007)\n  Users on Safari get logged out.\n\n  Bugs:\n    - cookie is dropped\n  See https://example.com/issue/4\n- [ ] Plain line\n\n## Later\n- [x] Old (agent)\n  - [ ] A subtask stays a task\n";
 
-    fn agent(profile: Option<&str>, machine: Option<&str>) -> Owner {
-        Owner::Agent { profile: profile.map(str::to_string), machine: machine.map(str::to_string) }
+    fn agent(profile: Option<&str>) -> Owner {
+        Owner::Agent { profile: profile.map(str::to_string) }
     }
 
     #[test]
@@ -1340,10 +1330,22 @@ mod tests {
     }
 
     #[test]
-    fn owners_are_a_profile_a_machine_or_both_and_the_thread_stands_apart() {
+    fn owners_are_a_profile_or_a_person_and_the_thread_stands_apart() {
         let tasks = parse("## A\n- [ ] One (codex-fast)\n- [ ] Two (@m1)\n- [ ] Three (codex-fast@m1) · t-0007\n- [ ] Four (me)\n- [ ] Five\n- [ ] Six (Priya Rao)\n- [ ] Fix (the) login (claude)\n- [ ] Unassigned but running · t-0009\n");
         let owners: Vec<&Owner> = tasks.iter().map(|t| &t.owner).collect();
-        assert_eq!(owners, [&agent(Some("codex-fast"), None), &agent(None, Some("m1")), &agent(Some("codex-fast"), Some("m1")), &Owner::Me, &Owner::Unassigned, &Owner::Person("Priya Rao".into()), &agent(Some("claude"), None), &Owner::Unassigned]);
+        assert_eq!(
+            owners,
+            [
+                &agent(Some("codex-fast")),
+                &Owner::Machine("@m1".into()),
+                &Owner::Machine("codex-fast@m1".into()),
+                &Owner::Me,
+                &Owner::Unassigned,
+                &Owner::Person("Priya Rao".into()),
+                &agent(Some("claude")),
+                &Owner::Unassigned
+            ]
+        );
         assert_eq!(tasks[2].thread.as_deref(), Some("t-0007"));
         assert_eq!(tasks[2].title, "Three");
         assert_eq!(tasks[6].title, "Fix (the) login");
@@ -1359,23 +1361,25 @@ mod tests {
     fn old_agent_owners_still_read() {
         let tasks = parse("## A\n- [ ] Old (agent)\n- [ ] Running (agent → t-0007)\n");
         assert_eq!(tasks[0].owner, Owner::Unassigned);
-        assert_eq!((&tasks[1].owner, tasks[1].thread.as_deref()), (&agent(None, None), Some("t-0007")));
+        assert_eq!((&tasks[1].owner, tasks[1].thread.as_deref()), (&agent(None), Some("t-0007")));
         assert_eq!(tasks[1].owner.to_string(), "default profile");
     }
 
     #[test]
-    fn delegation_takes_profile_and_machine_from_the_owner() {
+    fn delegation_takes_the_profile_from_the_owner() {
         let tasks = parse("## A\n- [ ] P (fast)\n- [ ] M (@m1)\n- [ ] PM (fast@m1)\n- [ ] U\n- [ ] Me (me)\n- [ ] X (Bob Smith)\n");
         let s = |v: &str| Some(v.to_string());
-        assert_eq!(launch_for(&tasks[0], None, None).unwrap(), (s("fast"), None));
-        assert_eq!(launch_for(&tasks[1], s("deep"), None).unwrap(), (s("deep"), s("m1")));
-        assert_eq!(launch_for(&tasks[2], None, s("m1")).unwrap(), (s("fast"), s("m1")));
-        assert_eq!(launch_for(&tasks[3], s("deep"), s("m2")).unwrap(), (s("deep"), s("m2")));
-        assert!(launch_for(&tasks[0], s("deep"), None).unwrap_err().to_string().contains("assigned to profile `fast`"));
-        assert!(launch_for(&tasks[0], None, s("m1")).unwrap_err().to_string().contains("assigned to this machine"));
-        assert!(launch_for(&tasks[2], None, s("m2")).is_err());
-        assert!(launch_for(&tasks[4], None, None).is_err());
-        assert!(launch_for(&tasks[5], None, None).unwrap_err().to_string().contains("a person"));
+        assert_eq!(launch_for(&tasks[0], None).unwrap(), s("fast"));
+        assert_eq!(launch_for(&tasks[3], s("deep")).unwrap(), s("deep"));
+        assert!(launch_for(&tasks[0], s("deep")).unwrap_err().to_string().contains("assigned to profile `fast`"));
+        // A machine owner is refused by name: it is not a person's task and
+        // nothing starts on another machine any more.
+        for machine in [&tasks[1], &tasks[2]] {
+            let error = launch_for(machine, None).unwrap_err().to_string();
+            assert!(error.contains("only start on this machine"), "{error}");
+        }
+        assert!(launch_for(&tasks[4], None).is_err());
+        assert!(launch_for(&tasks[5], None).unwrap_err().to_string().contains("a person"));
     }
 
     #[test]

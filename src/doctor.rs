@@ -19,7 +19,7 @@ fn github_hosts(root: &Path, runner: &dyn Runner) -> std::collections::BTreeMap<
     let mut dirs: Vec<String> = std::env::current_dir().map(|d| d.to_string_lossy().into_owned()).into_iter().collect();
     for slug in project::list_slugs(root) {
         if let Ok((settings, _)) = project::Project::load(root, &slug).and_then(|p| p.read_project_md()) {
-            dirs.extend(settings.repos.into_iter().filter(|r| r.machine.is_none()).map(|r| r.path));
+            dirs.extend(settings.repos.into_iter().map(|r| r.path));
         }
     }
     let mut hosts = std::collections::BTreeMap::new();
@@ -396,24 +396,6 @@ fn report(
             .collect();
         if !skipped.is_empty() {
             check(&mut out, None, &format!("routines {slug}"), format!("{}; routines run only while a coordinator runs", skipped.join("; ")));
-        }
-    }
-
-    // Machines that projects use need an SSH target for report and library copies.
-    let mut machines = std::collections::BTreeSet::new();
-    for slug in project::list_slugs(root) {
-        let Ok(project) = project::Project::load(root, &slug) else {
-            continue;
-        };
-        if let Ok((settings, _)) = project.read_project_md() {
-            machines.extend(settings.repos.into_iter().filter_map(|r| r.machine));
-        }
-        machines.extend(crate::thread::list(&project).into_iter().filter(|t| t.is_remote() && t.status != crate::thread::Status::Resolved).map(|t| t.machine));
-    }
-    for machine in machines {
-        match crate::remote::ssh_target(runner, &bin, config_dir, &machine) {
-            Ok(target) => check(&mut out, Some(true), &format!("machine {machine}"), format!("ssh target {target}")),
-            Err(error) => check(&mut out, Some(false), &format!("machine {machine}"), format!("{error:#}")),
         }
     }
 

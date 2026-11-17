@@ -255,7 +255,6 @@ impl Registry {
 
     /// Writes the registry. The caller holds `project.lock()`: this is the
     /// only writer and the file is written nowhere else.
-    #[cfg_attr(not(test), allow(dead_code))] // the writer lands with `lane adopt` (commit 4)
     pub fn save(&self, project: &Project) -> Result<()> {
         project::write_json(&registry_path(project), self)
     }
@@ -300,7 +299,6 @@ impl Registry {
     /// Writes the synthesized registry once, under the project lock. Returns
     /// whether it wrote. `open` calls this before it acts on a lane; a read
     /// must never be the thing that creates the file.
-    #[cfg_attr(not(test), allow(dead_code))]
     pub fn ensure_written(project: &Project) -> Result<bool> {
         if exists(project) {
             return Ok(false);
@@ -397,7 +395,6 @@ impl Registry {
 
     /// The lane `--lane <handle>` names: by `id` first (an id is a handle that
     /// never changes), then by `name`, then by `label`.
-    #[cfg_attr(not(test), allow(dead_code))] // `open --lane` and `lane adopt` (commit 4)
     pub fn find(&self, handle: &str) -> Option<&Lane> {
         self.get(handle).or_else(|| {
             self.lanes
@@ -413,7 +410,6 @@ impl Registry {
 
     /// Allocate `c-<n>` and append the lane; the caller fills in what a
     /// registry cannot know and holds `project.lock()`.
-    #[cfg_attr(not(test), allow(dead_code))] // `open --lane` (commit 4)
     pub fn create(&mut self, name: &str, label: &str) -> &mut Lane {
         let id = self.alloc_id();
         self.lanes.push(Lane {
@@ -428,7 +424,6 @@ impl Registry {
 
     /// The next id. The counter moves past it even if the lane is then thrown
     /// away: an allocated id never comes back.
-    #[cfg_attr(not(test), allow(dead_code))] // reached through `create` (commit 4)
     pub fn alloc_id(&mut self) -> String {
         let n = self.next.max(1);
         self.next = n.saturating_add(1);
@@ -548,7 +543,7 @@ impl LaneResolution {
         self == &LaneResolution::None
     }
 
-    #[cfg_attr(not(test), allow(dead_code))] // kept for tests of the ticker's held reason
+    #[cfg(test)]
     pub fn is_ambiguous(&self) -> bool {
         matches!(self, LaneResolution::Ambiguous { .. })
     }
@@ -1682,8 +1677,7 @@ pub fn lane_close(ctx: &Ctx, project: &Project, handle: &str) -> Result<()> {
     let mut registry = require_registry(project)?;
     let lane = require_lane(&registry, handle)?;
     let index = registry.lanes.iter().position(|record| record.id == lane.id).expect("require_lane found it");
-    let mut open = crate::ticker::open_threads(project, false);
-    open.extend(crate::ticker::open_threads(project, true));
+    let open = crate::ticker::open_threads(project);
     let blockers: Vec<String> = open
         .iter()
         .filter(|thread| registry.lane_of(&thread.lane).map(|record| record.id.as_str()) == Some(lane.id.as_str()))

@@ -101,13 +101,13 @@ enum Command {
         #[arg(long)]
         peek: bool,
     },
-    /// Who TASKS.md tasks may be assigned to: this project's thread profiles, and other machines with their profiles
+    /// Who TASKS.md tasks may be assigned to: this project's thread profiles here, and `me`
     Assignable {
         slug: String,
-        /// Look up other machines' profiles again instead of using the hour-long cache
-        #[arg(long)]
+        /// Accepted and ignored: it used to look up other machines' profiles again
+        #[arg(long, hide = true)]
         refresh: bool,
-        /// Exit with an error unless OWNER (me, PROFILE, @MACHINE or PROFILE@MACHINE) is valid
+        /// Exit with an error unless OWNER (me or PROFILE) is valid
         #[arg(long, value_name = "OWNER")]
         check: Option<String>,
     },
@@ -379,8 +379,6 @@ enum ThreadCommand {
         title: String,
         #[arg(long, value_name = "PATH")]
         repo: Option<String>,
-        #[arg(long, value_name = "LABEL")]
-        machine: Option<String>,
         /// The agent's profile (harness, model, effort, flags), one the project allows (default: thread_profile in PROJECT.md); `context` lists them
         #[arg(long, alias = "agent", value_name = "NAME")]
         profile: Option<String>,
@@ -392,7 +390,7 @@ enum ThreadCommand {
         /// The task; `-` reads standard input
         #[arg(long, value_name = "FILE")]
         task_file: String,
-        /// Delegating this TASKS.md task (its title as written there): its notes are added to the task, and its owner gives --profile and --machine
+        /// Delegating this TASKS.md task (its title as written there): its notes are added to the task, and its owner gives --profile
         #[arg(long, value_name = "TITLE")]
         from_task: Option<String>,
     },
@@ -552,11 +550,11 @@ enum ProfileCommand {
     List {
         #[arg(long, value_name = "SLUG")]
         project: Option<String>,
-        /// Only the names, one per line (what other machines read to assign tasks here)
+        /// Only the names, one per line
         #[arg(long, conflicts_with = "project")]
         names: bool,
     },
-    /// Print a profile's launch setup here as JSON (default: [defaults] thread_profile); other machines read it to start threads here
+    /// Print a profile's launch setup here as JSON (default: [defaults] thread_profile)
     Resolve {
         name: Option<String>,
     },
@@ -698,7 +696,7 @@ pub fn run() -> Result<()> {
 
     match cli.command {
         Command::New { name, goal, repos, thread_profile, coordinator_profile } => {
-            let repos = repos.iter().map(|arg| project::parse_repo_arg(arg)).collect();
+            let repos = repos.into_iter().map(|path| project::Repo { path }).collect();
             let config = crate::profiles::load(&ctx.config_dir)?;
             let thread = thread_profile.unwrap_or_else(|| config.new_project_default(crate::profiles::Role::Thread));
             let coordinator = coordinator_profile.unwrap_or_else(|| config.new_project_default(crate::profiles::Role::Coordinator));
@@ -821,10 +819,10 @@ pub fn run() -> Result<()> {
             }
         },
         Command::Thread { command } => match command {
-            ThreadCommand::Start { slug, title, repo, mut machine, mut profile, kind, base, task_file, from_task } => {
+            ThreadCommand::Start { slug, title, repo, mut profile, kind, base, task_file, from_task } => {
                 let mut task = read_text(&task_file)?;
                 if let Some(from) = from_task {
-                    // The task's owner picks the profile and machine.
+                    // The task's owner picks the profile.
                     let project = Project::load(&ctx.root, &slug)?;
                     let tasks_md = crate::tasks::read(&project.dir());
                     let registry = lanes::Registry::load(&project);
@@ -834,7 +832,7 @@ pub fn run() -> Result<()> {
                     if found.owner.is_person(|p| config.get(p).is_some()) {
                         bail!("\"{}\" belongs to {}, a person; people's tasks are never delegated. Change its owner in TASKS.md first if the user asks", found.title, found.owner);
                     }
-                    (profile, machine) = crate::tasks::launch_for(&found, profile, machine)?;
+                    profile = crate::tasks::launch_for(&found, profile)?;
                     task = if registry.is_some() {
                         crate::tasks::delegated_from(&found, &task)
                     } else {
@@ -844,7 +842,7 @@ pub fn run() -> Result<()> {
                     };
                 }
                 let kind = kind.as_deref().map(crate::thread::Kind::parse).transpose()?;
-                let thread = threads::start(&ctx, &slug, StartArgs { title, repo, machine, profile, kind, base, task })?;
+                let thread = threads::start(&ctx, &slug, StartArgs { title, repo, profile, kind, base, task })?;
                 println!("{}", serde_json::json!({ "id": thread.id, "kind": thread.kind, "profile": thread.profile, "agent": thread.agent, "branch": thread.branch, "pane_id": thread.pane_id }));
                 Ok(())
             }

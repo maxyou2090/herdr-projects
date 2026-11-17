@@ -17,7 +17,7 @@ use crate::herdr::{Agent, Herdr, Pane};
 use crate::paths::{self, Ctx, SessionFlags};
 use crate::profiles::Role;
 use crate::project::{self, Coordinator, Project, Status};
-use crate::remote::quote;
+use crate::shell::quote;
 use crate::{inbox, names, ticker};
 
 /// A coordinator counts as idle for a nudge once its `(agent_status,
@@ -1065,13 +1065,6 @@ pub fn context(ctx: &Ctx, slug: &str, peek: bool) -> Result<()> {
     Ok(())
 }
 
-/// The digest and the ids of the inbox items it showed.
-#[cfg_attr(not(test), allow(dead_code))] // `context` uses `digest_for`; the test suite compares this shape
-pub fn digest(ctx: &Ctx, project: &Project, prefix: &str) -> Result<(String, Vec<String>)> {
-    let (text, shown, _) = digest_for(ctx, project, prefix)?;
-    Ok((text, shown))
-}
-
 /// The digest, plus the lane scope it was rendered for (if any) so `context`
 /// can mark exactly that lane's items seen.
 fn digest_for(ctx: &Ctx, project: &Project, prefix: &str) -> Result<(String, Vec<String>, Option<crate::lanes::Scope>)> {
@@ -1102,10 +1095,7 @@ fn digest_for(ctx: &Ctx, project: &Project, prefix: &str) -> Result<(String, Vec
                 let _ = writeln!(out, "Repos: (none)");
             }
             for repo in &settings.repos {
-                match &repo.machine {
-                    Some(machine) => { let _ = writeln!(out, "Repo: {} (machine {machine})", repo.path); }
-                    None => { let _ = writeln!(out, "Repo: {}", repo.path); }
-                }
+                let _ = writeln!(out, "Repo: {}", repo.path);
             }
         }
         Err(error) => {
@@ -1358,7 +1348,7 @@ mod tests {
         // A pane in neither directory is still not the project's.
         let other = Pane { workspace_id: "w2".into(), cwd: "/tmp".into(), ..Pane::default() };
         assert!(!workspace_open(&record, std::slice::from_ref(&other)));
-        assert_eq!(project_workspace(&record, &[other.clone()], &[]), None);
+        assert_eq!(project_workspace(&record, std::slice::from_ref(&other), &[]), None);
         // ...unless its pane still runs the recorded coordinator session:
         // the workspace stays the project's home instead of splitting it
         // across a second same-named one. A workspace with a shell in the
@@ -1371,14 +1361,14 @@ mod tests {
             agent_session: Some(crate::herdr::AgentSession { value: "/sessions/demo.jsonl".into() }),
             ..agent("w2:p1", "/home/me", "idle", 1)
         };
-        assert_eq!(project_workspace(&record, &[other.clone()], &[drifted.clone()]), None);
-        assert_eq!(project_workspace(&recorded, &[other.clone()], &[drifted]).as_deref(), Some("w2"));
+        assert_eq!(project_workspace(&record, std::slice::from_ref(&other), std::slice::from_ref(&drifted)), None);
+        assert_eq!(project_workspace(&recorded, std::slice::from_ref(&other), &[drifted]).as_deref(), Some("w2"));
         let tabbed = Pane { workspace_id: "w3".into(), pane_id: "w3:p9".into(), cwd: "/r/demo/threads/t-0001".into(), ..Pane::default() };
         let reused = Agent {
             agent_session: Some(crate::herdr::AgentSession { value: "/sessions/other.jsonl".into() }),
             ..agent("w2:p1", "/home/me", "idle", 1)
         };
-        assert_eq!(project_workspace(&recorded, &[other, tabbed], &[reused.clone()]).as_deref(), Some("w3"));
+        assert_eq!(project_workspace(&recorded, &[other, tabbed], std::slice::from_ref(&reused)).as_deref(), Some("w3"));
         // A recycled pane id running another session does not win.
         assert_eq!(project_workspace(&recorded, &[], &[reused]), None);
     }

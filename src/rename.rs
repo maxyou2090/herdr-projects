@@ -39,7 +39,7 @@ pub struct Args<'a> {
 #[derive(Debug, Default)]
 pub struct Outcome {
     pub steps: Vec<String>,
-    /// References it could not (or does not) update: other machines, git.
+    /// References it could not (or does not) update: git, the trash.
     pub left: Vec<String>,
     /// Agents in the folder the ticker closes first, as `what (pane id)`.
     pub closing: Vec<String>,
@@ -264,7 +264,7 @@ pub fn run(ctx: &Ctx, args: &Args) -> Result<Outcome> {
     }
     step(&mut out, "rewrite AGENTS.md (CLAUDE.md links to it)".into());
     let threads = thread::list(&project);
-    let rewritten = threads.iter().filter(|t| !t.is_remote() && [&t.cwd, &t.worktree_path, &t.thread_dir].iter().any(|p| moved(p, &old_paths, &canonical_new).is_some())).count();
+    let rewritten = threads.iter().filter(|t| [&t.cwd, &t.worktree_path, &t.thread_dir].iter().any(|p| moved(p, &old_paths, &canonical_new).is_some())).count();
     if rewritten > 0 {
         step(&mut out, format!("point {rewritten} resolved thread record(s) at the new folder"));
     }
@@ -299,9 +299,7 @@ pub fn run(ctx: &Ctx, args: &Args) -> Result<Outcome> {
         if parts.is_empty() {
             continue;
         }
-        let place = if t.is_remote() { format!("on {} ", t.machine) } else { String::new() };
-        let swept = if t.is_remote() { "" } else { "; `sweep` still finds them" };
-        out.left.push(format!("{}: {place}{} keep the old slug{swept}", t.id, parts.join(", ")));
+        out.left.push(format!("{}: {} keep the old slug; `sweep` still finds them", t.id, parts.join(", ")));
     }
     let resumable = !record.agent_session.is_empty() && crate::agents::resume_args(&record.agent, &record.agent_session).is_some();
     if resumable {
@@ -346,7 +344,7 @@ pub fn run(ctx: &Ctx, args: &Args) -> Result<Outcome> {
         write_atomic(&project.project_md(), text.as_bytes()).with_context(|| finish.clone())?;
     }
     project::write_priming(&project, &crate::coordinator::current_prefix(&ctx.root)?, "rename").with_context(|| finish.clone())?;
-    for t in threads.iter().filter(|t| !t.is_remote()) {
+    for t in threads.iter() {
         thread::update(&project, &t.id, |t| {
             for field in [&mut t.cwd, &mut t.worktree_path, &mut t.thread_dir] {
                 if let Some(path) = moved(field, &old_paths, &canonical_new) {
@@ -382,7 +380,7 @@ pub fn run(ctx: &Ctx, args: &Args) -> Result<Outcome> {
 
     // 4. Herdr: the home Space's label (best effort; `open` also fixes it).
     if old_label != new_label && !record.workspace_id.is_empty() {
-        let herdr = crate::herdr::Herdr::new(&ctx.env.herdr_bin(), &record.socket, ctx.runner);
+        let herdr = crate::herdr::Herdr::new(ctx.env.herdr_bin(), &record.socket, ctx.runner);
         if !record.socket.is_empty() && crate::herdr::session_alive(&ctx.env.herdr_bin(), &record.socket, ctx.runner)
             && let Err(error) = herdr.workspace_rename(&record.workspace_id, &new_label)
             // Closed with the coordinator's pane: `open` makes a new one.

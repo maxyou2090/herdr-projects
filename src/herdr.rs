@@ -270,8 +270,6 @@ pub struct Herdr<'a> {
     /// a socket path here; a path is read as the default session, so records
     /// written before the port keep working.
     session: String,
-    /// A saved machine: every call is forwarded as `hc --on M ...`.
-    machine: Option<String>,
     runner: &'a dyn Runner,
 }
 
@@ -291,18 +289,7 @@ impl<'a> Herdr<'a> {
         Herdr {
             bin: bin.into(),
             session: session_key(&raw),
-            machine: None,
             runner,
-        }
-    }
-
-    /// The same session, with calls forwarded to a saved machine.
-    pub fn on_machine(&self, machine: &str) -> Herdr<'a> {
-        Herdr {
-            bin: self.bin.clone(),
-            session: self.session.clone(),
-            machine: (!machine.is_empty()).then(|| machine.to_string()),
-            runner: self.runner,
         }
     }
 
@@ -315,10 +302,7 @@ impl<'a> Herdr<'a> {
         } else {
             cmd.env("HC_SESSION", &self.session)
         };
-        match &self.machine {
-            Some(machine) => cmd.args(["--on", machine]),
-            None => cmd,
-        }
+        cmd
     }
 
     /// True when the core answers.
@@ -365,11 +349,6 @@ impl<'a> Herdr<'a> {
             return Err(HerdrError { code, message });
         }
         Err(HerdrError { code: "failed".into(), message: format!("`hc {}`: {}", args.join(" "), out.error_text()) })
-    }
-
-    #[allow(dead_code)] // used by the unit tests of the modules that report tokens
-    pub fn call(&self, args: &[&str], timeout: Duration) -> Result<serde_json::Value, HerdrError> {
-        self.json(args, timeout)
     }
 
     /// Every live terminal of this session, with its labels: `hc ls` prints one
@@ -601,7 +580,6 @@ impl<'a> Herdr<'a> {
     }
 
     pub fn tab_create(&self, workspace: &str, cwd: &Path, label: &str, _focus: bool) -> Result<Created, HerdrError> {
-        let dir = cwd.to_string_lossy().into_owned();
         if workspace.starts_with("sp") && crate::app::running(self.runner) {
             let tab = format!("{}-{}", workspace, suffix());
             let name = self.next_name(label)?;
@@ -720,7 +698,7 @@ impl<'a> Herdr<'a> {
     }
 
     /// The kind of agent a pane runs, from the label this binary writes.
-    #[cfg_attr(not(test), allow(dead_code))] // read by the fake-hc test only
+    #[cfg(test)]
     pub fn agent_kind(&self, pane: &str) -> Option<String> {
         let kind = self.term(pane).ok()?.label(L_KIND);
         (!kind.is_empty()).then_some(kind)
@@ -833,12 +811,6 @@ impl<'a> Herdr<'a> {
             interactive_ready: term.reported,
             tokens: term.labels.clone(),
         })
-    }
-
-    /// Remembers the agent's native session so `thread restart` can resume it.
-    #[allow(dead_code)] // wired when thread restart resumes a native session
-    pub fn set_agent_session(&self, pane: &str, id: &str) -> Result<(), HerdrError> {
-        self.label(pane, &[(L_SESSION, id)])
     }
 
     /// Submits a prompt. core refuses to type into a `blocked` program unless
@@ -970,12 +942,12 @@ fn agent_command(kind: &str, args: &[String]) -> String {
         .ok()
         .and_then(|path| path.parent().map(|dir| dir.join("hp-agent")))
         .filter(|path| path.exists())
-        .map(|path| crate::remote::quote(&path.to_string_lossy()))
+        .map(|path| crate::shell::quote(&path.to_string_lossy()))
         .unwrap_or_else(|| "hp-agent".into());
-    let mut line = format!("{binary} {}", crate::remote::quote(kind));
+    let mut line = format!("{binary} {}", crate::shell::quote(kind));
     for arg in args {
         line.push(' ');
-        line.push_str(&crate::remote::quote(arg));
+        line.push_str(&crate::shell::quote(arg));
     }
     line
 }

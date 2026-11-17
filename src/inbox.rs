@@ -42,7 +42,7 @@ fn parse(text: &str) -> Option<Item> {
     Some(item)
 }
 
-/// File-name-safe form of a subject (a thread id, routine name, machine label).
+/// File-name-safe form of a subject (a thread id, routine name, lane id).
 pub fn safe_subject(subject: &str) -> String {
     let cleaned: String = subject
         .chars()
@@ -101,7 +101,7 @@ pub fn lane_of_thread(project: &Project, id: &str) -> String {
 }
 
 /// The item kinds whose `subject` is a thread id. Every other kind names
-/// something else (a machine, a lane, a routine, a Space, a session, a file
+/// something else (a lane, a routine, a Space, a session, a file
 /// stem), so "the thread of this item" is only a question for these three.
 /// `thread-error` belongs here with the other two: it is written about a
 /// thread's own pane, and one still in the inbox after that thread is

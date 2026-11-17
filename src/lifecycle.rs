@@ -48,7 +48,7 @@ pub(crate) fn alive_panes(project: &Project, view: &SessionView) -> Vec<(String,
     }
     let now = jiff::Timestamp::now();
     for t in thread::list(project) {
-        if t.status == thread::Status::Resolved || t.is_remote() {
+        if t.status == thread::Status::Resolved {
             continue;
         }
         let live = thread::live_state(&t, &view.agents, &view.panes, now);
@@ -120,7 +120,7 @@ fn close_workspaces(project: &Project, view: &SessionView) -> Vec<String> {
     let mut done = Vec::new();
     let home = project.coordinator().map(|c| c.workspace_id).unwrap_or_default();
     for t in thread::list(project).iter().filter(|t| {
-        t.status != thread::Status::Resolved && !t.is_remote() && matches!(t.kind, thread::Kind::Worktree | thread::Kind::Tab | thread::Kind::Checkout)
+        t.status != thread::Status::Resolved && matches!(t.kind, thread::Kind::Worktree | thread::Kind::Tab | thread::Kind::Checkout)
     }) {
         // A worktree thread's Space is on its worktree, a tab thread's on its
         // own `threads/<id>/` folder; one still living in the home (placed
@@ -209,13 +209,13 @@ pub fn set_status(ctx: &Ctx, slug: &str, status: Status) -> Result<()> {
 /// worktree, branch or pull request.
 pub fn delete(ctx: &Ctx, slug: &str, force: bool) -> Result<()> {
     let project = Project::load(&ctx.root, slug)?;
-    if !force {
-        if let Some(view) = threads::session_view(ctx, &project) {
-            let alive = alive_panes(&project, &view);
-            if !alive.is_empty() {
-                let list: Vec<String> = alive.iter().map(|(what, pane, _)| format!("{what} (pane {pane})")).collect();
-                bail!("`{slug}` still has live panes: {}. Close them, or pass --force.", list.join(", "));
-            }
+    if !force
+        && let Some(view) = threads::session_view(ctx, &project)
+    {
+        let alive = alive_panes(&project, &view);
+        if !alive.is_empty() {
+            let list: Vec<String> = alive.iter().map(|(what, pane, _)| format!("{what} (pane {pane})")).collect();
+            bail!("`{slug}` still has live panes: {}. Close them, or pass --force.", list.join(", "));
         }
     }
     let threads = thread::list(&project);
@@ -237,8 +237,7 @@ pub fn delete(ctx: &Ctx, slug: &str, force: bool) -> Result<()> {
     if !left.is_empty() {
         println!("Left alone (remove them yourself if you no longer want them):");
         for t in left {
-            let place = if t.machine.is_empty() { String::new() } else { format!(" on {}", t.machine) };
-            println!("  {}: worktree {}{place}, branch {} in {}", t.id, if t.worktree_path.is_empty() { "-" } else { &t.worktree_path }, if t.branch.is_empty() { "-" } else { &t.branch }, t.repo);
+            println!("  {}: worktree {}, branch {} in {}", t.id, if t.worktree_path.is_empty() { "-" } else { &t.worktree_path }, if t.branch.is_empty() { "-" } else { &t.branch }, t.repo);
         }
     }
     // Only point at leftovers that actually exist: the per-project safety

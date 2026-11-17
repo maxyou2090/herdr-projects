@@ -5,7 +5,6 @@
 //! folders of long-resolved tab threads, handled inbox items older than 30
 //! days, and empty repository Spaces herdr grouped their worktrees under.
 //! `--dry-run` lists; otherwise each is removed after a confirmation.
-//! Remote machines are left to `thread resolve`.
 
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -78,8 +77,8 @@ pub fn find(ctx: &Ctx, project: &Project) -> Vec<Orphan> {
     let mut orphans = Vec::new();
 
     // Local repositories this project works in.
-    let mut repos: Vec<String> = settings.repos.iter().filter(|r| r.machine.is_none()).map(|r| r.path.clone()).collect();
-    repos.extend(threads.iter().filter(|t| !t.is_remote() && !t.repo.is_empty() && t.kind == Kind::Worktree).map(|t| t.repo.clone()));
+    let mut repos: Vec<String> = settings.repos.iter().map(|r| r.path.clone()).collect();
+    repos.extend(threads.iter().filter(|t| !t.repo.is_empty() && t.kind == Kind::Worktree).map(|t| t.repo.clone()));
     repos.sort();
     repos.dedup();
     let open = |branch: &str, path: &str| threads.iter().any(|t| t.status != Status::Resolved && (t.branch == branch || t.worktree_path == path));
@@ -121,7 +120,7 @@ pub fn find(ctx: &Ctx, project: &Project) -> Vec<Orphan> {
         }
     }
 
-    for t in threads.iter().filter(|t| t.status == Status::Resolved && !t.is_remote()) {
+    for t in threads.iter().filter(|t| t.status == Status::Resolved) {
         if matches!(t.kind, Kind::Tab | Kind::Checkout | Kind::Home)
             && let Some(view) = &view
             && !t.pane_id.is_empty()
