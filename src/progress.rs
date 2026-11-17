@@ -282,7 +282,7 @@ pub fn guidance(prefix: &str, pane_id: Option<&str>) -> String {
 }
 
 pub fn reminder(prefix: &str) -> String {
-    format!("Progress check-in is due if this is a natural boundary: `{prefix} report --percent N --activity '...'`. Reassess the current task; do not invent progress. Report `Waiting for you` before a question to the user.")
+    format!("Progress check-in is due if this is a natural boundary: `{prefix} report --activity '...'` with what the task is actually doing now; reassess it first, and do not invent progress. Report `Waiting for you` before a question to the user, and add `--done` only when the whole task is finished.")
 }
 
 /// Events the reporter reacts to: the top-level agent's own SessionStart,
@@ -322,7 +322,7 @@ pub fn respond(record: &mut Record, kind: &str, prefix: &str, now: i64) -> Optio
                 record.activity.clear();
                 record.reported_at = 0;
             }
-            Some(format!("Before task tools or a blocking question, check whether this request starts new work; if so report a fresh estimate. Then report before waiting for the user, for example `{prefix} report --unknown --activity 'Waiting for you'`."))
+            Some(format!("Before task tools or a blocking question, check whether this request starts new work; if so report it. Then report before waiting for the user, for example `{prefix} report --activity 'Waiting for you'`."))
         }
         "PostToolUse" => {
             let done = record.done;
@@ -364,5 +364,38 @@ pub fn prune(root: &Path, session: &str, live_pane_ids: &[String]) {
         if record.socket == session && !live_pane_ids.contains(&record.pane_id) {
             remove(root, &record.socket, &record.pane_id);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// An agent copies one of these strings into its terminal: a flag the CLI
+    /// no longer takes turns a due check-in into an error and a lost report.
+    #[test]
+    fn every_check_in_text_names_only_flags_the_cli_takes() {
+        let mut record = Record::default();
+        let texts = [
+            reminder("hp"),
+            respond(&mut record, "UserPromptSubmit", "hp", 1).unwrap(),
+            guidance("hp", Some("w1:p1")),
+            guidance("hp", None),
+        ];
+        for text in texts {
+            assert!(!text.contains("--percent"), "{text}");
+            assert!(!text.contains("--unknown"), "{text}");
+            assert!(text.contains("report --activity"), "{text}");
+        }
+    }
+
+    /// The reminder is the only thing that asks for a check-in; it still has
+    /// to ask for one, and `--done` belongs only to the end of the whole task.
+    #[test]
+    fn the_reminder_asks_for_a_report_and_keeps_done_for_the_end() {
+        let text = reminder("hp");
+        assert!(text.contains("`hp report --activity '...'`"), "{text}");
+        assert!(text.contains("add `--done` only when the whole task is finished"), "{text}");
+        assert!(text.contains("`Waiting for you`"), "{text}");
     }
 }
