@@ -298,14 +298,6 @@ fn recorded_kind(config: &crate::profiles::Config, record: &Coordinator) -> Stri
     }
 }
 
-/// The folder a coordinator records, for the adoption check above. Not
-/// canonical: core reports the terminal's physical folder as recorded, and on a
-/// symlinked root (`/tmp` is `/private/tmp` on macOS) canonicalizing breaks the
-/// comparison.
-fn dir_text_for_adopt(project: &Project) -> String {
-    project.dir().to_string_lossy().into_owned()
-}
-
 /// The lane `open` acts on: the one `--lane` names (created on the spot when it
 /// does not exist, or picked for it when the flag has no value), else the
 /// registry's default lane. The registry is written first when the project has

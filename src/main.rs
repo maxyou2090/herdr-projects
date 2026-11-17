@@ -4,6 +4,8 @@ mod assign;
 mod audit;
 mod brief;
 mod cli;
+#[cfg(test)]
+mod fake_hc;
 mod command_link;
 mod coordinator;
 mod doctor;
