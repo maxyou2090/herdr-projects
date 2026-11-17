@@ -735,7 +735,7 @@ pub fn open(ctx: &Ctx, slug: &str, options: &OpenOptions) -> Result<()> {
                 herdr.tab_create(&id, &dir, "coordinator", true)?
             }
             None => {
-                let created = herdr.workspace_create(&dir, &label, true)?;
+                let created = herdr.workspace_create(&dir, &label, "coordinator", true)?;
                 name_tab(&herdr, &created.tab_id);
                 created
             }

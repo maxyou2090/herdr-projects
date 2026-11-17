@@ -315,10 +315,10 @@ impl<'a> Herdr<'a> {
         }
     }
 
-    /// The core this call reaches. Herdr 1's variables are removed so an
-    /// inherited value can never compete with the session this project recorded.
+    /// The core this call reaches: `HC_SESSION` is either set to the session
+    /// this project recorded or removed, so the caller's value never competes.
     pub fn cmd(&self, timeout: Duration) -> Cmd {
-        let mut cmd = Cmd::new(&self.bin, timeout).env_remove("HERDR_SOCKET_PATH").env_remove("HERDR_SESSION");
+        let mut cmd = Cmd::new(&self.bin, timeout);
         cmd = if self.session.is_empty() {
             cmd.env_remove("HC_SESSION")
         } else {
@@ -555,7 +555,10 @@ impl<'a> Herdr<'a> {
         self.term(id)
     }
 
-    pub fn workspace_create(&self, cwd: &Path, label: &str, _focus: bool) -> Result<Created, HerdrError> {
+    /// A Space in `cwd`: named `label`, and its tab named `tab_label` — a
+    /// project's Space holds the `coordinator` tab, a thread's Space the
+    /// thread's title — so the core label and the app's tab agree.
+    pub fn workspace_create(&self, cwd: &Path, label: &str, tab_label: &str, _focus: bool) -> Result<Created, HerdrError> {
         let dir = cwd.to_string_lossy().into_owned();
         // A person who works in the Herdr app has to see the project: the app
         // makes the Space, and the terminal inside it is ours — named by us, so
@@ -573,7 +576,7 @@ impl<'a> Herdr<'a> {
                     (L_WS, placed.space.as_str()),
                     (L_WS_LABEL, label),
                     (L_TAB, tab.as_str()),
-                    (L_TAB_LABEL, "coordinator"),
+                    (L_TAB_LABEL, tab_label),
                     ("herdr.space", placed.space.as_str()),
                 ],
                 &Vec::new(),
@@ -584,7 +587,7 @@ impl<'a> Herdr<'a> {
             let address = term.address.clone();
             let _ = crate::app::retry(|| {
                 crate::app::tab_of(self.runner, &address)
-                    .is_some_and(|tab| crate::app::tab_rename(self.runner, &tab, "coordinator"))
+                    .is_some_and(|tab| crate::app::tab_rename(self.runner, &tab, tab_label))
             });
             return Ok(self.created(&term));
         }
@@ -595,7 +598,7 @@ impl<'a> Herdr<'a> {
         let term = self.start(
             &name,
             cwd,
-            &[(L_WS, ws.as_str()), (L_WS_LABEL, label), (L_TAB, tab.as_str()), (L_TAB_LABEL, "root")],
+            &[(L_WS, ws.as_str()), (L_WS_LABEL, label), (L_TAB, tab.as_str()), (L_TAB_LABEL, tab_label)],
             &argv,
         )?;
         Ok(self.created(&term))
@@ -664,7 +667,7 @@ impl<'a> Herdr<'a> {
             // The branch may already exist: reuse it instead of failing.
             git(&["worktree", "add", &path_text, branch])?;
         }
-        let created = self.workspace_create(&path, label, false)?;
+        let created = self.workspace_create(&path, label, label, false)?;
         let term = self.term(&created.pane_id)?;
         self.label(&term.pane_id(), &[(L_WORKTREE, path_text.as_str())])?;
         Ok((created, path_text.clone(), term.cwd()))
@@ -675,7 +678,7 @@ impl<'a> Herdr<'a> {
         if !path.is_dir() {
             return Err(HerdrError { code: "worktree_not_found".into(), message: format!("{path:?} is not a folder") });
         }
-        let created = self.workspace_create(&path, label, false)?;
+        let created = self.workspace_create(&path, label, label, false)?;
         let term = self.term(&created.pane_id)?;
         self.label(&term.pane_id(), &[(L_WORKTREE, path.to_string_lossy().as_ref())])?;
         Ok((created, path.to_string_lossy().into_owned(), term.cwd()))
