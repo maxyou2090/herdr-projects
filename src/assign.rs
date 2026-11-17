@@ -255,7 +255,6 @@ pub fn run(ctx: &Ctx, slug: &str, refresh: bool, check: Option<&str>) -> Result<
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::runner::fake::{fail, ok};
 
     fn agent(profile: Option<&str>, machine: Option<&str>) -> Owner {
         Owner::Agent { profile: profile.map(str::to_string), machine: machine.map(str::to_string) }

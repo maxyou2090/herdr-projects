@@ -1551,7 +1551,7 @@ pub fn routines(ctx: &Ctx, project: &Project, state: &mut State, routine_command
 mod tests {
     use super::*;
     use crate::herdr::Herdr;
-    use crate::runner::fake::{FakeRunner, ok};
+    use crate::runner::fake::FakeRunner;
 
     fn at(text: &str) -> jiff::Timestamp {
         text.parse().unwrap()
