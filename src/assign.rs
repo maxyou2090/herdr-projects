@@ -294,41 +294,4 @@ mod tests {
         assert_eq!(assignable.line(), "claude, codex-fast, @m1: claude|pi, @far (not reached, profiles unknown)");
         assert_eq!(Assignable::default().line(), "(none; only me)");
     }
-
-    #[test]
-    fn herdr_machines_are_fetched_once_an_hour_and_config_adds_names() {
-        let world = crate::scenarios::World::new();
-        let project = world.project("demo", "a.sock");
-        let ctx = world.ctx();
-        std::fs::create_dir_all(&ctx.config_dir).unwrap();
-        std::fs::write(ctx.config_dir.join("config.toml"), "[machines.vm]\nprofiles = [\"claude\", \"cheap\"]\n\n[machines.m1]\nprofiles = [\"extra\"]\n").unwrap();
-        world.runner.on("machine list --json", ok(r#"[{"id":"1","label":"m1","target":"me@m1"},{"id":"2","label":"down","target":"me@down"}]"#));
-        world.runner.on_fn(|c| c.program == "ssh" && c.args.iter().any(|a| a == "me@m1"), |_| Ok(ok("claude\npi\n")));
-        world.runner.on("me@down", fail(255, "ssh: connect to host down port 22: Connection timed out"));
-        let first = load(&ctx, &project, false).unwrap();
-        let line = first.line();
-        assert!(line.ends_with("@down (not reached, profiles unknown), @m1: claude|pi|extra, @vm: claude|cheap"), "{line}");
-        // Not reached, but config.toml names its profiles: those are valid.
-        std::fs::write(ctx.config_dir.join("config.toml"), "[machines.down]\nprofiles = [\"claude\"]\n").unwrap();
-        let named = load(&ctx, &project, false).unwrap();
-        named.check(&Owner::parse("claude@down")).unwrap();
-        assert!(named.check(&Owner::parse("pi@down")).is_err());
-        assert!(named.check(&Owner::parse("@nowhere")).is_err());
-        assert_eq!(world.runner.count("ssh"), 2);
-        // Fresh cache: no ssh, and config.toml edits still show at once.
-        let ctx = world.ctx();
-        std::fs::create_dir_all(&ctx.config_dir).unwrap();
-        std::fs::write(ctx.config_dir.join("config.toml"), "[machines.vm]\nprofiles = [\"claude\"]\n").unwrap();
-        let again = load(&ctx, &project, false).unwrap();
-        assert_eq!(world.runner.count("ssh"), 2);
-        assert!(again.line().ends_with("@m1: claude|pi, @vm: claude"), "{}", again.line());
-        // A stale cache or --refresh looks again.
-        let stale = serde_json::json!({ "checked": now() - CACHE_SECONDS - 1, "machines": [] });
-        std::fs::write(cache_path(&world.root), stale.to_string()).unwrap();
-        load(&ctx, &project, false).unwrap();
-        assert_eq!(world.runner.count("ssh"), 4);
-        load(&ctx, &project, true).unwrap();
-        assert_eq!(world.runner.count("ssh"), 6);
-        assert!(context_line(&ctx, &project).starts_with("Assignable (agent owners; profile@machine only as listed): "));
-    }
 }

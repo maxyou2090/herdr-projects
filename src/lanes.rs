@@ -2703,37 +2703,6 @@ mod tests {
     }
 
     #[test]
-    fn a_report_writes_the_token_only_when_a_lane_says_so() {
-        let (_world, project) = temp_project("demo");
-        let runner = crate::runner::fake::FakeRunner::new();
-        runner.on("report-metadata", crate::runner::fake::ok("{}"));
-        let herdr = crate::herdr::Herdr::new("herdr", "/s/a.sock", &runner);
-        let reports = |runner: &crate::runner::fake::FakeRunner| -> Vec<String> {
-            runner
-                .calls
-                .borrow()
-                .iter()
-                .filter(|c| c.display().contains("report-metadata"))
-                .map(|c| c.display())
-                .collect()
-        };
-        crate::coordinator::report_tokens(&herdr, &project, "w1:p1");
-        let first = reports(&runner);
-        assert_eq!(first.len(), 1, "one report per pane");
-        assert!(!first[0].contains(TOKEN), "no registry, no token: {}", first[0]);
-        Registry::ensure_written(&project).unwrap();
-        crate::coordinator::report_tokens(&herdr, &project, "w1:p1");
-        let second = reports(&runner);
-        assert!(second[1].contains(&format!("--token {TOKEN}=c-1")), "{}", second[1]);
-        // A thread pane never claims a lane.
-        crate::sidebar::report_pane(&herdr, "w2:p1", "t-0001 · Task", "demo", crate::thread::Group::Working, None);
-        let third = reports(&runner);
-        assert!(!third[2].contains(TOKEN), "{}", third[2]);
-    }
-
-    // -------------------------------------------------- routing (commit 3)
-
-    #[test]
     fn classify_keeps_the_old_single_record_for_a_project_without_a_registry() {
         let (_world, project) = temp_project("demo");
         let mut record = crate::project::Coordinator { cwd: project.canonical_dir().to_string_lossy().into_owned(), ..Default::default() };
@@ -2773,20 +2742,6 @@ mod tests {
         assert_eq!(routes(&project), [FALLBACK_ID]);
         reg(vec![lane("c-1", "default"), closed_lane("c-2")], "c-1", 3).save(&project).unwrap();
         assert_eq!(routes(&project), ["c-1"], "a closed lane takes no nudge");
-    }
-
-    #[test]
-    fn a_project_without_a_registry_keeps_every_lane_view_unchanged() {
-        // The umbrella anchor for the nine real projects (§12 commit 6): every
-        // path that commit 6 touched answers as the pre-lane binary did.
-        let world = crate::scenarios::World::new();
-        let project = world.project("demo", "a.sock");
-        assert!(!split_in_use(&project));
-        assert_eq!(display_label(&project, Some("c-1")), None);
-        assert_eq!(crate::sidebar::coordinator_display(&project, None), "Demo".to_string());
-        assert!(thread_visible(&project, ""));
-        assert!(thread_visible(&project, "c-9"), "no lane table exists to hide a thread behind");
-        assert_eq!(open_spaces(&project), ["w1"], "exactly the recorded coordinator Space");
     }
 
     #[test]

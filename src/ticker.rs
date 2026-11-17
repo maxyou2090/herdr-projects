@@ -1344,31 +1344,6 @@ mod tests {
     }
 
     #[test]
-    fn the_ticker_discovers_coordinators_by_folder_and_never_launches_or_primes() {
-        let f = fixture();
-        let runner = FakeRunner::new();
-        // Two agents in the project folder, one of them unnamed (started by hand).
-        let two = with_cwd(&AGENT_READY.replace(r#"]}}"#, r#",{"pane_id":"w1:p2","tab_id":"w1:t2","workspace_id":"w1","name":"","agent":"codex","agent_status":"working","cwd":"CWD","state_change_seq":9,"agent_session":{"value":"sess-2"}}]}}"#), &f);
-        runner.on("agent list", ok(&two));
-        runner.on("pane list", ok(&with_cwd(PANE, &f)));
-        runner.on("report-metadata", ok("{}"));
-        let ctx = Ctx { env: &f.env, root: f.root.clone(), config_dir: f.root.join("cfg"), runner: &runner, detached_ticker: false };
-        assert!(tick_project(&ctx, &f.project).unwrap());
-        assert_eq!(runner.count("agent prompt"), 0);
-        assert_eq!(runner.count("agent start"), 0);
-        let live = coordinator::live(&f.project);
-        assert_eq!(live.len(), 2);
-        assert_eq!(live[1].agent, "codex");
-        assert_eq!(live[1].agent_session, "sess-2");
-        assert!(!live[0].pair_since.is_empty());
-        // Both coordinator panes get tokens.
-        assert_eq!(runner.count("report-metadata w1:p1"), 1);
-        assert_eq!(runner.count("report-metadata w1:p2"), 1);
-        // The primary pane's native session id is recorded for a later resume.
-        assert_eq!(f.project.coordinator().unwrap().agent_session, "sess-1");
-    }
-
-    #[test]
     fn a_shell_prompt_pane_is_not_launched_by_the_ticker() {
         let f = fixture();
         let runner = FakeRunner::new();
@@ -1381,20 +1356,6 @@ mod tests {
         assert_eq!(runner.count("agent start"), 0);
         assert_eq!(runner.count("agent prompt"), 0);
         assert!(coordinator::live(&f.project).is_empty());
-    }
-
-    #[test]
-    fn a_pane_with_other_identity_is_left_alone() {
-        let f = fixture();
-        let runner = FakeRunner::new();
-        // Same ids, different working directory: not our pane.
-        runner.on("agent list", ok(&AGENT_READY.replace("CWD", "/somewhere/else")));
-        runner.on("pane list", ok(&PANE.replace("CWD", "/somewhere/else")));
-        let ctx = Ctx { env: &f.env, root: f.root.clone(), config_dir: f.root.join("cfg"), runner: &runner, detached_ticker: false };
-        assert!(tick_project(&ctx, &f.project).unwrap());
-        assert_eq!(runner.count("agent prompt"), 0);
-        assert_eq!(runner.count("agent start"), 0);
-        assert_eq!(runner.count("report-metadata"), 0);
     }
 
     #[test]

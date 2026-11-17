@@ -204,45 +204,44 @@ mod tests {
     #[test]
     fn empty_variable_counts_as_unset() {
         let home = tempfile::tempdir().unwrap();
-        let env = Env::for_test(home.path(), &[("HERDR_PROJECTS_ROOT", ""), ("HERDR_BIN_PATH", "")]);
+        let env = Env::for_test(home.path(), &[("HERDR_PROJECTS_ROOT", ""), ("HC_BIN_PATH", "")]);
         assert_eq!(
             resolve_root(None, &env, &home.path().join("none")).unwrap(),
             home.path().join(".herdr-projects")
         );
-        assert_eq!(env.herdr_bin(), "herdr");
+        assert_eq!(env.herdr_bin(), "hc");
     }
 
     #[test]
     fn herdr_bin_prefers_the_variable() {
-        let env = Env::for_test(Path::new("/h"), &[("HERDR_BIN_PATH", "/opt/herdr")]);
-        assert_eq!(env.herdr_bin(), "/opt/herdr");
+        let env = Env::for_test(Path::new("/h"), &[("HC_BIN_PATH", "/opt/hc")]);
+        assert_eq!(env.herdr_bin(), "/opt/hc");
     }
 
     #[test]
-    fn session_order_flag_then_hc_session() {
+    fn session_order_flag_then_hc_session_then_default() {
         let runner = FakeRunner::new();
-        let env = Env::for_test(Path::new("/h"), &[("HC_SESSION", "hp-dev"), ("HERDR_SESSION", "old")]);
-
         let by_flag = SessionFlags { session: Some("explicit".into()), socket: None };
+        let env = Env::for_test(Path::new("/h"), &[("HC_SESSION", "hp-dev")]);
         let got = resolve_session(&by_flag, &env, &runner).unwrap();
-        assert_eq!(got.socket, "explicit");
-        assert_eq!(got.name.as_deref(), Some("explicit"));
+        assert_eq!(got, Session { socket: "explicit".into(), name: Some("explicit".into()) });
 
         let got = resolve_session(&SessionFlags::default(), &env, &runner).unwrap();
         assert_eq!(got, Session { socket: "hp-dev".into(), name: Some("hp-dev".into()) });
 
-        // Herdr 1's session shapes still parse, and mean the default core.
-        let env = Env::for_test(Path::new("/h"), &[("HERDR_SESSION", "hp-dev")]);
-        let got = resolve_session(&SessionFlags::default(), &env, &runner).unwrap();
-        assert_eq!(got.name.as_deref(), Some("hp-dev"));
-
+        // Herdr 1's `--socket` and `HERDR_SESSION` still parse; a socket path
+        // means the default core, and a name is a name.
         let by_socket = SessionFlags { session: None, socket: Some("/flag.sock".into()) };
+        let env = Env::for_test(Path::new("/h"), &[]);
         let got = resolve_session(&by_socket, &env, &runner).unwrap();
         assert_eq!(got, Session { socket: String::new(), name: None });
 
+        let env = Env::for_test(Path::new("/h"), &[("HERDR_SESSION", "hp-dev")]);
+        assert_eq!(resolve_session(&SessionFlags::default(), &env, &runner).unwrap().name.as_deref(), Some("hp-dev"));
+
+        // Nothing set: the default core, which has no name to pass on.
         let env = Env::for_test(Path::new("/h"), &[]);
-        let got = resolve_session(&SessionFlags::default(), &env, &runner).unwrap();
-        assert_eq!(got, Session { socket: String::new(), name: None });
+        assert_eq!(resolve_session(&SessionFlags::default(), &env, &runner).unwrap(), Session { socket: String::new(), name: None });
     }
 
     #[test]

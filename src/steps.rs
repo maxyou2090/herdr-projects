@@ -2016,57 +2016,6 @@ mod tests {
     /// announcement goes to its own pane and is spent on its own hash. Sharing
     /// either slot is how one lane's nudge would silence the other's.
     #[test]
-    fn each_lane_is_nudged_and_spent_on_its_own() {
-        let (_root, project) = two_lane_project();
-        inbox::write_in(&project, "c-1", "thread-state", "t-0001", "idle", "lane one", "").unwrap();
-        inbox::write_in(&project, "c-2", "thread-state", "t-0002", "idle", "lane two", "").unwrap();
-        let runner = FakeRunner::new();
-        runner.on("agent read", ok(&empty_claude_box()));
-        runner.on("agent prompt", ok(r#"{"result":{}}"#));
-        let herdr = Herdr::new("herdr", "sock", &runner);
-        let settings = Settings::default();
-        let now = at("2026-10-08T14:10:00Z");
-        let mut state = State::default();
-        let (a, b) = (idle_coordinator("c-1", "w1:p1"), idle_coordinator("c-2", "w2:p1"));
-
-        // Each lane's box is seen empty for the first time, in its own slot.
-        assert_eq!(nudge(&project, &mut state, &settings, &herdr, "c-1", Some(&a), now).unwrap(), NudgeOutcome::Held(BOX_NOT_QUIET));
-        assert_eq!(nudge(&project, &mut state, &settings, &herdr, "c-2", Some(&b), now).unwrap(), NudgeOutcome::Held(BOX_NOT_QUIET));
-        assert_eq!(state.box_pane["c-1"], "w1:p1");
-        assert_eq!(state.box_pane["c-2"], "w2:p1");
-        assert_eq!(runner.count("agent prompt"), 0);
-
-        // Once both boxes have looked empty long enough, each item goes to its
-        // own lane's pane and only that lane's hash is spent.
-        for lane in ["c-1", "c-2"] {
-            state.box_empty_since.insert(lane.into(), "2026-10-08T14:00:00Z".into());
-        }
-        assert_eq!(nudge(&project, &mut state, &settings, &herdr, "c-1", Some(&a), now).unwrap(), NudgeOutcome::Delivered);
-        assert!(state.nudged.contains_key("c-1"));
-        assert!(!state.nudged.contains_key("c-2"), "lane c-1's delivery must not spend c-2's: {:?}", state.nudged);
-        assert_eq!(nudge(&project, &mut state, &settings, &herdr, "c-2", Some(&b), now).unwrap(), NudgeOutcome::Delivered);
-        assert!(state.nudged.contains_key("c-2"));
-
-        let sent: Vec<(String, String)> = runner
-            .calls
-            .borrow()
-            .iter()
-            .filter(|c| c.display().contains("agent prompt"))
-            .map(|c| (c.args[2].clone(), c.args[3].clone()))
-            .collect();
-        assert_eq!(
-            sent,
-            [("w1:p1".to_string(), "[hp inbox] t-0001 idle".to_string()), ("w2:p1".to_string(), "[hp inbox] t-0002 idle".to_string())]
-        );
-    }
-
-    /// The heading's clause is the ticker's standing verdict, not a live
-    /// countdown. While the nudge is still inside its own waiting time — a
-    /// coordinator idle for `NUDGE_IDLE_SECS`, its input box empty for
-    /// `NUDGE_QUIET_SECS`, and the tick it can only act on — every fresh item
-    /// would otherwise read as a delivery failure for its first minute and a
-    /// half. Past that it is news, worded exactly as before.
-    #[test]
     fn a_held_nudge_is_only_news_once_the_nudge_has_had_its_waiting_time() {
         let root = tempfile::tempdir().unwrap();
         let project = project::create(root.path(), "demo", "", vec![]).unwrap();

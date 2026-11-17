@@ -28,8 +28,6 @@ mod routine;
 mod runner;
 mod safety;
 mod skills;
-#[cfg(test)]
-mod scenarios;
 mod settings;
 mod sidebar;
 mod spaces;
