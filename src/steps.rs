@@ -1457,19 +1457,25 @@ pub fn routines(project: &Project, state: &mut State, coordinator: bool, project
 mod tests {
     use super::*;
     use crate::core::Core;
-    use crate::runner::fake::FakeRunner;
+    use crate::runner::fake::{ok, FakeRunner};
 
     fn at(text: &str) -> jiff::Timestamp {
         text.parse().unwrap()
     }
 
-    /// One unhandled `thread-state` item created at `created` and marked seen.
-    fn seen_item(project: &Project, id: &str, created: &str) {
+    /// One unhandled `thread-state` item created at `created`, not yet shown to
+    /// any coordinator.
+    fn unseen_item(project: &Project, id: &str, created: &str) {
         let text = format!(
             "+++\nid = \"{id}\"\nkind = \"thread-state\"\nsubject = \"t-0001\"\ncreated = \"{created}\"\nsummary = \"s\"\nevent = \"new report\"\n+++\n"
         );
         std::fs::create_dir_all(project.dir().join("inbox")).unwrap();
         std::fs::write(project.dir().join("inbox").join(format!("{id}.md")), text).unwrap();
+    }
+
+    /// The same item, already marked seen (a coordinator's `context` showed it).
+    fn seen_item(project: &Project, id: &str, created: &str) {
+        unseen_item(project, id, created);
         let ids = vec![id.to_string()];
         inbox::mark_seen(project, &ids).unwrap();
     }
@@ -1878,6 +1884,77 @@ mod tests {
         assert!(state.renudged_at.is_empty());
     }
 
+    /// A coordinator pane core reports as `idle` since `since`.
+    fn idle_pane(since: &str) -> crate::coordinator::LivePane {
+        crate::coordinator::LivePane { pane_id: "w1:p1".into(), agent: "codex".into(), agent_status: "idle".into(), pair_since: since.into(), ..Default::default() }
+    }
+
+    /// What core's `read` answers with: a Codex-shaped screen whose input box
+    /// holds `box_text` (empty for an empty box).
+    fn screen(box_text: &str) -> String {
+        serde_json::json!({ "text": format!("a transcript line\n› {box_text}\n") }).to_string()
+    }
+
+    /// The idle window is [`crate::coordinator::NUDGE_IDLE_SECS`]: a coordinator
+    /// idle for 15 seconds, with an empty box on two checks ten seconds apart,
+    /// is prompted on that second check — while the box's own quiet wait, not
+    /// the idle one, is what keeps the prompt out of a draft.
+    #[test]
+    fn a_coordinator_idle_for_the_window_with_a_quiet_box_is_nudged() {
+        let root = tempfile::tempdir().unwrap();
+        let project = project::create(root.path(), "demo", "", vec![]).unwrap();
+        unseen_item(&project, "20261008T140000Z-thread-state-t-0001-1", "2026-10-08T14:00:00Z");
+        let runner = FakeRunner::new();
+        runner.on("read w1:p1", ok(&screen("")));
+        runner.on("send w1:p1", ok("{}"));
+        let herdr = Core::new("herdr", "sock", &runner);
+        let mut state = State::default();
+        let settings = Settings::default();
+        // Idle for exactly the window at the first tick below.
+        let pane = idle_pane("2026-10-08T14:09:45Z");
+        assert_eq!(crate::coordinator::NUDGE_IDLE_SECS, 15, "the idle window is a quarter minute");
+        assert_eq!(
+            nudge(&project, &mut state, &settings, &herdr, crate::lanes::FALLBACK_ID, Some(&pane), at("2026-10-08T14:10:00Z")).unwrap(),
+            NudgeOutcome::Held(BOX_NOT_QUIET),
+            "the box was only first seen empty now, so its own wait starts here"
+        );
+        // Ten seconds of an empty box later, the very next tick delivers, and the
+        // announcement is spent on the items' hash.
+        assert_eq!(
+            nudge(&project, &mut state, &settings, &herdr, crate::lanes::FALLBACK_ID, Some(&pane), at("2026-10-08T14:10:10Z")).unwrap(),
+            NudgeOutcome::Delivered
+        );
+        assert_eq!(runner.count("send w1:p1"), 1);
+        assert_eq!(state.nudged.len(), 1, "the announcement is spent: {:?}", state.nudged);
+    }
+
+    /// A box holding someone's draft stops the nudge however long the
+    /// coordinator has been idle: shortening the idle window does not shorten
+    /// this wait, because it is the box that protects the typing.
+    #[test]
+    fn a_coordinator_with_a_draft_in_its_box_is_never_nudged() {
+        let root = tempfile::tempdir().unwrap();
+        let project = project::create(root.path(), "demo", "", vec![]).unwrap();
+        unseen_item(&project, "20261008T140000Z-thread-state-t-0001-1", "2026-10-08T14:00:00Z");
+        let runner = FakeRunner::new();
+        runner.on("read w1:p1", ok(&screen("half-typed thought")));
+        let herdr = Core::new("herdr", "sock", &runner);
+        let mut state = State::default();
+        let settings = Settings::default();
+        let pane = idle_pane("2026-10-08T13:58:00Z");
+        let first = at("2026-10-08T14:10:00Z");
+        for tick in 0..10 {
+            let now = first + jiff::SignedDuration::from_secs(15 * tick);
+            assert_eq!(
+                nudge(&project, &mut state, &settings, &herdr, crate::lanes::FALLBACK_ID, Some(&pane), now).unwrap(),
+                NudgeOutcome::Held(BOX_NOT_QUIET),
+                "tick {tick}"
+            );
+        }
+        assert_eq!(runner.count("send w1:p1"), 0, "nothing is typed into a draft");
+        assert!(state.nudged.is_empty(), "a held announcement is not spent");
+    }
+
     #[test]
     fn aged_seen_items_ask_for_a_coordinator_but_are_not_spent() {
         let root = tempfile::tempdir().unwrap();
@@ -1919,9 +1996,9 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let project = project::create(root.path(), "demo", "", vec![]).unwrap();
         let now = at("2026-10-08T14:10:00Z");
-        // 60s idle + 10s quiet box + one 15s tick: the whole time a nudge may
+        // 15s idle + 10s quiet box + one 15s tick: the whole time a nudge may
         // legitimately still be waiting.
-        assert_eq!(HELD_NOTE_AFTER_SECS, 85, "the threshold is the nudge's three waits");
+        assert_eq!(HELD_NOTE_AFTER_SECS, 40, "the threshold is the nudge's three waits");
         let heading = |secs: i64, reason: &str| {
             let mut state = State { tick_at: now.to_string(), ..Default::default() };
             state.hold("", reason, now - jiff::SignedDuration::from_secs(secs));
@@ -1936,11 +2013,11 @@ mod tests {
         // One second past the nudge's whole waiting time the same holds are news.
         assert_eq!(
             heading(HELD_NOTE_AFTER_SECS, NO_COORDINATOR).as_deref(),
-            Some("no prompt reached a coordinator for 1m: items wait but no coordinator is idle long enough")
+            Some("no prompt reached a coordinator for 40s: items wait but no coordinator is idle long enough")
         );
         assert_eq!(
             heading(HELD_NOTE_AFTER_SECS, BOX_NOT_QUIET).as_deref(),
-            Some("no prompt reached a coordinator for 1m: items wait for the coordinator's input box to look empty")
+            Some("no prompt reached a coordinator for 40s: items wait for the coordinator's input box to look empty")
         );
         assert_eq!(
             heading(44 * 60, NO_COORDINATOR).as_deref(),

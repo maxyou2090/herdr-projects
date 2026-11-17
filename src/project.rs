@@ -158,8 +158,9 @@ impl Default for Settings {
             max_parallel_threads: 1000,
             auto_resolve_days: 7,
             // On by default (W15): the ticker prompts only a coordinator that
-            // has been idle for a minute and whose input box is empty, because on herdr 0.9.1 a prompt
-            // merges with half-typed text (docs/herdr-notes.md, stage 2).
+            // has been idle for a quarter minute and whose input box has looked
+            // empty for ten seconds, because on herdr 0.9.1 a prompt merges with
+            // half-typed text (docs/herdr-notes.md, stage 2).
             nudge: true,
             repos: Vec::new(),
         }
