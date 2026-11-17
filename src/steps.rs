@@ -424,12 +424,11 @@ pub fn thread_label(t: &Thread) -> String {
 
 /// Step 1's inbox items, written after the copies so a Ready for review item
 /// always points at a home copy that exists.
-pub fn write_thread_items(project: &Project, state: &mut State, transitions: &[Transition], session_lost: bool, copy_notes: &BTreeMap<String, Vec<String>>, notifier: &crate::notify::Notifier) -> Result<()> {
+pub fn write_thread_items(project: &Project, state: &mut State, transitions: &[Transition], session_lost: bool, copy_notes: &BTreeMap<String, Vec<String>>) -> Result<()> {
     if session_lost {
         if !state.session_item_written {
             let open = thread::list(project).iter().filter(|t| t.status == Status::Open && !t.is_remote()).count();
             inbox::write(project, "session", "session", "herdr session restarted", &format!("herdr session restarted; {open} threads need `thread restart`, and the coordinator needs `open`"), "")?;
-            notifier.send("", &format!("needs you · the Herdr session restarted; {open} thread(s) need a restart"), crate::notify::Sound::Request, false);
             state.session_item_written = true;
         }
         return Ok(());
@@ -459,11 +458,6 @@ pub fn write_thread_items(project: &Project, state: &mut State, transitions: &[T
             }
         }
         inbox::write_in(project, &inbox::lane_of_thread(project, &t.id), "thread-state", &t.id, transition_event(change), &summary, "")?;
-        if change.to == Group::WaitingOnYou {
-            let reason = if !t.state_line.is_empty() && t.state_line != "needs you" { t.state_line.clone() } else { format!("needs you · {}", change.note) };
-            let reason = if !t.activity.is_empty() && t.activity == crate::progress::WAITING { format!("needs you · {}", t.activity) } else { reason };
-            notifier.send(&t.id, &reason, crate::notify::Sound::Request, false);
-        }
     }
 
     // Ready for review: once per report hash, so an agent that goes back and
@@ -480,7 +474,6 @@ pub fn write_thread_items(project: &Project, state: &mut State, transitions: &[T
             summary.push_str(&format!("; not everything was copied: {}", notes.join("; ")));
         }
         inbox::write_in(project, &inbox::lane_of_thread(project, &t.id), "thread-state", &t.id, "new report", &summary, "")?;
-        notifier.send(&t.id, &format!("review · new report: {}", t.title), crate::notify::Sound::Done, false);
         let hash = t.report_hash.clone();
         thread::update(project, &t.id, |t| t.last_review_item_hash = hash)?;
     }
@@ -509,7 +502,6 @@ pub fn audit_items(
     socket: &str,
     now: jiff::Timestamp,
     lists: &mut dyn crate::audit::LiveLists,
-    notifier: &crate::notify::Notifier,
 ) -> Result<Vec<crate::audit::Finding>> {
     let Ok(last) = state.last_audit.parse::<jiff::Timestamp>() else {
         // First sight, a brand-new project or the upgrade that added this step:
@@ -537,7 +529,6 @@ pub fn audit_items(
         );
         inbox::write_in(project, &inbox::lane_of_thread(project, &finding.thread), AUDIT_KIND, &finding.thread, finding.event(), &summary, "")?;
         state.audited.insert(finding.thread.clone(), finding.kind.to_string());
-        notifier.send(&finding.thread, &format!("audit · {}", finding.event()), crate::notify::Sound::Request, false);
         written.push(finding.clone());
     }
     // Forget the findings that are gone, so one that comes back is news again.
@@ -554,7 +545,7 @@ pub fn audit_items(
 /// so no other step would tell the coordinator. One `thread-error` item per
 /// failure line, repeated only when the line changes; when the error leaves
 /// the screen the thread is armed again.
-pub fn write_stuck_items(project: &Project, state: &mut State, stuck: &[Stuck], notifier: &crate::notify::Notifier) -> Result<()> {
+pub fn write_stuck_items(project: &Project, state: &mut State, stuck: &[Stuck]) -> Result<()> {
     state.error_seen.retain(|id, _| stuck.iter().any(|s| &s.id == id));
     for s in stuck {
         if state.error_seen.get(&s.id).map(String::as_str) == Some(s.line.as_str()) {
@@ -575,7 +566,6 @@ pub fn write_stuck_items(project: &Project, state: &mut State, stuck: &[Stuck], 
             t.id,
         );
         inbox::write_in(project, &inbox::lane_of_thread(project, &t.id), "thread-error", &t.id, "stalled on a failed retry", &summary, "")?;
-        notifier.send(&t.id, &format!("stalled · {}", s.line), crate::notify::Sound::Request, false);
     }
     Ok(())
 }
@@ -741,9 +731,9 @@ const REMINDED: &str = "a reminder went out recently; the next waits for its spa
 /// Step 6, once per lane. A given set of unseen items is announced once, to
 /// that lane's coordinator only (§12 commit 3: each lane has its own seen set,
 /// delivered hash and input box, so one lane's announcement can never be spent
-/// on another's). With `nudge = false` the user gets a herdr notification
-/// instead of a prompt in the coordinator. `coordinator_ready` is that lane's
-/// coordinator, idle long enough to be prompted (see
+/// on another's). With `nudge = false` nothing is announced.
+/// `coordinator_ready` is that lane's coordinator, idle long enough to be
+/// prompted (see
 /// `coordinator::nudge_target`; an `Ambiguous` pane is never one); until there
 /// is one, nothing is announced and nothing is spent, so a coordinator that
 /// appears or quiets down on a later tick still hears about the items. A prompt
@@ -774,9 +764,9 @@ pub fn nudge(project: &Project, state: &mut State, settings: &Settings, herdr: &
         forget_box(state, lane);
         return Ok(NudgeOutcome::Held(WAITING_FOR_READ));
     }
-    // The user already got a specific notification per event; this step only
-    // wakes a coordinator. Without one ready (or with `nudge = false`) the
-    // one announcement is not spent: the items wait for a later tick.
+    // This step only wakes a coordinator. Without one ready (or with
+    // `nudge = false`) the one announcement is not spent: the items wait for
+    // a later tick.
     if !settings.nudge {
         forget_box(state, lane);
         return Ok(NudgeOutcome::Quiet);
@@ -1066,7 +1056,6 @@ pub fn pr_routine_prompt(name: &str, body: &str, url: &str, events: &[&str], sum
 
 pub fn pull_requests(ctx: &Ctx, project: &Project, state: &mut State, memory: &mut Memory, now: jiff::Timestamp) -> Vec<anyhow::Error> {
     let mut errors = Vec::new();
-    let notifier = crate::notify::Notifier::new(ctx, project);
     if thread::seconds_since(&state.last_pr_check, now) < PR_INTERVAL_SECS && !state.last_pr_check.is_empty() {
         return errors;
     }
@@ -1100,7 +1089,7 @@ pub fn pull_requests(ctx: &Ctx, project: &Project, state: &mut State, memory: &m
                     found.unwrap_or_default()
                 }
                 Err(error) => {
-                    gh_failed(project, &notifier, memory, &error, now, &mut errors);
+                    gh_failed(project, memory, &error, now, &mut errors);
                     continue;
                 }
             }
@@ -1121,7 +1110,7 @@ pub fn pull_requests(ctx: &Ctx, project: &Project, state: &mut State, memory: &m
                 json
             }
             Err(error) => {
-                gh_failed(project, &notifier, memory, &error, now, &mut errors);
+                gh_failed(project, memory, &error, now, &mut errors);
                 continue;
             }
         };
@@ -1144,20 +1133,11 @@ pub fn pull_requests(ctx: &Ctx, project: &Project, state: &mut State, memory: &m
                     t.pr_review = pr_review;
                 }).err());
                 let change = pr::describe_change(old.as_ref(), &summary);
-                let merged = summary.state == "MERGED";
                 if memory.gh_login.is_none() {
                     memory.gh_login = pr::own_login(ctx.runner, &t.origin);
                 }
                 let events = pr_events(old.as_ref(), &summary, memory.gh_login.as_deref());
                 errors.extend(inbox::write_in(project, &inbox::lane_of_thread(project, &t.id), "pr", &t.id, pr_event(&events, &summary), &format!("{}: pull request {change}", thread_label(&t)), "").err());
-                let number = url.rsplit('/').next().unwrap_or("");
-                if merged {
-                    notifier.send(&t.id, &format!("PR #{number} merged"), crate::notify::Sound::Done, false);
-                } else if events.contains(&"checks-failed") {
-                    notifier.send(&t.id, &format!("PR #{number} · checks failed"), crate::notify::Sound::None, false);
-                } else if events.contains(&"review") {
-                    notifier.send(&t.id, &format!("PR #{number} · new review activity"), crate::notify::Sound::None, false);
-                }
                 errors.extend(fire_pr_routines(ctx, project, &t, &url, &events, &summary));
                 state.prs.insert(t.id.clone(), summary);
             }
@@ -1172,12 +1152,11 @@ fn gh_worked(project: &Project, memory: &mut Memory, now: jiff::Timestamp, error
     }
 }
 
-fn gh_failed(project: &Project, notifier: &crate::notify::Notifier, memory: &mut Memory, error: &anyhow::Error, now: jiff::Timestamp, errors: &mut Vec<anyhow::Error>) {
+fn gh_failed(project: &Project, memory: &mut Memory, error: &anyhow::Error, now: jiff::Timestamp, errors: &mut Vec<anyhow::Error>) {
     let text = pr::sanitize(&format!("{error:#}"));
     if memory.gh.record(false, &text, now, memory.outage_secs) == Some(OutageEvent::Down) {
         let summary = format!("`gh` has been failing for {} minutes; pull requests are not being followed. Last error: {text}", memory.outage_secs / 60);
         errors.extend(inbox::write(project, "outage", "gh", "failing", &summary, "").err());
-        notifier.send("gh", "pull requests are not being followed: `gh` keeps failing", crate::notify::Sound::None, true);
     }
 }
 
@@ -1462,7 +1441,6 @@ pub fn routines(ctx: &Ctx, project: &Project, state: &mut State, routine_command
         if state.config_errors.insert(hash) {
             let stem = file.trim_start_matches("routines/").trim_end_matches(".md");
             errors.extend(inbox::write(project, "config-error", stem, "not usable", &format!("{file} is not usable: {}", pr::sanitize(&error)), "").err());
-            crate::notify::Notifier::new(ctx, project).send(stem, &format!("{file} is not usable"), crate::notify::Sound::None, true);
         }
     }
 
@@ -1517,7 +1495,6 @@ pub fn routines(ctx: &Ctx, project: &Project, state: &mut State, routine_command
             entry.output_hash = fingerprint;
             entry.seen_items = items.into_iter().map(|i| i.id).collect();
             errors.extend(inbox::write(project, "routine", &r.name, "due", &format!("routine `{}` is due", r.name), &r.prompt).err());
-            crate::notify::Notifier::new(ctx, project).send(&r.name, "routine due; the coordinator handles it", crate::notify::Sound::None, false);
             continue;
         }
         if !routine_commands || !routine::is_approved(&ctx.config_dir, project, r) {

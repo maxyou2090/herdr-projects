@@ -720,6 +720,7 @@ impl<'a> Herdr<'a> {
     }
 
     /// The kind of agent a pane runs, from the label this binary writes.
+    #[cfg_attr(not(test), allow(dead_code))] // read by the fake-hc test only
     pub fn agent_kind(&self, pane: &str) -> Option<String> {
         let kind = self.term(pane).ok()?.label(L_KIND);
         (!kind.is_empty()).then_some(kind)
@@ -900,20 +901,6 @@ impl<'a> Herdr<'a> {
         self.label(pane, &[(L_AGENT, name)])
     }
 
-    /// A desktop notification, outside core: `hc` has none.
-    pub fn notification_show(&self, title: &str, body: &str) -> Result<(), HerdrError> {
-        #[cfg(target_os = "macos")]
-        let script = format!("display notification {} with title {}", osa(body), osa(title));
-        #[cfg(not(target_os = "macos"))]
-        let script = format!("-u normal {} {}", title.replace('\'', ""), body.replace('\'', ""));
-        #[cfg(target_os = "macos")]
-        let cmd = Cmd::new("osascript", Duration::from_secs(10)).args(["-e", &script]);
-        #[cfg(not(target_os = "macos"))]
-        let cmd = Cmd::new("notify-send", Duration::from_secs(10)).arg(&script);
-        let _ = self.runner.run(&cmd);
-        Ok(())
-    }
-
     /// Herdr 1's agent view was a window feature; core draws nothing, so the
     /// projection this used to install is a no-op. Kept until the modules that
     /// call it are removed.
@@ -1021,12 +1008,6 @@ fn key_name(key: &str) -> String {
         "escape" => "esc".into(),
         other => other.into(),
     }
-}
-
-/// An AppleScript string literal.
-#[cfg(target_os = "macos")]
-fn osa(text: &str) -> String {
-    format!("\"{}\"", text.replace('\\', "\\\\").replace('"', "\\\""))
 }
 
 #[cfg(test)]

@@ -951,7 +951,7 @@ fn tick_cheap_body(ctx: &Ctx, project: &Project, sessions: &mut Sessions, state:
     let recorded_panes = pass.recorded_panes + coordinator_recorded;
     let missing_panes = pass.missing_panes + coordinator_missing;
 
-    // Nudge (or notify) about inbox items `context` has not shown yet, once
+    // Nudge about inbox items `context` has not shown yet, once
     // per lane: each lane's coordinator hears only its own lane's items, and
     // one lane's announcement is never spent on another's (§4.4, §12 commit
     // 3). Without a registry there is exactly one lane, so this is the single
@@ -1102,9 +1102,8 @@ fn tick_slow(ctx: &Ctx, project: &Project, seen: &Seen, memory: &mut Memory, log
         errors.extend(steps::write_machine_outage(project, &machine, event, memory).err());
     }
 
-    let notifier = crate::notify::Notifier::new(ctx, project);
-    errors.extend(steps::write_thread_items(project, &mut state, &transitions, seen.session_lost, &copy_notes, &notifier).err());
-    errors.extend(steps::write_stuck_items(project, &mut state, &seen.stuck, &notifier).err());
+    errors.extend(steps::write_thread_items(project, &mut state, &transitions, seen.session_lost, &copy_notes).err());
+    errors.extend(steps::write_stuck_items(project, &mut state, &seen.stuck).err());
     errors.extend(steps::write_idle_notes(project, &mut state, now).err());
     // The registry audit, on its own clock (`steps::AUDIT_EVERY_SECS`) instead
     // of on the sweep routine's: that prompt is suppressed while a project is
@@ -1115,7 +1114,7 @@ fn tick_slow(ctx: &Ctx, project: &Project, seen: &Seen, memory: &mut Memory, log
     // most once per audit through the same gate as the remote pass.
     {
         let mut lists = AuditLists { seen, herdr: &herdr, memory, machines: Default::default() };
-        match steps::audit_items(project, &mut state, &seen.socket, now, &mut lists, &notifier) {
+        match steps::audit_items(project, &mut state, &seen.socket, now, &mut lists) {
             Ok(written) if !written.is_empty() => {
                 let what: Vec<String> = written.iter().map(|f| format!("{} {}", f.thread, f.kind)).collect();
                 log.line(&format!("{}: audit wrote {} item(s): {}", project.slug, written.len(), what.join(", ")));

@@ -174,22 +174,6 @@ enum Command {
         #[command(flatten)]
         session: SessionArgs,
     },
-    /// Continue the current workspace's agent pane as a new project
-    AdoptWorkspace {
-        /// Project name (default: the workspace label herdr passes to the action)
-        #[arg(long)]
-        name: String,
-        #[arg(long, default_value = "")]
-        goal: String,
-        /// The agent pane to adopt
-        #[arg(long)]
-        pane: String,
-        /// The workspace's directory (the project's repo when it is a git repository)
-        #[arg(long, default_value = "")]
-        workspace_cwd: String,
-        #[command(flatten)]
-        session: SessionArgs,
-    },
     /// Agent profiles: named launch setups (harness, model, effort, flags) and which ones threads and coordinators may use
     Profile {
         #[command(subcommand)]
@@ -220,7 +204,7 @@ enum Command {
         #[arg(long)]
         yes: bool,
     },
-    /// Change one setting in PROJECT.md (name, goal, coordinator_profile, thread_profile, max_parallel_threads, auto_resolve_days, nudge, mute, repos.add, repos.remove)
+    /// Change one setting in PROJECT.md (name, goal, coordinator_profile, thread_profile, max_parallel_threads, auto_resolve_days, nudge, repos.add, repos.remove)
     Set { slug: String, key: String, value: String },
     /// Open a file: text in a new Herdr tab running $EDITOR, anything else with the system opener
     OpenFile {
@@ -931,9 +915,6 @@ pub fn run() -> Result<()> {
         Command::Rename { slug, new_slug, name, dry_run, session } => {
             crate::rename::cli(&ctx, &crate::rename::Args { from: &slug, to: &new_slug, name: name.as_deref(), dry_run, by_ticker: false }, &session.into())
         }
-        Command::AdoptWorkspace { name, goal, pane, workspace_cwd, session } => {
-            adopt::adopt_workspace(&ctx, &adopt::AdoptWorkspace { name, goal, pane, workspace_cwd, session: session.into() })
-        }
         Command::Profile { command } => {
             if let ProfileCommand::Resolve { name } = &command {
                 println!("{}", crate::profiles::resolve_json(&ctx, name.as_deref())?);
@@ -966,7 +947,7 @@ pub fn run() -> Result<()> {
         },
         Command::Skill => {
             print!("{}", include_str!("../skill/COORDINATOR.md"));
-            // Every harness learns to report here; hooks only add reminders.
+            // Every harness learns to report from this text; nothing is installed.
             let pane = crate::progress::current(ctx.env, ctx.runner).map(|p| p.pane_id);
             println!("\n## Progress\n\n{}", crate::progress::guidance(&crate::coordinator::current_prefix(&ctx.root)?, pane.as_deref()));
             Ok(())

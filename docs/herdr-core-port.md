@@ -22,8 +22,8 @@ about the port itself.
 | A sidebar, a popup, an action menu, key bindings, a tab-bar entry | nothing: core draws nothing | every surface is a command; `overview`, `context`, `list`, `thread list` print what a window used to draw |
 | `worktree create/open/remove`, Spaces grouped under a repository | nothing | plain `git worktree add/remove` under `~/.herdr/worktrees/<repo>/<branch>`, the path Herdr 1 used |
 | Sessions with socket files (`session list --json`, `HERDR_SOCKET_PATH`) | one core per `HC_SESSION`, no registry | a session is a name; a socket path recorded by Herdr 1 reads as the default session |
-| `notification show` | nothing | macOS `osascript display notification`, best effort |
-| Harness hooks (Claude Code, Codex, Droid, Gemini, Copilot) injecting progress | nothing: status is only OSC 7501 | `hp report --activity … [--done]`, run by the agent, plus the ticker's own screen reading |
+| `notification show` | nothing | desktop notifications were removed; an inbox item is the record |
+| Harness hooks (Claude Code, Codex, Droid, Gemini, Copilot) injecting progress | nothing: status is only OSC 7501 | `hp report --activity … [--done]`, run by the agent, plus the ticker's own screen reading; no hook code is left |
 
 The binary keeps the *engine* (projects, lanes, threads, tasks, inbox, briefs,
 routines, pull requests, safety settings, the ticker) and replaces the *host*.
@@ -107,7 +107,10 @@ Rules that follow from this, worth keeping:
 | the test modules that used that fake (`adopt`, `assign`, `brief`, `lifecycle`, `overview`, `settings`, `spaces`, parts of `lanes`/`steps`/`ticker`, `tests/cli.rs`'s `progress_hooks`) | same reason |
 | `agent.view` (`focus`, `unfocus`), `workspace.move` | window features core does not have |
 | the percentage in `hp report` | nothing drew it any more; `--done` carries the only meaning it had (`done` vs still working) |
-| the per-harness hook machinery (`progress::normalize/respond/eligible/…`) | no harness hooks are installed any more |
+| the per-harness hook machinery (`progress::eligible/respond/reminder`, `instructions`, the `managed` pane test, `Record::reminded_at`/`session_started_at`/`session_id`) | no harness hooks are installed any more, so nothing called them; `hp report` is the whole path |
+| `adopt-workspace` (`cli.rs`, `adopt::adopt_workspace`, `AdoptWorkspace`) | it carried Herdr 1 action arguments (`--pane`, `--workspace-cwd`, `--session`) and had no caller; `hp thread adopt` is the command |
+| `src/notify.rs` (`Notifier`, `Sound`) and `Herdr::notification_show` | the user does not want desktop notifications; inbox items are the record |
+| `mute` in `PROJECT.md` | it only silenced notifications; a leftover line in an older project reads as ignored |
 
 `docs/manual-test.md` is kept with a note: it is the Herdr 1 acceptance script,
 useful as a record of what was verified then, not as a current checklist.

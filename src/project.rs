@@ -142,8 +142,6 @@ pub struct Settings {
     pub max_parallel_threads: u32,
     pub auto_resolve_days: u32,
     pub nudge: bool,
-    /// Silences every notification for the project except errors.
-    pub mute: bool,
     pub repos: Vec<Repo>,
 }
 
@@ -163,7 +161,6 @@ impl Default for Settings {
             // has been idle for a minute and whose input box is empty, because on herdr 0.9.1 a prompt
             // merges with half-typed text (docs/herdr-notes.md, stage 2).
             nudge: true,
-            mute: false,
             repos: Vec::new(),
         }
     }
@@ -719,12 +716,6 @@ pub fn priming_problems(project: &Project, prefix: &str) -> Vec<String> {
 /// Creates the folder and skeleton files. The only code path that creates a
 /// project's directories. Fails if the slug exists.
 pub fn create(root: &Path, name: &str, goal: &str, repos: Vec<Repo>) -> Result<Project> {
-    create_from(root, name, goal, repos, "new")
-}
-
-/// `create`, naming the command that got here for the routine journal's create
-/// lines (for example `adopt`).
-pub fn create_from(root: &Path, name: &str, goal: &str, repos: Vec<Repo>, source: &str) -> Result<Project> {
     let slug = slug_from_name(name)?;
     let project = Project {
         root: root.to_path_buf(),
@@ -766,7 +757,7 @@ pub fn create_from(root: &Path, name: &str, goal: &str, repos: Vec<Repo>, source
         b"# Memory\n\nOne line per memory file: `- [title](memory/file.md): what it holds`.\n",
     )?;
     write_atomic(&dir.join("TASKS.md"), TASKS_TEMPLATE.as_bytes())?;
-    write_default_routine_locked(&project, source)?;
+    write_default_routine_locked(&project, "new")?;
     write_json(&project.state_dir().join("project.json"), &ProjectState::default())?;
     // PROJECT.md last: a folder without it is not a project, so a half-made
     // skeleton is never picked up by `list` or the ticker.
@@ -984,6 +975,20 @@ mod tests {
         assert!(parse_project_md("+++\nname = \"X\"\n").is_err());
         let (_, body) = parse_project_md("+++\nname = \"X\"\n+++").unwrap();
         assert_eq!(body, "");
+    }
+
+    #[test]
+    fn a_leftover_mute_line_is_ignored() {
+        // Projects made before `mute` was removed still carry the line; it must
+        // read as an ordinary project, not as an error.
+        let text = "+++\nname = \"Old\"\nmute = true\nnudge = true\n+++\n\nBody\n";
+        let (settings, body) = parse_project_md(text).unwrap();
+        assert_eq!((settings.name.as_str(), settings.nudge, body.as_str()), ("Old", true, "Body\n"));
+        // And a `set` on such a file leaves the stale line alone rather than
+        // failing on it.
+        let edited = crate::settings::set_in(text, "goal", "Later").unwrap();
+        let (settings, _) = parse_project_md(&edited).unwrap();
+        assert_eq!((settings.name.as_str(), settings.goal.as_str()), ("Old", "Later"));
     }
 
     #[test]

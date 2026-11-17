@@ -24,7 +24,7 @@ Checked on 2026-09-23 in a scratch `hp-dev` session (herdr 0.9.1, macOS, Claude 
 | 5 | Resolving a merged thread leaves no worktree, branch or workspace and keeps `threads/<id>.md` and `library/<id>/`; an unmerged one keeps its branch and says so | Builder |
 | 5 | `sweep --dry-run` lists a planted orphan worktree and `sweep --yes` removes it; `archive` closes and hides, `unarchive` reopens | Builder |
 | 6 | A real pull request is polled; a review comment fires `pr-followup` and the thread fixes it; forwarding "Merge the PR" merges it; the merge resolves and cleans the thread | Builder (private scratch repo `eliasstravik/hp-pr-probe`) |
-| 6 | A needs-you event gives one notification titled `<Project> · t-0009` with the request sound; `mute` silences it; the nudge waits for a minute of idle | Unit. Seeing the notification: client-witnessed |
+| 6 | A needs-you event gives one notification titled `<Project> · t-0009` with the request sound; `mute` silences it; the nudge waits for a minute of idle (all three removed: the inbox item is the record, and the nudge alone wakes the coordinator) | Unit. Seeing the notification: client-witnessed |
 
 ## Before 0.2.0
 
@@ -67,7 +67,7 @@ scripts/dev-herdr pane read <pane>                   # read a pane; `pane send-k
 | 6 | A title with quotes, spaces and `$(...)` reaches the remote `--label` unchanged and runs nothing | Builder |
 | 6 | Always-on recipe: open a project on the second machine, reattach from this Mac with `herdr --remote <target> --session <name>`, answer a blocked prompt through it | Builder |
 | 7 | `thread adopt` gives a thread with a brief; two adopted panes in one directory get separate thread directories; an adopted agent that ends in `done` still gets its pending prompt | Builder (first), unit (all three) |
-| 7 | `adopt-workspace` creates a project from the current workspace | Builder: the action's handoff live, then the popup's core through the CLI. The popup itself: client-witnessed |
+| 7 | `adopt-workspace` creates a project from the current workspace (removed: it was the Herdr 1 action's command; `thread adopt` is the one that stayed) | Builder: the action's handoff live, then the popup's core through the CLI. The popup itself: client-witnessed |
 | 7 | A paused project refuses `thread start` and is skipped by the ticker; an archived one is marked `archived` in `list` and its tokens are gone; `delete` refuses while the coordinator is alive, `--force` moves the folder to `.trash/` and leaves worktrees alone | Builder, unit |
 | 7 | `new ../x`, `open ../x`, `thread list ../x` are refused | Unit (`tests/cli.rs`) |
 

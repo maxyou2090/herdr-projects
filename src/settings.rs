@@ -11,7 +11,7 @@ use crate::paths::Ctx;
 use crate::project::{self, Project, Settings};
 
 /// The keys `set` accepts, with what they hold.
-pub const KEYS: [(&str, &str); 10] = [
+pub const KEYS: [(&str, &str); 9] = [
     ("name", "text"),
     ("goal", "text"),
     ("coordinator_profile", "profile name"),
@@ -19,7 +19,6 @@ pub const KEYS: [(&str, &str); 10] = [
     ("max_parallel_threads", "number"),
     ("auto_resolve_days", "number (0 = never)"),
     ("nudge", "true/false"),
-    ("mute", "true/false"),
     ("repos.add", "PATH or PATH@MACHINE"),
     ("repos.remove", "PATH"),
 ];
@@ -96,7 +95,7 @@ pub fn set_in(text: &str, key: &str, value: &str) -> Result<String> {
             }
             doc[key] = toml_edit::value(n);
         }
-        "nudge" | "mute" => doc[key] = toml_edit::value(parse_bool(value)?),
+        "nudge" => doc[key] = toml_edit::value(parse_bool(value)?),
         "repos.add" => {
             let repo = project::parse_repo_arg(value);
             if repo.path.is_empty() {
@@ -250,8 +249,6 @@ mod tests {
         assert_eq!(old, "+++\nthread_profile = \"luna\"\n+++\n");
         assert_eq!(project::parse_project_md(&set_in(&old, "coordinator_profile", "sol").unwrap()).unwrap().0.coordinator_profile, "sol");
         assert!(set_in(MD, "whatever", "x").is_err());
-        let muted = set_in(MD, "mute", "on").unwrap();
-        assert!(project::parse_project_md(&muted).unwrap().0.mute);
         let goal = set_in(MD, "goal", "Ship \"it\"").unwrap();
         assert_eq!(project::parse_project_md(&goal).unwrap().0.goal, "Ship \"it\"");
     }
