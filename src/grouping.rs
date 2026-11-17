@@ -19,7 +19,7 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::time::{Duration, Instant};
 
-use crate::herdr::{Agent, CALL_TIMEOUT, Herdr, Workspace};
+use crate::herdr::{Agent, Herdr, Workspace};
 
 /// Ends every home Space label; the Space rows make a label that contains it
 /// the project's bold head.
@@ -217,19 +217,15 @@ impl Sent {
 /// Herdr takes at most 16 tokens per report.
 const PER_REPORT: usize = 16;
 
-pub fn report(herdr: &Herdr, kind: &str, id: &str, tokens: &Tokens) {
-    let ttl = crate::sidebar::TOKEN_TTL_MS.to_string();
-    for chunk in tokens.chunks(PER_REPORT) {
-        let mut args: Vec<String> = [kind, "report-metadata", id, "--source", crate::herdr::SOURCE, "--ttl-ms", &ttl].iter().map(|s| s.to_string()).collect();
-        for (name, value) in chunk {
-            match value {
-                Some(value) => args.extend(["--token".to_string(), format!("{name}={value}")]),
-                None => args.extend(["--clear-token".to_string(), name.clone()]),
-            }
-        }
-        let args: Vec<&str> = args.iter().map(String::as_str).collect();
-        let _ = herdr.call(&args, CALL_TIMEOUT);
+pub fn report(herdr: &Herdr, _kind: &str, id: &str, tokens: &Tokens) {
+    if id.is_empty() {
+        return;
     }
+    let set: Vec<(String, String)> =
+        tokens.iter().filter_map(|(name, value)| value.as_ref().map(|value| (name.clone(), value.clone()))).collect();
+    let _ = herdr.set_labels(id, &set);
+    let clear: Vec<&str> = tokens.iter().filter(|(_, value)| value.is_none()).map(|(name, _)| name.as_str()).collect();
+    let _ = herdr.clear_labels(id, &clear);
 }
 
 /// Clears every token this module and the earlier layouts wrote, plus the

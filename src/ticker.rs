@@ -461,7 +461,7 @@ impl Sessions {
         }
         let mut found = Vec::new();
         if let Ok(session) = crate::paths::resolve_session(&Default::default(), ctx.env, ctx.runner) {
-            found.push((session.socket.to_string_lossy().into_owned(), session.name.unwrap_or_default()));
+            found.push((session.socket.clone(), session.name.unwrap_or_default()));
         }
         for socket in &self.known {
             if !found.iter().any(|(s, _)| s == socket) {

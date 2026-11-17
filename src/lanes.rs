@@ -1591,10 +1591,7 @@ pub fn lane_assign(ctx: &Ctx, project: &Project, handle: &str, pane: &str) -> Re
         // Clear only the lane claim: the old pane may still be a shell or an
         // agent the user is using for something else. It must not keep saying
         // it is this lane's coordinator.
-        if let Err(error) = session.herdr.call(
-            &["pane", "report-metadata", old_pane.as_str(), "--source", crate::herdr::SOURCE, "--clear-token", TOKEN],
-            crate::herdr::CALL_TIMEOUT,
-        ) {
+        if let Err(error) = session.herdr.clear_labels(old_pane.as_str(), &[TOKEN]) {
             println!("could not clear `{TOKEN}` on old pane {old_pane}: {error}");
         }
     }

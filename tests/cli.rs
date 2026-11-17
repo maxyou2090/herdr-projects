@@ -3,7 +3,7 @@
 use std::path::Path;
 use std::process::Command;
 
-const BIN: &str = env!("CARGO_BIN_EXE_herdr-projects");
+const BIN: &str = env!("CARGO_BIN_EXE_hp");
 
 fn hp(home: &Path, args: &[&str]) -> std::process::Output {
     Command::new(BIN)

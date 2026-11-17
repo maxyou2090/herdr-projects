@@ -31,7 +31,7 @@ pub fn session_view<'a>(ctx: &'a Ctx, project: &Project) -> Option<SessionView<'
         Some(record) => record,
         None => {
             let session = crate::paths::resolve_session(&Default::default(), ctx.env, ctx.runner).ok()?;
-            let socket = session.socket.to_string_lossy().into_owned();
+            let socket = session.socket.clone();
             let agents = Herdr::new(ctx.env.herdr_bin(), &socket, ctx.runner).agent_list().ok()?;
             // Read only: the ticker records it on its next tick.
             crate::coordinator::found(project, &socket, &session.name.unwrap_or_default(), &agents)?

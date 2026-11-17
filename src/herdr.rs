@@ -1,4 +1,21 @@
-//! Typed calls to the herdr CLI. Differences between herdr versions stay here.
+//! Typed calls to herdr-core's `hc` CLI. Differences between core and the
+//! Herdr 1 plugin API stay here.
+//!
+//! herdr-core has no workspaces, tabs, panes, agent registry or plugin API: it
+//! runs programs in terminals, keeps them alive, takes labels and reads status
+//! from OSC 7501. This module keeps the shapes the rest of the binary speaks
+//! (a Space, a tab, a pane, an agent) and builds them out of terminals and
+//! labels:
+//!
+//! | here | core |
+//! | --- | --- |
+//! | Space | every terminal labelled `hp_ws=<id>` |
+//! | tab | every terminal labelled `hp_tab=<id>` |
+//! | pane | one terminal, named `hp-<...>` (a name is stable across restarts) |
+//! | agent | a terminal labelled `hp_agent=<name>`, `hp_kind=<kind>` |
+//!
+//! So a project's panes are whatever carries its labels, and losing them is
+//! losing the Space — the same thing core means by a finished terminal.
 
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -8,8 +25,23 @@ use serde::Deserialize;
 
 use crate::runner::{Cmd, Runner};
 
-pub const MIN_VERSION: Version = Version(0, 9, 1);
+/// herdr-core 0.1.21 is the first release this binary was written against.
+pub const MIN_VERSION: Version = Version(0, 1, 21);
 pub const CALL_TIMEOUT: Duration = Duration::from_secs(10);
+pub const AGENT_START_TIMEOUT: Duration = Duration::from_secs(20);
+/// How long `agent_prompt_confirmed` lets core watch for the turn to start.
+pub const PROMPT_WAIT: Duration = Duration::from_secs(8);
+pub const SOURCE: &str = "herdr-projects";
+
+/// Label keys this binary owns. Nothing else writes them.
+pub const L_WS: &str = "hp_ws";
+pub const L_WS_LABEL: &str = "hp_ws_label";
+pub const L_TAB: &str = "hp_tab";
+pub const L_TAB_LABEL: &str = "hp_tab_label";
+pub const L_AGENT: &str = "hp_agent";
+pub const L_KIND: &str = "hp_kind";
+pub const L_SESSION: &str = "hp_session";
+pub const L_WORKTREE: &str = "hp_worktree";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub struct Version(pub u64, pub u64, pub u64);
@@ -20,7 +52,7 @@ impl std::fmt::Display for Version {
     }
 }
 
-/// Parses `herdr 0.9.1` and `herdr 0.9.2-preview.3`; a pre-release suffix is ignored.
+/// Parses `hc 0.1.21` and `hc 0.1.22-preview.3`; a pre-release suffix is ignored.
 pub fn parse_version(text: &str) -> Option<Version> {
     let token = text
         .split_whitespace()
@@ -30,7 +62,18 @@ pub fn parse_version(text: &str) -> Option<Version> {
     Some(Version(parts.next()??, parts.next()??, parts.next()??))
 }
 
-/// A herdr command that does not talk to a server (`--version`, `session list`).
+/// Two recorded sessions are the same one, paths from Herdr 1 included.
+pub fn same_session(a: &str, b: &str) -> bool {
+    session_key(a) == session_key(b)
+}
+
+/// True when the named core answers. A session that is gone is not an error:
+/// the caller decides whether to rebind, report or ignore it.
+pub fn session_alive(bin: &str, session: &str, runner: &dyn Runner) -> bool {
+    Herdr::new(bin, session, runner).reachable()
+}
+
+/// A herdr call that does not need a session (`--version`).
 fn bare(bin: &str) -> Cmd {
     Cmd::new(bin, CALL_TIMEOUT)
 }
@@ -44,87 +87,10 @@ pub fn version(bin: &str, runner: &dyn Runner) -> Result<Version> {
         .with_context(|| format!("could not read a version from `{}`", out.stdout.trim()))
 }
 
-#[derive(Debug, Clone, Deserialize, PartialEq)]
-pub struct SessionInfo {
-    pub name: String,
-    #[serde(default)]
-    pub default: bool,
-    #[serde(default)]
-    pub running: bool,
-    pub socket_path: PathBuf,
-}
-
-pub fn session_list(bin: &str, runner: &dyn Runner) -> Result<Vec<SessionInfo>> {
-    #[derive(Deserialize)]
-    struct Reply {
-        sessions: Vec<SessionInfo>,
-    }
-    let out = runner.run(&bare(bin).args(["session", "list", "--json"]))?;
-    if !out.success() {
-        bail!("`{bin} session list` failed: {}", out.error_text());
-    }
-    let reply: Reply =
-        serde_json::from_str(&out.stdout).context("`herdr session list --json` output changed")?;
-    Ok(reply.sessions)
-}
-
-/// herdr bound to one session's socket. Every call a project makes goes through
-/// this, so a project always talks to the session it was opened in.
-pub struct Herdr<'a> {
-    bin: String,
-    socket: PathBuf,
-    /// A saved SSH machine: every call is forwarded as `herdr --machine M ...`.
-    machine: Option<String>,
-    runner: &'a dyn Runner,
-}
-
-impl<'a> Herdr<'a> {
-    pub fn new(bin: impl Into<String>, socket: impl Into<PathBuf>, runner: &'a dyn Runner) -> Self {
-        Herdr {
-            bin: bin.into(),
-            socket: socket.into(),
-            machine: None,
-            runner,
-        }
-    }
-
-    /// The same session, with calls forwarded to a saved machine.
-    pub fn on_machine(&self, machine: &str) -> Herdr<'a> {
-        Herdr {
-            bin: self.bin.clone(),
-            socket: self.socket.clone(),
-            machine: (!machine.is_empty()).then(|| machine.to_string()),
-            runner: self.runner,
-        }
-    }
-
-    /// `HERDR_SESSION` is removed so an inherited value can never compete with
-    /// the socket this project recorded.
-    pub fn cmd(&self, timeout: Duration) -> Cmd {
-        let cmd = Cmd::new(&self.bin, timeout)
-            .env("HERDR_SOCKET_PATH", self.socket.to_string_lossy())
-            .env_remove("HERDR_SESSION");
-        match &self.machine {
-            Some(machine) => cmd.args(["--machine", machine]),
-            None => cmd,
-        }
-    }
-
-    /// True when the socket file exists and the server answers.
-    pub fn reachable(&self) -> bool {
-        if !self.socket.exists() {
-            return false;
-        }
-        self.runner
-            .run(&self.cmd(CALL_TIMEOUT).args(["status", "server"]))
-            .map(|out| out.success())
-            .unwrap_or(false)
-    }
-}
-
-/// A herdr call that failed. `code` is herdr's own error code (for example
-/// `agent_blocked` or `pane_not_found`), or `timeout` / `unreachable` / `failed`
-/// when herdr never answered with one.
+/// A herdr call that failed. `code` is core's own error kind (for example
+/// `blocked` or `not_found`), or `timeout` / `unreachable` / `failed` when core
+/// never answered with one. The names Herdr 1 used for the same refusals are
+/// kept where callers match on them.
 #[derive(Debug, Clone, PartialEq)]
 pub struct HerdrError {
     pub code: String,
@@ -139,11 +105,7 @@ impl std::fmt::Display for HerdrError {
 
 impl std::error::Error for HerdrError {}
 
-pub const AGENT_START_TIMEOUT: Duration = Duration::from_secs(20);
-/// How long `agent_prompt_confirmed` lets herdr wait for the agent to start.
-pub const PROMPT_WAIT: Duration = Duration::from_secs(8);
-
-/// herdr refused the prompt before typing anything.
+/// core refused the prompt before typing anything.
 pub fn refused_before_typing(error: &HerdrError) -> bool {
     matches!(error.code.as_str(), "agent_blocked" | "pane_not_found" | "unreachable")
 }
@@ -155,18 +117,14 @@ pub struct Pane {
     pub workspace_id: String,
     #[serde(default)]
     pub cwd: String,
-    /// The working directory of the pane's foreground process; differs from
-    /// `cwd` (the shell's) while `open` runs a coordinator in the pane.
     #[serde(default)]
     pub foreground_cwd: String,
-    /// Stable across pane moves; restarts with the server.
     #[serde(default)]
     pub terminal_id: String,
     #[serde(default)]
     pub focused: bool,
 }
 
-/// A Space as `workspace list` shows it.
 #[derive(Debug, Clone, Deserialize, PartialEq, Default)]
 pub struct Workspace {
     pub workspace_id: String,
@@ -180,8 +138,6 @@ pub struct Workspace {
     pub worktree: Option<WorkspaceWorktree>,
 }
 
-/// The git checkout herdr groups a Space under. A repository's primary Space
-/// (the "parent" herdr makes or reuses for its worktrees) is not linked.
 #[derive(Debug, Clone, Deserialize, PartialEq, Default)]
 pub struct WorkspaceWorktree {
     #[serde(default)]
@@ -192,7 +148,7 @@ pub struct WorkspaceWorktree {
     pub is_linked_worktree: bool,
 }
 
-/// The native session reference an official integration reported.
+/// The native session reference an agent reported (core: the `hp_session` label).
 #[derive(Debug, Clone, Deserialize, PartialEq, Default)]
 pub struct AgentSession {
     #[serde(default)]
@@ -212,7 +168,6 @@ pub struct Agent {
     pub agent_status: String,
     #[serde(default)]
     pub cwd: String,
-    /// See `Pane::foreground_cwd`.
     #[serde(default)]
     pub foreground_cwd: String,
     #[serde(default)]
@@ -221,17 +176,8 @@ pub struct Agent {
     pub state_change_seq: u64,
     #[serde(default)]
     pub agent_session: Option<AgentSession>,
-    /// Herdr saw the agent's composer open for input. Codex can rest at
-    /// `agent_status: "unknown"` with this set. It does not show that the box
-    /// is on screen or empty: the trust-screen and empty-box checks still
-    /// gate typing.
     #[serde(default)]
     pub interactive_ready: bool,
-    /// The pane's reported metadata tokens (`hp_project`, `hp_rank`,
-    /// `hp_lane`, …) as `agent list` gives them. Read-only here: this module
-    /// never writes them, and `lanes::resolve` rule 1 is the only reader —
-    /// without this field the strongest identity signal would silently never
-    /// fire, since serde would just skip the key.
     #[serde(default)]
     pub tokens: std::collections::BTreeMap<String, String>,
 }
@@ -242,15 +188,10 @@ impl Agent {
         ready_state(&self.agent_status)
     }
 
-    /// Ready for a first brief: `ready`, or `unknown` while Herdr reports the
-    /// composer open, but only for a `kind` whose input box this binary can
-    /// read: the brief checks that box is empty before typing, and an
-    /// unreadable box would be typed into unchecked.
     pub fn ready_for_brief(&self, kind: &str) -> bool {
         self.ready() || (self.agent_status == "unknown" && self.interactive_ready && crate::prompt_box::knows(kind))
     }
 
-    /// True when the agent works in `dir`, judged by [`own_dir`].
     pub fn works_in(&self, dir: &str) -> bool {
         !dir.is_empty() && own_dir(&self.cwd, &self.foreground_cwd) == dir
     }
@@ -260,13 +201,7 @@ impl Agent {
     }
 }
 
-/// The directory a pane's agent works in: its foreground process's when Herdr
-/// reports one, else the shell's. `open` runs a coordinator as a child in a
-/// shell pane elsewhere, so the shell's directory may be another project's
-/// home: deciding by either would make the pane a coordinator of both (#97).
-/// The foreground directory is the group leader's and stays put while the
-/// agent runs a tool in another folder (checked with Claude Code 2.1.300 and
-/// Codex 0.162.1 on Herdr 0.9.3).
+/// The directory a pane's agent works in.
 pub fn own_dir<'a>(cwd: &'a str, foreground_cwd: &'a str) -> &'a str {
     if foreground_cwd.is_empty() { cwd } else { foreground_cwd }
 }
@@ -282,324 +217,710 @@ pub struct Created {
     pub pane_id: String,
 }
 
+/// A terminal as core reports it, cut to what this binary reads.
+#[derive(Debug, Clone, Deserialize, Default)]
+struct Term {
+    #[serde(default)]
+    address: String,
+    #[serde(default)]
+    name: Option<String>,
+    #[serde(default)]
+    labels: std::collections::BTreeMap<String, String>,
+    #[serde(default)]
+    cwd: String,
+    #[serde(default)]
+    last_cwd: Option<String>,
+    #[serde(default)]
+    status: Option<TermStatus>,
+    #[serde(default)]
+    turn: u64,
+    #[serde(default)]
+    state: String,
+    #[serde(default)]
+    reported: bool,
+}
+
+#[derive(Debug, Clone, Deserialize, Default)]
+struct TermStatus {
+    #[serde(default)]
+    state: String,
+}
+
+impl Term {
+    /// The pane id the rest of the binary stores: the terminal's name, which
+    /// survives a core restart, else its address.
+    fn pane_id(&self) -> String {
+        self.name.clone().unwrap_or_else(|| self.address.clone())
+    }
+    fn label(&self, key: &str) -> String {
+        self.labels.get(key).cloned().unwrap_or_default()
+    }
+    fn live(&self) -> bool {
+        self.state != "finished"
+    }
+    fn cwd(&self) -> String {
+        if self.cwd.is_empty() { self.last_cwd.clone().unwrap_or_default() } else { self.cwd.clone() }
+    }
+}
+
+/// `hc` bound to one core session. Every call a project makes goes through this,
+/// so a project always talks to the session it was opened in.
+pub struct Herdr<'a> {
+    bin: String,
+    /// The `HC_SESSION` this call runs in (empty: the default one). Herdr 1 put
+    /// a socket path here; a path is read as the default session, so records
+    /// written before the port keep working.
+    session: String,
+    /// A saved machine: every call is forwarded as `hc --on M ...`.
+    machine: Option<String>,
+    runner: &'a dyn Runner,
+}
+
+/// A recorded socket path from Herdr 1 means "the default session" here.
+pub fn session_key(raw: &str) -> String {
+    let raw = raw.trim();
+    if raw.is_empty() || raw == "-" || raw.contains('/') || raw.ends_with(".sock") {
+        String::new()
+    } else {
+        raw.to_string()
+    }
+}
+
 impl<'a> Herdr<'a> {
-    /// Runs one herdr command and returns the `result` object of its JSON reply.
-    pub fn call(&self, args: &[&str], timeout: Duration) -> Result<serde_json::Value, HerdrError> {
-        let cmd = self.cmd(timeout).args(args.iter().copied());
+    pub fn new(bin: impl Into<String>, session: impl std::fmt::Display, runner: &'a dyn Runner) -> Self {
+        let raw = session.to_string();
+        Herdr {
+            bin: bin.into(),
+            session: session_key(&raw),
+            machine: None,
+            runner,
+        }
+    }
+
+    /// The same session, with calls forwarded to a saved machine.
+    pub fn on_machine(&self, machine: &str) -> Herdr<'a> {
+        Herdr {
+            bin: self.bin.clone(),
+            session: self.session.clone(),
+            machine: (!machine.is_empty()).then(|| machine.to_string()),
+            runner: self.runner,
+        }
+    }
+
+    /// The core this call reaches. Herdr 1's variables are removed so an
+    /// inherited value can never compete with the session this project recorded.
+    pub fn cmd(&self, timeout: Duration) -> Cmd {
+        let mut cmd = Cmd::new(&self.bin, timeout).env_remove("HERDR_SOCKET_PATH").env_remove("HERDR_SESSION");
+        cmd = if self.session.is_empty() {
+            cmd.env_remove("HC_SESSION")
+        } else {
+            cmd.env("HC_SESSION", &self.session)
+        };
+        match &self.machine {
+            Some(machine) => cmd.args(["--on", machine]),
+            None => cmd,
+        }
+    }
+
+    /// True when the core answers.
+    pub fn reachable(&self) -> bool {
+        self.runner
+            .run(&self.cmd(CALL_TIMEOUT).args(["server", "status"]))
+            .map(|out| out.success())
+            .unwrap_or(false)
+    }
+
+    /// Runs one `hc` command and returns its JSON result.
+    fn json(&self, args: &[&str], timeout: Duration) -> Result<serde_json::Value, HerdrError> {
+        let cmd = self.cmd(timeout).arg("--json").args(args.iter().copied());
         let out = self.runner.run(&cmd).map_err(|e| HerdrError {
             code: "unreachable".into(),
             message: format!("{e:#}"),
         })?;
         if out.timed_out {
-            return Err(HerdrError {
-                code: "timeout".into(),
-                message: format!("`herdr {}` timed out", args.join(" ")),
+            return Err(HerdrError { code: "timeout".into(), message: format!("`hc {}` timed out", args.join(" ")) });
+        }
+        if out.success() {
+            let text = out.stdout.trim();
+            if text.is_empty() {
+                return Ok(serde_json::Value::Null);
+            }
+            return serde_json::from_str(text).map_err(|e| HerdrError {
+                code: "failed".into(),
+                message: format!("`hc {}` reply did not parse: {e}", args.join(" ")),
             });
         }
-        // herdr prints one JSON object; on failure it carries `error`, and
-        // which stream it lands on is not something to depend on.
-        let reply = [&out.stdout, &out.stderr]
-            .into_iter()
-            .find_map(|text| serde_json::from_str::<serde_json::Value>(text.trim()).ok());
-        if let Some(reply) = reply {
-            if let Some(error) = reply.get("error") {
-                return Err(HerdrError {
-                    code: error["code"].as_str().unwrap_or("failed").to_string(),
-                    message: error["message"].as_str().unwrap_or("").to_string(),
-                });
-            }
-            if out.success() {
-                return Ok(reply.get("result").cloned().unwrap_or(serde_json::Value::Null));
-            }
-        } else if out.success() && out.stdout.trim().is_empty() {
-            // Metadata writes acknowledge success with the exit status alone.
-            return Ok(serde_json::Value::Null);
+        // `hc` prints one JSON object with `error` on stderr when asked for JSON.
+        let body = serde_json::from_str::<serde_json::Value>(out.stderr.trim()).ok();
+        if let Some(error) = body.as_ref().and_then(|b| b.get("error")) {
+            let kind = error["kind"].as_str().unwrap_or("failed").to_string();
+            let code = match kind.as_str() {
+                // core says `blocked`: the program is waiting for a person.
+                "blocked" => "agent_blocked".to_string(),
+                "not_found" | "unknown_terminal" => "pane_not_found".to_string(),
+                _ => kind,
+            };
+            let message = error["message"].as_str().unwrap_or("").to_string();
+            let hint = error["hint"].as_str().unwrap_or("");
+            let message = if hint.is_empty() { message } else { format!("{message} ({hint})") };
+            return Err(HerdrError { code, message });
         }
-        Err(HerdrError {
+        Err(HerdrError { code: "failed".into(), message: format!("`hc {}`: {}", args.join(" "), out.error_text()) })
+    }
+
+    pub fn call(&self, args: &[&str], timeout: Duration) -> Result<serde_json::Value, HerdrError> {
+        self.json(args, timeout)
+    }
+
+    /// Every live terminal of this session, with its labels: `hc ls` prints one
+    /// short row per terminal and leaves the labels to `hc get`.
+    fn terminals(&self) -> Result<Vec<Term>, HerdrError> {
+        let result = self.json(&["ls"], CALL_TIMEOUT)?;
+        let rows = result["terminals"].as_array().cloned().unwrap_or_default();
+        let mut out = Vec::new();
+        for row in rows {
+            let id = row["name"]
+                .as_str()
+                .filter(|n| !n.is_empty())
+                .or_else(|| row["address"].as_str())
+                .unwrap_or_default()
+                .to_string();
+            if id.is_empty() {
+                continue;
+            }
+            if let Ok(term) = self.term(&id)
+                && term.live()
+            {
+                out.push(term);
+            }
+        }
+        Ok(out)
+    }
+
+    fn term(&self, pane: &str) -> Result<Term, HerdrError> {
+        let result = self.json(&["get", pane], CALL_TIMEOUT)?;
+        serde_json::from_value(result).map_err(|e| HerdrError {
             code: "failed".into(),
-            message: format!("`herdr {}`: {}", args.join(" "), out.error_text()),
+            message: format!("`hc get {pane}` reply changed: {e}"),
         })
     }
 
-    fn call_as<T: serde::de::DeserializeOwned>(
-        &self,
-        args: &[&str],
-        field: &str,
-    ) -> Result<T, HerdrError> {
-        let result = self.call(args, CALL_TIMEOUT)?;
-        serde_json::from_value(result[field].clone()).map_err(|e| HerdrError {
-            code: "failed".into(),
-            message: format!("`herdr {}` reply changed: {e}", args.join(" ")),
-        })
+    fn label(&self, pane: &str, pairs: &[(&str, &str)]) -> Result<(), HerdrError> {
+        let args: Vec<String> = pairs.iter().map(|(k, v)| format!("{k}={v}")).collect();
+        let mut all: Vec<&str> = vec!["label", pane];
+        all.extend(args.iter().map(String::as_str));
+        self.json(&all, CALL_TIMEOUT).map(|_| ())
+    }
+
+    /// Writes labels onto a terminal. Herdr 1's token reports are labels here:
+    /// the same names (`hp_project`, `hp_lane`, `hp_rank`), no TTL.
+    pub fn set_labels(&self, pane: &str, pairs: &[(String, String)]) -> Result<(), HerdrError> {
+        if pairs.is_empty() || pane.is_empty() {
+            return Ok(());
+        }
+        let refs: Vec<(&str, &str)> = pairs.iter().map(|(key, value)| (key.as_str(), value.as_str())).collect();
+        self.label(pane, &refs)
+    }
+
+    /// Removes labels from a terminal, in one call.
+    pub fn clear_labels(&self, pane: &str, keys: &[&str]) -> Result<(), HerdrError> {
+        if keys.is_empty() || pane.is_empty() {
+            return Ok(());
+        }
+        let pairs: Vec<(&str, &str)> = keys.iter().map(|key| (*key, "")).collect();
+        self.label(pane, &pairs)
     }
 
     pub fn pane_list(&self) -> Result<Vec<Pane>, HerdrError> {
-        self.call_as(&["pane", "list"], "panes")
+        Ok(self
+            .terminals()?
+            .into_iter()
+            .map(|t| Pane {
+                pane_id: t.pane_id(),
+                tab_id: t.label(L_TAB),
+                workspace_id: t.label(L_WS),
+                cwd: t.cwd(),
+                foreground_cwd: t.cwd(),
+                terminal_id: t.address.clone(),
+                focused: false,
+            })
+            .collect())
     }
 
     pub fn agent_list(&self) -> Result<Vec<Agent>, HerdrError> {
-        self.call_as(&["agent", "list"], "agents")
+        Ok(self
+            .terminals()?
+            .into_iter()
+            .filter(|t| !t.label(L_AGENT).is_empty())
+            .map(|t| {
+                let status = t.status.clone().unwrap_or_default();
+                Agent {
+                    pane_id: t.pane_id(),
+                    tab_id: t.label(L_TAB),
+                    workspace_id: t.label(L_WS),
+                    name: t.label(L_AGENT),
+                    agent: t.label(L_KIND),
+                    agent_status: if t.reported { status.state.clone() } else { String::new() },
+                    cwd: t.cwd(),
+                    foreground_cwd: t.cwd(),
+                    terminal_id: t.address.clone(),
+                    state_change_seq: t.turn,
+                    agent_session: {
+                        let value = t.label(L_SESSION);
+                        (!value.is_empty()).then_some(AgentSession { value })
+                    },
+                    interactive_ready: t.reported,
+                    tokens: t.labels.clone(),
+                }
+            })
+            .collect())
     }
 
     pub fn workspace_list(&self) -> Result<Vec<Workspace>, HerdrError> {
-        self.call_as(&["workspace", "list"], "workspaces")
+        let mut out: Vec<Workspace> = Vec::new();
+        for term in self.terminals()? {
+            let id = term.label(L_WS);
+            if id.is_empty() {
+                continue;
+            }
+            let worktree = {
+                let path = term.label(L_WORKTREE);
+                (!path.is_empty()).then(|| WorkspaceWorktree {
+                    repo_key: String::new(),
+                    checkout_path: path,
+                    is_linked_worktree: true,
+                })
+            };
+            match out.iter_mut().find(|w| w.workspace_id == id) {
+                Some(space) => {
+                    space.pane_count += 1;
+                    if space.worktree.is_none() {
+                        space.worktree = worktree;
+                    }
+                }
+                None => out.push(Workspace {
+                    workspace_id: id,
+                    label: term.label(L_WS_LABEL),
+                    focused: false,
+                    pane_count: 1,
+                    worktree,
+                }),
+            }
+        }
+        Ok(out)
     }
 
-    /// True when the pane's shell is its foreground process: nothing runs in
-    /// it. Unknown (no shell pid, an error) counts as busy.
+    /// True when nothing runs in the pane: no program there reports a status.
     pub fn pane_idle_shell(&self, pane: &str) -> bool {
-        let Ok(result) = self.call(&["pane", "process-info", "--pane", pane], CALL_TIMEOUT) else {
-            return false;
-        };
-        let info = &result["process_info"];
-        let Some(shell) = info["shell_pid"].as_u64() else {
-            return false;
-        };
-        info["foreground_process_group_id"].as_u64() == Some(shell)
-            && info["foreground_processes"].as_array().is_some_and(|all| all.iter().all(|p| p["pid"].as_u64() == Some(shell)))
-    }
-
-    fn created(result: &serde_json::Value) -> Result<Created, HerdrError> {
-        let pane = &result["root_pane"];
-        match (
-            pane["workspace_id"].as_str(),
-            pane["tab_id"].as_str(),
-            pane["pane_id"].as_str(),
-        ) {
-            (Some(w), Some(t), Some(p)) => Ok(Created {
-                workspace_id: w.into(),
-                tab_id: t.into(),
-                pane_id: p.into(),
-            }),
-            _ => Err(HerdrError {
-                code: "failed".into(),
-                message: "herdr's create reply has no root_pane ids".into(),
-            }),
+        match self.term(pane) {
+            Ok(term) => !term.reported,
+            Err(_) => false,
         }
     }
 
-    pub fn workspace_create(&self, cwd: &Path, label: &str, focus: bool) -> Result<Created, HerdrError> {
-        let cwd = cwd.to_string_lossy();
-        let focus = if focus { "--focus" } else { "--no-focus" };
-        let result = self.call(
-            &["workspace", "create", "--cwd", &cwd, "--label", label, focus],
-            CALL_TIMEOUT,
-        )?;
-        Self::created(&result)
+    fn created(&self, pane: &Term) -> Created {
+        Created {
+            workspace_id: pane.label(L_WS),
+            tab_id: pane.label(L_TAB),
+            pane_id: pane.pane_id(),
+        }
     }
 
-    pub fn tab_create(&self, workspace: &str, cwd: &Path, label: &str, focus: bool) -> Result<Created, HerdrError> {
-        let cwd = cwd.to_string_lossy();
-        let focus = if focus { "--focus" } else { "--no-focus" };
-        let result = self.call(
-            &["tab", "create", "--workspace", workspace, "--cwd", &cwd, "--label", label, focus],
-            CALL_TIMEOUT,
-        )?;
-        Self::created(&result)
+    /// Starts a terminal and returns it once core lists it.
+    fn start(&self, name: &str, cwd: &Path, labels: &[(&str, &str)], argv: &[String]) -> Result<Term, HerdrError> {
+        let cwd_text = cwd.to_string_lossy().into_owned();
+        let mut args: Vec<String> = vec![
+            "run".into(),
+            "--bg".into(),
+            "--no-parent".into(),
+            "--name".into(),
+            name.to_string(),
+            "--cwd".into(),
+            cwd_text,
+        ];
+        for (key, value) in labels {
+            args.push("--label".into());
+            args.push(format!("{key}={value}"));
+        }
+        args.extend(argv.iter().cloned());
+        let refs: Vec<&str> = args.iter().map(String::as_str).collect();
+        let result = self.json(&refs, Duration::from_secs(20))?;
+        // `hc run` answers with the short row `hc ls` prints; the labels it was
+        // given come back only from `hc get`.
+        let id = result["name"].as_str().filter(|n| !n.is_empty()).or_else(|| result["address"].as_str()).unwrap_or_default();
+        if id.is_empty() {
+            return Err(HerdrError { code: "failed".into(), message: "`hc run` reply has no terminal".into() });
+        }
+        self.term(id)
     }
 
-    /// Creates a worktree-backed workspace. Returns the ids and the checkout
-    /// path as herdr reports it (on the machine the call ran on).
+    pub fn workspace_create(&self, cwd: &Path, label: &str, _focus: bool) -> Result<Created, HerdrError> {
+        let ws = self.next_id("hpw", label)?;
+        let tab = format!("{ws}-t1");
+        let name = self.next_name(&ws, 1)?;
+        let argv: Vec<String> = Vec::new();
+        let term = self.start(
+            &name,
+            cwd,
+            &[(L_WS, ws.as_str()), (L_WS_LABEL, label), (L_TAB, tab.as_str()), (L_TAB_LABEL, "root")],
+            &argv,
+        )?;
+        Ok(self.created(&term))
+    }
+
+    pub fn tab_create(&self, workspace: &str, cwd: &Path, label: &str, _focus: bool) -> Result<Created, HerdrError> {
+        let existing = self.terminals()?;
+        let ws_label = existing
+            .iter()
+            .find(|t| t.label(L_WS) == workspace)
+            .map(|t| t.label(L_WS_LABEL))
+            .unwrap_or_default();
+        let used = existing.iter().filter(|t| t.label(L_WS) == workspace).count();
+        let tab = format!("{workspace}-t{}", used + 1);
+        let name = self.next_name(workspace, used + 1)?;
+        let term = self.start(
+            &name,
+            cwd,
+            &[(L_WS, workspace), (L_WS_LABEL, &ws_label), (L_TAB, tab.as_str()), (L_TAB_LABEL, label)],
+            &Vec::new(),
+        )?;
+        Ok(self.created(&term))
+    }
+
+    /// Creates a real git worktree under `~/.herdr/worktrees/<repo>/<branch>`,
+    /// the path Herdr 1 used, so a restored thread record still names it.
     pub fn worktree_create(&self, repo: &str, branch: &str, base: &str, label: &str) -> Result<(Created, String, String), HerdrError> {
-        let result = self.call(
-            &["worktree", "create", "--cwd", repo, "--branch", branch, "--base", base, "--label", label, "--no-focus"],
-            Duration::from_secs(20),
-        )?;
-        Self::worktree_reply(&result)
-    }
-
-    /// `--cwd <repo>` is required: without it herdr answers `worktree_not_found`
-    /// even for a path git lists (checked on 0.9.1).
-    pub fn worktree_open(&self, repo: &str, path: &str, label: &str) -> Result<(Created, String, String), HerdrError> {
-        let result = self.call(
-            &["worktree", "open", "--cwd", repo, "--path", path, "--label", label, "--no-focus"],
-            Duration::from_secs(20),
-        )?;
-        Self::worktree_reply(&result)
-    }
-
-    /// (ids, checkout path, pane working directory)
-    fn worktree_reply(result: &serde_json::Value) -> Result<(Created, String, String), HerdrError> {
-        let created = Self::created(result)?;
-        let path = result["worktree"]["path"]
-            .as_str()
-            .or_else(|| result["workspace"]["worktree"]["checkout_path"].as_str())
-            .unwrap_or_default()
-            .to_string();
-        let cwd = result["root_pane"]["cwd"].as_str().unwrap_or(&path).to_string();
-        if path.is_empty() {
-            return Err(HerdrError { code: "failed".into(), message: "herdr's worktree reply has no path".into() });
+        let path = worktree_path(repo, branch)?;
+        if let Some(parent) = path.parent() {
+            let _ = std::fs::create_dir_all(parent);
         }
-        Ok((created, path, cwd))
+        let path_text = path.to_string_lossy().into_owned();
+        let git = |args: &[&str]| -> Result<(), HerdrError> {
+            let out = self.runner.run(&Cmd::new("git", Duration::from_secs(60)).arg("-C").arg(repo).args(args.iter().copied())).map_err(
+                |e| HerdrError { code: "failed".into(), message: format!("{e:#}") },
+            )?;
+            if out.success() {
+                Ok(())
+            } else {
+                Err(HerdrError { code: "failed".into(), message: out.error_text() })
+            }
+        };
+        let base = if base.is_empty() { "HEAD" } else { base };
+        if git(&["worktree", "add", "-b", branch, &path_text, base]).is_err() {
+            // The branch may already exist: reuse it instead of failing.
+            git(&["worktree", "add", &path_text, branch])?;
+        }
+        let created = self.workspace_create(&path, label, false)?;
+        let term = self.term(&created.pane_id)?;
+        self.label(&term.pane_id(), &[(L_WORKTREE, path_text.as_str())])?;
+        Ok((created, path_text.clone(), term.cwd()))
     }
 
-    /// Never passes `--force`: herdr refuses a dirty worktree and that refusal
-    /// is reported unchanged.
+    pub fn worktree_open(&self, _repo: &str, path: &str, label: &str) -> Result<(Created, String, String), HerdrError> {
+        let path = PathBuf::from(path);
+        if !path.is_dir() {
+            return Err(HerdrError { code: "worktree_not_found".into(), message: format!("{path:?} is not a folder") });
+        }
+        let created = self.workspace_create(&path, label, false)?;
+        let term = self.term(&created.pane_id)?;
+        self.label(&term.pane_id(), &[(L_WORKTREE, path.to_string_lossy().as_ref())])?;
+        Ok((created, path.to_string_lossy().into_owned(), term.cwd()))
+    }
+
+    /// Never passes `--force`: git refuses a dirty worktree and that refusal is
+    /// reported unchanged.
     pub fn worktree_remove(&self, workspace: &str) -> Result<(), HerdrError> {
-        self.call(&["worktree", "remove", "--workspace", workspace], Duration::from_secs(20)).map(|_| ())
+        let term = self
+            .terminals()?
+            .into_iter()
+            .find(|t| t.label(L_WS) == workspace)
+            .ok_or_else(|| HerdrError { code: "pane_not_found".into(), message: format!("no terminal in {workspace}") })?;
+        let path = term.label(L_WORKTREE);
+        if path.is_empty() {
+            return Err(HerdrError { code: "worktree_not_found".into(), message: format!("{workspace} is not a worktree") });
+        }
+        let out = self
+            .runner
+            .run(&Cmd::new("git", Duration::from_secs(60)).arg("-C").arg(&path).args(["worktree", "remove", &path]))
+            .map_err(|e| HerdrError { code: "failed".into(), message: format!("{e:#}") })?;
+        if out.success() {
+            return Ok(());
+        }
+        let text = out.error_text();
+        let code = if text.contains("modified or untracked") { "dirty_worktree_requires_force" } else { "failed" };
+        Err(HerdrError { code: code.into(), message: text })
     }
 
-    /// A workspace's label, as the sidebar shows it.
+    /// A Space's label, as the overview shows it.
     pub fn workspace_label(&self, workspace: &str) -> Result<String, HerdrError> {
-        let result = self.call(&["workspace", "get", workspace], CALL_TIMEOUT)?;
-        Ok(result["workspace"]["label"].as_str().unwrap_or_default().to_string())
+        self.terminals()?
+            .into_iter()
+            .find(|t| t.label(L_WS) == workspace)
+            .map(|t| t.label(L_WS_LABEL))
+            .ok_or_else(|| HerdrError { code: "pane_not_found".into(), message: format!("no Space {workspace}") })
     }
 
     pub fn workspace_rename(&self, workspace: &str, label: &str) -> Result<(), HerdrError> {
-        self.call(&["workspace", "rename", workspace, label], CALL_TIMEOUT).map(|_| ())
+        for term in self.terminals()?.into_iter().filter(|t| t.label(L_WS) == workspace) {
+            self.label(&term.pane_id(), &[(L_WS_LABEL, label)])?;
+        }
+        Ok(())
     }
 
     pub fn tab_rename(&self, tab: &str, label: &str) -> Result<(), HerdrError> {
-        self.call(&["tab", "rename", tab, label], CALL_TIMEOUT).map(|_| ())
-    }
-
-    /// The working directory herdr reports for a new tab's pane.
-    pub fn pane_cwd(&self, pane: &str) -> Result<String, HerdrError> {
-        let result = self.call(&["pane", "get", pane], CALL_TIMEOUT)?;
-        Ok(result["pane"]["cwd"].as_str().unwrap_or_default().to_string())
-    }
-
-    /// Starts an agent in a pane that is at a shell prompt. Success means herdr
-    /// detected the agent and it is ready for input.
-    pub fn agent_start(&self, name: &str, kind: &str, pane: &str, agent_args: &[String]) -> Result<Agent, HerdrError> {
-        let timeout_ms = AGENT_START_TIMEOUT.as_millis().to_string();
-        let mut args = vec!["agent", "start", name, "--kind", kind, "--pane", pane, "--timeout", &timeout_ms];
-        if !agent_args.is_empty() {
-            args.push("--");
-            args.extend(agent_args.iter().map(String::as_str));
+        for term in self.terminals()?.into_iter().filter(|t| t.label(L_TAB) == tab) {
+            self.label(&term.pane_id(), &[(L_TAB_LABEL, label)])?;
         }
-        // herdr enforces the timeout itself; the outer deadline only guards a hang.
-        let result = self.call(&args, AGENT_START_TIMEOUT + Duration::from_secs(5))?;
-        serde_json::from_value(result["agent"].clone()).map_err(|e| HerdrError {
-            code: "failed".into(),
-            message: format!("`herdr agent start` reply changed: {e}"),
+        Ok(())
+    }
+
+    /// The working directory core reports for a pane.
+    pub fn pane_cwd(&self, pane: &str) -> Result<String, HerdrError> {
+        Ok(self.term(pane)?.cwd())
+    }
+
+    /// Starts an agent in a pane. core has no `agent start`: the agent is a
+    /// program typed into the pane's shell, and "ready" is its first status
+    /// report, so a trust dialog shows up as `blocked` rather than a timeout.
+    pub fn agent_start(&self, name: &str, kind: &str, pane: &str, agent_args: &[String]) -> Result<Agent, HerdrError> {
+        self.label(pane, &[(L_AGENT, name), (L_KIND, kind)])?;
+        let line = agent_command(kind, agent_args);
+        self.json(&["send", pane, &line], AGENT_START_TIMEOUT)?;
+        let deadline = std::time::Instant::now() + AGENT_START_TIMEOUT;
+        loop {
+            let agent = self.agent(pane)?;
+            if agent.reported_status_blocked() {
+                return Err(HerdrError {
+                    code: "agent_not_ready".into(),
+                    message: format!("{name} is blocked during startup"),
+                });
+            }
+            if agent.ready() {
+                return Ok(agent);
+            }
+            if std::time::Instant::now() > deadline {
+                return Err(HerdrError { code: "timeout".into(), message: format!("{name} did not report ready in time") });
+            }
+            std::thread::sleep(Duration::from_millis(300));
+        }
+    }
+
+    /// One agent by pane id.
+    fn agent(&self, pane: &str) -> Result<Agent, HerdrError> {
+        let term = self.term(pane)?;
+        let status = term.status.clone().unwrap_or_default();
+        Ok(Agent {
+            pane_id: term.pane_id(),
+            tab_id: term.label(L_TAB),
+            workspace_id: term.label(L_WS),
+            name: term.label(L_AGENT),
+            agent: term.label(L_KIND),
+            agent_status: if term.reported { status.state.clone() } else { String::new() },
+            cwd: term.cwd(),
+            foreground_cwd: term.cwd(),
+            terminal_id: term.address.clone(),
+            state_change_seq: term.turn,
+            agent_session: {
+                let value = term.label(L_SESSION);
+                (!value.is_empty()).then_some(AgentSession { value })
+            },
+            interactive_ready: term.reported,
+            tokens: term.labels.clone(),
         })
     }
 
-    /// Submits a prompt. herdr's parser takes positionals first and options
-    /// after them, and has no `--` separator here; text in the second
-    /// position is accepted even when it starts with a dash (checked on 0.9.1).
-    pub fn agent_prompt(&self, target: &str, text: &str) -> Result<(), HerdrError> {
-        self.call(&["agent", "prompt", target, text], CALL_TIMEOUT).map(|_| ())
+    /// Remembers the agent's native session so `thread restart` can resume it.
+    #[allow(dead_code)] // wired when thread restart resumes a native session
+    pub fn set_agent_session(&self, pane: &str, id: &str) -> Result<(), HerdrError> {
+        self.label(pane, &[(L_SESSION, id)])
     }
 
-    /// Submits a prompt and waits until the agent is seen `working` (or
-    /// `blocked`, a question it asked): herdr's own proof that the text was
-    /// taken, not only typed. `agent_prompt_stalled` (herdr saw neither within
-    /// its 5 s), a timeout or a reply without a result mean the text may or may
-    /// not sit in the input box: callers never type it again blindly.
+    /// Submits a prompt. core refuses to type into a `blocked` program unless
+    /// forced, which is what the caller wants to hear about.
+    pub fn agent_prompt(&self, target: &str, text: &str) -> Result<(), HerdrError> {
+        self.json(&["send", target, text], CALL_TIMEOUT).map(|_| ())
+    }
+
+    /// Submits a prompt and returns core's word on whether the turn started.
     pub fn agent_prompt_confirmed(&self, target: &str, text: &str) -> Result<(), HerdrError> {
-        let timeout_ms = PROMPT_WAIT.as_millis().to_string();
-        let args = ["agent", "prompt", target, text, "--wait", "--until", "working", "--until", "blocked", "--timeout", &timeout_ms];
-        match self.call(&args, PROMPT_WAIT + Duration::from_secs(5))? {
-            serde_json::Value::Null => Err(HerdrError { code: "no_reply".into(), message: "`herdr agent prompt --wait` answered without a result".into() }),
-            _ => Ok(()),
+        let result = self.json(&["send", target, text], PROMPT_WAIT + Duration::from_secs(5))?;
+        match result["started"].as_bool() {
+            Some(true) => Ok(()),
+            // The program does not report status, or it took the text without
+            // starting: the caller must not type it again blindly.
+            _ => Err(HerdrError {
+                code: "agent_prompt_stalled".into(),
+                message: format!("{target} did not start working after the prompt"),
+            }),
         }
     }
 
-    /// The agent's screen as plain text: what is visible now, or the last
-    /// `lines` lines of scrollback. `agent read` prints the text itself, not a
-    /// JSON reply; only a failure is JSON (checked on 0.9.1).
+    /// The agent's screen and history as core keeps it.
     pub fn agent_read(&self, target: &str, lines: Option<usize>) -> Result<String, HerdrError> {
         self.agent_read_as(target, lines, "text")
     }
 
-    fn agent_read_as(&self, target: &str, lines: Option<usize>, format: &str) -> Result<String, HerdrError> {
-        let lines = lines.map(|n| n.to_string());
-        let mut args = vec!["agent", "read", target, "--format", format];
-        match &lines {
-            Some(n) => args.extend(["--source", "recent", "--lines", n.as_str()]),
-            None => args.extend(["--source", "visible"]),
-        }
-        let cmd = self.cmd(CALL_TIMEOUT).args(args.iter().copied());
-        let out = self.runner.run(&cmd).map_err(|e| HerdrError { code: "unreachable".into(), message: format!("{e:#}") })?;
-        if out.timed_out {
-            return Err(HerdrError { code: "timeout".into(), message: format!("`herdr {}` timed out", args.join(" ")) });
-        }
-        if out.success() {
-            return Ok(out.stdout);
-        }
-        let reply = [&out.stderr, &out.stdout]
-            .into_iter()
-            .find_map(|text| serde_json::from_str::<serde_json::Value>(text.trim()).ok());
-        Err(match reply.as_ref().and_then(|r| r.get("error")) {
-            Some(error) => HerdrError {
-                code: error["code"].as_str().unwrap_or("failed").to_string(),
-                message: error["message"].as_str().unwrap_or("").to_string(),
-            },
-            None => HerdrError { code: "failed".into(), message: format!("`herdr {}`: {}", args.join(" "), out.error_text()) },
-        })
+    /// `format` is kept for the call sites; core only prints plain text.
+    pub fn agent_read_as(&self, target: &str, lines: Option<usize>, _format: &str) -> Result<String, HerdrError> {
+        let lines = lines.map(|n| n.to_string()).unwrap_or_else(|| "0".into());
+        let result = self.json(&["read", target, "--lines", &lines], CALL_TIMEOUT)?;
+        Ok(result["text"].as_str().unwrap_or_default().to_string())
     }
 
-    /// The visible screen with its styling (SGR escapes), for telling typed
-    /// text from a dim placeholder (`prompt_box`).
     pub fn agent_screen(&self, target: &str) -> Result<String, HerdrError> {
-        self.agent_read_as(target, None, "ansi")
+        let result = self.json(&["read", target], CALL_TIMEOUT)?;
+        Ok(result["text"].as_str().unwrap_or_default().to_string())
     }
 
-    /// Key presses in herdr's key syntax (`enter`, `esc`, `up`, `tab`,
-    /// `ctrl+c`, a single character). herdr checks every key before it sends
-    /// any, and refuses a pane that no longer hosts the agent.
     pub fn agent_send_keys(&self, target: &str, keys: &[String]) -> Result<(), HerdrError> {
-        let mut args = vec!["agent", "send-keys", target];
+        let keys: Vec<String> = keys.iter().map(|k| key_name(k)).collect();
+        let mut args: Vec<&str> = vec!["keys", target];
         args.extend(keys.iter().map(String::as_str));
-        self.call(&args, CALL_TIMEOUT).map(|_| ())
+        self.json(&args, CALL_TIMEOUT).map(|_| ())
     }
 
-    /// Literal text typed into a pane, with no Enter (herdr has no agent-level
-    /// form of this in 0.9.1).
+    /// Pasting text without a submit is not something core offers: `send` is
+    /// paste plus Enter, and that is what every caller here wants.
     pub fn pane_send_text(&self, pane: &str, text: &str) -> Result<(), HerdrError> {
-        self.call(&["pane", "send-text", pane, text], CALL_TIMEOUT).map(|_| ())
+        self.json(&["send", pane, text], CALL_TIMEOUT).map(|_| ())
     }
 
+    /// With no windows to focus, the honest answer is how to reach the pane.
     pub fn agent_focus(&self, target: &str) -> Result<(), HerdrError> {
-        self.call(&["agent", "focus", target], CALL_TIMEOUT).map(|_| ())
+        println!("hc attach {target}");
+        Ok(())
     }
 
-    /// Names an already detected agent (after Herdr's native resume leaves a
-    /// restored pane unnamed).
     pub fn agent_rename(&self, pane: &str, name: &str) -> Result<(), HerdrError> {
-        self.call(&["agent", "rename", pane, name], CALL_TIMEOUT).map(|_| ())
+        self.label(pane, &[(L_AGENT, name)])
     }
 
+    /// A desktop notification, outside core: `hc` has none.
     pub fn notification_show(&self, title: &str, body: &str) -> Result<(), HerdrError> {
-        self.call(&["notification", "show", title, "--body", body], CALL_TIMEOUT).map(|_| ())
+        #[cfg(target_os = "macos")]
+        let script = format!("display notification {} with title {}", osa(body), osa(title));
+        #[cfg(not(target_os = "macos"))]
+        let script = format!("-u normal {} {}", title.replace('\'', ""), body.replace('\'', ""));
+        #[cfg(target_os = "macos")]
+        let cmd = Cmd::new("osascript", Duration::from_secs(10)).args(["-e", &script]);
+        #[cfg(not(target_os = "macos"))]
+        let cmd = Cmd::new("notify-send", Duration::from_secs(10)).arg(&script);
+        let _ = self.runner.run(&cmd);
+        Ok(())
     }
 
+    /// Herdr 1's agent view was a window feature; core draws nothing, so the
+    /// projection this used to install is a no-op. Kept until the modules that
+    /// call it are removed.
+    pub fn agent_view_set(&self, _params: serde_json::Value) -> Result<(), HerdrError> {
+        Ok(())
+    }
+
+    /// Herdr 1 let a Space be moved in its list. With no list, nothing to move.
+    pub fn workspace_move(&self, _workspace_id: &str, _insert_index: usize) -> Result<(), HerdrError> {
+        Ok(())
+    }
+
+    /// `hpw-<label>-<n>`, unique among the terminals this session has.
+    fn next_id(&self, prefix: &str, label: &str) -> Result<String, HerdrError> {
+        let slug = slug(label);
+        let used: Vec<String> = self.terminals()?.iter().map(|t| t.label(L_WS)).collect();
+        let mut n = 1;
+        loop {
+            let id = format!("{prefix}-{slug}-{n}");
+            if !used.iter().any(|u| u == &id) {
+                return Ok(id);
+            }
+            n += 1;
+        }
+    }
+
+    /// A terminal name core accepts: 1-32 of a-z 0-9 - _ .
+    fn next_name(&self, workspace: &str, n: usize) -> Result<String, HerdrError> {
+        let base = format!("hp-{}-{n}", slug(workspace.trim_start_matches("hpw-")));
+        let used: Vec<String> = self.terminals()?.iter().map(|t| t.pane_id()).collect();
+        let mut name = truncate_name(&base);
+        let mut n = n;
+        while used.contains(&name) {
+            n += 1;
+            name = truncate_name(&format!("{base}-{n}"));
+        }
+        Ok(name)
+    }
 }
 
-pub const SOURCE: &str = "herdr-projects";
+impl Agent {
+    /// core reported a program waiting for a person.
+    fn reported_status_blocked(&self) -> bool {
+        self.agent_status == "blocked"
+    }
+}
 
-impl<'a> Herdr<'a> {
-    fn request(&self, method: &str, params: serde_json::Value) -> Result<serde_json::Value, HerdrError> {
-        let line = serde_json::json!({ "id": "herdr-projects", "method": method, "params": params }).to_string();
-        let reply = self
-            .runner
-            .socket_request(&self.socket, &line, CALL_TIMEOUT)
-            .map_err(|e| HerdrError { code: "unreachable".into(), message: format!("{e:#}") })?;
-        let reply: serde_json::Value = serde_json::from_str(reply.trim())
-            .map_err(|e| HerdrError { code: "failed".into(), message: format!("herdr's reply to {method} did not parse: {e}") })?;
-        match reply.get("error") {
-            Some(error) => Err(HerdrError {
-                code: error["code"].as_str().unwrap_or("failed").to_string(),
-                message: error["message"].as_str().unwrap_or("").to_string(),
-            }),
-            None => Ok(reply["result"].clone()),
+/// `<repo's folder name>/<branch>` under `~/.herdr/worktrees`, as Herdr 1 laid
+/// it out, so a restored record's path still resolves.
+fn worktree_path(repo: &str, branch: &str) -> Result<PathBuf, HerdrError> {
+    let home = std::env::var_os("HOME").map(PathBuf::from).ok_or_else(|| HerdrError {
+        code: "failed".into(),
+        message: "HOME is not set".into(),
+    })?;
+    let repo_name = Path::new(repo)
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "repo".into());
+    let branch = branch.replace('/', "-");
+    Ok(home.join(".herdr").join("worktrees").join(repo_name).join(branch))
+}
+
+/// The command that runs an agent under `hp-agent`, so its states reach core.
+fn agent_command(kind: &str, args: &[String]) -> String {
+    let binary = crate::paths::binary()
+        .ok()
+        .and_then(|path| path.parent().map(|dir| dir.join("hp-agent")))
+        .filter(|path| path.exists())
+        .map(|path| crate::remote::quote(&path.to_string_lossy()))
+        .unwrap_or_else(|| "hp-agent".into());
+    let mut line = format!("{binary} {}", crate::remote::quote(kind));
+    for arg in args {
+        line.push(' ');
+        line.push_str(&crate::remote::quote(arg));
+    }
+    line
+}
+
+/// `hpw-Law Office-2` → `law-office`.
+fn slug(text: &str) -> String {
+    let mut out = String::new();
+    let mut dash = false;
+    for ch in text.chars() {
+        if ch.is_ascii_alphanumeric() {
+            out.push(ch.to_ascii_lowercase());
+            dash = false;
+        } else if !dash {
+            out.push('-');
+            dash = true;
         }
     }
+    let out = out.trim_matches('-').to_string();
+    if out.is_empty() { "space".into() } else { out }
+}
 
-    /// Installs an agent view (socket only in 0.9.1). One view is active
-    /// globally, so this replaces any other tool's view.
-    pub fn agent_view_set(&self, params: serde_json::Value) -> Result<(), HerdrError> {
-        self.request("agent.view.set", params).map(|_| ())
+fn truncate_name(name: &str) -> String {
+    name.chars().take(32).collect::<String>().trim_end_matches('-').to_string()
+}
+
+/// core's key names: enter, esc, tab, up, ctrl+c.
+fn key_name(key: &str) -> String {
+    match key.to_ascii_lowercase().as_str() {
+        "return" => "enter".into(),
+        "escape" => "esc".into(),
+        other => other.into(),
     }
+}
 
-    /// Moves a Space to `insert_index` (a gap in the list before the move;
-    /// socket only in 0.9.1).
-    pub fn workspace_move(&self, workspace_id: &str, insert_index: usize) -> Result<(), HerdrError> {
-        self.request("workspace.move", serde_json::json!({ "workspace_id": workspace_id, "insert_index": insert_index })).map(|_| ())
-    }
-
+/// An AppleScript string literal.
+#[cfg(target_os = "macos")]
+fn osa(text: &str) -> String {
+    format!("\"{}\"", text.replace('\\', "\\\\").replace('"', "\\\""))
 }
 
 #[cfg(test)]
@@ -608,11 +929,30 @@ mod tests {
 
     #[test]
     fn parses_versions() {
-        assert_eq!(parse_version("herdr 0.9.0\n"), Some(Version(0, 9, 0)));
-        assert_eq!(parse_version("herdr 0.9.2-preview.3"), Some(Version(0, 9, 2)));
-        assert_eq!(parse_version("0.10.0"), Some(Version(0, 10, 0)));
+        assert_eq!(parse_version("hc 0.1.21"), Some(Version(0, 1, 21)));
+        assert_eq!(parse_version("hc 0.1.21-preview.1"), Some(Version(0, 1, 21)));
         assert_eq!(parse_version("herdr"), None);
-        assert!(Version(0, 9, 0) < MIN_VERSION);
-        assert!(Version(0, 10, 0) > MIN_VERSION);
+    }
+
+    #[test]
+    fn a_recorded_socket_path_means_the_default_session() {
+        assert_eq!(session_key("/h/.config/herdr/herdr.sock"), "");
+        assert_eq!(session_key("-"), "");
+        assert_eq!(session_key("hp-dev"), "hp-dev");
+    }
+
+    #[test]
+    fn labels_become_the_space_tab_and_pane_ids() {
+        let term = Term {
+            address: "t7".into(),
+            name: Some("hp-law-1".into()),
+            labels: [(L_WS, "hpw-law-1"), (L_TAB, "hpw-law-1-t1")].iter().map(|(k, v)| (k.to_string(), v.to_string())).collect(),
+            cwd: "/w".into(),
+            state: "live".into(),
+            ..Term::default()
+        };
+        assert_eq!(term.pane_id(), "hp-law-1");
+        assert_eq!(term.label(L_WS), "hpw-law-1");
+        assert_eq!(term.label(L_TAB), "hpw-law-1-t1");
     }
 }

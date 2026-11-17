@@ -104,36 +104,30 @@ pub fn coordinator_display(project: &Project, lane: Option<&str>) -> String {
 /// cleared on every report, which would erase the claim as fast as it is
 /// written.
 pub fn report_pane(herdr: &Herdr, pane: &str, display: &str, slug: &str, group: Group, lane: Option<&str>) {
-    let ttl = TOKEN_TTL_MS.to_string();
-    let rank = group.rank().to_string();
-    let mut tokens = vec![format!("hp_project={slug}"), format!("hp_rank={rank}")];
+    if pane.is_empty() {
+        return;
+    }
+    let mut pairs: Vec<(String, String)> = vec![
+        ("hp_project".into(), slug.to_string()),
+        ("hp_rank".into(), group.rank().to_string()),
+        ("hp_display".into(), display.to_string()),
+    ];
     if let Some(lane) = lane.filter(|lane| !lane.is_empty()) {
-        tokens.push(format!("{}={lane}", crate::lanes::TOKEN));
+        pairs.push((crate::lanes::TOKEN.to_string(), lane.to_string()));
     }
-    let mut args = vec!["pane", "report-metadata", pane, "--source", crate::herdr::SOURCE, "--display-agent", display, "--ttl-ms", &ttl];
-    for token in &tokens {
-        args.push("--token");
-        args.push(token);
-    }
-    for old in OLD_TOKENS {
-        args.push("--clear-token");
-        args.push(old);
-    }
-    let _ = herdr.call(&args, CALL_TIMEOUT);
+    let _ = herdr.set_labels(pane, &pairs);
+    let _ = herdr.clear_labels(pane, &OLD_TOKENS);
 }
 
-/// Clears every token and the display name this plugin set on a pane — ours,
-/// the lane claim, and the grouping tokens `grouping::clear` also removes.
+/// Clears every label this plugin set on a pane — ours, the lane claim, and the
+/// grouping tokens `grouping::clear` also removes.
 pub fn clear_pane(herdr: &Herdr, pane: &str) {
     if pane.is_empty() {
         return;
     }
-    let mut args = vec!["pane", "report-metadata", pane, "--source", crate::herdr::SOURCE, "--clear-display-agent"];
-    for name in ["hp_project", "hp_rank", crate::lanes::TOKEN].into_iter().chain(OLD_TOKENS) {
-        args.push("--clear-token");
-        args.push(name);
-    }
-    let _ = herdr.call(&args, CALL_TIMEOUT);
+    let mut keys: Vec<&str> = vec!["hp_project", "hp_rank", "hp_display", crate::lanes::TOKEN];
+    keys.extend(OLD_TOKENS);
+    let _ = herdr.clear_labels(pane, &keys);
     crate::grouping::clear(herdr, "pane", pane);
 }
 

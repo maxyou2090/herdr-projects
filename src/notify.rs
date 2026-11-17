@@ -16,6 +16,7 @@ pub enum Sound {
 }
 
 impl Sound {
+    #[allow(dead_code)] // core's notifications are ours to voice
     fn arg(self) -> &'static str {
         match self {
             Sound::None => "none",
@@ -34,13 +35,13 @@ pub struct Notifier<'a> {
 impl<'a> Notifier<'a> {
     pub fn new(ctx: &'a Ctx, project: &Project) -> Notifier<'a> {
         let settings = project.read_project_md().map(|(s, _)| s).unwrap_or_default();
-        let herdr = project.coordinator().filter(|c| !c.socket.is_empty() && std::path::Path::new(&c.socket).exists()).map(|c| Herdr::new(ctx.env.herdr_bin(), c.socket, ctx.runner));
+        let herdr = project.coordinator().map(|c| Herdr::new(ctx.env.herdr_bin(), c.socket, ctx.runner));
         Notifier { herdr, name: project::display_name(&settings.name, &project.slug), mute: settings.mute }
     }
 
     /// `subject` is a thread id or another short name; `error` notifications
     /// go out even when the project is muted.
-    pub fn send(&self, subject: &str, body: &str, sound: Sound, error: bool) {
+    pub fn send(&self, subject: &str, body: &str, _sound: Sound, error: bool) {
         if self.mute && !error {
             return;
         }
@@ -48,6 +49,6 @@ impl<'a> Notifier<'a> {
             return;
         };
         let title = if subject.is_empty() { self.name.clone() } else { format!("{} · {subject}", self.name) };
-        let _ = herdr.call(&["notification", "show", &title, "--body", body, "--sound", sound.arg()], crate::herdr::CALL_TIMEOUT);
+        let _ = herdr.notification_show(&title, body);
     }
 }

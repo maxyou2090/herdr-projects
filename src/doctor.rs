@@ -165,7 +165,7 @@ fn report(
                 "session",
                 format!(
                     "{} (name: {name}){}",
-                    found.socket.display(),
+                    found.socket,
                     if reachable { "" } else { "; not reachable" }
                 ),
             );
@@ -334,13 +334,13 @@ fn report(
         // With no usable record, the agents the ticker would discover: the
         // ones working in the project folder in this session.
         let (record, mut notes) = match project.coordinator() {
-            Some(record) if Path::new(&record.socket).exists() => (Some(record), Vec::new()),
-            Some(record) => (None, vec![format!("recorded socket {} no longer exists", record.socket)]),
+            Some(record) if crate::herdr::session_alive(&bin, &record.socket, runner) => (Some(record), Vec::new()),
+            Some(record) => (None, vec![format!("recorded session `{}` no longer runs", record.socket)]),
             None => (None, Vec::new()),
         };
         let socket = match (&record, paths::resolve_session(session, env, runner)) {
             (Some(record), _) => record.socket.clone(),
-            (None, Ok(found)) => found.socket.to_string_lossy().into_owned(),
+            (None, Ok(found)) => found.socket,
             (None, Err(_)) => {
                 notes.push(none);
                 check(&mut out, Some(true), &label, format!("{}; {}", project.status(), notes.join("; ")));

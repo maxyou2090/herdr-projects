@@ -546,7 +546,7 @@ pub fn open(ctx: &Ctx, slug: &str, options: &OpenOptions) -> Result<()> {
     // coordinator is gone, which needs the live panes. An unreachable session is
     // still reported below, after the session-ownership check.
     let session = paths::resolve_session(&options.session, ctx.env, ctx.runner)?;
-    let socket = session.socket.to_string_lossy().into_owned();
+    let socket = session.socket.clone();
     let herdr = Herdr::new(ctx.env.herdr_bin(), &session.socket, ctx.runner);
     let listed = herdr.agent_list();
     // The lane is resolved before the profile: an existing lane carries its
@@ -568,22 +568,21 @@ pub fn open(ctx: &Ctx, slug: &str, options: &OpenOptions) -> Result<()> {
         Some(lane_registry.coordinator_for(&project, &target_lane))
     };
     if let Some(record) = &previous
-        && !record.socket.is_empty()
-        && record.socket != socket
+        && !crate::herdr::same_session(&record.socket, &socket)
     {
-        if Path::new(&record.socket).exists() {
+        if crate::herdr::session_alive(&ctx.env.herdr_bin(), &record.socket, ctx.runner) {
             bail!(
-                "`{slug}` belongs to the herdr session at {}; open it there, not at {socket}",
+                "`{slug}` belongs to the herdr session `{}`; open it there, not in `{socket}`",
                 record.socket
             );
         }
         if !options.rebind {
             bail!(
-                "`{slug}` was opened in a session whose socket no longer exists ({}); pass --rebind to move it to {socket}",
+                "`{slug}` was opened in a session that no longer runs (`{}`); pass --rebind to move it to `{socket}`",
                 record.socket
             );
         }
-        println!("rebinding `{slug}` from {} to {socket}", record.socket);
+        println!("rebinding `{slug}` from `{}` to `{socket}`", record.socket);
         previous = None;
     }
 

@@ -9,7 +9,6 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result, bail};
 use serde::Deserialize;
 
-use crate::herdr;
 use crate::runner::Runner;
 
 #[derive(Debug, Clone)]
@@ -120,65 +119,53 @@ fn absolute(path: &Path) -> Result<PathBuf> {
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct SessionFlags {
     pub session: Option<String>,
+    /// Herdr 1's `--socket`; kept so old scripts still parse.
     pub socket: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct Session {
-    pub socket: PathBuf,
+    /// The core session a project lives in: an `HC_SESSION` name, empty for the
+    /// default core. Herdr 1 recorded a socket path here; a path reads as the
+    /// default session, so records written before the port keep working.
+    pub socket: String,
     /// Known only when the session was chosen by name.
     pub name: Option<String>,
 }
 
-/// `--session`, then `--socket`, then `HERDR_SOCKET_PATH`, then `HERDR_SESSION`,
-/// then herdr's default socket. A name is turned into a socket path by asking
-/// herdr (`session list --json`), never by guessing herdr's directory layout.
-pub fn resolve_session(flags: &SessionFlags, env: &Env, runner: &dyn Runner) -> Result<Session> {
+/// `--session`, then `HC_SESSION`, then `HERDR_SESSION`. herdr-core has one core
+/// per session and no session registry, so a name is used as given and there is
+/// nothing to ask.
+///
+/// `--socket` and `HERDR_SOCKET_PATH` were Herdr 1's way to pick a session; both
+/// now mean "the default core", which is the only such session that exists
+/// unless a name is given.
+pub fn resolve_session(flags: &SessionFlags, env: &Env, _runner: &dyn Runner) -> Result<Session> {
     if flags.session.is_some() && flags.socket.is_some() {
         bail!("pass --session or --socket, not both");
     }
     if let Some(name) = &flags.session {
-        return session_by_name(name, env, runner);
-    }
-    if let Some(socket) = &flags.socket {
         return Ok(Session {
-            socket: absolute(socket)?,
-            name: None,
+            socket: name.clone(),
+            name: Some(name.clone()),
         });
     }
-    if let Some(socket) = env.var("HERDR_SOCKET_PATH") {
+    if let Some(name) = env.var("HC_SESSION").or_else(|| env.var("HERDR_SESSION")) {
         return Ok(Session {
-            socket: PathBuf::from(socket),
-            name: None,
-        });
-    }
-    if let Some(name) = env.var("HERDR_SESSION") {
-        return session_by_name(name, env, runner);
-    }
-    let sessions = herdr::session_list(&env.herdr_bin(), runner).unwrap_or_default();
-    let socket = sessions
-        .into_iter()
-        .find(|s| s.default)
-        .map(|s| s.socket_path)
-        .unwrap_or_else(|| env.home.join(".config/herdr/herdr.sock"));
-    Ok(Session { socket, name: None })
-}
-
-fn session_by_name(name: &str, env: &Env, runner: &dyn Runner) -> Result<Session> {
-    let sessions = herdr::session_list(&env.herdr_bin(), runner)?;
-    match sessions.into_iter().find(|s| s.name == name) {
-        Some(found) => Ok(Session {
-            socket: found.socket_path,
+            socket: name.to_string(),
             name: Some(name.to_string()),
-        }),
-        None => bail!("herdr has no session named `{name}`; start it with `herdr --session {name}`"),
+        });
     }
+    Ok(Session {
+        socket: String::new(),
+        name: None,
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::runner::fake::{FakeRunner, ok};
+    use crate::runner::fake::FakeRunner;
 
     const SESSIONS: &str = r#"{"sessions":[
         {"default":true,"name":"default","running":true,"session_dir":"/h/.config/herdr","socket_path":"/h/.config/herdr/herdr.sock"},
@@ -236,53 +223,30 @@ mod tests {
     }
 
     #[test]
-    fn session_order_flag_socket_env_default() {
+    fn session_order_flag_then_hc_session() {
         let runner = FakeRunner::new();
-        runner.on("session list --json", ok(SESSIONS));
-        let both = [
-            ("HERDR_SOCKET_PATH", "/env.sock"),
-            ("HERDR_SESSION", "hp-dev"),
-        ];
-        let env = Env::for_test(Path::new("/h"), &both);
+        let env = Env::for_test(Path::new("/h"), &[("HC_SESSION", "hp-dev"), ("HERDR_SESSION", "old")]);
 
-        let by_name = SessionFlags {
-            session: Some("hp-dev".into()),
-            socket: None,
-        };
-        let got = resolve_session(&by_name, &env, &runner).unwrap();
-        assert_eq!(got.socket, PathBuf::from("/h/.config/herdr/sessions/hp-dev/herdr.sock"));
-        assert_eq!(got.name.as_deref(), Some("hp-dev"));
+        let by_flag = SessionFlags { session: Some("explicit".into()), socket: None };
+        let got = resolve_session(&by_flag, &env, &runner).unwrap();
+        assert_eq!(got.socket, "explicit");
+        assert_eq!(got.name.as_deref(), Some("explicit"));
 
-        let by_socket = SessionFlags {
-            session: None,
-            socket: Some("/flag.sock".into()),
-        };
-        let got = resolve_session(&by_socket, &env, &runner).unwrap();
-        assert_eq!(got, Session { socket: "/flag.sock".into(), name: None });
+        let got = resolve_session(&SessionFlags::default(), &env, &runner).unwrap();
+        assert_eq!(got, Session { socket: "hp-dev".into(), name: Some("hp-dev".into()) });
 
-        let none = SessionFlags::default();
-        let got = resolve_session(&none, &env, &runner).unwrap();
-        assert_eq!(got, Session { socket: "/env.sock".into(), name: None });
-
+        // Herdr 1's session shapes still parse, and mean the default core.
         let env = Env::for_test(Path::new("/h"), &[("HERDR_SESSION", "hp-dev")]);
-        let got = resolve_session(&none, &env, &runner).unwrap();
+        let got = resolve_session(&SessionFlags::default(), &env, &runner).unwrap();
         assert_eq!(got.name.as_deref(), Some("hp-dev"));
 
-        let env = Env::for_test(Path::new("/h"), &[]);
-        let got = resolve_session(&none, &env, &runner).unwrap();
-        assert_eq!(got, Session { socket: "/h/.config/herdr/herdr.sock".into(), name: None });
-    }
+        let by_socket = SessionFlags { session: None, socket: Some("/flag.sock".into()) };
+        let got = resolve_session(&by_socket, &env, &runner).unwrap();
+        assert_eq!(got, Session { socket: String::new(), name: None });
 
-    #[test]
-    fn unknown_session_name_is_refused() {
-        let runner = FakeRunner::new();
-        runner.on("session list --json", ok(SESSIONS));
         let env = Env::for_test(Path::new("/h"), &[]);
-        let flags = SessionFlags {
-            session: Some("nope".into()),
-            socket: None,
-        };
-        assert!(resolve_session(&flags, &env, &runner).is_err());
+        let got = resolve_session(&SessionFlags::default(), &env, &runner).unwrap();
+        assert_eq!(got, Session { socket: String::new(), name: None });
     }
 
     #[test]
