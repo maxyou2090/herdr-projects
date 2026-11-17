@@ -86,6 +86,16 @@ Rules that follow from this, worth keeping:
   broke things: after a terminal closed, its count was handed to the next one,
   so a thread's tab id could equal the coordinator's — and closing the thread
   closed the coordinator with it.
+- **A thread's three names live in one place** (`src/labels.rs`): the tab is
+  the thread's **id** (`thread_tab_label`), the Space is its **title**
+  (`thread_space_label`), the pane's `hp_display` is `<id> <title>` with one
+  space (`thread_display`). The app draws a row as `<tab> <Space>`, so a thread
+  reads `t-0047 线程命名 tab 用 id`: the id once, the title once, no `·`. The
+  Space label stays the title on purpose — a restart recognises a thread's own
+  Space by it (`thread::recorded_own_space`, `threads::place_tab`,
+  `spaces::empty`), so changing the tab name does not disturb placement. The
+  coordinator's names (`coordinator` tab, the project's Space label) are not
+  these and did not change.
 - **A recorded session is a name, not a path.** `Session { socket }` holds the
   `HC_SESSION` value; a Herdr 1 socket path (`/…/herdr.sock`) reads as the
   default session (`core::session_key`). This compatibility shim is what made
@@ -148,7 +158,7 @@ Each of these was run for real on a machine with core 0.1.21 and the app 0.1.16:
 | a thread runs to review and resolves | the agent finished its turn, the thread showed `Ready for review`, `thread resolve` closed its tab |
 | `hp ticker start/stop/status` | a LaunchAgent is written, bootstrapped and booted out; `status` reports the running version |
 | rename, sweep | `rename --dry-run`, a real rename, a rename deferred to the ticker, `sweep --dry-run` and a real sweep |
-| the app shows it | `herdr-app ls` shows a Space named after the project with `coordinator` and thread-title tabs |
+| the app shows it | `herdr-app ls` shows a Space named after the project with `coordinator` and thread-id tabs |
 | `cargo test` | 275 unit tests, 18 more in `hp-agent`, 7 CLI tests, plus the adapter tests against the fake core |
 | `hp-agent` reports the middle of a turn | a script drawing claude-shaped screens under the real `hp-agent`, read back with `hc get`: `idle` → `working` → `blocked` → `working` → `idle` → the terminal `finished` |
 | a harness that reports itself is not double-reported | every pi pane in `hc ls` shows pi's own `working`; `hp-agent` stays silent for `pi` (`watch_kind`) |

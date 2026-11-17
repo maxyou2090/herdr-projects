@@ -213,7 +213,13 @@ fn place_and_brief(ctx: &Ctx, project: &Project, view: &SessionView, id: &str, r
                 record.base.clone()
             };
             let branch = thread::branch_name(slug, id, &record.title);
-            let (created, path, cwd) = view.herdr.worktree_create(&record.repo, &branch, &base, &record.title)?;
+            let (created, path, cwd) = view.herdr.worktree_create(
+                &record.repo,
+                &branch,
+                &base,
+                crate::labels::thread_space_label(&record.title),
+                &crate::labels::thread_tab_label(&record.id),
+            )?;
             let repo_workspace = repo_space(&view.herdr, &record.repo);
             // Recorded immediately, so a command killed midway still leaves a
             // record `thread restart` can act on.
@@ -287,10 +293,12 @@ fn place_tab(project: &Project, view: &SessionView, record: &Thread) -> Result<T
     // while the Space stays open), else one named by a pane working in its
     // folder. A checkout thread's folder is the repository's main checkout,
     // which other panes may work in too, so there only a Space carrying the
-    // thread's title counts, exactly like the recorded one.
+    // thread's title counts, exactly like the recorded one. The title is the
+    // Space's label (`labels::thread_space_label`); the tab inside is the id.
+    let title = crate::labels::thread_space_label(&record.title);
     let own_space = if matches!(record.kind, Kind::Tab | Kind::Checkout) {
         let listed = view.herdr.workspace_list().unwrap_or_default();
-        let named = |id: &str| listed.iter().any(|w| w.workspace_id == id && w.worktree.is_none() && w.label == record.title);
+        let named = |id: &str| listed.iter().any(|w| w.workspace_id == id && w.worktree.is_none() && w.label == title);
         thread::recorded_own_space(record, &listed).filter(|w| w.workspace_id != project_home).map(|w| w.workspace_id.clone()).or_else(|| {
             view.panes
                 .iter()
@@ -317,7 +325,7 @@ fn place_tab(project: &Project, view: &SessionView, record: &Thread) -> Result<T
             // rather than add a second tab for the same thread.
             match view.panes.iter().find(|p| p.workspace_id == home && !p.cwd.is_empty() && Path::new(&p.cwd).starts_with(&folder)) {
                 Some(pane) => crate::core::Created { workspace_id: pane.workspace_id.clone(), tab_id: pane.tab_id.clone(), pane_id: pane.pane_id.clone() },
-                None => view.herdr.tab_create(&home, &folder, &record.title, false)?,
+                None => view.herdr.tab_create(&home, &folder, &crate::labels::thread_tab_label(&record.id), false)?,
             }
         }
         // Its own Space, never a tab of the project's home: a restart first
@@ -325,11 +333,11 @@ fn place_tab(project: &Project, view: &SessionView, record: &Thread) -> Result<T
         // opens one only when that is really gone. A checkout thread is
         // placed the same way, on the repo's main checkout.
         Kind::Tab | Kind::Checkout => match own_space {
-            Some(id) => view.herdr.tab_create(&id, &folder, &record.title, false)?,
+            Some(id) => view.herdr.tab_create(&id, &folder, &crate::labels::thread_tab_label(&record.id), false)?,
             None => {
-                // Its own Space, its tab named after the thread, in the core label
-                // and in the app alike: `workspace_create` writes both.
-                view.herdr.workspace_create(&folder, &record.title, &record.title, false)?
+                // Its own Space, its tab named after the thread's id, in the core
+                // label and in the app alike: `workspace_create` writes both.
+                view.herdr.workspace_create(&folder, title, &crate::labels::thread_tab_label(&record.id), false)?
             }
         },
         Kind::Worktree | Kind::Adopted => bail!("a {:?} thread is not placed in a tab", record.kind),
@@ -480,7 +488,8 @@ pub fn restart(ctx: &Ctx, slug: &str, id: &str, profile: Option<&str>) -> Result
             RestartPlan::ReusePane => {}
             RestartPlan::Reopen => match record.kind {
                 Kind::Worktree => {
-                    let (created, path, cwd) = view.herdr.worktree_open(&record.repo, &record.worktree_path, &record.title)?;
+                    let (created, path, cwd) =
+                        view.herdr.worktree_open(&record.repo, &record.worktree_path, crate::labels::thread_space_label(&record.title), &crate::labels::thread_tab_label(&record.id))?;
                     let repo_workspace = repo_space(&view.herdr, &record.repo);
                     thread::update(&project, id, |t| {
                         if !repo_workspace.is_empty() {
@@ -1395,6 +1404,125 @@ mod tests {
         assert!(prompt_state(&t, &[agent("blocked")]).unwrap_err().to_string().contains("agent_blocked"));
         assert_eq!(prompt_state(&t, &[agent("working")]).unwrap(), "working");
         assert_eq!(prompt_state(&t, &[agent("idle")]).unwrap(), "idle");
+    }
+
+    /// A project with a live coordinator in its own Space (id `whome`), over a
+    /// fake core, so `place_tab` runs its real placement path in a test.
+    struct FakeProject {
+        core: crate::fake_hc::FakeCore,
+        project: Project,
+        /// Kept alive: the project lives under it.
+        _home: tempfile::TempDir,
+    }
+
+    impl FakeProject {
+        fn new() -> FakeProject {
+            let home = tempfile::tempdir().unwrap();
+            let project = crate::project::create(&home.path().join("root"), "demo", "", vec![]).unwrap();
+            let dir = project.canonical_dir().to_string_lossy().into_owned();
+            let core = crate::fake_hc::FakeCore::new();
+            let coordinator = core.terminal("hpc-demo", &dir, &[("hp_ws", "whome"), ("hp_ws_label", "Demo")]);
+            project
+                .update_coordinator(|c| {
+                    c.socket = String::new();
+                    c.workspace_id = "whome".into();
+                    c.tab_id = "whome-t".into();
+                    c.pane_id = coordinator.name.clone();
+                    c.cwd = dir.clone();
+                })
+                .unwrap();
+            FakeProject { core, project, _home: home }
+        }
+
+        fn view(&self) -> SessionView<'_> {
+            let herdr = Core::new("hc", "", &self.core);
+            let agents = herdr.agent_list().unwrap();
+            let panes = herdr.pane_list().unwrap();
+            SessionView { herdr, socket: String::new(), agents, panes }
+        }
+
+        /// The labels of the terminal a placement ended on.
+        fn labels_of(&self, pane: &str) -> std::collections::BTreeMap<String, String> {
+            self.core.terminals.borrow().iter().find(|t| t.name == pane).map(|t| t.labels.clone()).unwrap_or_default()
+        }
+
+        fn spaces(&self) -> Vec<crate::core::Workspace> {
+            Core::new("hc", "", &self.core).workspace_list().unwrap()
+        }
+    }
+
+    #[test]
+    fn a_restarted_tab_thread_finds_its_space_and_names_its_tab_after_the_id() {
+        let world = FakeProject::new();
+        let title = "线程命名 tab 用 id";
+        let record = thread::allocate(&world.project, |t| {
+            t.kind = Kind::Tab;
+            t.title = title.into();
+            t.status = Status::Open;
+            t.own_workspace = "wthread".into();
+        })
+        .unwrap();
+        let folder = world.project.dir().join("threads").join(&record.id);
+        std::fs::create_dir_all(&folder).unwrap();
+        let folder = std::fs::canonicalize(&folder).unwrap().to_string_lossy().into_owned();
+        // Its own Space as a restart finds it: the recorded id, the thread's
+        // title as the label, and no pane inside.
+        world.core.terminal("hp-own", &folder, &[("hp_ws", "wthread"), ("hp_ws_label", title)]);
+        let view = world.view();
+        let placed = place_tab(&world.project, &view, &record).unwrap();
+        assert_eq!(placed.workspace_id, "wthread", "the recorded Space is reused: no twin is made");
+        let labels = world.labels_of(&placed.pane_id);
+        assert_eq!(labels.get("hp_tab_label").map(String::as_str), Some(record.id.as_str()), "the tab is the thread's id");
+        assert_eq!(labels.get("hp_ws_label").map(String::as_str), Some(title), "the Space keeps the thread's title");
+        assert!(!world.spaces().iter().any(|w| w.workspace_id.starts_with("hpw-")), "no second Space");
+    }
+
+    #[test]
+    fn a_restarted_checkout_thread_finds_its_space_by_the_title_and_the_tab_by_the_id() {
+        let world = FakeProject::new();
+        let repo = tempfile::tempdir().unwrap();
+        let repo_path = std::fs::canonicalize(repo.path()).unwrap().to_string_lossy().into_owned();
+        let title = "checkout thread";
+        let record = thread::allocate(&world.project, |t| {
+            t.kind = Kind::Checkout;
+            t.title = title.into();
+            t.status = Status::Open;
+            t.repo = repo_path.clone();
+            t.own_workspace = "wcheck".into();
+        })
+        .unwrap();
+        // The Space is recognised by the thread's title, the only label a
+        // checkout thread can claim on its repository's main checkout.
+        world.core.terminal("hp-check", &repo_path, &[("hp_ws", "wcheck"), ("hp_ws_label", title)]);
+        let view = world.view();
+        let placed = place_tab(&world.project, &view, &record).unwrap();
+        assert_eq!(placed.workspace_id, "wcheck", "the recorded Space is reused, never the repo's or a twin");
+        let labels = world.labels_of(&placed.pane_id);
+        assert_eq!(labels.get("hp_tab_label").map(String::as_str), Some(record.id.as_str()));
+        assert_eq!(labels.get("hp_ws_label").map(String::as_str), Some(title));
+        assert!(!world.spaces().iter().any(|w| w.workspace_id.starts_with("hpw-")));
+    }
+
+    #[test]
+    fn a_restarted_home_thread_reuses_its_tab_in_the_project_space() {
+        let world = FakeProject::new();
+        let record = thread::allocate(&world.project, |t| {
+            t.kind = Kind::Home;
+            t.title = "home thread".into();
+            t.status = Status::Open;
+        })
+        .unwrap();
+        let folder = world.project.dir().join("threads").join(&record.id);
+        std::fs::create_dir_all(&folder).unwrap();
+        let folder = std::fs::canonicalize(&folder).unwrap().to_string_lossy().into_owned();
+        // A home thread has no Space of its own: the home is found from the
+        // project's record, and the tab by the folder it runs in.
+        world.core.terminal("hp-home-tab", &folder, &[("hp_ws", "whome"), ("hp_ws_label", "Demo")]);
+        let view = world.view();
+        let placed = place_tab(&world.project, &view, &record).unwrap();
+        assert_eq!(placed.pane_id, "hp-home-tab", "the tab the thread already has is reused");
+        assert_eq!(placed.workspace_id, "whome", "never a second home Space");
+        assert_eq!(world.spaces().len(), 1, "the project Space is the only one");
     }
 
     #[test]
