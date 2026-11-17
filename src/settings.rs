@@ -189,8 +189,9 @@ pub fn is_text(path: &Path) -> bool {
     !buf[..n].contains(&0)
 }
 
-/// `open-file <path> [--workspace W]`: a text file opens in a new Herdr tab
-/// running `$EDITOR`; anything else with the system opener. No viewer.
+/// `open-file <path> [--workspace W]`: a text file opens in an editor in this
+/// terminal (`$VISUAL`, else `$EDITOR`); anything else with the system opener.
+/// No viewer, and no tab: `--workspace` is ignored.
 pub fn open_file(ctx: &Ctx, path: &Path, _workspace: Option<&str>) -> Result<()> {
     let path = std::fs::canonicalize(path).with_context(|| format!("{} does not exist", path.display()))?;
     if path.is_dir() || !is_text(&path) {
