@@ -101,7 +101,12 @@ Rules that follow from this, worth keeping:
   none of them, so every check that read them was permanently false — `open`'s
   "start in this terminal", the lane a `context` reads, `lane adopt`, and
   `thread resolve`'s coordinator test all silently stopped working. Nothing in
-  `src/` reads a `HERDR_*` variable for identity any more.
+  `src/` reads a `HERDR_*` variable for identity any more, `overview` included:
+  the project of the terminal a command runs in (t-0040) is the `hp_project`
+  label this binary writes on the pane (`labels::report_pane`), else the Space
+  that pane is in — a Space is the terminals carrying one `hp_ws` label, since
+  core has no Space of its own — read from `panes`/`agent list` and the project
+  records, never from a variable.
 - **"Is the session alive" is a call, not a file test.** Every `Path::new(&record.socket).exists()`
   left in the code was a bug (see §6).
 
@@ -217,25 +222,30 @@ Ordered by what a user would notice first:
    §9's ordering and token-lease paragraphs are still the old host's design.
 3. **Tab order in the app is creation order.** Putting "needs you" first means
    `herdr-app do tab.move`, which is not implemented.
-4. **Remote machines are deleted, not ported.** `hc --on <machine>` was the
-   only mapping `Herdr::on_machine` had, `remote.rs` still read Herdr 1's
-   machine list (a program that no longer exists), and `hp assignable` printed
+4. **[closed] Remote machines are deleted, not ported.** `hc --on <machine>` was the
+   only mapping `Herdr::on_machine` had, and `hp assignable` printed
    `Machines: none` on a real machine, so the client dropped the feature:
    `remote.rs`, `--machine`, `Thread::machine`, the SSH/scp/rsync copies, the
    per-machine outage memory and `profile@machine` owners are gone. A record or
    a `TASKS.md` line written when it existed still loads; an `@machine` owner is
-   refused with a clear error.
+   refused with a clear error. Nothing on a remote is untested: there is no
+   remote path left.
 5. **`hp update` has no release feed.** It says which build this is and how to
    move it (`git pull`, `cargo build --release --locked`, `ticker stop && ticker
    start`), and `--check` says the same without changing anything. There is no
    feed to add until this build is published somewhere.
-6. **Test coverage is thinner than the old suite.** 259 unit tests, 7 CLI tests
-   and 5 adapter tests against `src/fake_hc.rs` (a fake core that answers the
-   `hc` commands this binary runs). The fake models terminals, labels, status,
-   `send`, `read`, `kill`; it does not model worktrees, the app, or waiting.
-   Growing it is the cheapest way to buy coverage back.
-7. **The branch is `port/herdr-core`** in the same clone; `main` still holds the
-   Herdr 1 plugin. Nothing is merged or published.
+6. **Test coverage is thinner than the old suite.** 273 unit tests (5 of them
+   the fake core's own), 7 CLI tests and 5 adapter tests against
+   `src/fake_hc.rs` (a fake core that answers the `hc` commands this binary
+   runs). The fake models terminals, labels, status, `send`, `read`, `kill`; it
+   does not model worktrees, the app, or waiting. Growing it is the cheapest way
+   to buy coverage back.
+7. **[closed] The branch has landed.** `port/herdr-core` is the fork's default
+   branch (`origin/port/herdr-core`), and PRs #26–#30 are merged into it: the
+   remote-machine deletion and dead code (#27), the three always-false checks
+   (#28), the ticker that cannot die silently (#30) and the routine/sidebar/
+   `hp-agent` rename (#29). It is still not published anywhere as a product: no
+   release feed, no crate, no install other than `scripts/link-command.sh`.
 
 ## 9. Where the code is
 
@@ -256,7 +266,7 @@ Ordered by what a user would notice first:
 
 ```bash
 cd ~/repos/herdr-projects
-cargo test --locked                 # 262 + 7 + 5
+cargo test --locked                 # 273 + 7
 cargo build --release --locked
 hp ticker stop && hp ticker start   # the ticker is a daemon: a rebuild does not reach it
 hp doctor

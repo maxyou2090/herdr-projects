@@ -122,6 +122,12 @@ pub struct Pane {
     pub terminal_id: String,
     #[serde(default)]
     pub focused: bool,
+    /// Every label the terminal carries (`hp_project`, `hp_ws`, …), as `hc get`
+    /// reports them. The pane's Space and its project are labels in core, so a
+    /// caller that wants "which project is this pane's" reads them here rather
+    /// than asking for the terminal twice.
+    #[serde(default)]
+    pub tokens: std::collections::BTreeMap<String, String>,
 }
 
 #[derive(Debug, Clone, Deserialize, PartialEq, Default)]
@@ -444,6 +450,7 @@ impl<'a> Herdr<'a> {
                 foreground_cwd: t.cwd(),
                 terminal_id: t.address.clone(),
                 focused: false,
+                tokens: t.labels.clone(),
             })
             .collect())
     }
@@ -719,6 +726,7 @@ impl<'a> Herdr<'a> {
             foreground_cwd: term.cwd(),
             terminal_id: term.address.clone(),
             focused: false,
+            tokens: term.labels.clone(),
         })
     }
 

@@ -1301,8 +1301,9 @@ fn require_lane(registry: &Registry, handle: &str) -> Result<Lane> {
     })
 }
 
-/// The project a lane command means: `--project`, else the current Herdr
-/// workspace's project, else the only project whose registry has that handle.
+/// The project a lane command means: `--project`, else the project of the
+/// terminal the command runs in, else the only project whose registry has that
+/// handle.
 /// Lane ids repeat across projects (`c-1` everywhere), so silence is never
 /// allowed to pick one.
 pub fn project_for_command(ctx: &Ctx, handle: &str, explicit: Option<&str>) -> Result<Project> {

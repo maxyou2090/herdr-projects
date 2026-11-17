@@ -211,7 +211,7 @@ pub fn run(ctx: &Ctx, slug: Option<&str>, json: bool) -> Result<()> {
         // The pane's own project, else nothing: a picker would block a sweep.
         None => match crate::overview::resolve_slug_quiet(ctx) {
             Some(slug) => slug,
-            None => bail!("no project resolves from this herdr workspace; pass one: `thread audit <slug>`"),
+            None => bail!("no project resolves from this terminal; pass one: `thread audit <slug>`"),
         },
     };
     let project = Project::load(&ctx.root, &slug)?;

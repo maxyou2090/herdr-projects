@@ -6,36 +6,82 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Result, bail};
 
+use crate::herdr::{Herdr, Pane};
 use crate::paths::Ctx;
 use crate::project::{self, Project, Status};
 use crate::thread::{self, Group};
 use crate::threads::{self, Row};
 
-/// The project a herdr workspace belongs to, only among projects whose
-/// recorded socket is the current one (workspace ids repeat across sessions).
-/// First by where the workspace's panes work (the focused pane first): in the
-/// project folder or in an open thread's worktree. Recorded ids go stale when
-/// a coordinator is reopened or started elsewhere, so they come second: the
-/// coordinator's workspace, a live coordinator's, or an open local thread's.
-pub fn project_for_workspace(ctx: &Ctx, workspace_id: &str, socket: &str) -> Option<String> {
-    if workspace_id.is_empty() || socket.is_empty() {
+/// Where this command runs, in core's terms: the terminal it sits in
+/// (`HC_TERMINAL_ID`) and that terminal's pane among the live panes of this
+/// session (`HC_SESSION`, empty for the default core). `None` outside a core
+/// terminal — the ticker, the app, a test — or when the session lists no such
+/// terminal any more, which is the same answer Herdr 1's variables gave by not
+/// being set at all.
+fn here(ctx: &Ctx) -> Option<(Pane, Vec<Pane>)> {
+    let terminal = ctx.env.this_terminal()?;
+    let herdr = Herdr::new(ctx.env.herdr_bin(), ctx.env.this_session(), ctx.runner);
+    let panes = herdr.pane_list().ok()?;
+    let mine = panes.iter().find(|pane| pane.terminal_id == terminal)?.clone();
+    Some((mine, panes))
+}
+
+/// The project the pane a command runs in belongs to, without asking.
+///
+/// This is the one place the port's identity question is answered
+/// (t-0040): herdr-core sets neither `HERDR_PANE_ID` nor `HERDR_WORKSPACE_ID`
+/// nor `HERDR_SOCKET_PATH`, so every lookup that read them answered `None` and
+/// `overview` silently printed the first project by name. Two answers, most
+/// precise first:
+///
+/// 1. the `hp_project` label this binary writes on the panes it starts and
+///    reports ([`crate::labels::report_pane`]); it survives a working directory
+///    that drifted to `~`, which is exactly where a coordinator usually sits;
+/// 2. the Space the pane is in — in core a Space is the set of terminals
+///    carrying the same `hp_ws` label — resolved by where its panes work and,
+///    failing that, by the ids the projects recorded.
+///
+/// `None` when neither answers, and never "the first project": an unknown
+/// pane must leave `overview` on its picker and `thread audit` on all projects.
+/// A pane that is neither a project's nor a thread's (a shell opened in `~`, a
+/// terminal of another session) is such a case.
+pub fn resolve_slug_quiet(ctx: &Ctx) -> Option<String> {
+    let (mine, panes) = here(ctx)?;
+    labelled(ctx, &mine).or_else(|| project_for_space(ctx, &panes, &mine))
+}
+
+/// The project a pane's `hp_project` label names, when that project is still
+/// there and not archived. A label naming a deleted project is no answer.
+fn labelled(ctx: &Ctx, pane: &Pane) -> Option<String> {
+    let slug = pane.tokens.get(crate::labels::PROJECT_TOKEN)?.clone();
+    Project::load(&ctx.root, &slug).ok().filter(|p| p.status() != Status::Archived).map(|p| p.slug)
+}
+
+/// The project a Space belongs to, only among projects recorded in the same
+/// session (space ids repeat across sessions). First by where the Space's
+/// panes work (the reader's own pane first): in the project folder or in an
+/// open thread's worktree. Recorded ids go stale when a coordinator is
+/// reopened or started elsewhere, so they come second: the coordinator's
+/// Space, a live coordinator's, or an open local thread's.
+fn project_for_space(ctx: &Ctx, panes: &[Pane], mine: &Pane) -> Option<String> {
+    let workspace_id = mine.workspace_id.as_str();
+    if workspace_id.is_empty() {
         return None;
     }
+    let session = crate::herdr::session_key(ctx.env.this_session());
     let projects: Vec<(Project, crate::project::Coordinator)> = project::list_slugs(&ctx.root)
         .into_iter()
         .filter_map(|slug| Project::load(&ctx.root, &slug).ok())
         .filter(|p| p.status() != Status::Archived)
-        .filter_map(|p| p.coordinator().filter(|r| r.socket == socket).map(|r| (p, r)))
+        .filter_map(|p| p.coordinator().filter(|r| crate::herdr::session_key(&r.socket) == session).map(|r| (p, r)))
         .collect();
     if projects.is_empty() {
         return None;
     }
-    let herdr = crate::herdr::Herdr::new(ctx.env.herdr_bin(), socket, ctx.runner);
-    let mut panes: Vec<crate::herdr::Pane> = herdr.pane_list().unwrap_or_default().into_iter().filter(|p| p.workspace_id == workspace_id).collect();
-    let focused = ctx.env.var("HERDR_PANE_ID").unwrap_or("");
-    panes.sort_by_key(|p| p.pane_id != focused);
+    let mut members: Vec<&Pane> = panes.iter().filter(|pane| pane.workspace_id == workspace_id).collect();
+    members.sort_by_key(|pane| pane.terminal_id != mine.terminal_id);
     let open_threads = |project: &Project| thread::list(project).into_iter().filter(|t| t.status != thread::Status::Resolved).collect::<Vec<_>>();
-    for pane in &panes {
+    for pane in members {
         for dir in [&pane.foreground_cwd, &pane.cwd].into_iter().filter(|d| !d.is_empty()) {
             let dir = Path::new(dir);
             let found = projects.iter().find(|(project, record)| {
@@ -63,29 +109,21 @@ fn canonical(path: &str) -> PathBuf {
     std::fs::canonicalize(path).unwrap_or_else(|_| PathBuf::from(path))
 }
 
-/// The current workspace's project, without asking.
-pub fn resolve_slug_quiet(ctx: &Ctx) -> Option<String> {
-    let workspace = ctx.env.var("HERDR_WORKSPACE_ID").unwrap_or("");
-    let socket = ctx.env.var("HERDR_SOCKET_PATH").unwrap_or("");
-    project_for_workspace(ctx, workspace, socket)
-}
-
+#[derive(Debug, PartialEq, Eq)]
 pub enum Resolved {
     Slug(String),
     /// Nothing resolved and there is no terminal to ask on.
     All,
 }
 
-/// An explicit slug, else the current herdr workspace, else a numbered picker
-/// when on a terminal, else every project.
+/// An explicit slug, else the project of the terminal this command runs in,
+/// else a numbered picker when on a terminal, else every project.
 pub fn resolve_slug(ctx: &Ctx, slug: Option<&str>) -> Result<Resolved> {
     if let Some(slug) = slug {
         project::validate_slug(slug)?;
         return Ok(Resolved::Slug(slug.to_string()));
     }
-    let workspace = ctx.env.var("HERDR_WORKSPACE_ID").unwrap_or("");
-    let socket = ctx.env.var("HERDR_SOCKET_PATH").unwrap_or("");
-    if let Some(slug) = project_for_workspace(ctx, workspace, socket) {
+    if let Some(slug) = resolve_slug_quiet(ctx) {
         return Ok(Resolved::Slug(slug));
     }
     if std::io::stdin().is_terminal() && std::io::stdout().is_terminal() {
@@ -187,4 +225,109 @@ pub fn run(ctx: &Ctx, slug: Option<&str>, wait: bool) -> Result<()> {
         let _ = std::io::stdin().lock().read_line(&mut line);
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::fake_hc::FakeCore;
+    use crate::herdr::L_WS;
+    use crate::paths::Env;
+
+    /// A projects root plus a fake core that answers `hc`: the two things
+    /// identity resolution reads. `HC_SESSION` stays unset, which is the
+    /// default core.
+    struct World {
+        home: tempfile::TempDir,
+        core: FakeCore,
+    }
+
+    impl World {
+        fn new() -> World {
+            World { home: tempfile::tempdir().unwrap(), core: FakeCore::new() }
+        }
+
+        fn project(&self, name: &str) -> Project {
+            project::create(&self.home.path().join("root"), name, "", vec![]).unwrap()
+        }
+
+        fn dir(&self, project: &Project) -> String {
+            project.canonical_dir().to_string_lossy().into_owned()
+        }
+
+        /// A `Ctx` as the given core terminal would see it; `terminal` empty
+        /// stands for a process core started for no terminal at all.
+        fn ctx(&self, terminal: &str) -> Ctx<'_> {
+            let env = Env::for_test(self.home.path(), &[("HC_TERMINAL_ID", terminal)]);
+            Ctx {
+                env: Box::leak(Box::new(env)),
+                root: self.home.path().join("root"),
+                config_dir: self.home.path().join("cfg"),
+                runner: &self.core,
+                detached_ticker: false,
+            }
+        }
+    }
+
+    #[test]
+    fn a_command_in_a_projects_terminal_reads_that_project() {
+        let world = World::new();
+        let alpha = world.project("alpha");
+        let beta = world.project("beta");
+        // Alpha is first by name, so reading `beta` back proves the terminal
+        // decided it and not the list order — the bug t-0040 fixed.
+        let alpha_pane = world.core.terminal("hp-alpha", &world.dir(&alpha), &[(crate::labels::PROJECT_TOKEN, "alpha"), (L_WS, "ws-alpha")]);
+        let beta_pane = world.core.terminal("hp-beta", &world.dir(&beta), &[(crate::labels::PROJECT_TOKEN, "beta"), (L_WS, "ws-beta")]);
+        let ctx = world.ctx(&beta_pane.address);
+        assert_eq!(resolve_slug_quiet(&ctx).as_deref(), Some("beta"));
+        assert_eq!(resolve_slug(&ctx, None).unwrap(), Resolved::Slug("beta".into()));
+        let ctx = world.ctx(&alpha_pane.address);
+        assert_eq!(resolve_slug_quiet(&ctx).as_deref(), Some("alpha"));
+        assert_eq!(resolve_slug(&ctx, None).unwrap(), Resolved::Slug("alpha".into()));
+    }
+
+    #[test]
+    fn a_pane_with_no_label_is_known_by_its_space() {
+        let world = World::new();
+        let alpha = world.project("alpha");
+        world.project("beta");
+        let dir = world.dir(&alpha);
+        // The project's own record: a coordinator opened in the default
+        // session, in this Space.
+        alpha
+            .update_coordinator(|record| {
+                record.socket = String::new();
+                record.workspace_id = "ws-alpha".into();
+                record.cwd = dir.clone();
+            })
+            .unwrap();
+        // A plain shell in the project folder: it carries no `hp_project`.
+        let shell = world.core.terminal("hp-alpha-shell", &dir, &[(L_WS, "ws-alpha")]);
+        let ctx = world.ctx(&shell.address);
+        assert_eq!(resolve_slug_quiet(&ctx).as_deref(), Some("alpha"));
+        // A pane that drifted out of the folder says nothing about a project by
+        // where it works (a coordinator often sits in `~`); the Space id it was
+        // recorded with still does.
+        let drifted = world.core.terminal("hp-alpha-coordinator", world.home.path().to_str().unwrap(), &[(L_WS, "ws-alpha")]);
+        let ctx = world.ctx(&drifted.address);
+        assert_eq!(resolve_slug_quiet(&ctx).as_deref(), Some("alpha"));
+    }
+
+    #[test]
+    fn an_unrecognized_terminal_resolves_to_nothing_never_to_one_project() {
+        let world = World::new();
+        let alpha = world.project("alpha");
+        world.core.terminal("hp-alpha", &world.dir(&alpha), &[(crate::labels::PROJECT_TOKEN, "alpha"), (L_WS, "ws-alpha")]);
+        // A terminal this session does not list: another session, a closed tab.
+        let ctx = world.ctx("t-gone");
+        assert_eq!(resolve_slug_quiet(&ctx), None);
+        assert_eq!(resolve_slug(&ctx, None).unwrap(), Resolved::All, "an unknown pane reads every project, not the first one");
+        // No terminal at all: the ticker, the app, a test.
+        let ctx = world.ctx("");
+        assert_eq!(resolve_slug_quiet(&ctx), None);
+        // A label naming a project that is not there is no answer either.
+        let ghost = world.core.terminal("hp-ghost", "/tmp", &[(crate::labels::PROJECT_TOKEN, "ghost"), (L_WS, "ws-ghost")]);
+        let ctx = world.ctx(&ghost.address);
+        assert_eq!(resolve_slug_quiet(&ctx), None);
+    }
 }
