@@ -557,8 +557,8 @@ impl<'a> Herdr<'a> {
 
     pub fn workspace_create(&self, cwd: &Path, label: &str, _focus: bool) -> Result<Created, HerdrError> {
         let ws = self.next_id("hpw", label)?;
-        let tab = format!("{ws}-t1");
-        let name = self.next_name(&ws, 1)?;
+        let tab = format!("{ws}-t");
+        let name = self.next_name(label)?;
         let argv: Vec<String> = Vec::new();
         let term = self.start(
             &name,
@@ -576,9 +576,9 @@ impl<'a> Herdr<'a> {
             .find(|t| t.label(L_WS) == workspace)
             .map(|t| t.label(L_WS_LABEL))
             .unwrap_or_default();
-        let used = existing.iter().filter(|t| t.label(L_WS) == workspace).count();
-        let tab = format!("{workspace}-t{}", used + 1);
-        let name = self.next_name(workspace, used + 1)?;
+        let _ = existing;
+        let tab = format!("{}-{}", workspace, suffix());
+        let name = self.next_name(label)?;
         let term = self.start(
             &name,
             cwd,
@@ -870,32 +870,41 @@ impl<'a> Herdr<'a> {
         Ok(())
     }
 
-    /// `hpw-<label>-<n>`, unique among the terminals this session has.
+    /// `hpw-<label>-<suffix>`, unique among the terminals this session has.
+    ///
+    /// The suffix is random, not a count: ids outlive the terminals that carried
+    /// them (thread records, coordinator records, a digest), and a count hands an
+    /// old id to a new terminal the moment one closes — which is how closing a
+    /// thread's tab once closed the coordinator in the same tab id.
     fn next_id(&self, prefix: &str, label: &str) -> Result<String, HerdrError> {
-        let slug = slug(label);
         let used: Vec<String> = self.terminals()?.iter().map(|t| t.label(L_WS)).collect();
-        let mut n = 1;
-        loop {
-            let id = format!("{prefix}-{slug}-{n}");
-            if !used.iter().any(|u| u == &id) {
-                return Ok(id);
-            }
-            n += 1;
+        let mut id = format!("{prefix}-{}-{}", slug(label), suffix());
+        while used.iter().any(|u| u == &id) {
+            id = format!("{prefix}-{}-{}", slug(label), suffix());
         }
+        Ok(id)
     }
 
     /// A terminal name core accepts: 1-32 of a-z 0-9 - _ .
-    fn next_name(&self, workspace: &str, n: usize) -> Result<String, HerdrError> {
-        let base = format!("hp-{}-{n}", slug(workspace.trim_start_matches("hpw-")));
+    fn next_name(&self, label: &str) -> Result<String, HerdrError> {
         let used: Vec<String> = self.terminals()?.iter().map(|t| t.pane_id()).collect();
-        let mut name = truncate_name(&base);
-        let mut n = n;
+        let mut name = truncate_name(&format!("hp-{}-{}", slug(label), suffix()));
         while used.contains(&name) {
-            n += 1;
-            name = truncate_name(&format!("{base}-{n}"));
+            name = truncate_name(&format!("hp-{}-{}", slug(label), suffix()));
         }
         Ok(name)
     }
+}
+
+/// Six hex digits that make an id unique within a machine's lifetime: the
+/// nanosecond clock with this process's pid mixed in.
+fn suffix() -> String {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.subsec_nanos() as u64 ^ d.as_secs())
+        .unwrap_or_default();
+    let mixed = nanos ^ ((std::process::id() as u64) << 20);
+    format!("{:06x}", mixed & 0xff_ffff)
 }
 
 impl Agent {
