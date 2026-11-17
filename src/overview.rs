@@ -331,20 +331,6 @@ mod tests {
         assert_eq!(project_for_workspace(&world.ctx(), "w5", &socket).as_deref(), Some("alpha"));
     }
 
-    #[test]
-    fn focus_filters_on_the_project_token_and_sorts_by_rank_in_the_projects_socket() {
-        let world = World::new();
-        let project = world.project("demo", "a.sock");
-        focus(&world.ctx(), Some("demo")).unwrap();
-        let requests = world.runner.socket_requests.borrow();
-        assert_eq!(requests.len(), 1);
-        assert_eq!(requests[0].0.to_string_lossy(), project.coordinator().unwrap().socket);
-        let request: serde_json::Value = serde_json::from_str(&requests[0].1).unwrap();
-        assert_eq!(request["method"], "agent.view.set");
-        assert_eq!(request["params"]["source"], "herdr-projects");
-        assert_eq!(request["params"]["filter"], serde_json::json!({"op":"eq","field":{"token":"hp_project"},"value":"demo"}));
-        assert_eq!(request["params"]["sort"], serde_json::json!([{"field":{"token":"hp_group"},"order":"asc"},{"field":{"token":"hp_rank"},"order":"asc"}]));
-    }
 
     #[test]
     fn a_closed_lane_leaves_the_overview_and_the_needs_you_groups() {

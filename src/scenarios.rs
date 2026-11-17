@@ -1579,14 +1579,14 @@ fn a_merged_thread_whose_agent_stays_idle_is_resolved_after_the_grace_period() {
 
 /// The agent's own progress report, as `herdr-projects report` writes it. The
 /// thread's pane is listed too, or the ticker drops the record as stale.
-fn thread_progress(world: &World, project: &Project, percent: u8, activity: &str) {
+fn thread_progress(world: &World, project: &Project, done: bool, activity: &str) {
     let cwd = world.home.path().to_string_lossy().into_owned();
     *world.panes.borrow_mut() = format!("[{},{}]", world.coordinator_pane(project), pane_json("w2", "w2:t1", "w2:p1", &cwd));
     let record = crate::progress::Record {
         socket: project.coordinator().unwrap().socket,
         pane_id: "w2:p1".into(),
         activity: activity.into(),
-        percent: Some(percent),
+        done,
         reported_at: jiff::Timestamp::now().as_second(),
         ..Default::default()
     };
@@ -1600,7 +1600,7 @@ fn thread_progress(world: &World, project: &Project, percent: u8, activity: &str
 #[test]
 fn a_merged_thread_that_reports_work_in_progress_is_not_resolved() {
     let (world, project) = merged_world("done");
-    thread_progress(&world, &project, 70, "Waiting on CI");
+    thread_progress(&world, &project, false, "Waiting on CI");
     let ctx = world.ctx();
     ticker::tick_project(&ctx, &project).unwrap();
     merged_seen_ago(&project, 60);
@@ -1616,7 +1616,7 @@ fn a_merged_thread_that_reports_work_in_progress_is_not_resolved() {
     assert_eq!(world.runner.count("worktree remove"), 0);
 
     // It finishes the rollout and says so: resolved on the next pass.
-    thread_progress(&world, &project, 100, "Done");
+    thread_progress(&world, &project, true, "Done");
     ticker::tick_project(&ctx, &project).unwrap();
     let t = thread::load(&project, "t-0001").unwrap();
     assert_eq!((t.status, t.resolved_reason.as_str()), (Status::Resolved, "merged"));
@@ -1627,7 +1627,7 @@ fn a_merged_thread_that_reports_work_in_progress_is_not_resolved() {
 #[test]
 fn a_merged_thread_with_another_open_pull_request_is_not_resolved() {
     let (world, project) = merged_world("done");
-    thread_progress(&world, &project, 100, "Done");
+    thread_progress(&world, &project, true, "Done");
     let open = Rc::new(RefCell::new(r#"[{"number":8}]"#.to_string()));
     let answer = open.clone();
     world.runner.on_fn(|cmd| cmd.display().contains("gh pr list --repo owner/app --state open --author @me"), move |_| Ok(ok(&answer.borrow())));

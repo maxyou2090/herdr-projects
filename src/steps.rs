@@ -1244,11 +1244,11 @@ fn merged_thread_may_resolve(t: &Thread, seen: &str, now: jiff::Timestamp) -> bo
     if busy {
         return false;
     }
-    // An agent that reports progress says when it is finished: only `Done`
-    // counts, and no timeout overrides a lower percentage. Waiting on CI or a
-    // rollout in background shells reads as idle.
-    if t.percent.is_some() || !t.activity.is_empty() {
-        return t.percent == Some(100);
+    // An agent that reports progress says when it is finished: only a `--done`
+    // report counts, and no timeout overrides a plain activity. Waiting on CI or
+    // a rollout in background shells reads as idle.
+    if !t.activity.is_empty() {
+        return t.activity == crate::progress::DONE;
     }
     let Ok(seen) = seen.parse::<jiff::Timestamp>() else {
         return true;

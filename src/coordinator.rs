@@ -869,12 +869,11 @@ fn start_when_shell_ready(herdr: &Herdr, name: &str, kind: &str, pane: &str, arg
 /// A coordinator's sidebar group and line 3, from Herdr's state and its own report.
 pub fn row_state(pane: &LivePane, report: Option<&crate::progress::Record>) -> (crate::thread::Group, String) {
     use crate::thread::Group;
-    let percent = report.and_then(|r| r.percent).filter(|p| *p < 100).map(|p| format!(" · ~{p}%")).unwrap_or_default();
     let waiting = report.is_some_and(|r| r.waiting()) && pane.agent_status != "working";
     if pane.agent_status == "blocked" || waiting {
-        (Group::WaitingOnYou, format!("needs you{percent}"))
+        (Group::WaitingOnYou, "needs you".into())
     } else if pane.agent_status == "working" {
-        (Group::Working, format!("working{percent}"))
+        (Group::Working, "working".into())
     } else {
         (Group::Idle, "idle".into())
     }

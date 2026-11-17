@@ -238,13 +238,13 @@ enum Command {
     },
     /// Open a URL (a pull request) in the browser
     OpenUrl { url: String },
-    /// Report your progress (run by an agent in its own Herdr pane)
+    /// Report what the agent is doing (run by an agent in its own terminal)
     Report {
-        #[arg(long, value_parser = clap::value_parser!(u8).range(0..=100), required_unless_present = "unknown", conflicts_with = "unknown")]
-        percent: Option<u8>,
+        /// The whole requested outcome and its checks are finished
         #[arg(long)]
-        unknown: bool,
-        #[arg(long)]
+        done: bool,
+        /// Two to four words; `Waiting for you` before asking the user something
+        #[arg(long, default_value = "")]
         activity: String,
     },
     /// Print the progress record of this pane, or of --pane
@@ -986,7 +986,7 @@ pub fn run() -> Result<()> {
             }
             Ok(())
         }
-        Command::Report { percent, unknown: _, activity } => crate::progress::report(&ctx, percent, &activity),
+        Command::Report { done, activity } => crate::progress::report(&ctx, done, &activity),
         Command::Progress { pane } => crate::progress::print(&ctx, pane.as_deref()),
         Command::Update { check } => crate::update::run(&ctx, check),
         Command::Ticker { command } => match command {

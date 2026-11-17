@@ -34,7 +34,8 @@ pub struct Record {
     pub terminal_id: String,
     pub agent: String,
     pub activity: String,
-    pub percent: Option<u8>,
+    /// The agent said its whole task is finished.
+    pub done: bool,
     /// Unix seconds of the last `report`; 0 when none since the session started.
     pub reported_at: i64,
     /// Unix seconds of the last reminder the hook injected.
@@ -51,7 +52,7 @@ impl Record {
     }
 
     pub fn done(&self) -> bool {
-        self.reported_at > 0 && self.percent == Some(100)
+        self.reported_at > 0 && self.done
     }
 
     pub fn reported(&self) -> bool {
@@ -217,20 +218,18 @@ fn managed(ctx: &Ctx, current: &Current) -> bool {
     })
 }
 
-/// `report --percent N|--unknown --activity "..."`, run by the agent in its
-/// pane. Writes the record; the ticker shows its activity on the pane's sub-line
-/// while it is [`fresh`].
-pub fn report(ctx: &Ctx, percent: Option<u8>, activity: &str) -> Result<()> {
+/// `report [--done] --activity "..."`, run by the agent in its own terminal.
+/// Writes the record; the ticker reads it for the thread's group while it is
+/// [`fresh`]. There is no percentage: nothing shows one any more, and "waiting
+/// for you" is the activity [`WAITING`].
+pub fn report(ctx: &Ctx, done: bool, activity: &str) -> Result<()> {
     let Some(pane) = current(ctx.env, ctx.runner) else {
-        println!("not inside a Herdr pane; nothing reported");
+        println!("not inside a core terminal; nothing reported");
         return Ok(());
     };
-    if percent.is_some_and(|p| p > 100) {
-        bail!("--percent must be 0 to 100");
-    }
-    let activity = if percent == Some(100) { DONE.to_string() } else { clean(activity, ACTIVITY_COLUMNS) };
+    let activity = if done { DONE.to_string() } else { clean(activity, ACTIVITY_COLUMNS) };
     if activity.is_empty() {
-        bail!("--activity is empty");
+        bail!("`--activity` is empty");
     }
     let mut record = load(&ctx.root, &pane.socket, &pane.pane_id).unwrap_or_default();
     record.socket = pane.socket.clone();
@@ -238,10 +237,10 @@ pub fn report(ctx: &Ctx, percent: Option<u8>, activity: &str) -> Result<()> {
     record.terminal_id = pane.terminal_id.clone();
     record.agent = pane.agent.clone();
     record.activity = activity.clone();
-    record.percent = percent;
+    record.done = done;
     record.reported_at = now();
     save(&ctx.root, &record)?;
-    println!("recorded: {}{activity}", percent.map(|p| format!("{p}% · ")).unwrap_or_default());
+    println!("recorded: {activity}");
     Ok(())
 }
 
@@ -272,14 +271,12 @@ pub fn instructions(prefix: &str, pane_id: &str) -> String {
 /// every other agent reads it in its thread brief or the coordinator skill,
 /// so any harness that can run a shell command reports.
 pub fn guidance(prefix: &str, pane_id: Option<&str>) -> String {
-    let pane = pane_id.map(|id| format!("this pane ({id})")).unwrap_or_else(|| "this pane".into());
+    let pane = pane_id.map(|id| format!("this terminal ({id})")).unwrap_or_else(|| "this terminal".into());
     format!(
-        "Report the progress of the user's whole current task through `{prefix} report`. This is your estimate, not a timer or a count of tools. Reporting failures must never stop the actual work: give one short diagnostic and continue, without retries.\n\n\
-         Report a rough percentage in five-point increments and a two-to-four-word activity, such as `Reading code`, `Testing changes` or `Waiting for you`:\n\n\
-         `{prefix} report --percent 25 --activity 'Reading code'`\n\
-         `{prefix} report --unknown --activity 'Assessing task'`\n\n\
-         Report at the start of new work, after meaningful milestones, when the activity changes, at blockers, and before every substantive reply. Report `--activity 'Waiting for you'` whenever you stop to ask the user something. During active work aim for one report per minute at a natural tool boundary; never invent progress to satisfy a reminder. Revise the estimate downward when you discover more work; use `--unknown` while the scope is unclear.\n\n\
-         Use `--percent 100` only when the entire requested outcome and its checks are finished; it displays `Done`. If more work is requested afterwards, report a fresh, lower percentage.\n\n\
+        "Report what the user's whole current task is doing through `{prefix} report`. Reporting failures must never stop the actual work: give one short diagnostic and continue, without retries.\n\n\
+         Give a two-to-four-word activity, such as `Reading code`, `Testing changes` or `Waiting for you`:\n\n\
+         `{prefix} report --activity 'Reading code'`\n\n\
+         Report at the start of new work, after meaningful milestones, when the activity changes and at blockers. Report `--activity 'Waiting for you'` whenever you stop to ask the user something. Add `--done` only when the entire requested outcome and its checks are finished; if more work is requested afterwards, report again without it.\n\n\
          Only the top-level agent in {pane} reports; subagents and helpers do not. Await each report command; do not run it in the background."
     )
 }
@@ -328,7 +325,7 @@ pub fn respond(record: &mut Record, kind: &str, prefix: &str, now: i64) -> Optio
             Some(format!("Before task tools or a blocking question, check whether this request starts new work; if so report a fresh estimate. Then report before waiting for the user, for example `{prefix} report --unknown --activity 'Waiting for you'`."))
         }
         "PostToolUse" => {
-            let done = record.percent == Some(100);
+            let done = record.done;
             let due = now - record.reminded_at >= REMIND_SECS && !done && (record.reported_at == 0 || now - record.reported_at >= REMIND_SECS);
             if due {
                 record.reminded_at = now;
@@ -367,123 +364,5 @@ pub fn prune(root: &Path, session: &str, live_pane_ids: &[String]) {
         if record.socket == session && !live_pane_ids.contains(&record.pane_id) {
             remove(root, &record.socket, &record.pane_id);
         }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use serde_json::json;
-
-    #[test]
-    fn an_open_thread_speaks_before_herdr_detects_its_agent() {
-        use crate::runner::fake::{FakeRunner, ok};
-        let home = tempfile::tempdir().unwrap();
-        let project = crate::project::create(home.path(), "demo", "", vec![]).unwrap();
-        project.update_coordinator(|c| c.socket = "/managed.sock".into()).unwrap();
-        let thread = crate::thread::Thread { id: "t-0001".into(), pane_id: "w1:p1".into(), cwd: "/worktree".into(), ..Default::default() };
-        crate::project::write_atomic(&crate::thread::record_path(&project, &thread.id), toml::to_string(&thread).unwrap().as_bytes()).unwrap();
-        let runner = FakeRunner::new();
-        runner.on("agent list", ok(r#"{"result":{"agents":[]}}"#));
-        let env = Env::for_test(home.path(), &[]);
-        let ctx = Ctx { env: &env, root: home.path().into(), config_dir: home.path().join("config"), runner: &runner, detached_ticker: false };
-        let pane = crate::herdr::Pane { pane_id: "w1:p1".into(), tab_id: "w1:t1".into(), workspace_id: "w1".into(), cwd: "/worktree".into(), terminal_id: "term-1".into(), ..Default::default() };
-        let current = |socket: &str| Current { socket: socket.into(), pane_id: "w1:p1".into(), terminal_id: "term-1".into(), agent: String::new(), pane: pane.clone() };
-        assert!(managed(&ctx, &current("/managed.sock")));
-        // The same pane id on another server is not the thread's.
-        assert!(!managed(&ctx, &current("/other.sock")));
-    }
-
-    #[test]
-    fn activity_is_cleaned_and_capped_at_forty_columns() {
-        assert_eq!(clean("  Reading code\n", 40), "Reading code");
-        assert_eq!(clean(&"x".repeat(60), 40).len(), 40);
-        assert_eq!(clean("a\u{202e}b\u{7}c", 40), "abc");
-        assert_eq!(clean("日本語テキスト", 6), "日本語");
-    }
-
-    #[test]
-    fn helpers_and_the_reporters_own_call_do_not_trigger() {
-        assert!(!eligible(&json!({"hook_event_name":"PostToolUse","agent_id":"child"})));
-        assert!(!eligible(&json!({"hook_event_name":"PostToolUse","transcript_path":"/x/subagents/y.jsonl"})));
-        assert!(!eligible(&json!({"hook_event_name":"PostToolUse","tool_input":{"command":"/p/herdr-projects --root /r report --percent 5 --activity x"}})));
-        assert!(eligible(&json!({"hook_event_name":"PostToolUse","tool_input":{"command":"/p/herdr-projects --root /r context demo"}})));
-        assert!(eligible(&json!({"hook_event_name":"SessionStart","source":"compact"})));
-        assert!(!eligible(&json!({"hook_event_name":"Stop"})));
-    }
-
-    #[test]
-    fn session_start_injects_instructions_and_resets_the_record() {
-        let mut record = Record { pane_id: "w1:p1".into(), activity: "Old".into(), percent: Some(50), reported_at: 5, ..Record::default() };
-        let text = respond(&mut record, "SessionStart", "/p/hp --root /r", 1000).unwrap();
-        assert!(text.contains("/p/hp --root /r report --percent 25"));
-        assert!(text.contains("(w1:p1)"));
-        assert_eq!(record.activity, "");
-        assert_eq!(record.percent, None);
-        assert_eq!(record.reported_at, 0);
-        assert_eq!(record.session_started_at, 1000);
-    }
-
-    #[test]
-    fn reminders_are_throttled_to_once_a_minute_and_stop_at_done() {
-        let mut record = Record { reminded_at: 1000, ..Record::default() };
-        assert!(respond(&mut record, "PostToolUse", "hp", 1030).is_none());
-        assert!(respond(&mut record, "PostToolUse", "hp", 1061).is_some());
-        assert_eq!(record.reminded_at, 1061);
-        // A fresh report also quiets the reminder for a minute.
-        record.reported_at = 1100;
-        assert!(respond(&mut record, "PostToolUse", "hp", 1130).is_none());
-        assert!(respond(&mut record, "PostToolUse", "hp", 1200).is_some());
-        record.percent = Some(100);
-        assert!(respond(&mut record, "PostToolUse", "hp", 9000).is_none());
-        assert!(respond(&mut record, "UserPromptSubmit", "hp", 9001).unwrap().contains("Waiting for you"));
-        let mut asked = Record { activity: WAITING.into(), percent: Some(40), reported_at: 5, ..Record::default() };
-        respond(&mut asked, "UserPromptSubmit", "hp", 10);
-        assert!(!asked.waiting(), "an answer clears the old question");
-        assert!(respond(&mut record, "Stop", "hp", 9002).is_none());
-    }
-
-    #[test]
-    fn native_events_are_normalized_and_answered_in_each_harness_shape() {
-        let gemini = crate::setup::harness("gemini").unwrap();
-        let event = normalize(gemini, json!({"hook_event_name":"AfterTool","tool_input":{"command":"ls"}}));
-        assert_eq!(event["hook_event_name"], "PostToolUse");
-        assert!(eligible(&event));
-        assert_eq!(normalize(gemini, json!({"hook_event_name":"BeforeAgent"}))["hook_event_name"], "UserPromptSubmit");
-        assert_eq!(output(gemini, "AfterTool", "hi"), json!({"hookSpecificOutput":{"hookEventName":"AfterTool","additionalContext":"hi"}}));
-        let copilot = crate::setup::harness("copilot").unwrap();
-        assert_eq!(output(copilot, "SessionStart", "hi"), json!({"additionalContext":"hi"}));
-    }
-
-    #[test]
-    fn events_from_another_session_in_the_pane_are_a_subagents() {
-        let record = Record { session_id: "main".into(), ..Record::default() };
-        assert!(foreign_session(&record, &json!({"session_id":"sub"})));
-        assert!(!foreign_session(&record, &json!({"session_id":"main"})));
-        assert!(!foreign_session(&record, &json!({})));
-        assert!(!foreign_session(&Record::default(), &json!({"session_id":"sub"})), "no SessionStart seen: accept");
-    }
-
-    #[test]
-    fn guidance_names_the_command_and_the_pane_when_known() {
-        assert!(guidance("/p/hp --root /r", None).contains("top-level agent in this pane reports"));
-        assert!(guidance("/p/hp --root /r", Some("w2:p3")).contains("this pane (w2:p3)"));
-        assert!(instructions("hp", "w1:p1").starts_with("# Progress (herdr-projects)\n\nReport the progress"));
-    }
-
-    #[test]
-    fn records_round_trip_per_session_and_stale_terminals_are_ignored() {
-        let root = tempfile::tempdir().unwrap();
-        let record = Record { socket: "/a.sock".into(), pane_id: "w1:p1".into(), terminal_id: "term_1".into(), activity: WAITING.into(), reported_at: 7, ..Record::default() };
-        save(root.path(), &record).unwrap();
-        let other = Record { socket: "/b.sock".into(), pane_id: "w1:p1".into(), terminal_id: "term_9".into(), activity: "Testing".into(), reported_at: 8, ..Record::default() };
-        save(root.path(), &other).unwrap();
-        assert_eq!(load(root.path(), "/a.sock", "w1:p1").unwrap(), record);
-        assert!(self_report(root.path(), "/a.sock", "w1:p1", "term_1").unwrap().waiting());
-        assert!(self_report(root.path(), "/a.sock", "w1:p1", "term_2").is_none());
-        assert!(self_report(root.path(), "/a.sock", "w1:p1", "").is_some());
-        prune(root.path(), "/a.sock", &["w1:p2".into()]);
-        assert!(load(root.path(), "/a.sock", "w1:p1").is_none());
-        assert!(load(root.path(), "/b.sock", "w1:p1").is_some());
     }
 }

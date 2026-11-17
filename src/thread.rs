@@ -152,9 +152,8 @@ pub struct Thread {
     /// repository's `info/exclude` (a thread placed before `prepare` wrote
     /// it); checked once per thread, not every tick.
     pub agents_excluded: bool,
-    /// The agent's own last activity and percent (local threads).
+    /// The agent's own last activity (local threads).
     pub activity: String,
-    pub percent: Option<u8>,
     /// The lane this thread belongs to: its **id**, never its name, so
     /// renaming a lane touches no thread file (`docs/lanes.md` §4.2). Empty
     /// on every record written before lanes; empty reads as the default lane,
@@ -499,7 +498,7 @@ pub fn compose_brief(input: &BriefInput) -> String {
 
     brief.push_str("\n# Progress\n\n");
     if input.report_prefix.is_empty() {
-        brief.push_str("Report progress with `herdr-projects report --percent N --activity '...'` if that command exists on this machine (use `--activity 'Waiting for you'` before asking the user something, and `--percent 100` when done); otherwise skip it.\n");
+        brief.push_str("Report progress with `hp report --activity '...'` if that command exists on this machine (use `--activity 'Waiting for you'` before asking the user something, and `--done` when finished); otherwise skip it.\n");
     } else {
         brief.push_str(&crate::progress::guidance(input.report_prefix, None));
         brief.push('\n');
@@ -1129,26 +1128,26 @@ mod tests {
         assert_eq!(group(&open_thread(), &gone, now()), Group::WaitingOnYou);
     }
 
-    fn reported(activity: &str, percent: Option<u8>, age: i64, state: &str) -> Live {
-        let record = crate::progress::Record { activity: activity.into(), percent, reported_at: 1, ..Default::default() };
+    fn reported(activity: &str, done: bool, age: i64, state: &str) -> Live {
+        let record = crate::progress::Record { activity: activity.into(), done, reported_at: 1, ..Default::default() };
         Live { report_age_secs: age, self_report: Some(record), ..live(Some(state), 0) }
     }
 
     #[test]
     fn self_reports_feed_the_group() {
         // Asked a question but the harness reads idle: needs you.
-        assert_eq!(group(&open_thread(), &reported("Waiting for you", Some(40), 5, "idle"), now()), Group::WaitingOnYou);
+        assert_eq!(group(&open_thread(), &reported("Waiting for you", false, 5, "idle"), now()), Group::WaitingOnYou);
         // Waiting beats a new report, but not a harness that is working again.
         let t = Thread { report_hash: "h".into(), ..open_thread() };
-        assert_eq!(group(&t, &reported("Waiting for you", None, 5, "idle"), now()), Group::WaitingOnYou);
-        assert_eq!(group(&t, &reported("Waiting for you", None, 5, "working"), now()), Group::Working);
+        assert_eq!(group(&t, &reported("Waiting for you", false, 5, "idle"), now()), Group::WaitingOnYou);
+        assert_eq!(group(&t, &reported("Waiting for you", false, 5, "working"), now()), Group::Working);
         // Under 100% and fresh: working, even between tool calls.
-        assert_eq!(group(&open_thread(), &reported("Testing changes", Some(55), 30, "idle"), now()), Group::Working);
+        assert_eq!(group(&open_thread(), &reported("Testing changes", false, 30, "idle"), now()), Group::Working);
         // Stale after five minutes, and 100% is done.
-        assert_eq!(group(&open_thread(), &reported("Testing changes", Some(55), 400, "idle"), now()), Group::Idle);
-        assert_eq!(group(&open_thread(), &reported("Done", Some(100), 5, "idle"), now()), Group::Idle);
+        assert_eq!(group(&open_thread(), &reported("Testing changes", false, 400, "idle"), now()), Group::Idle);
+        assert_eq!(group(&open_thread(), &reported("Done", true, 5, "idle"), now()), Group::Idle);
         // A new report beats self-reported progress.
-        assert_eq!(group(&t, &reported("Polishing", Some(90), 5, "idle"), now()), Group::ReadyForReview);
+        assert_eq!(group(&t, &reported("Polishing", false, 5, "idle"), now()), Group::ReadyForReview);
     }
 
     #[test]
@@ -1328,7 +1327,7 @@ mod tests {
         assert!(pos("Always run the tests.") < pos("# Memory"));
         assert!(pos("# Memory") < pos("alpha fact"));
         assert!(pos("alpha fact") < pos("# Progress"));
-        assert!(pos("/bin/hp --root /r report --percent 25") < pos("Do the thing."));
+        assert!(pos("/bin/hp --root /r report --activity") < pos("Do the thing."));
         assert!(pos("Do the thing.") < pos("# Paths"));
         assert!(brief.contains("gamma fact"));
         assert!(brief.contains("Not inlined because project memory is over 32000 characters: memory/b.md."));

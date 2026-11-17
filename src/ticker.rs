@@ -803,11 +803,8 @@ fn thread_pass(project: &Project, herdr: &Herdr, socket: &str, threads: &[thread
             pass.transitions.push(Transition { id: t.id.clone(), to: group, note });
         }
         let line = crate::sidebar::state_line(group, &after, &live, now);
-        let (activity, percent) = match &live.self_report {
-            Some(record) => (record.activity.clone(), record.percent),
-            None => (String::new(), None),
-        };
-        let self_changed = !t.is_remote() && (activity != t.activity || percent != t.percent);
+        let activity = live.self_report.as_ref().map(|r| r.activity.clone()).unwrap_or_default();
+        let self_changed = !t.is_remote() && activity != t.activity;
         if delivered || state != t.last_state || group.token() != t.last_group || line != t.state_line || self_changed {
             thread::update(project, &t.id, |t| {
                 if delivered {
@@ -821,7 +818,6 @@ fn thread_pass(project: &Project, herdr: &Herdr, socket: &str, threads: &[thread
                 t.state_line = line.clone();
                 if self_changed {
                     t.activity = activity.clone();
-                    t.percent = percent;
                 }
             })?;
         }
