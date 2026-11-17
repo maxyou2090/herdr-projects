@@ -16,6 +16,11 @@
 //! instead of the two trading the head of the list every tick. Anything in
 //! no project comes last.
 
+//! The order a Herdr 1 sidebar showed agents and Spaces in. herdr-core draws
+//! nothing, so nothing consumes it now; what is left is kept only until it is
+//! pruned, and `hp_rank` is the one label a reader still uses.
+#![allow(dead_code)]
+
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::time::{Duration, Instant};
 

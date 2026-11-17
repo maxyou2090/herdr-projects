@@ -386,8 +386,10 @@ pub fn tick(ctx: &Ctx, log: &Log, memory: &mut Memory) -> bool {
         let Ok(project) = Project::load(&ctx.root, &slug) else {
             continue;
         };
+        if project.status() != Status::Active {
+            continue;
+        }
         if project.status() == Status::Paused {
-            mark_paused(ctx, &project, &mut sessions);
             continue;
         }
         if project.status() != Status::Active {
@@ -414,15 +416,6 @@ pub fn tick(ctx: &Ctx, log: &Log, memory: &mut Memory) -> bool {
         }
     }
     let any_reachable = !reachable.is_empty() || sessions.any_reachable();
-    // One sidebar layout per session, from every project's part.
-    for (socket, parts) in std::mem::take(&mut sessions.parts) {
-        // Only sessions this tick already listed: a paused project alone
-        // costs no call.
-        if let Some(Some((agents, _))) = sessions.lists.get(&socket).cloned() {
-            let herdr = Herdr::new(ctx.env.herdr_bin(), &socket, ctx.runner);
-            crate::grouping::apply(&herdr, &socket, &parts, &agents, &mut memory.grouping);
-        }
-    }
     for (project, seen) in &reachable {
         for error in tick_slow(ctx, project, seen, memory, log) {
             log.line(&format!("{}: {error:#}", project.slug));
