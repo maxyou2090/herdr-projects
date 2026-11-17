@@ -335,9 +335,9 @@ fn place_tab(project: &Project, view: &SessionView, record: &Thread) -> Result<T
         Kind::Tab | Kind::Checkout => match own_space {
             Some(id) => view.herdr.tab_create(&id, &folder, &record.title, false)?,
             None => {
-                let created = view.herdr.workspace_create(&folder, &record.title, false)?;
-                let _ = view.herdr.tab_rename(&created.tab_id, &record.title);
-                created
+                // Its own Space, its tab named after the thread, in the core label
+                // and in the app alike: `workspace_create` writes both.
+                view.herdr.workspace_create(&folder, &record.title, &record.title, false)?
             }
         },
         Kind::Worktree | Kind::Adopted => bail!("a {:?} thread is not placed in a tab", record.kind),

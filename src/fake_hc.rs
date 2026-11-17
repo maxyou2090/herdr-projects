@@ -249,10 +249,109 @@ impl Runner for FakeCore {
     }
 }
 
+/// The desktop app over a [`FakeCore`]: `herdr-app status`, `ls` and
+/// `do space.new / tab.close / tab.rename`. A space it makes starts with a
+/// placeholder tab (the app will not leave a space without one), and every
+/// core terminal carrying `herdr.space` shows up in a tab of its own, exactly
+/// as the window puts it there.
+pub struct FakeApp<'a> {
+    pub core: &'a FakeCore,
+    /// Every command line, `herdr-app` and `hc` alike.
+    pub calls: RefCell<Vec<String>>,
+    /// The spaces it made: (space id, the name it was asked for).
+    pub spaces: RefCell<Vec<(String, String)>>,
+    /// Every `tab.rename` it was asked for: (tab id, name).
+    pub renamed: RefCell<Vec<(String, String)>>,
+    next: RefCell<u32>,
+}
+
+impl<'a> FakeApp<'a> {
+    pub fn new(core: &'a FakeCore) -> Self {
+        FakeApp { core, calls: RefCell::new(Vec::new()), spaces: RefCell::new(Vec::new()), renamed: RefCell::new(Vec::new()), next: RefCell::new(0) }
+    }
+
+    /// The tab the window ties each core terminal to.
+    fn tab_for(address: &str) -> String {
+        format!("apptab-{address}")
+    }
+
+    /// `herdr-app ls`: spaces, their tabs, and the terminals in each.
+    fn ls_json(&self) -> String {
+        let terminals = self.core.terminals.borrow();
+        let spaces: Vec<serde_json::Value> = self
+            .spaces
+            .borrow()
+            .iter()
+            .map(|(space, _)| {
+                let mut tabs = vec![serde_json::json!({
+                    "id": format!("placeholder-{space}"),
+                    "name": "shell",
+                    "terminals": [],
+                })];
+                for term in terminals.iter().filter(|t| t.labels.get("herdr.space") == Some(space)) {
+                    tabs.push(serde_json::json!({
+                        "id": Self::tab_for(&term.address),
+                        "name": "shell",
+                        "terminals": [{"terminal": term.address}],
+                    }));
+                }
+                serde_json::json!({"id": space, "tabs": tabs})
+            })
+            .collect();
+        serde_json::json!({"spaces": spaces}).to_string()
+    }
+
+    fn dispatch(&self, args: &[String]) -> Result<Output> {
+        let args: Vec<&str> = args.iter().map(String::as_str).collect();
+        match args.as_slice() {
+            ["status"] => ok("{\"version\":\"0.1.16\"}"),
+            ["ls"] => ok(self.ls_json()),
+            ["do", "space.new", rest @ ..] => {
+                let name = flag(rest, "--name");
+                let mut next = self.next.borrow_mut();
+                *next += 1;
+                let space = format!("sp{next}");
+                drop(next);
+                self.spaces.borrow_mut().push((space.clone(), name));
+                ok(serde_json::json!({"space": space, "tab": format!("placeholder-{space}"), "terminal": "tshell"}).to_string())
+            }
+            ["do", "tab.close", _rest @ ..] => ok("{}"),
+            ["do", "tab.rename", rest @ ..] => {
+                let id = flag(rest, "--id");
+                let name = flag(rest, "--name");
+                self.renamed.borrow_mut().push((id, name));
+                ok("{}")
+            }
+            other => fail("unsupported", &format!("the fake app does not model `{}`", other.join(" "))),
+        }
+    }
+}
+
+/// `--name`'s value: the app takes its arguments as flags.
+fn flag(args: &[&str], name: &str) -> String {
+    args.iter().position(|arg| *arg == name).and_then(|at| args.get(at + 1)).copied().unwrap_or_default().to_string()
+}
+
+impl Runner for FakeApp<'_> {
+    fn run(&self, cmd: &Cmd) -> Result<Output> {
+        self.calls.borrow_mut().push(cmd.display());
+        if cmd.program == crate::app::bin() {
+            self.dispatch(&cmd.args)
+        } else {
+            self.core.run(cmd)
+        }
+    }
+
+    fn run_foreground(&self, cmd: &Cmd, poll: &mut dyn FnMut() -> bool) -> Result<Option<i32>> {
+        self.calls.borrow_mut().push(cmd.display());
+        self.core.run_foreground(cmd, poll)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::herdr::Herdr;
+    use crate::herdr::{Herdr, L_TAB_LABEL};
 
     fn core() -> (tempfile::TempDir, FakeCore) {
         (tempfile::tempdir().unwrap(), FakeCore::new())
@@ -263,7 +362,7 @@ mod tests {
         let (home, fake) = core();
         let herdr = Herdr::new("hc", "", &fake);
         let dir = home.path();
-        let first = herdr.workspace_create(dir, "Demo", false).unwrap();
+        let first = herdr.workspace_create(dir, "Demo", "Demo", false).unwrap();
         let second = herdr.tab_create(&first.workspace_id, dir, "thread", false).unwrap();
         assert_ne!(first.pane_id, second.pane_id, "each terminal is its own pane");
         assert_ne!(first.tab_id, second.tab_id, "a tab is its own terminal");
@@ -315,5 +414,33 @@ mod tests {
         fake.terminal("hp-demo-1", "/tmp/demo", &[]);
         fake.set_screen("hp-demo-1", "hello\n❯ \n");
         assert_eq!(herdr.agent_read("hp-demo-1", None).unwrap(), "hello\n❯ \n");
+    }
+
+    #[test]
+    fn a_thread_space_names_its_tab_after_the_thread() {
+        let (home, child) = core();
+        let fake = FakeApp::new(&child);
+        let herdr = Herdr::new("hc", "", &fake);
+        let title = "t-0042 own group";
+        let created = herdr.workspace_create(home.path(), title, title, false).unwrap();
+        assert_eq!(fake.spaces.borrow()[0].1, title, "the Space carries the thread's title");
+        let address = &child.terminals.borrow()[0].address;
+        assert_eq!(fake.renamed.borrow().last(), Some(&(FakeApp::tab_for(address), title.to_string())), "the app's tab carries it too");
+        let label = child.terminals.borrow()[0].labels.get(L_TAB_LABEL).cloned();
+        assert_eq!(label.as_deref(), Some(title), "the core label says the same, so there is one name");
+        assert!(!created.pane_id.is_empty() && !created.tab_id.is_empty());
+    }
+
+    #[test]
+    fn a_project_space_keeps_its_coordinator_tab() {
+        let (home, child) = core();
+        let fake = FakeApp::new(&child);
+        let herdr = Herdr::new("hc", "", &fake);
+        herdr.workspace_create(home.path(), "Herdr Projects", "coordinator", true).unwrap();
+        assert_eq!(fake.spaces.borrow()[0].1, "Herdr Projects", "the Space is the project, not the tab");
+        let address = &child.terminals.borrow()[0].address;
+        assert_eq!(fake.renamed.borrow().last(), Some(&(FakeApp::tab_for(address), "coordinator".to_string())));
+        let label = child.terminals.borrow()[0].labels.get(L_TAB_LABEL).cloned();
+        assert_eq!(label.as_deref(), Some("coordinator"));
     }
 }
