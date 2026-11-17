@@ -1,6 +1,20 @@
-//! What the binary knows about Herdr agent kinds: the 24 kinds `agent start`
-//! accepts and the per-kind resume arguments from Herdr's session-state page
-//! (herdr.dev, "Native agent session restore", 0.9.1).
+//! What the binary knows about launching agents: the 24 harness CLIs it types
+//! into a terminal, and the flag each of them needs to resume a native session.
+//!
+//! `KINDS` is this binary's own list. herdr-core has no notion of an agent
+//! kind — it keeps a terminal and reads a program's own status (OSC 7501) — and
+//! `hp-agent <kind>` is what turns a kind into a program, so this list is the
+//! set `agent start` can write into a pane.
+//!
+//! The resume table in [`resume_args`] is **maintained by hand**. It came from
+//! Herdr 1's session-state page (herdr.dev, "Native agent session restore",
+//! 0.9.1) when this binary was a Herdr 1 plugin. In the herdr-core port the
+//! core supplies the native session id (the `hp_session` label, read back as
+//! `Agent::agent_session`) but it carries no resume table, so nothing upstream
+//! keeps these flags current: when a harness renames its resume flag, edit the
+//! table here and the test that pins it at the bottom of this file. A kind that
+//! is not in the table resumes nothing — `open` starts that conversation anew
+//! instead of guessing a flag.
 
 pub const KINDS: [&str; 24] = [
     "pi", "claude", "codex", "gemini", "cursor", "devin", "agy", "cline", "omp", "mastracode", "opencode", "copilot", "kimi", "kiro", "droid",
@@ -12,7 +26,9 @@ pub fn is_kind(kind: &str) -> bool {
 }
 
 /// The arguments that resume a native session `id` for `kind`, or `None` for
-/// a kind whose resume command Herdr does not document.
+/// a kind whose resume flag this table does not name (see the module comment:
+/// these are each harness CLI's own flag, kept by hand, not a core-provided
+/// table).
 pub fn resume_args(kind: &str, id: &str) -> Option<Vec<String>> {
     if id.is_empty() || id.starts_with('-') {
         return None;
@@ -96,7 +112,7 @@ mod tests {
     }
 
     #[test]
-    fn resume_arguments_follow_herdrs_table() {
+    fn resume_arguments_are_the_harness_flags_this_table_holds() {
         assert_eq!(resume_args("claude", "abc").unwrap(), ["--resume", "abc"]);
         assert_eq!(resume_args("codex", "abc").unwrap(), ["resume", "abc"]);
         assert_eq!(resume_args("opencode", "abc").unwrap(), ["--session", "abc"]);
