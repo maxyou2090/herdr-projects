@@ -5,7 +5,7 @@ use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 
-use crate::herdr::{Agent, Herdr};
+use crate::core::{Agent, Core};
 use crate::paths::Ctx;
 use crate::project::{self, Project};
 use crate::runner::Cmd;
@@ -16,7 +16,7 @@ const DEFAULT_TASK: &str = "Continue the work you were already doing in this pan
 
 /// The refusals `thread adopt` makes before anything is created. Returns the
 /// agent herdr detects in the pane.
-pub fn adoptable_agent(ctx: &Ctx, herdr: &Herdr, socket: &str, pane: &str) -> Result<Agent> {
+pub fn adoptable_agent(ctx: &Ctx, herdr: &Core, socket: &str, pane: &str) -> Result<Agent> {
     adoptable_agent_except(ctx, herdr, socket, pane, None)
 }
 
@@ -25,7 +25,7 @@ pub fn adoptable_agent(ctx: &Ctx, herdr: &Herdr, socket: &str, pane: &str) -> Re
 /// matches the old single-record test by definition, and that is exactly the
 /// pane the command exists to claim. Threads and other projects' coordinators
 /// are still refused.
-pub fn adoptable_agent_except(ctx: &Ctx, herdr: &Herdr, socket: &str, pane: &str, own: Option<&str>) -> Result<Agent> {
+pub fn adoptable_agent_except(ctx: &Ctx, herdr: &Core, socket: &str, pane: &str, own: Option<&str>) -> Result<Agent> {
     let agents = herdr.agent_list().map_err(|e| anyhow::anyhow!("the herdr session at {socket} is not reachable: {e}"))?;
     let agent = agents
         .into_iter()
@@ -63,7 +63,7 @@ pub fn adopt(ctx: &Ctx, slug: &str, pane: &str, title: &str, task: Option<String
     }
     let record = project.coordinator().with_context(|| format!("`{slug}` has never been opened; run `open {slug}` first"))?;
     ticker::start(ctx)?;
-    let herdr = Herdr::new(ctx.env.herdr_bin(), &record.socket, ctx.runner);
+    let herdr = Core::new(ctx.env.hc_bin(), &record.socket, ctx.runner);
     let agent = adoptable_agent(ctx, &herdr, &record.socket, pane)?;
 
     // The pane's repository and branch, when it is in one.

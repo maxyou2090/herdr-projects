@@ -13,7 +13,7 @@ use std::time::Duration;
 use anyhow::{Context as _, Result, bail};
 use serde::{Deserialize, Serialize};
 
-use crate::herdr::{Agent, Herdr, Pane};
+use crate::core::{Agent, Core, Pane};
 use crate::paths::{self, Ctx, SessionFlags};
 use crate::profiles::Role;
 use crate::project::{self, Coordinator, Project, Status};
@@ -46,7 +46,7 @@ pub fn current_prefix(root: &Path) -> Result<String> {
 /// coordinator runs commands wherever, and demanding a pane in the folder made
 /// `open` create a second, same-named Space beside the real one. `None` means
 /// the Space is gone (the user closed it); then a new one is made.
-fn home_space(herdr: &Herdr, record: Option<&Coordinator>, panes: &[Pane]) -> Option<String> {
+fn home_space(herdr: &Core, record: Option<&Coordinator>, panes: &[Pane]) -> Option<String> {
     let id = record.map(|record| record.workspace_id.clone()).filter(|id| !id.is_empty())?;
     if panes.iter().any(|pane| pane.workspace_id == id) {
         return Some(id);
@@ -56,14 +56,14 @@ fn home_space(herdr: &Herdr, record: Option<&Coordinator>, panes: &[Pane]) -> Op
 }
 
 /// True when `pane` is the pane the record describes: same workspace, tab and
-/// working directory (see `herdr::own_dir`). Ids are only unique within one
+/// working directory (see `core::own_dir`). Ids are only unique within one
 /// server, so callers only ever compare panes listed through the project's
 /// recorded socket.
 pub fn pane_matches(record: &Coordinator, pane: &Pane) -> bool {
     pane.pane_id == record.pane_id
         && pane.workspace_id == record.workspace_id
         && pane.tab_id == record.tab_id
-        && crate::herdr::own_dir(&pane.cwd, &pane.foreground_cwd) == record.cwd
+        && crate::core::own_dir(&pane.cwd, &pane.foreground_cwd) == record.cwd
 }
 
 /// A coordinator of the project: any agent whose working directory is the
@@ -227,7 +227,7 @@ pub fn save_live(project: &Project, panes: &[LivePane]) -> Result<()> {
 /// no lane (an `Ambiguous` one) is never a target, so rule 4 of §5.2 holds on
 /// the hot path: send nothing rather than to the wrong lane.
 pub fn nudge_target<'a>(project: &Project, panes: &'a [LivePane], now: jiff::Timestamp) -> BTreeMap<String, &'a LivePane> {
-    let idle = |p: &&LivePane| crate::herdr::ready_state(&p.agent_status) && crate::thread::seconds_since(&p.pair_since, now) >= NUDGE_IDLE_SECS;
+    let idle = |p: &&LivePane| crate::core::ready_state(&p.agent_status) && crate::thread::seconds_since(&p.pair_since, now) >= NUDGE_IDLE_SECS;
     let mut out: BTreeMap<String, &'a LivePane> = BTreeMap::new();
     if !crate::lanes::split_in_use(project) {
         if let Some(pane) = panes.iter().filter(idle).max_by_key(|p| p.state_change_seq) {
@@ -283,7 +283,7 @@ pub struct OpenOptions {
 /// pane and plugin variables are not set by herdr-core, so reading them made
 /// this always `None`.
 fn here_pane(ctx: &Ctx, options: &OpenOptions, socket: &str, agents: &[Agent]) -> Option<String> {
-    if !options.here || !crate::herdr::same_session(ctx.env.this_session(), socket) {
+    if !options.here || !crate::core::same_session(ctx.env.this_session(), socket) {
         return None;
     }
     let terminal = ctx.env.this_terminal()?;
@@ -511,7 +511,7 @@ fn stray_signal(project: &Project, home: &Path, agent: &Agent, resolution: &crat
         crate::lanes::LaneResolution::Ambiguous { .. } => return None,
         _ => {}
     }
-    let own = Path::new(crate::herdr::own_dir(&agent.cwd, &agent.foreground_cwd));
+    let own = Path::new(crate::core::own_dir(&agent.cwd, &agent.foreground_cwd));
     if own == home {
         return Some(format!("it works in the project home {}", home.display()));
     }
@@ -560,7 +560,7 @@ pub fn open(ctx: &Ctx, slug: &str, options: &OpenOptions) -> Result<()> {
     // still reported below, after the session-ownership check.
     let session = paths::resolve_session(&options.session, ctx.env, ctx.runner)?;
     let socket = session.socket.clone();
-    let herdr = Herdr::new(ctx.env.herdr_bin(), &session.socket, ctx.runner);
+    let herdr = Core::new(ctx.env.hc_bin(), &session.socket, ctx.runner);
     let listed = herdr.agent_list();
     // The lane is resolved before the profile: an existing lane carries its
     // own default profile (§4.1), and `--lane` must be able to create one.
@@ -581,9 +581,9 @@ pub fn open(ctx: &Ctx, slug: &str, options: &OpenOptions) -> Result<()> {
         Some(lane_registry.coordinator_for(&project, &target_lane))
     };
     if let Some(record) = &previous
-        && !crate::herdr::same_session(&record.socket, &socket)
+        && !crate::core::same_session(&record.socket, &socket)
     {
-        if crate::herdr::session_alive(&ctx.env.herdr_bin(), &record.socket, ctx.runner) {
+        if crate::core::session_alive(&ctx.env.hc_bin(), &record.socket, ctx.runner) {
             bail!(
                 "`{slug}` belongs to the herdr session `{}`; open it there, not in `{socket}`",
                 record.socket
@@ -822,7 +822,7 @@ pub fn open(ctx: &Ctx, slug: &str, options: &OpenOptions) -> Result<()> {
 /// returns when it exits: the pane is back at the user's shell. While it
 /// starts, the agent Herdr detects in the pane gets its name and its session
 /// is recorded. Nothing is printed while the agent owns the terminal.
-fn run_here(ctx: &Ctx, herdr: &Herdr, project: &Project, run: HereRun<'_>) -> Result<()> {
+fn run_here(ctx: &Ctx, herdr: &Core, project: &Project, run: HereRun<'_>) -> Result<()> {
     let record = run.record;
     let kind = &record.agent;
     let resuming = run.args.len() > run.base_args.len();
@@ -865,7 +865,7 @@ struct HereRun<'a> {
 
 /// Names the agent Herdr detects in the recorded pane and records its
 /// session. False until the agent shows up; errors count as not yet.
-fn adopt_here(herdr: &Herdr, project: &Project, record: &Coordinator, lane_id: Option<&str>) -> bool {
+fn adopt_here(herdr: &Core, project: &Project, record: &Coordinator, lane_id: Option<&str>) -> bool {
     let Ok(agents) = herdr.agent_list() else {
         return false;
     };
@@ -891,7 +891,7 @@ fn adopt_here(herdr: &Herdr, project: &Project, record: &Coordinator, lane_id: O
 
 /// A pane that was just created is not an available shell for a moment
 /// (`agent_pane_busy` while its shell starts): retry for a few seconds.
-fn start_when_shell_ready(herdr: &Herdr, name: &str, kind: &str, pane: &str, args: &[String]) -> Result<Agent, crate::herdr::HerdrError> {
+fn start_when_shell_ready(herdr: &Core, name: &str, kind: &str, pane: &str, args: &[String]) -> Result<Agent, crate::core::CoreError> {
     let deadline = std::time::Instant::now() + Duration::from_secs(10);
     loop {
         match herdr.agent_start(name, kind, pane, args) {
@@ -919,7 +919,7 @@ pub fn row_state(pane: &LivePane, report: Option<&crate::progress::Record>) -> (
 /// Reports a coordinator pane's row, claiming the lane the registry ties it to
 /// (`hp_lane`). A project with no lane registry claims nothing, so its rows
 /// read exactly as they did before lanes.
-pub fn report_tokens(herdr: &Herdr, project: &Project, pane_id: &str) {
+pub fn report_tokens(herdr: &Core, project: &Project, pane_id: &str) {
     let lane = crate::lanes::token_for_pane(project, pane_id);
     let display = crate::labels::coordinator_display(project, lane.as_deref());
     crate::labels::report_pane(herdr, pane_id, &display, &project.slug, crate::thread::Group::Idle, lane.as_deref());
@@ -929,7 +929,7 @@ pub fn report_tokens(herdr: &Herdr, project: &Project, pane_id: &str) {
 /// recorded one, or the one a pane `open` runs in — so a `name` edited in
 /// PROJECT.md shows on the next `open` and an adopted Space drops the label
 /// it was made with. Never fails: a wrong label is cosmetic.
-fn sync_label(herdr: &Herdr, workspace_id: &str, label: &str) {
+fn sync_label(herdr: &Core, workspace_id: &str, label: &str) {
     if workspace_id.is_empty() {
         return;
     }
@@ -945,7 +945,7 @@ fn sync_label(herdr: &Herdr, workspace_id: &str, label: &str) {
 
 /// Labels the tab a coordinator starts in `coordinator`, like the tab and
 /// workspace creation paths do. Never fails: a wrong label is cosmetic.
-fn name_tab(herdr: &Herdr, tab_id: &str) {
+fn name_tab(herdr: &Core, tab_id: &str) {
     if tab_id.is_empty() {
         return;
     }
@@ -1311,13 +1311,13 @@ mod tests {
         };
         // Its shell works in another folder for a while.
         let drifted = Agent {
-            agent_session: Some(crate::herdr::AgentSession { value: "/sessions/demo.jsonl".into() }),
+            agent_session: Some(crate::core::AgentSession { value: "/sessions/demo.jsonl".into() }),
             ..agent("w1:p1", "/elsewhere", "idle", 1)
         };
         assert!(is_coordinator(&record, &drifted));
         // A reused pane id running a different session does not count.
         let reused = Agent {
-            agent_session: Some(crate::herdr::AgentSession { value: "/sessions/other.jsonl".into() }),
+            agent_session: Some(crate::core::AgentSession { value: "/sessions/other.jsonl".into() }),
             ..agent("w1:p1", "/elsewhere", "idle", 1)
         };
         assert!(!is_coordinator(&record, &reused));
@@ -1353,14 +1353,14 @@ mod tests {
         recorded.pane_id = "w2:p1".into();
         recorded.agent_session = "/sessions/demo.jsonl".into();
         let drifted = Agent {
-            agent_session: Some(crate::herdr::AgentSession { value: "/sessions/demo.jsonl".into() }),
+            agent_session: Some(crate::core::AgentSession { value: "/sessions/demo.jsonl".into() }),
             ..agent("w2:p1", "/home/me", "idle", 1)
         };
         assert_eq!(project_workspace(&record, std::slice::from_ref(&other), std::slice::from_ref(&drifted)), None);
         assert_eq!(project_workspace(&recorded, std::slice::from_ref(&other), &[drifted]).as_deref(), Some("w2"));
         let tabbed = Pane { workspace_id: "w3".into(), pane_id: "w3:p9".into(), cwd: "/r/demo/threads/t-0001".into(), ..Pane::default() };
         let reused = Agent {
-            agent_session: Some(crate::herdr::AgentSession { value: "/sessions/other.jsonl".into() }),
+            agent_session: Some(crate::core::AgentSession { value: "/sessions/other.jsonl".into() }),
             ..agent("w2:p1", "/home/me", "idle", 1)
         };
         assert_eq!(project_workspace(&recorded, &[other, tabbed], std::slice::from_ref(&reused)).as_deref(), Some("w3"));
@@ -1394,7 +1394,7 @@ mod tests {
         // one of them at most.
         let record = Coordinator { cwd: "".into(), pane_id: "w1:p1".into(), agent_session: "sess-1".into(), ..Coordinator::default() };
         let drifted = |pane: &str, session: &str| Agent {
-            agent_session: Some(crate::herdr::AgentSession { value: session.into() }),
+            agent_session: Some(crate::core::AgentSession { value: session.into() }),
             ..agent(pane, "/elsewhere", "idle", 1)
         };
         let found = discover(&project, &record, &[], &[drifted("w1:p1", "sess-1"), drifted("w2:p1", "sess-2")], "2026-09-23T10:00:00Z");

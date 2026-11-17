@@ -6,7 +6,7 @@ use std::time::Duration;
 
 use anyhow::Result;
 
-use crate::herdr::{self, Herdr};
+use crate::core::{self, Core};
 use crate::paths::{self, Ctx, Env, SessionFlags};
 use crate::project;
 use crate::runner::{Cmd, Runner};
@@ -48,7 +48,7 @@ pub fn run(ctx: &Ctx, session: &SessionFlags, fix: bool) -> Result<bool> {
 /// rule recognizes it (`degraded`) — is reported with the command that fixes
 /// it. Empty without a lane registry, so a pre-lane project's report is byte
 /// for byte what it was.
-fn lane_notes(project: &project::Project, agents: &[crate::herdr::Agent]) -> Vec<String> {
+fn lane_notes(project: &project::Project, agents: &[crate::core::Agent]) -> Vec<String> {
     if !crate::lanes::exists(project) {
         return Vec::new();
     }
@@ -194,16 +194,16 @@ fn report(
         check(&mut out, None, "app", format!("{app} is not running: terminals start in core and are reached with `hc attach`"));
     }
 
-    let bin = env.herdr_bin();
-    match herdr::version(&bin, runner) {
-        Ok(version) if version >= herdr::MIN_VERSION => {
+    let bin = env.hc_bin();
+    match core::version(&bin, runner) {
+        Ok(version) if version >= core::MIN_VERSION => {
             check(&mut out, Some(true), "herdr", format!("{version} ({bin})"))
         }
         Ok(version) => check(
             &mut out,
             Some(false),
             "herdr",
-            format!("{version} ({bin}); {} or later is required", herdr::MIN_VERSION),
+            format!("{version} ({bin}); {} or later is required", core::MIN_VERSION),
         ),
         Err(error) => check(&mut out, Some(false), "herdr", format!("{error:#}")),
     }
@@ -217,7 +217,7 @@ fn report(
 
     match paths::resolve_session(session, env, runner) {
         Ok(found) => {
-            let reachable = Herdr::new(&bin, &found.socket, runner).reachable();
+            let reachable = Core::new(&bin, &found.socket, runner).reachable();
             // Never print an empty name: the default core is a real session, it
             // just has no `HC_SESSION` to be named by.
             let (label, origin) = match found.name.as_deref() {
@@ -416,7 +416,7 @@ fn report(
         // With no usable record, the agents the ticker would discover: the
         // ones working in the project folder in this session.
         let (record, mut notes) = match project.coordinator() {
-            Some(record) if crate::herdr::session_alive(&bin, &record.socket, runner) => (Some(record), Vec::new()),
+            Some(record) if crate::core::session_alive(&bin, &record.socket, runner) => (Some(record), Vec::new()),
             Some(record) => (None, vec![format!("recorded session `{}` no longer runs", record.socket)]),
             None => (None, Vec::new()),
         };
@@ -429,7 +429,7 @@ fn report(
                 continue;
             }
         };
-        let herdr = Herdr::new(&bin, &socket, runner);
+        let herdr = Core::new(&bin, &socket, runner);
         match (herdr.pane_list(), herdr.agent_list()) {
             (Ok(panes), Ok(agents)) => {
                 let dir = project.canonical_dir().to_string_lossy().into_owned();

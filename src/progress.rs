@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{Result, bail};
 use serde::{Deserialize, Serialize};
 
-use crate::herdr::Herdr;
+use crate::core::Core;
 use crate::paths::{Ctx, Env};
 use crate::runner::Runner;
 
@@ -113,7 +113,7 @@ pub fn current(env: &Env, runner: &dyn Runner) -> Option<Current> {
     // core names the terminal in `HC_TERMINAL_ID`; `HERDR_*` was Herdr 1's.
     let address = env.var("HC_TERMINAL_ID")?.to_string();
     let socket = env.var("HC_SESSION").unwrap_or("").to_string();
-    let herdr = Herdr::new(env.herdr_bin(), &socket, runner);
+    let herdr = Core::new(env.hc_bin(), &socket, runner);
     let pane = herdr.pane_get(&address).ok()?;
     Some(Current { socket, pane_id: pane.pane_id.clone(), terminal_id: pane.terminal_id.clone() })
 }

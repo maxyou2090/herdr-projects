@@ -1,6 +1,6 @@
 //! A fake herdr-core for tests: an in-memory set of terminals that answers the
 //! `hc` commands this binary runs, so a test exercises the real adapter
-//! ([`crate::herdr`]) instead of a canned CLI.
+//! ([`crate::core`]) instead of a canned CLI.
 //!
 //! Only what the adapter calls is modelled: `--version`, `server status`, `ls`,
 //! `get`, `run --bg`, `label`, `send`, `keys`, `read`, `kill`, `rm`. Behaviour
@@ -351,7 +351,7 @@ impl Runner for FakeApp<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::herdr::{Herdr, L_TAB_LABEL};
+    use crate::core::{Core, L_TAB_LABEL};
 
     fn core() -> (tempfile::TempDir, FakeCore) {
         (tempfile::tempdir().unwrap(), FakeCore::new())
@@ -360,7 +360,7 @@ mod tests {
     #[test]
     fn creating_a_space_and_a_tab_yields_distinct_ids_and_live_panes() {
         let (home, fake) = core();
-        let herdr = Herdr::new("hc", "", &fake);
+        let herdr = Core::new("hc", "", &fake);
         let dir = home.path();
         let first = herdr.workspace_create(dir, "Demo", "Demo", false).unwrap();
         let second = herdr.tab_create(&first.workspace_id, dir, "thread", false).unwrap();
@@ -373,7 +373,7 @@ mod tests {
     #[test]
     fn labels_are_the_tokens_the_lane_resolver_reads() {
         let (_home, fake) = core();
-        let herdr = Herdr::new("hc", "", &fake);
+        let herdr = Core::new("hc", "", &fake);
         let term = fake.terminal("hp-demo-1", "/tmp/demo", &[("hp_agent", "hpc-demo"), ("hp_kind", "pi")]);
         fake.set_status("hp-demo-1", "idle");
         herdr.set_labels(&term.name, &[("hp_lane".to_string(), "c-1".to_string())]).unwrap();
@@ -386,18 +386,18 @@ mod tests {
     #[test]
     fn a_prompt_is_refused_while_the_program_is_blocked() {
         let (_home, fake) = core();
-        let herdr = Herdr::new("hc", "", &fake);
+        let herdr = Core::new("hc", "", &fake);
         fake.terminal("hp-demo-1", "/tmp/demo", &[("hp_agent", "hpc-demo")]);
         fake.set_status("hp-demo-1", "blocked");
         let error = herdr.agent_prompt("hp-demo-1", "hello").unwrap_err();
         assert_eq!(error.code, "agent_blocked");
-        assert!(crate::herdr::refused_before_typing(&error));
+        assert!(crate::core::refused_before_typing(&error));
     }
 
     #[test]
     fn starting_an_agent_types_the_wrapper_and_waits_for_its_first_word() {
         let (_home, fake) = core();
-        let herdr = Herdr::new("hc", "", &fake);
+        let herdr = Core::new("hc", "", &fake);
         fake.terminal("hp-demo-1", "/tmp/demo", &[]);
         let agent = herdr.agent_start("hpc-demo", "pi", "hp-demo-1", &["--model".into(), "auto/x".into()]).unwrap();
         assert_eq!(agent.name, "hpc-demo");
@@ -410,7 +410,7 @@ mod tests {
     #[test]
     fn reading_returns_the_screen_the_screen_check_parses() {
         let (_home, fake) = core();
-        let herdr = Herdr::new("hc", "", &fake);
+        let herdr = Core::new("hc", "", &fake);
         fake.terminal("hp-demo-1", "/tmp/demo", &[]);
         fake.set_screen("hp-demo-1", "hello\n❯ \n");
         assert_eq!(herdr.agent_read("hp-demo-1", None).unwrap(), "hello\n❯ \n");
@@ -420,7 +420,7 @@ mod tests {
     fn a_thread_space_names_its_tab_after_the_thread() {
         let (home, child) = core();
         let fake = FakeApp::new(&child);
-        let herdr = Herdr::new("hc", "", &fake);
+        let herdr = Core::new("hc", "", &fake);
         let title = "t-0042 own group";
         let created = herdr.workspace_create(home.path(), title, title, false).unwrap();
         assert_eq!(fake.spaces.borrow()[0].1, title, "the Space carries the thread's title");
@@ -435,7 +435,7 @@ mod tests {
     fn a_project_space_keeps_its_coordinator_tab() {
         let (home, child) = core();
         let fake = FakeApp::new(&child);
-        let herdr = Herdr::new("hc", "", &fake);
+        let herdr = Core::new("hc", "", &fake);
         herdr.workspace_create(home.path(), "Herdr Projects", "coordinator", true).unwrap();
         assert_eq!(fake.spaces.borrow()[0].1, "Herdr Projects", "the Space is the project, not the tab");
         let address = &child.terminals.borrow()[0].address;

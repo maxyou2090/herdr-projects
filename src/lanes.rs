@@ -25,7 +25,7 @@ use std::path::PathBuf;
 use anyhow::{Context as _, Result, bail};
 use serde::{Deserialize, Serialize};
 
-use crate::herdr::Agent;
+use crate::core::Agent;
 use crate::paths::Ctx;
 use crate::project::{self, Coordinator, Project};
 
@@ -473,7 +473,7 @@ impl Registry {
             .filter(|agent| ours(agent, slug))
             .filter_map(|agent| {
                 let resolution = resolve(self, agent, project_home, slug);
-                let in_folder = !project_home.is_empty() && crate::herdr::own_dir(&agent.cwd, &agent.foreground_cwd) == project_home;
+                let in_folder = !project_home.is_empty() && crate::core::own_dir(&agent.cwd, &agent.foreground_cwd) == project_home;
                 (!resolution.is_none() || in_folder).then(|| Sighting {
                     pane_id: agent.pane_id.clone(),
                     agent: agent.agent.clone(),
@@ -642,7 +642,7 @@ pub fn resolve(registry: &Registry, agent: &Agent, project_home: &str, slug: &st
     // exists: every lane's coordinator works in the same home (decision 1),
     // so with two the folder says nothing and the answer is a refusal that
     // names the command which fixes it — not `max_by_key` picking one.
-    if !project_home.is_empty() && crate::herdr::own_dir(&agent.cwd, &agent.foreground_cwd) == project_home {
+    if !project_home.is_empty() && crate::core::own_dir(&agent.cwd, &agent.foreground_cwd) == project_home {
         let open = registry.open_lanes();
         return match open.len() {
             1 => LaneResolution::Known {
@@ -791,7 +791,7 @@ pub fn lane_of_initiator(ctx: &Ctx, project: &Project, agents: &[Agent]) -> Stri
     let agents: &[Agent] = if ctx.env.this_session().is_empty() {
         agents
     } else {
-        listed = crate::herdr::Herdr::new(ctx.env.herdr_bin(), ctx.env.this_session(), ctx.runner).agent_list().unwrap_or_default();
+        listed = crate::core::Core::new(ctx.env.hc_bin(), ctx.env.this_session(), ctx.runner).agent_list().unwrap_or_default();
         &listed
     };
     let Some(agent) = agents.iter().find(|agent| agent.in_terminal(terminal) && ours(agent, &project.slug)) else {
@@ -997,7 +997,7 @@ impl View {
             home: project_home(project),
             slug: project.slug.clone(),
             this_pane: session
-                .map(|view| crate::herdr::pane_of_terminal(ctx.env.this_terminal().unwrap_or(""), &view.agents, &view.panes))
+                .map(|view| crate::core::pane_of_terminal(ctx.env.this_terminal().unwrap_or(""), &view.agents, &view.panes))
                 .unwrap_or_default(),
             reachable: session.is_some(),
             counts: BTreeMap::new(),
@@ -1089,7 +1089,7 @@ impl View {
                 if !lane.agent_session.is_empty() && agent.session_id() != lane.agent_session {
                     why.push("its recorded session no longer matches".to_string());
                 }
-                let folder = crate::herdr::own_dir(&agent.cwd, &agent.foreground_cwd);
+                let folder = crate::core::own_dir(&agent.cwd, &agent.foreground_cwd);
                 if folder != self.home {
                     why.push(format!("it works in {folder}, outside {}", self.home));
                 }
@@ -1429,7 +1429,7 @@ pub fn lane_adopt(ctx: &Ctx, project: Option<&str>, handle: &str) -> Result<()> 
         .context("this is not a core terminal; `lane adopt` must run in the terminal it adopts")?
         .to_string();
     let socket = ctx.env.this_session().to_string();
-    let herdr = crate::herdr::Herdr::new(ctx.env.herdr_bin(), &socket, ctx.runner);
+    let herdr = crate::core::Core::new(ctx.env.hc_bin(), &socket, ctx.runner);
     let listed = herdr.agent_list().map_err(|error| anyhow::anyhow!("the herdr session at {socket} is not reachable: {error}"))?;
     let early = listed
         .iter()
@@ -1444,7 +1444,7 @@ pub fn lane_adopt(ctx: &Ctx, project: Option<&str>, handle: &str) -> Result<()> 
     let canonical = project.canonical_dir().to_string_lossy().into_owned();
     // Check the directory before the adoption path's "already thread" refusal,
     // so a thread pane always gets the command that belongs to it.
-    let dir = crate::herdr::own_dir(&early.cwd, &early.foreground_cwd);
+    let dir = crate::core::own_dir(&early.cwd, &early.foreground_cwd);
     if !early.works_in(&home) && !early.works_in(&canonical) {
         bail!(
             "pane {pane} works in {dir}, not in the project home {home}; a lane's coordinator works in the project home — if this is a thread, run `hp thread adopt {} --pane {pane} --title <title>`",
@@ -1522,10 +1522,10 @@ fn project_for_pane(ctx: &Ctx, socket: &str, pane: &str) -> Result<Project> {
     // Read the pane's own directory before the adoption checks so the project
     // can be chosen from it; `adoptable_agent_except` lists the agents again
     // for its own refusals.
-    let herdr = crate::herdr::Herdr::new(ctx.env.herdr_bin(), socket, ctx.runner);
+    let herdr = crate::core::Core::new(ctx.env.hc_bin(), socket, ctx.runner);
     let agents = herdr.agent_list().map_err(|error| anyhow::anyhow!("the herdr session at {socket} is not reachable: {error}"))?;
     let agent = agents.iter().find(|agent| agent.pane_id == pane).with_context(|| format!("no agent is detected in pane {pane} of the session at {socket}"))?;
-    let dir = crate::herdr::own_dir(&agent.cwd, &agent.foreground_cwd).to_string();
+    let dir = crate::core::own_dir(&agent.cwd, &agent.foreground_cwd).to_string();
     let mut found: Vec<Project> = Vec::new();
     for slug in crate::project::list_slugs(&ctx.root) {
         let Ok(project) = Project::load(&ctx.root, &slug) else {
@@ -1774,7 +1774,7 @@ pub fn lane_open_message(lane: &Lane, running: Option<&str>, was_open: bool, slu
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::herdr::AgentSession;
+    use crate::core::AgentSession;
 
     const HOME: &str = "/r/demo";
 
@@ -2089,7 +2089,7 @@ mod tests {
             detached_ticker: false,
         };
         let session = crate::threads::SessionView {
-            herdr: crate::herdr::Herdr::new("hc", "", &runner),
+            herdr: crate::core::Core::new("hc", "", &runner),
             socket: String::new(),
             agents: vec![shares, books_pane],
             panes: Vec::new(),
@@ -2745,7 +2745,7 @@ mod tests {
         Registry::ensure_written(&project).unwrap();
         let runner = crate::runner::fake::FakeRunner::new();
         runner.on("label", crate::runner::fake::ok("{}"));
-        let herdr = crate::herdr::Herdr::new("hc", "", &runner);
+        let herdr = crate::core::Core::new("hc", "", &runner);
         crate::coordinator::report_tokens(&herdr, &project, "w1:p1");
         let calls: Vec<String> = runner.calls.borrow().iter().map(|c| c.display()).collect();
         assert!(calls.iter().any(|t| t.contains(&format!("{TOKEN}=c-1"))), "{calls:?}");

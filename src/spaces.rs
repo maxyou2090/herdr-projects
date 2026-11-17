@@ -5,7 +5,7 @@
 
 use std::path::{Path, PathBuf};
 
-use crate::herdr::{Herdr, Workspace};
+use crate::core::{Core, Workspace};
 use crate::paths::Ctx;
 use crate::project::{self, Project};
 use crate::thread::{self, Kind, Status, Thread};
@@ -35,7 +35,7 @@ fn local_worktree(t: &Thread) -> bool {
 /// Records the primary Space on open local worktree threads that have none
 /// yet: threads placed before this was recorded, or placed while herdr was
 /// slow to list it.
-pub fn record(project: &Project, herdr: &Herdr) {
+pub fn record(project: &Project, herdr: &Core) {
     let missing: Vec<Thread> = thread::list(project).into_iter().filter(|t| t.status != Status::Resolved && local_worktree(t) && t.repo_workspace.is_empty()).collect();
     if missing.is_empty() {
         return;
@@ -58,7 +58,7 @@ pub fn record(project: &Project, herdr: &Herdr) {
 /// thread's own plain Space (recorded and titled after it; tab and checkout
 /// threads have one). None of them may hold an agent, and every pane must be
 /// an idle shell. A focused Space or pane is kept unless `include_focused`.
-pub fn empty(ctx: &Ctx, project: &Project, herdr: &Herdr, include_focused: bool) -> Vec<Space> {
+pub fn empty(ctx: &Ctx, project: &Project, herdr: &Core, include_focused: bool) -> Vec<Space> {
     let threads = thread::list(project);
     let mut recorded: Vec<(String, String)> = threads.iter().filter(|t| local_worktree(t) && !t.repo_workspace.is_empty()).map(|t| (t.repo_workspace.clone(), t.repo.clone())).collect();
     // Threads' own Spaces: a plain Space named after the thread, which only
@@ -176,7 +176,7 @@ pub fn empty(ctx: &Ctx, project: &Project, herdr: &Herdr, include_focused: bool)
 
 /// Closes a Space. Never `--group`: herdr refuses a Space with worktree
 /// Spaces under it.
-pub fn close(herdr: &Herdr, space: &Space) -> Result<(), crate::herdr::HerdrError> {
+pub fn close(herdr: &Core, space: &Space) -> Result<(), crate::core::CoreError> {
     herdr.workspace_close(&space.id)
 }
 
@@ -211,7 +211,7 @@ fn forget(project: &Project, id: &str) {
 /// Closes `project`'s empty repository Spaces, one inbox item each. A Space
 /// kept because something is busy or focused is retried on a later tick,
 /// silently. Records of Spaces herdr no longer shows are dropped.
-pub fn close_empty(ctx: &Ctx, project: &Project, herdr: &Herdr) -> Vec<anyhow::Error> {
+pub fn close_empty(ctx: &Ctx, project: &Project, herdr: &Core) -> Vec<anyhow::Error> {
     let mut errors = Vec::new();
     for space in empty(ctx, project, herdr, false) {
         match close(herdr, &space) {
@@ -238,7 +238,7 @@ pub fn close_empty(ctx: &Ctx, project: &Project, herdr: &Herdr) -> Vec<anyhow::E
 /// a name changed outside `herdr-projects rename` would otherwise leave the
 /// old label in the sidebar until the next `open`. Silent, so a ticker tick
 /// never prints.
-pub fn sync_home_label(project: &Project, herdr: &Herdr) {
+pub fn sync_home_label(project: &Project, herdr: &Core) {
     let Some(record) = project.coordinator() else {
         return;
     };

@@ -55,11 +55,9 @@ impl Env {
         self.home.join(".config").join("herdr-projects")
     }
 
-    /// `HC_BIN_PATH` when set, else `hc` on `PATH`.
-    ///
-    /// The port keeps the caller-facing name `herdr_bin` so the engine modules
-    /// change in one place; the binary it returns is herdr-core's `hc`.
-    pub fn herdr_bin(&self) -> String {
+    /// `HC_BIN_PATH` when set, else `hc` on `PATH`: herdr-core's own CLI, the
+    /// one binary every engine module reaches core through.
+    pub fn hc_bin(&self) -> String {
         self.var("HC_BIN_PATH").unwrap_or("hc").to_string()
     }
 
@@ -77,7 +75,7 @@ impl Env {
     }
 
     /// The core session this process runs in: `HC_SESSION`, empty for the
-    /// default core. The same name [`crate::herdr::Herdr::cmd`] hands its
+    /// default core. The same name [`crate::core::Core::cmd`] hands its
     /// children, so a command and the `hc` it runs always agree on the session.
     pub fn this_session(&self) -> &str {
         self.var("HC_SESSION").unwrap_or("")
@@ -231,13 +229,13 @@ mod tests {
             resolve_root(None, &env, &home.path().join("none")).unwrap(),
             home.path().join(".herdr-projects")
         );
-        assert_eq!(env.herdr_bin(), "hc");
+        assert_eq!(env.hc_bin(), "hc");
     }
 
     #[test]
-    fn herdr_bin_prefers_the_variable() {
+    fn hc_bin_prefers_the_variable() {
         let env = Env::for_test(Path::new("/h"), &[("HC_BIN_PATH", "/opt/hc")]);
-        assert_eq!(env.herdr_bin(), "/opt/hc");
+        assert_eq!(env.hc_bin(), "/opt/hc");
     }
 
     #[test]

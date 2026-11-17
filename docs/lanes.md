@@ -12,7 +12,7 @@
 > calls `sidebar::` live in `src/labels.rs` (formerly `src/sidebar.rs`). Panes are
 > core terminals; a coordinator's own identity is `HC_TERMINAL_ID`, its session
 > `HC_SESSION` (`src/paths.rs::Env::this_terminal` / `this_session`), and the
-> `hp_lane`/`hp_project` tokens are ordinary core labels (`src/herdr.rs`). The
+> `hp_lane`/`hp_project` tokens are ordinary core labels (`src/core.rs`). The
 > `Coordinators:` line and every lane command are unchanged.
 
 A **lane** is one line of work inside one project. Each lane has its own
@@ -68,7 +68,7 @@ the wrong one.** Concretely:
    server restart or while the ticker is stopped.
 4. `is_coordinator()` (`src/coordinator.rs`) decides who is a coordinator with
    `agent.works_in(&record.cwd) || session_matches(record, agent)`. `works_in`
-   (`src/herdr.rs`) compares `own_dir(cwd, foreground_cwd)` (same file) to the
+   (`src/core.rs`) compares `own_dir(cwd, foreground_cwd)` (same file) to the
    recorded directory.
 5. Therefore, when two agents work in the same project home, `works_in` is true
    for **both**, and every "find the coordinator" site picks
@@ -168,7 +168,7 @@ of `lanes::resolve` returning the three-valued `LaneResolution`
 (`labels::report_pane`, `src/labels.rs`) and its clear
 (`labels::clear_pane`, same file; the Herdr 1 `grouping::clear` is gone with
 `src/grouping.rs`);
-`Agent.tokens` (`src/herdr.rs`); `Thread.lane` (`src/thread.rs`) and
+`Agent.tokens` (`src/core.rs`); `Thread.lane` (`src/thread.rs`) and
 `inbox::Item::lane` (`src/inbox.rs`) written by their creators; per-lane
 `inbox::seen`/`mark_seen` (`src/inbox.rs`) and the `steps::State` maps
 (`src/steps.rs`); lane-routed nudge, prompt and discovery
@@ -334,7 +334,7 @@ TTL of `TOKEN_TTL_MS = 300_000` (same file). Live panes show it:
 
 Adding one token — `hp_lane=c-1` — is enough for a coordinator to say which lane
 it is. `herdr pane report-metadata --token NAME=VALUE --ttl-ms N` is the same
-mechanism (`--source` is `herdr::SOURCE`, `src/herdr.rs`); the token
+mechanism (`--source` is `core::SOURCE`, `src/core.rs`); the token
 also expired the same way, so a stopped ticker or a dead pane leaves no stale
 claim behind after the TTL.
 

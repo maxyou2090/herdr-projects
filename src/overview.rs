@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Result, bail};
 
-use crate::herdr::{Herdr, Pane};
+use crate::core::{Core, Pane};
 use crate::paths::Ctx;
 use crate::project::{self, Project, Status};
 use crate::thread::{self, Group};
@@ -20,7 +20,7 @@ use crate::threads::{self, Row};
 /// being set at all.
 fn here(ctx: &Ctx) -> Option<(Pane, Vec<Pane>)> {
     let terminal = ctx.env.this_terminal()?;
-    let herdr = Herdr::new(ctx.env.herdr_bin(), ctx.env.this_session(), ctx.runner);
+    let herdr = Core::new(ctx.env.hc_bin(), ctx.env.this_session(), ctx.runner);
     let panes = herdr.pane_list().ok()?;
     let mine = panes.iter().find(|pane| pane.terminal_id == terminal)?.clone();
     Some((mine, panes))
@@ -68,12 +68,12 @@ fn project_for_space(ctx: &Ctx, panes: &[Pane], mine: &Pane) -> Option<String> {
     if workspace_id.is_empty() {
         return None;
     }
-    let session = crate::herdr::session_key(ctx.env.this_session());
+    let session = crate::core::session_key(ctx.env.this_session());
     let projects: Vec<(Project, crate::project::Coordinator)> = project::list_slugs(&ctx.root)
         .into_iter()
         .filter_map(|slug| Project::load(&ctx.root, &slug).ok())
         .filter(|p| p.status() != Status::Archived)
-        .filter_map(|p| p.coordinator().filter(|r| crate::herdr::session_key(&r.socket) == session).map(|r| (p, r)))
+        .filter_map(|p| p.coordinator().filter(|r| crate::core::session_key(&r.socket) == session).map(|r| (p, r)))
         .collect();
     if projects.is_empty() {
         return None;
@@ -231,7 +231,7 @@ pub fn run(ctx: &Ctx, slug: Option<&str>, wait: bool) -> Result<()> {
 mod tests {
     use super::*;
     use crate::fake_hc::FakeCore;
-    use crate::herdr::L_WS;
+    use crate::core::L_WS;
     use crate::paths::Env;
 
     /// A projects root plus a fake core that answers `hc`: the two things

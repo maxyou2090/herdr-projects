@@ -16,7 +16,7 @@ use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 
 use crate::coordinator;
-use crate::herdr::{Agent, Herdr, Pane};
+use crate::core::{Agent, Core, Pane};
 use crate::paths::Ctx;
 use crate::project::{self, Project, Status};
 use crate::runner::{Cmd, Runner};
@@ -555,7 +555,7 @@ fn run_logged(ctx: &Ctx, log: &Log) -> Result<()> {
         tools: ["herdr", "git", "gh", "ssh", "scp", "rsync"]
             .iter()
             .map(|tool| {
-                let name = if *tool == "herdr" { ctx.env.herdr_bin() } else { tool.to_string() };
+                let name = if *tool == "herdr" { ctx.env.hc_bin() } else { tool.to_string() };
                 (tool.to_string(), which(&name, &path_var))
             })
             .collect(),
@@ -684,7 +684,7 @@ pub fn brief_pass(ctx: &Ctx, log: &Log) -> bool {
         let Some(record) = project.coordinator().filter(|r| !pending.is_empty() && !r.socket.is_empty()) else {
             continue;
         };
-        let herdr = Herdr::new(ctx.env.herdr_bin(), &record.socket, ctx.runner);
+        let herdr = Core::new(ctx.env.hc_bin(), &record.socket, ctx.runner);
         for t in &pending {
             let Some(agents) = lists.entry(record.socket.clone()).or_insert_with(|| herdr.agent_list().ok()) else {
                 continue;
@@ -736,7 +736,7 @@ impl Sessions {
             .or_insert_with(|| {
                 // A session is a core session name, empty for the default core;
                 // the two calls below are what say whether it answers.
-                let herdr = Herdr::new(ctx.env.herdr_bin(), socket, ctx.runner);
+                let herdr = Core::new(ctx.env.hc_bin(), socket, ctx.runner);
                 Some((herdr.agent_list().ok()?, herdr.pane_list().ok()?))
             })
             .as_ref()
@@ -868,7 +868,7 @@ struct Pass {
     error: Option<anyhow::Error>,
 }
 
-fn thread_pass(project: &Project, herdr: &Herdr, socket: &str, threads: &[thread::Thread], agents: &[Agent], panes: &[Pane], hashes: Option<&std::collections::BTreeMap<String, String>>) -> Result<Pass> {
+fn thread_pass(project: &Project, herdr: &Core, socket: &str, threads: &[thread::Thread], agents: &[Agent], panes: &[Pane], hashes: Option<&std::collections::BTreeMap<String, String>>) -> Result<Pass> {
     let slug = &project.slug;
     let now = jiff::Timestamp::now();
     let mut pass = Pass { transitions: Vec::new(), stuck: Vec::new(), recorded_panes: 0, missing_panes: 0, error: None };
@@ -900,7 +900,7 @@ fn thread_pass(project: &Project, herdr: &Herdr, socket: &str, threads: &[thread
         }
         // A brief about to go to a trust screen Herdr reads as ready would
         // answer it: hold the brief and count the thread as blocked.
-        let brief_due = t.prompt_pending && live.agent_state.as_deref().is_some_and(crate::herdr::ready_state);
+        let brief_due = t.prompt_pending && live.agent_state.as_deref().is_some_and(crate::core::ready_state);
         // An unreadable screen holds the brief too, without calling it blocked.
         let screen = brief_due.then(|| herdr.trust_screen(&t.pane_id, &t.agent));
         let hold_brief = !matches!(screen, None | Some(Ok(None)));
@@ -980,7 +980,7 @@ fn thread_pass(project: &Project, herdr: &Herdr, socket: &str, threads: &[thread
 /// listed before any start.
 fn launch_pass(ctx: &Ctx, project: &Project, seen: &Seen, threads: &[thread::Thread], may_start: &mut bool, errors: &mut Vec<anyhow::Error>) {
     let now = jiff::Timestamp::now();
-    let herdr = Herdr::new(ctx.env.herdr_bin(), &seen.socket, ctx.runner);
+    let herdr = Core::new(ctx.env.hc_bin(), &seen.socket, ctx.runner);
     let (agents, panes) = (&seen.agents, &seen.panes);
     for t in threads {
         if t.status != thread::Status::Open || !t.prompt_pending {
@@ -1090,7 +1090,7 @@ fn tick_cheap_body(ctx: &Ctx, project: &Project, sessions: &mut Sessions, state:
     let Some((agents, panes)) = sessions.get(ctx, &record.socket).cloned() else {
         return Ok(None);
     };
-    let herdr = Herdr::new(ctx.env.herdr_bin(), &record.socket, ctx.runner);
+    let herdr = Core::new(ctx.env.hc_bin(), &record.socket, ctx.runner);
     let slug = &project.slug;
     let mut first_error = None;
 
@@ -1192,7 +1192,7 @@ fn tick_cheap_body(ctx: &Ctx, project: &Project, sessions: &mut Sessions, state:
 fn tick_slow(ctx: &Ctx, project: &Project, seen: &Seen, memory: &mut Memory, log: &Log) -> Vec<anyhow::Error> {
     let mut errors = Vec::new();
     let mut copy_notes: std::collections::BTreeMap<String, Vec<String>> = Default::default();
-    let herdr = Herdr::new(ctx.env.herdr_bin(), &seen.socket, ctx.runner);
+    let herdr = Core::new(ctx.env.hc_bin(), &seen.socket, ctx.runner);
     let now = jiff::Timestamp::now();
     let mut may_start = true;
     let transitions = &seen.transitions;

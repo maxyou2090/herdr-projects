@@ -7,7 +7,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 
-use crate::herdr::Herdr;
+use crate::core::Core;
 use crate::paths::Ctx;
 use crate::project::{self, Project, Settings};
 use crate::thread::{self, CopyOutcome, Group, Status, Thread};
@@ -445,8 +445,8 @@ pub fn audit_items(
     state: &mut State,
     socket: &str,
     now: jiff::Timestamp,
-    agents: &[crate::herdr::Agent],
-    panes: &[crate::herdr::Pane],
+    agents: &[crate::core::Agent],
+    panes: &[crate::core::Pane],
 ) -> Result<Vec<crate::audit::Finding>> {
     let Ok(last) = state.last_audit.parse::<jiff::Timestamp>() else {
         // First sight, a brand-new project or the upgrade that added this step:
@@ -685,7 +685,7 @@ const REMINDED: &str = "a reminder went out recently; the next waits for its spa
 /// but never moved to `done` get one reminder once the oldest is
 /// `RE_NUDGE_AFTER_SECS` old, at most every `RE_NUDGE_EVERY_SECS`: an
 /// interrupted turn cannot strand them silently.
-pub fn nudge(project: &Project, state: &mut State, settings: &Settings, herdr: &Herdr, lane: &str, coordinator_ready: Option<&crate::coordinator::LivePane>, now: jiff::Timestamp) -> Result<NudgeOutcome> {
+pub fn nudge(project: &Project, state: &mut State, settings: &Settings, herdr: &Core, lane: &str, coordinator_ready: Option<&crate::coordinator::LivePane>, now: jiff::Timestamp) -> Result<NudgeOutcome> {
     // Every lane has its own unseen set, seen set, delivered hash and input
     // box (§4.4). Without a registry `lane` is the single synthesized default
     // lane, so this is one run over the old files and the old slots.
@@ -729,7 +729,7 @@ pub fn nudge(project: &Project, state: &mut State, settings: &Settings, herdr: &
 
 /// The aged reminder: every unhandled item has been shown to a coordinator
 /// that never finished with it.
-fn aged_renudge(state: &mut State, settings: &Settings, herdr: &Herdr, lane: &str, coordinator_ready: Option<&crate::coordinator::LivePane>, unhandled: &[inbox::Item], now: jiff::Timestamp) -> Result<NudgeOutcome> {
+fn aged_renudge(state: &mut State, settings: &Settings, herdr: &Core, lane: &str, coordinator_ready: Option<&crate::coordinator::LivePane>, unhandled: &[inbox::Item], now: jiff::Timestamp) -> Result<NudgeOutcome> {
     let quiet: Vec<inbox::Item> = unhandled.iter().filter(|i| RE_NUDGE_KINDS.contains(&i.kind.as_str())).cloned().collect();
     if quiet.is_empty() || !settings.nudge {
         forget_box(state, lane);
@@ -868,7 +868,7 @@ fn forget_box(state: &mut State, lane: &str) {
 /// earlier one at least `NUDGE_QUIET_SECS` before, with nothing typed seen in
 /// between. A box that holds text, or that the screen does not show, starts
 /// the wait over.
-fn box_quiet(state: &mut State, herdr: &Herdr, lane: &str, pane: &crate::coordinator::LivePane, now: jiff::Timestamp) -> Result<bool> {
+fn box_quiet(state: &mut State, herdr: &Core, lane: &str, pane: &crate::coordinator::LivePane, now: jiff::Timestamp) -> Result<bool> {
     let screen = herdr.agent_screen(&pane.pane_id).map_err(|error| anyhow::anyhow!("{error}"))?;
     if crate::prompt_box::check(&pane.agent, &screen) != crate::prompt_box::Draft::Empty {
         forget_box(state, lane);
@@ -1456,7 +1456,7 @@ pub fn routines(project: &Project, state: &mut State, coordinator: bool, project
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::herdr::Herdr;
+    use crate::core::Core;
     use crate::runner::fake::FakeRunner;
 
     fn at(text: &str) -> jiff::Timestamp {
@@ -1865,7 +1865,7 @@ mod tests {
         let project = project::create(root.path(), "demo", "", vec![]).unwrap();
         seen_item(&project, "20261008T140000Z-thread-state-t-0001-1", "2026-10-08T14:00:00Z");
         let runner = FakeRunner::new();
-        let herdr = Herdr::new("herdr", "sock", &runner);
+        let herdr = Core::new("herdr", "sock", &runner);
         let mut state = State::default();
         let settings = Settings::default();
         let now = at("2026-10-08T14:10:00Z");
@@ -1884,7 +1884,7 @@ mod tests {
         let project = project::create(root.path(), "demo", "", vec![]).unwrap();
         seen_item(&project, "20261008T130000Z-thread-state-t-0001-1", "2026-10-08T13:00:00Z");
         let runner = FakeRunner::new();
-        let herdr = Herdr::new("herdr", "sock", &runner);
+        let herdr = Core::new("herdr", "sock", &runner);
         let mut state = State::default();
         let settings = Settings::default();
         let now = at("2026-10-08T14:10:00Z");

@@ -17,7 +17,7 @@
 use anyhow::{Result, bail};
 use serde::Serialize;
 
-use crate::herdr::{Agent, Pane};
+use crate::core::{Agent, Pane};
 use crate::paths::Ctx;
 use crate::project::Project;
 use crate::thread::{self, Status, Thread};

@@ -6,7 +6,7 @@ use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 
-use crate::herdr::{Agent, Herdr, Pane};
+use crate::core::{Agent, Core, Pane};
 use crate::paths::Ctx;
 use crate::project::{self, Project};
 use crate::runner::{Cmd, Runner};
@@ -18,7 +18,7 @@ const FETCH_TIMEOUT: Duration = Duration::from_secs(15);
 
 /// The project's session as the binary sees it right now.
 pub struct SessionView<'a> {
-    pub herdr: Herdr<'a>,
+    pub herdr: Core<'a>,
     pub socket: String,
     pub agents: Vec<Agent>,
     pub panes: Vec<Pane>,
@@ -34,12 +34,12 @@ pub fn session_view<'a>(ctx: &'a Ctx, project: &Project) -> Option<SessionView<'
         None => {
             let session = crate::paths::resolve_session(&Default::default(), ctx.env, ctx.runner).ok()?;
             let socket = session.socket.clone();
-            let agents = Herdr::new(ctx.env.herdr_bin(), &socket, ctx.runner).agent_list().ok()?;
+            let agents = Core::new(ctx.env.hc_bin(), &socket, ctx.runner).agent_list().ok()?;
             // Read only: the ticker records it on its next tick.
             crate::coordinator::found(project, &socket, &session.name.unwrap_or_default(), &agents)?
         }
     };
-    let herdr = Herdr::new(ctx.env.herdr_bin(), &record.socket, ctx.runner);
+    let herdr = Core::new(ctx.env.hc_bin(), &record.socket, ctx.runner);
     let agents = herdr.agent_list().ok()?;
     let panes = herdr.pane_list().ok()?;
     Some(SessionView { herdr, socket: record.socket, agents, panes })
@@ -62,11 +62,11 @@ fn git(runner: &dyn Runner, repo: &str, args: &[&str], timeout: Duration) -> Res
     Ok(out.stdout.trim().to_string())
 }
 
-pub fn report_thread_tokens(herdr: &Herdr, thread: &Thread, slug: &str, group: Group) {
+pub fn report_thread_tokens(herdr: &Core, thread: &Thread, slug: &str, group: Group) {
     crate::labels::report_pane(herdr, &thread.pane_id, &crate::labels::thread_display(thread), slug, group, None);
 }
 
-fn clear_thread_tokens(herdr: &Herdr, thread: &Thread) {
+fn clear_thread_tokens(herdr: &Core, thread: &Thread) {
     crate::labels::clear_pane(herdr, &thread.pane_id);
 }
 
@@ -255,7 +255,7 @@ fn prepare_thread_agents(thread: &Thread) -> Result<()> {
 
 /// The repository's primary Space herdr grouped a new worktree Space under,
 /// or "" when herdr does not list one (the ticker looks again).
-fn repo_space(herdr: &crate::herdr::Herdr, repo: &str) -> String {
+fn repo_space(herdr: &crate::core::Core, repo: &str) -> String {
     herdr.workspace_list().ok().and_then(|all| crate::spaces::primary(&all, repo).map(|w| w.workspace_id.clone())).unwrap_or_default()
 }
 
@@ -324,7 +324,7 @@ fn place_tab(project: &Project, view: &SessionView, record: &Thread) -> Result<T
             // thread already has (ids move when the server restarts): reuse it
             // rather than add a second tab for the same thread.
             match view.panes.iter().find(|p| p.workspace_id == home && !p.cwd.is_empty() && Path::new(&p.cwd).starts_with(&folder)) {
-                Some(pane) => crate::herdr::Created { workspace_id: pane.workspace_id.clone(), tab_id: pane.tab_id.clone(), pane_id: pane.pane_id.clone() },
+                Some(pane) => crate::core::Created { workspace_id: pane.workspace_id.clone(), tab_id: pane.tab_id.clone(), pane_id: pane.pane_id.clone() },
                 None => view.herdr.tab_create(&home, &folder, &record.title, false)?,
             }
         }
@@ -565,7 +565,7 @@ pub fn prompt(ctx: &Ctx, slug: &str, id: &str, text: &str, recorded: Recorded) -
     // typed but not confirmed is never typed again: it may sit in the box.
     let sent = herdr.agent_prompt_confirmed(&record.pane_id, text.trim());
     if let Err(error) = &sent
-        && crate::herdr::refused_before_typing(error)
+        && crate::core::refused_before_typing(error)
     {
         bail!("{error}");
     }
@@ -637,7 +637,7 @@ pub fn stop(ctx: &Ctx, slug: &str, id: &str) -> Result<()> {
 /// at a bare shell prompt.
 struct PaneAgent<'a> {
     record: Thread,
-    herdr: Herdr<'a>,
+    herdr: Core<'a>,
     state: String,
     agent: Agent,
 }
@@ -682,7 +682,7 @@ pub fn keys(ctx: &Ctx, slug: &str, id: &str, keys: &[String], text: Option<&str>
         bail!("a key name is empty");
     }
     let pane = pane_agent(ctx, slug, id)?;
-    let fail = |error: crate::herdr::HerdrError| anyhow::anyhow!("{error}");
+    let fail = |error: crate::core::CoreError| anyhow::anyhow!("{error}");
     // With `trust_screens = user`, a trust answer is the user's alone.
     if Project::load(&ctx.root, slug)?.safety(&ctx.config_dir)?.trust_screens == crate::safety::USER
         && let Some(phrase) = pane.herdr.trust_screen(&pane.record.pane_id, &pane.record.agent).map_err(fail)?
@@ -902,10 +902,10 @@ fn called_from_coordinator(ctx: &Ctx, project: &Project) -> bool {
     let Some(record) = project.coordinator() else {
         return false;
     };
-    if !crate::herdr::same_session(ctx.env.this_session(), &record.socket) {
+    if !crate::core::same_session(ctx.env.this_session(), &record.socket) {
         return false;
     }
-    let agent = crate::herdr::Herdr::new(ctx.env.herdr_bin(), &record.socket, ctx.runner)
+    let agent = crate::core::Core::new(ctx.env.hc_bin(), &record.socket, ctx.runner)
         .agent_list()
         .unwrap_or_default()
         .into_iter()
@@ -1374,8 +1374,8 @@ mod tests {
         Agent { pane_id: "w2:p1".into(), agent_status: state.into(), ..Agent::default() }
     }
 
-    fn space(id: &str, label: &str) -> crate::herdr::Workspace {
-        crate::herdr::Workspace { workspace_id: id.into(), label: label.into(), ..crate::herdr::Workspace::default() }
+    fn space(id: &str, label: &str) -> crate::core::Workspace {
+        crate::core::Workspace { workspace_id: id.into(), label: label.into(), ..crate::core::Workspace::default() }
     }
 
     #[test]
@@ -1386,7 +1386,7 @@ mod tests {
         // A reused id with another label, a home Space, a worktree Space and
         // a disappeared id are all refused.
         assert!(thread::recorded_own_space(&t, &[space("w3", "mine")]).is_none());
-        let worktree = crate::herdr::Workspace { worktree: Some(crate::herdr::WorkspaceWorktree::default()), ..space("w3", "Research") };
+        let worktree = crate::core::Workspace { worktree: Some(crate::core::WorkspaceWorktree::default()), ..space("w3", "Research") };
         assert!(thread::recorded_own_space(&t, &[worktree]).is_none());
         assert!(thread::recorded_own_space(&t, &[space("w9", "Research")]).is_none());
         // A record from before `own_workspace` existed falls back to its
