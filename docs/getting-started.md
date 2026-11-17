@@ -34,6 +34,12 @@ hp ticker start      # writes ~/Library/LaunchAgents/dev.hp.ticker.plist and loa
 hp ticker status
 ```
 
+The plist has `RunAtLoad` and an unconditional `KeepAlive`: launchd starts the
+ticker after a reboot and after any exit, so a crashed or killed loop comes
+back on its own, and every exit leaves its reason in `~/.herdr-projects/.ticker.log`.
+`hp doctor` has a `ticker agent` line for a plist that is missing, out of date
+or not loaded; `hp doctor --fix` rewrites and reloads it.
+
 ## 2. Create a project
 
 ```bash

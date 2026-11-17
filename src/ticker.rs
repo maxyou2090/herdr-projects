@@ -1,7 +1,10 @@
 //! The ticker: one background loop per projects root.
 //!
 //! Everything it does is "check on an interval, compare with last time, act".
-//! It exits on request through a stop file, never through signals.
+//! It exits on request through a stop file, never through signals, and every
+//! exit — the stop file, the five-minute idle one, an error, a panic — leaves
+//! a line in `.ticker.log`: a ticker that stops is never a silent one. On macOS
+//! a LaunchAgent with an unconditional `KeepAlive` starts it again.
 
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom, Write};
@@ -16,6 +19,7 @@ use crate::coordinator;
 use crate::herdr::{Agent, Herdr, Pane};
 use crate::paths::Ctx;
 use crate::project::{self, Project, Status};
+use crate::runner::{Cmd, Runner};
 use crate::steps::{self, Memory, Transition};
 use crate::{inbox, thread};
 
@@ -24,6 +28,8 @@ pub const TICK: Duration = Duration::from_secs(15);
 const BRIEF_POLL: Duration = Duration::from_secs(2);
 const STOP_WAIT: Duration = Duration::from_secs(60);
 const IDLE_EXIT: Duration = Duration::from_secs(300);
+/// How long `ticker start` waits for the loop it just started to take the lock.
+const START_WAIT: Duration = Duration::from_secs(10);
 const LOG_CAP: u64 = 1_000_000;
 
 fn lock_path(root: &Path) -> PathBuf {
@@ -94,21 +100,31 @@ pub fn decide_start(lock: &LockState, my_version: &str, stop_file_exists: bool) 
 /// The LaunchAgent that keeps the ticker alive across reboots and crashes.
 pub const AGENT_LABEL: &str = "dev.hp.ticker";
 
-fn agent_path() -> Option<PathBuf> {
-    let home = std::env::var_os("HOME").map(PathBuf::from)?;
-    Some(home.join("Library/LaunchAgents").join(format!("{AGENT_LABEL}.plist")))
+const LAUNCHCTL_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// How long launchd waits before starting the ticker again after it exited:
+/// long enough that a crash loop (a panic at startup) costs one start a
+/// minute rather than a spinning CPU, short enough that a real outage is
+/// recovered while somebody is still looking at the screen.
+const THROTTLE_SECS: u32 = 60;
+
+fn agent_path_in(home: &Path) -> PathBuf {
+    home.join("Library/LaunchAgents").join(format!("{AGENT_LABEL}.plist"))
 }
 
-/// Writes the plist and loads it, so a stopped or rebooted machine brings the
-/// ticker back without anybody running a command.
-pub fn install_agent(root: &Path) -> Result<()> {
-    let Some(path) = agent_path() else {
-        return Ok(());
-    };
-    let binary = crate::paths::binary()?;
+/// The plist text for a ticker of `root`.
+///
+/// `KeepAlive` is unconditional and `RunAtLoad` is set, so launchd starts the
+/// ticker after a reboot and after *any* exit: a crash, a panic, `ticker stop`
+/// without the plist being removed, and the five-minute idle exit. Until
+/// 2026-11-17 it was `<dict><key>SuccessfulExit</key><false/></dict>`, which
+/// restarted only a non-zero exit — a ticker that exited cleanly (or was
+/// killed so that its exit code looked clean) stayed dead, and nothing said
+/// so: the 2026-11-17 14:39Z disappearance had no stop line, no crash line and
+/// no LaunchAgent loaded at all.
+fn agent_plist(binary: &Path, root: &Path, log: &Path) -> String {
     let escape = |text: &str| text.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;");
-    let log = log_path(root);
-    let plist = format!(
+    format!(
         "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
 <!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n\
 <plist version=\"1.0\">\n<dict>\n\
@@ -117,7 +133,8 @@ pub fn install_agent(root: &Path) -> Result<()> {
     <string>{binary}</string>\n    <string>--root</string>\n    <string>{root}</string>\n    <string>ticker</string>\n    <string>run</string>\n\
   </array>\n\
   <key>RunAtLoad</key><true/>\n\
-  <key>KeepAlive</key><dict><key>SuccessfulExit</key><false/></dict>\n\
+  <key>KeepAlive</key><true/>\n\
+  <key>ThrottleInterval</key><integer>{THROTTLE_SECS}</integer>\n\
   <key>ProcessType</key><string>Background</string>\n\
   <key>StandardOutPath</key><string>{log}</string>\n\
   <key>StandardErrorPath</key><string>{log}</string>\n\
@@ -125,31 +142,98 @@ pub fn install_agent(root: &Path) -> Result<()> {
         binary = escape(&binary.to_string_lossy()),
         root = escape(&root.to_string_lossy()),
         log = escape(&log.to_string_lossy()),
-    );
-    if let Some(dir) = path.parent() {
-        std::fs::create_dir_all(dir)?;
+    )
+}
+
+/// The LaunchAgent as `doctor` sees it: whether the plist is there, whether it
+/// is the text [`install_agent`] would write now (an old `KeepAlive` is what
+/// the 2026-11-17 accident left on disk), and whether launchd has the job
+/// loaded — a written plist nobody loaded starts nothing.
+pub struct AgentState {
+    pub path: PathBuf,
+    pub installed: bool,
+    pub current: bool,
+    pub loaded: bool,
+}
+
+/// `None` where this machine has no LaunchAgents (not macOS), so `doctor`
+/// there prints exactly what it printed before.
+pub fn agent_state(home: &Path, binary: &Path, root: &Path, runner: &dyn Runner) -> Option<AgentState> {
+    if !cfg!(target_os = "macos") {
+        return None;
     }
-    std::fs::write(&path, plist).with_context(|| format!("could not write {}", path.display()))?;
+    let path = agent_path_in(home);
+    let text = std::fs::read_to_string(&path).ok();
+    Some(AgentState {
+        installed: text.is_some(),
+        current: text.is_some_and(|text| text == agent_plist(binary, root, &log_path(root))),
+        loaded: agent_loaded(runner),
+        path,
+    })
+}
+
+/// Whether launchd holds the job, asked of launchd itself rather than guessed
+/// from the plist: `launchctl print` fails for a label that is not loaded.
+fn agent_loaded(runner: &dyn Runner) -> bool {
     let uid = unsafe { libc_getuid() };
+    let print = Cmd::new("launchctl", LAUNCHCTL_TIMEOUT).args(["print", &format!("gui/{uid}/{AGENT_LABEL}")]);
+    runner.run(&print).map(|out| out.success()).unwrap_or(false)
+}
+
+fn launchctl(runner: &dyn Runner, args: &[&str]) {
+    let _ = runner.run(&Cmd::new("launchctl", LAUNCHCTL_TIMEOUT).args(args.iter().copied()));
+}
+
+/// Writes the plist and loads it, so a stopped or rebooted machine brings the
+/// ticker back without anybody running a command. Idempotent: a plist that is
+/// already this text and already loaded is left alone (nothing is bounced), an
+/// outdated one — an old `KeepAlive`, a moved binary or root — is rewritten and
+/// reloaded.
+pub fn install_agent(home: &Path, binary: &Path, root: &Path, runner: &dyn Runner) -> Result<()> {
+    load_agent(home, binary, root, runner, false)
+}
+
+/// Writes and loads the plist even when it is already right and loaded: that is
+/// what starts a ticker whose plist says it should be running and is not
+/// (`doctor --fix` uses it; `ticker start` reuses [`install_agent`] and then
+/// checks the process rather than bouncing a healthy one).
+pub fn reload_agent(home: &Path, binary: &Path, root: &Path, runner: &dyn Runner) -> Result<()> {
+    load_agent(home, binary, root, runner, true)
+}
+
+fn load_agent(home: &Path, binary: &Path, root: &Path, runner: &dyn Runner, force: bool) -> Result<()> {
+    let path = agent_path_in(home);
+    let text = agent_plist(binary, root, &log_path(root));
+    let uid = unsafe { libc_getuid() };
+    let current = std::fs::read_to_string(&path).map(|old| old == text).unwrap_or(false);
+    if current && !force && agent_loaded(runner) {
+        return Ok(());
+    }
+    if !current {
+        if let Some(dir) = path.parent() {
+            std::fs::create_dir_all(dir).with_context(|| format!("could not create {}", dir.display()))?;
+        }
+        std::fs::write(&path, text).with_context(|| format!("could not write {}", path.display()))?;
+    }
     // `bootout` first: loading a label that is already loaded fails.
-    let _ = Command::new("launchctl").args(["bootout", &format!("gui/{uid}/{AGENT_LABEL}")]).output();
-    let loaded = Command::new("launchctl").args(["bootstrap", &format!("gui/{uid}"), &path.to_string_lossy()]).output();
-    match loaded {
-        Ok(out) if out.status.success() => Ok(()),
-        Ok(out) => bail!("launchctl bootstrap failed: {}", String::from_utf8_lossy(&out.stderr).trim()),
+    launchctl(runner, &["bootout", &format!("gui/{uid}/{AGENT_LABEL}")]);
+    let bootstrap = Cmd::new("launchctl", LAUNCHCTL_TIMEOUT).args(["bootstrap", &format!("gui/{uid}"), &path.to_string_lossy()]);
+    match runner.run(&bootstrap) {
+        Ok(out) if out.success() => Ok(()),
+        Ok(out) => bail!("launchctl bootstrap failed: {}", out.error_text()),
         Err(error) => Err(error).context("could not run launchctl"),
     }
 }
 
 /// Unloads the agent and removes its plist: `ticker stop` means stopped.
-pub fn remove_agent() -> Result<()> {
-    let Some(path) = agent_path() else {
-        return Ok(());
-    };
+///
+/// `home` and `runner` are parameters rather than the process's own, so a test
+/// can never unload the LaunchAgent of the machine it runs on.
+pub fn remove_agent(home: &Path, runner: &dyn Runner) {
+    let path = agent_path_in(home);
     let uid = unsafe { libc_getuid() };
-    let _ = Command::new("launchctl").args(["bootout", &format!("gui/{uid}/{AGENT_LABEL}")]).output();
+    launchctl(runner, &["bootout", &format!("gui/{uid}/{AGENT_LABEL}")]);
     let _ = std::fs::remove_file(&path);
-    Ok(())
 }
 
 unsafe extern "C" {
@@ -161,6 +245,12 @@ unsafe extern "C" {
 /// nothing when the root does not exist or contains no projects, so a linked
 /// plugin's `[[startup]]` is harmless in sessions that have no projects.
 pub fn start(ctx: &Ctx) -> Result<()> {
+    start_with(ctx, START_WAIT, &spawn)
+}
+
+/// [`start`] with the wait and the fallback passed in, so a test can follow the
+/// stop-then-spawn path without starting a process.
+fn start_with(ctx: &Ctx, wait: Duration, spawn_directly: &dyn Fn(&Path) -> Result<()>) -> Result<()> {
     let root = &ctx.root;
     if !ctx.detached_ticker || project::list_slugs(root).is_empty() {
         return Ok(());
@@ -171,16 +261,42 @@ pub fn start(ctx: &Ctx) -> Result<()> {
         StartAction::Spawn => {
             // A leftover stop file would make the new ticker exit at once.
             let _ = std::fs::remove_file(stop_path(root));
-            if cfg!(target_os = "macos") && install_agent(root).is_ok() {
-                return Ok(());
-            }
-            spawn(root)
+            launch_with(ctx, wait, spawn_directly)
         }
         StartAction::StopThenSpawn => {
-            stop(root)?;
-            spawn(root)
+            stop(ctx)?;
+            launch_with(ctx, wait, spawn_directly)
         }
     }
+}
+
+/// Starts the loop the way this machine can keep it: through its LaunchAgent
+/// where there is one, so a version change does not leave a ticker that nothing
+/// restarts (that is how the 2026-11-17 disappearance left no agent behind); a
+/// plain detached process otherwise (`spawn_directly`).
+///
+/// Loading the agent is not the same as the ticker running: `launchctl
+/// bootstrap` can succeed while nothing takes the lock (a stale job, a launchd
+/// in a bad state). So the loop that was started is looked for in the lock file,
+/// and when it does not appear, one is spawned directly and the reason is
+/// printed — `hp ticker start` never reports success with no process behind it.
+/// The wait and the fallback are parameters, so a test can see both without
+/// starting a process.
+fn launch_with(ctx: &Ctx, wait: Duration, spawn_directly: &dyn Fn(&Path) -> Result<()>) -> Result<()> {
+    if cfg!(target_os = "macos") {
+        let installed = crate::paths::binary().and_then(|binary| install_agent(&ctx.env.home, &binary, &ctx.root, ctx.runner));
+        match installed {
+            Ok(()) if wait_for_ticker(&ctx.root, wait) => return Ok(()),
+            Ok(()) => println!(
+                "ticker start: the LaunchAgent is loaded but no ticker took {} within {}s; starting one directly (see {})",
+                lock_path(&ctx.root).display(),
+                wait.as_secs(),
+                log_path(&ctx.root).display()
+            ),
+            Err(error) => println!("ticker start: could not install the LaunchAgent ({error:#}); starting the loop directly"),
+        }
+    }
+    spawn_directly(&ctx.root)
 }
 
 unsafe extern "C" {
@@ -216,24 +332,58 @@ fn spawn(root: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Asks the running ticker to exit and waits for the lock to be released.
-pub fn stop(root: &Path) -> Result<()> {
-    let _ = remove_agent();
-    if lock_state(root) == LockState::Free {
-        let _ = std::fs::remove_file(stop_path(root));
-        return Ok(());
+/// Asks the running ticker to exit and waits for the lock to be released: the
+/// stop file first (its own path, which writes a log line), then the
+/// LaunchAgent is unloaded and its plist removed, so an unconditional
+/// `KeepAlive` does not start the loop again.
+pub fn stop(ctx: &Ctx) -> Result<()> {
+    let root = &ctx.root;
+    // The stop file first: the ticker then exits through its own path, which
+    // logs it, instead of being killed by `bootout`'s SIGTERM.
+    if lock_state(root) != LockState::Free {
+        std::fs::write(stop_path(root), b"")?;
+        wait_until_free(root, STOP_WAIT);
     }
-    std::fs::write(stop_path(root), b"")?;
-    let deadline = Instant::now() + STOP_WAIT;
-    while Instant::now() < deadline {
+    // Unload it after the wait: with an unconditional `KeepAlive` the job is
+    // what would start the loop again, so it goes last, and removing it is
+    // also the SIGTERM for a ticker that ignored the stop file.
+    remove_agent(&ctx.env.home, ctx.runner);
+    let free = wait_until_free(root, STOP_WAIT);
+    let _ = std::fs::remove_file(stop_path(root));
+    if free {
+        Ok(())
+    } else {
+        bail!("the ticker did not exit within {} seconds", 2 * STOP_WAIT.as_secs())
+    }
+}
+
+/// Whether a ticker holds `root`'s lock right now, waiting up to `limit` for
+/// one to appear. The lock is the only thing that says "a loop is running":
+/// a loaded LaunchAgent is not the same fact.
+pub fn wait_for_ticker(root: &Path, limit: Duration) -> bool {
+    let deadline = Instant::now() + limit;
+    loop {
+        if lock_state(root) != LockState::Free {
+            return true;
+        }
+        if Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::sleep(Duration::from_millis(200));
+    }
+}
+
+fn wait_until_free(root: &Path, limit: Duration) -> bool {
+    let deadline = Instant::now() + limit;
+    loop {
         if lock_state(root) == LockState::Free {
-            let _ = std::fs::remove_file(stop_path(root));
-            return Ok(());
+            return true;
+        }
+        if Instant::now() >= deadline {
+            return false;
         }
         std::thread::sleep(Duration::from_millis(250));
     }
-    let _ = std::fs::remove_file(stop_path(root));
-    bail!("the ticker did not exit within {} seconds", STOP_WAIT.as_secs())
 }
 
 pub fn status(root: &Path) -> Result<()> {
@@ -298,11 +448,84 @@ impl Log {
     }
 }
 
-/// The loop. Exits when another ticker holds the lock, when the stop file
-/// appears, or when no project has had a reachable session for five minutes.
+/// Set by the SIGTERM/SIGINT handler; read by the loop. An atomic store is all
+/// a signal handler may do safely.
+static TERMINATE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+extern "C" fn on_signal(_: i32) {
+    TERMINATE.store(true, std::sync::atomic::Ordering::SeqCst);
+}
+
+unsafe extern "C" {
+    fn signal(signum: i32, handler: usize) -> usize;
+}
+
+const SIGINT: i32 = 2;
+const SIGTERM: i32 = 15;
+
+/// SIGTERM and SIGINT ask the loop to stop instead of killing it: launchd's
+/// `bootout` (`ticker stop`, a reinstall after a version change) and a terminal
+/// Ctrl-C are the two ways this process is ended from outside, and both used to
+/// leave a log that simply stopped. `signal(2)` with a handler that only sets a
+/// flag is the whole mechanism — no crate, no unsafe work beyond the call — and
+/// the loop logs the exit like every other way out.
+fn install_signal_handlers() {
+    let handler = on_signal as extern "C" fn(i32);
+    // SAFETY: `signal` with a handler that touches nothing but an atomic.
+    unsafe {
+        signal(SIGTERM, handler as usize);
+        signal(SIGINT, handler as usize);
+    }
+}
+
+/// Whether a signal has asked the loop to stop.
+fn terminated() -> bool {
+    TERMINATE.load(std::sync::atomic::Ordering::SeqCst)
+}
+
+/// The loop, with every exit written to `.ticker.log`.
+///
+/// A ticker that stops has to say why: a `.ticker.log` that simply ends is what
+/// made the 2026-11-17 disappearance invisible (no stop line, no crash line,
+/// and no LaunchAgent loaded to start it again). Each way out is logged — the
+/// root has no projects, another ticker holds the lock, the stop file, five
+/// minutes with no reachable session, an error return — and a panic anywhere in
+/// the loop goes through [`install_panic_hook`].
 pub fn run(ctx: &Ctx) -> Result<()> {
+    let log = Log { path: log_path(&ctx.root) };
+    install_panic_hook(log.path.clone());
+    // The tests share one process and one process-wide signal table: a test
+    // binary must not start ignoring SIGTERM for its parent.
+    if !cfg!(test) {
+        install_signal_handlers();
+    }
+    let outcome = run_logged(ctx, &log);
+    if let Err(error) = &outcome {
+        log.line(&format!("ticker stopped on an error: {error:#}"));
+    }
+    outcome
+}
+
+/// Records a panic in the ticker's log, then runs the previous hook (the
+/// default one prints to standard error, which the plist also sends to the
+/// same file). A process that dies without a word is the failure this exists
+/// to end.
+fn install_panic_hook(path: PathBuf) {
+    let previous = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        let location = info.location().map(|place| format!(" at {}:{}", place.file(), place.line())).unwrap_or_default();
+        Log { path: path.clone() }.line(&format!("ticker panicked{location}: {info}"));
+        previous(info);
+    }));
+}
+
+/// The loop. Exits when the root has no projects, when another ticker holds
+/// the lock, when the stop file appears, or when no project has had a
+/// reachable session for five minutes.
+fn run_logged(ctx: &Ctx, log: &Log) -> Result<()> {
     let root = &ctx.root;
     if project::list_slugs(root).is_empty() {
+        log.line(&format!("no projects under {}; exiting", root.display()));
         return Ok(());
     }
     let mut lock = File::options()
@@ -312,6 +535,15 @@ pub fn run(ctx: &Ctx) -> Result<()> {
         .write(true)
         .open(lock_path(root))?;
     if lock.try_lock().is_err() {
+        log.line(&format!("another ticker holds the lock ({}); exiting", lock_path(root).display()));
+        // Under launchd, exiting means being started again a moment later: two
+        // tickers would trade the lock for ever. Unload the job (not the plist,
+        // so `doctor` sees it was written but is not loaded) and step aside.
+        if std::env::var("XPC_SERVICE_NAME").map(|name| name == AGENT_LABEL).unwrap_or(false) {
+            let uid = unsafe { libc_getuid() };
+            log.line("this instance is launchd's job and another ticker has the lock; unloading the job");
+            launchctl(ctx.runner, &["bootout", &format!("gui/{uid}/{AGENT_LABEL}")]);
+        }
         return Ok(());
     }
     let path_var = ctx.env.var("PATH").unwrap_or("").to_string();
@@ -332,7 +564,6 @@ pub fn run(ctx: &Ctx) -> Result<()> {
     lock.write_all(serde_json::to_string_pretty(&info)?.as_bytes())?;
     lock.flush()?;
 
-    let log = Log { path: log_path(root) };
     log.line(&format!("ticker {} started (pid {})", info.version, info.pid));
     let mut last_reachable = Instant::now();
     let mut memory = Memory::new(ctx);
@@ -341,10 +572,14 @@ pub fn run(ctx: &Ctx) -> Result<()> {
             log.line("stop file found; exiting");
             return Ok(());
         }
-        if tick(ctx, &log, &mut memory) {
+        if terminated() {
+            log.line("asked to stop by a signal (SIGTERM or SIGINT); exiting");
+            return Ok(());
+        }
+        if tick(ctx, log, &mut memory) {
             last_reachable = Instant::now();
         } else if last_reachable.elapsed() > IDLE_EXIT {
-            log.line("no project has had a reachable session for five minutes; exiting");
+            log.line("no project has had a reachable session for five minutes; exiting (the LaunchAgent starts it again)");
             return Ok(());
         }
         // Sleep in short slices so a stop request is honoured promptly.
@@ -353,11 +588,11 @@ pub fn run(ctx: &Ctx) -> Result<()> {
         let mut briefs = true;
         let mut next_brief = Instant::now() + BRIEF_POLL;
         while Instant::now() < wake {
-            if stop_path(root).exists() {
+            if stop_path(root).exists() || terminated() {
                 break;
             }
             if briefs && Instant::now() >= next_brief {
-                briefs = brief_pass(ctx, &log);
+                briefs = brief_pass(ctx, log);
                 next_brief = Instant::now() + BRIEF_POLL;
             }
             std::thread::sleep(Duration::from_millis(500));
@@ -1098,7 +1333,205 @@ mod tests {
         std::fs::create_dir(&missing).unwrap();
         start(&ctx).unwrap();
         run(&ctx).unwrap();
-        assert_eq!(std::fs::read_dir(&missing).unwrap().count(), 0);
+        // The run logs why it exits and takes no lock; nothing else is created.
+        let mut entries: Vec<String> = std::fs::read_dir(&missing).unwrap().map(|e| e.unwrap().file_name().to_string_lossy().into_owned()).collect();
+        entries.sort();
+        assert_eq!(entries, [".ticker.log"]);
+        let log = std::fs::read_to_string(missing.join(".ticker.log")).unwrap();
+        assert!(log.contains("no projects under"), "{log}");
+    }
+
+    #[test]
+    fn the_launch_agent_is_there_to_start_the_ticker_after_any_exit() {
+        let plist = agent_plist(Path::new("/opt/hp/hp"), Path::new("/Users/me/.herdr-projects"), Path::new("/Users/me/.herdr-projects/.ticker.log"));
+        // A clean exit is restarted too: `SuccessfulExit` was why the episode
+        // of 2026-11-17 stayed dead.
+        assert!(plist.contains("<key>KeepAlive</key><true/>"), "{plist}");
+        assert!(!plist.contains("SuccessfulExit"), "{plist}");
+        assert!(plist.contains("<key>RunAtLoad</key><true/>"), "{plist}");
+        assert!(plist.contains("<string>/opt/hp/hp</string>"), "{plist}");
+        assert!(plist.contains("<string>--root</string>") && plist.contains("<string>ticker</string>") && plist.contains("<string>run</string>"), "{plist}");
+        assert!(plist.contains("<key>StandardOutPath</key><string>/Users/me/.herdr-projects/.ticker.log</string>"), "{plist}");
+    }
+
+    #[test]
+    fn installing_the_launch_agent_rewrites_only_what_is_out_of_date() {
+        let home = tempfile::tempdir().unwrap();
+        let root = home.path().join("root");
+        let runner = FakeRunner::new();
+        runner.on("launchctl print", ok(""));
+        runner.on("launchctl bootout", ok(""));
+        runner.on("launchctl bootstrap", ok(""));
+        let binary = Path::new("/opt/hp/hp");
+        let plist = home.path().join(format!("Library/LaunchAgents/{AGENT_LABEL}.plist"));
+
+        install_agent(home.path(), binary, &root, &runner).unwrap();
+        assert!(std::fs::read_to_string(&plist).unwrap().contains("<key>KeepAlive</key><true/>"));
+        assert_eq!(runner.count("launchctl bootstrap"), 1);
+
+        // Already this text and already loaded: nothing is rewritten or bounced.
+        install_agent(home.path(), binary, &root, &runner).unwrap();
+        assert_eq!(runner.count("launchctl bootout"), 1);
+        assert_eq!(runner.count("launchctl bootstrap"), 1);
+
+        // The old shape, as the accident left it: rewritten and reloaded.
+        std::fs::write(&plist, "<plist><dict><key>KeepAlive</key><dict><key>SuccessfulExit</key><false/></dict></dict></plist>").unwrap();
+        install_agent(home.path(), binary, &root, &runner).unwrap();
+        assert!(std::fs::read_to_string(&plist).unwrap().contains("<key>KeepAlive</key><true/>"));
+        assert_eq!(runner.count("launchctl bootout"), 2);
+        assert_eq!(runner.count("launchctl bootstrap"), 2);
+    }
+
+    #[test]
+    fn a_version_change_leaves_a_launch_agent_behind() {
+        if !cfg!(target_os = "macos") {
+            return;
+        }
+        let home = tempfile::tempdir().unwrap();
+        let root = home.path().join("root");
+        project::create(&root, "demo", "", vec![]).unwrap();
+        let env = Env::for_test(home.path(), &[]);
+        let runner = FakeRunner::new();
+        runner.on("launchctl print", fail(113, "Could not find service"));
+        runner.on("launchctl bootout", ok(""));
+        runner.on("launchctl bootstrap", ok(""));
+        let ctx = Ctx { env: &env, root: root.clone(), config_dir: home.path().join("cfg"), runner: &runner, detached_ticker: true };
+
+        // A ticker of another version holds the lock and lets go when it sees
+        // the stop file: the stop-then-spawn path, which used to spawn a plain
+        // process and leave no LaunchAgent at all (the 2026-11-17 shape).
+        let holder = File::options().create(true).truncate(false).read(true).write(true).open(lock_path(&root)).unwrap();
+        holder.lock().unwrap();
+        let watched = root.clone();
+        let releaser = std::thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_secs(20);
+            while Instant::now() < deadline && !stop_path(&watched).exists() {
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            drop(holder);
+        });
+        let started = std::cell::Cell::new(0);
+        start_with(&ctx, Duration::from_millis(100), &|_| {
+            started.set(started.get() + 1);
+            Ok(())
+        })
+        .unwrap();
+        releaser.join().unwrap();
+
+        let plist = home.path().join(format!("Library/LaunchAgents/{AGENT_LABEL}.plist"));
+        let text = std::fs::read_to_string(&plist).unwrap_or_default();
+        assert!(text.contains("<key>KeepAlive</key><true/>"), "no LaunchAgent written: {text}");
+        assert_eq!(runner.count("launchctl bootstrap"), 1);
+        // Nothing took the lock (the fake launchctl starts no process), so the
+        // fallback ran: start never reports success with no process.
+        assert_eq!(started.get(), 1);
+    }
+
+    /// A stand-in for a ticker process: it takes the root's lock a moment
+    /// later, then holds it long enough to be seen.
+    fn pretend_ticker(root: &Path) -> std::thread::JoinHandle<()> {
+        let path = lock_path(root);
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(50));
+            let file = File::options().create(true).truncate(false).read(true).write(true).open(&path).unwrap();
+            file.lock().unwrap();
+            std::thread::sleep(Duration::from_secs(3));
+            drop(file);
+        })
+    }
+
+    #[test]
+    fn a_loaded_agent_that_starts_nothing_falls_back_to_a_plain_process() {
+        if !cfg!(target_os = "macos") {
+            return;
+        }
+        let home = tempfile::tempdir().unwrap();
+        let root = home.path().join("root");
+        project::create(&root, "demo", "", vec![]).unwrap();
+        let env = Env::for_test(home.path(), &[]);
+        let runner = FakeRunner::new();
+        runner.on("launchctl print", ok(""));
+        runner.on("launchctl bootout", ok(""));
+        runner.on("launchctl bootstrap", ok(""));
+        let ctx = Ctx { env: &env, root: root.clone(), config_dir: home.path().join("cfg"), runner: &runner, detached_ticker: true };
+        let started = std::cell::Cell::new(0);
+        // `launchctl` says the job is loaded, but no loop took the lock: the
+        // agent alone is not "the ticker is running".
+        launch_with(&ctx, Duration::from_millis(100), &|_| {
+            started.set(started.get() + 1);
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(runner.count("launchctl bootstrap"), 1, "the LaunchAgent was written and loaded");
+        assert_eq!(started.get(), 1, "nothing took the lock, so a process is started directly");
+    }
+
+    #[test]
+    fn a_loaded_agent_whose_ticker_took_the_lock_is_not_started_again() {
+        if !cfg!(target_os = "macos") {
+            return;
+        }
+        let home = tempfile::tempdir().unwrap();
+        let root = home.path().join("root");
+        project::create(&root, "demo", "", vec![]).unwrap();
+        let env = Env::for_test(home.path(), &[]);
+        let runner = FakeRunner::new();
+        runner.on("launchctl print", ok(""));
+        runner.on("launchctl bootout", ok(""));
+        runner.on("launchctl bootstrap", ok(""));
+        let ctx = Ctx { env: &env, root: root.clone(), config_dir: home.path().join("cfg"), runner: &runner, detached_ticker: true };
+        let ticker = pretend_ticker(&root);
+        let started = std::cell::Cell::new(0);
+        launch_with(&ctx, Duration::from_secs(5), &|_| {
+            started.set(started.get() + 1);
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(started.get(), 0);
+        ticker.join().unwrap();
+    }
+
+    #[test]
+    fn the_stop_file_path_is_logged() {
+        let home = tempfile::tempdir().unwrap();
+        let root = home.path().join("root");
+        project::create(&root, "demo", "", vec![]).unwrap();
+        let env = Env::for_test(home.path(), &[]);
+        let runner = FakeRunner::new();
+        let ctx = Ctx { env: &env, root: root.clone(), config_dir: home.path().join("cfg"), runner: &runner, detached_ticker: false };
+        std::fs::write(stop_path(&root), b"").unwrap();
+        let log = Log { path: root.join(".ticker.log") };
+        run_logged(&ctx, &log).unwrap();
+        let text = std::fs::read_to_string(&log.path).unwrap();
+        assert!(text.contains("stop file found; exiting"), "{text}");
+    }
+
+    #[test]
+    fn a_panic_is_written_to_the_log() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("log");
+        // The installed hook chains to whatever was there: a panic still prints
+        // to standard error as before, and lands in the ticker's log.
+        install_panic_hook(path.clone());
+        assert!(std::panic::catch_unwind(|| panic!("boom in the ticker")).is_err());
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.contains("ticker panicked"), "{text}");
+        assert!(text.contains("boom in the ticker"), "{text}");
+    }
+
+    #[test]
+    fn a_second_ticker_says_why_it_steps_aside() {
+        let home = tempfile::tempdir().unwrap();
+        let root = home.path().join("root");
+        project::create(&root, "demo", "", vec![]).unwrap();
+        let env = Env::for_test(home.path(), &[]);
+        let runner = FakeRunner::new();
+        let ctx = Ctx { env: &env, root: root.clone(), config_dir: home.path().join("cfg"), runner: &runner, detached_ticker: false };
+        let held = File::options().create(true).truncate(false).read(true).write(true).open(lock_path(&root)).unwrap();
+        held.lock().unwrap();
+        run(&ctx).unwrap();
+        let log = std::fs::read_to_string(root.join(".ticker.log")).unwrap();
+        assert!(log.contains("another ticker holds the lock"), "{log}");
     }
 
     #[test]
@@ -1124,10 +1557,17 @@ mod tests {
 
     #[test]
     fn stop_with_a_free_lock_removes_a_stale_stop_file() {
-        let root = tempfile::tempdir().unwrap();
-        std::fs::write(stop_path(root.path()), b"").unwrap();
-        stop(root.path()).unwrap();
-        assert!(!stop_path(root.path()).exists());
+        let home = tempfile::tempdir().unwrap();
+        let root = home.path().join("root");
+        std::fs::create_dir(&root).unwrap();
+        std::fs::write(stop_path(&root), b"").unwrap();
+        // A temporary HOME and a fake runner: the real machine's LaunchAgent is
+        // never unloaded by a test.
+        let env = Env::for_test(home.path(), &[]);
+        let runner = FakeRunner::new();
+        let ctx = Ctx { env: &env, root: root.clone(), config_dir: home.path().join("cfg"), runner: &runner, detached_ticker: false };
+        stop(&ctx).unwrap();
+        assert!(!stop_path(&root).exists());
     }
 
     const NO_AGENTS: &str = r#"{"result":{"agents":[]}}"#;

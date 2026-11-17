@@ -88,6 +88,70 @@ fn lane_notes(project: &project::Project, agents: &[crate::herdr::Agent]) -> Vec
     notes
 }
 
+/// How long `doctor --fix` waits for the ticker it just loaded to take the lock.
+const AGENT_WAIT: Duration = Duration::from_secs(10);
+
+/// `ticker agent`: the LaunchAgent that starts the ticker after a reboot and
+/// after any exit, and the loop it is supposed to be starting. `None` where this
+/// machine has no LaunchAgents, so `doctor` there prints exactly what it printed
+/// before.
+///
+/// `Some((None, …))` is the warning the 2026-11-17 accident asks for: the ticker
+/// may be running right now, but nothing will start it again — or launchd has
+/// the plist and never loaded it, which is the state the second disappearance
+/// left behind (`launchctl print` empty while the file sat on disk). `fix`
+/// rewrites and reloads the plist, and checks that a process really took the
+/// lock rather than trusting `launchctl bootstrap` alone.
+fn ticker_agent_line(env: &Env, root: &Path, runner: &dyn Runner, fix: bool, running: bool) -> Option<(Option<bool>, String)> {
+    let binary = paths::binary().ok()?;
+    let state = crate::ticker::agent_state(&env.home, &binary, root, runner)?;
+    let path = state.path.display();
+    if fix && !(state.installed && state.current && state.loaded && running) {
+        return Some(match crate::ticker::reload_agent(&env.home, &binary, root, runner) {
+            Ok(()) => {
+                let loaded = crate::ticker::agent_state(&env.home, &binary, root, runner).is_some_and(|after| after.installed && after.current && after.loaded);
+                let started = running || crate::ticker::wait_for_ticker(root, AGENT_WAIT);
+                match (loaded, started) {
+                    (true, true) => (Some(true), format!("fixed: {path} is written (KeepAlive is unconditional), loaded, and a ticker holds the lock")),
+                    (true, false) => (
+                        Some(false),
+                        format!("reloaded {path}, but no ticker took the lock within {}s; read {}", AGENT_WAIT.as_secs(), root.join(".ticker.log").display()),
+                    ),
+                    (false, _) => (Some(false), format!("wrote {path} but launchd did not load it; run `hp ticker start`")),
+                }
+            }
+            Err(error) => (Some(false), format!("could not install {path}: {error:#}")),
+        });
+    }
+    if !state.installed {
+        return Some((
+            None,
+            format!(
+                "no LaunchAgent at {path}: the ticker dies with its terminal and is not started after a reboot; run `hp ticker start` (or `hp doctor --fix`), which writes the plist and loads it"
+            ),
+        ));
+    }
+    if !state.current {
+        return Some((
+            None,
+            format!(
+                "{path} is out of date (its KeepAlive does not restart every exit); run `hp doctor --fix` (or `hp ticker start`), which rewrites the plist and loads it again"
+            ),
+        ));
+    }
+    if !state.loaded {
+        return Some((
+            None,
+            format!(
+                "{path} is written but launchd has not loaded it, so nothing starts the ticker; run `hp doctor --fix` or `hp ticker start` to load it (`launchctl bootstrap gui/<uid> {})",
+                crate::ticker::AGENT_LABEL
+            ),
+        ));
+    }
+    Some((Some(true), format!("{path} is written (KeepAlive is unconditional) and loaded")))
+}
+
+/// The whole report, as text, and whether every required check passed.
 fn report(
     env: &Env,
     root: &Path,
@@ -239,19 +303,37 @@ fn report(
         );
     }
 
-    match crate::ticker::lock_state(root) {
-        crate::ticker::LockState::Free => check(&mut out, None, "ticker", "not running".into()),
-        crate::ticker::LockState::Held(info) => check(
-            &mut out,
-            Some(true),
-            "ticker",
-            format!(
-                "running, version {} (this binary: {}), root {}",
-                info.version,
-                crate::VERSION,
-                info.root
-            ),
-        ),
+    let running = match crate::ticker::lock_state(root) {
+        crate::ticker::LockState::Free => {
+            check(
+                &mut out,
+                None,
+                "ticker",
+                "not running; run `hp ticker start` (it installs the LaunchAgent and starts the loop)".into(),
+            );
+            false
+        }
+        crate::ticker::LockState::Held(info) => {
+            check(
+                &mut out,
+                Some(true),
+                "ticker",
+                format!(
+                    "running, version {} (this binary: {}), root {}",
+                    info.version,
+                    crate::VERSION,
+                    info.root
+                ),
+            );
+            true
+        }
+    };
+
+    // A running ticker is not enough: without a loaded LaunchAgent it dies with
+    // its terminal and nothing starts it again (2026-11-17: the loop vanished
+    // with no stop line as well). Worth a warning even while it runs.
+    if let Some((ok, detail)) = ticker_agent_line(env, root, runner, fix, running) {
+        check(&mut out, ok, "ticker agent", detail);
     }
 
     // Every project's priming files, and the binary path they carry: a
@@ -404,4 +486,137 @@ fn report(
     }
 
     (out, healthy)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::runner::fake::{FakeRunner, fail, ok};
+
+    /// A plist written by `install_agent`, under a temporary HOME, and the root
+    /// it points at. `print` answers whether launchd has the job loaded.
+    fn installed(home: &Path, root: &Path, runner: &FakeRunner) {
+        let binary = paths::binary().unwrap();
+        crate::ticker::install_agent(home, &binary, root, runner).unwrap();
+    }
+
+    fn plist_path(home: &Path) -> std::path::PathBuf {
+        home.join(format!("Library/LaunchAgents/{}.plist", crate::ticker::AGENT_LABEL))
+    }
+
+    #[test]
+    fn doctor_warns_about_a_missing_launch_agent() {
+        if !cfg!(target_os = "macos") {
+            return;
+        }
+        let home = tempfile::tempdir().unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let env = Env::for_test(home.path(), &[]);
+        let runner = FakeRunner::new();
+        runner.on("launchctl print", fail(113, "Could not find service"));
+        let (mark, detail) = ticker_agent_line(&env, root.path(), &runner, false, true).unwrap();
+        assert_eq!(mark, None, "{detail}");
+        assert!(detail.contains("no LaunchAgent"), "{detail}");
+        assert!(detail.contains("hp ticker start"), "{detail}");
+    }
+
+    #[test]
+    fn doctor_warns_about_a_plist_launchd_did_not_load() {
+        if !cfg!(target_os = "macos") {
+            return;
+        }
+        let home = tempfile::tempdir().unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let env = Env::for_test(home.path(), &[]);
+        let runner = FakeRunner::new();
+        runner.on("launchctl print", fail(113, "Could not find service"));
+        runner.on("launchctl bootout", ok(""));
+        runner.on("launchctl bootstrap", ok(""));
+        installed(home.path(), root.path(), &runner);
+        let (mark, detail) = ticker_agent_line(&env, root.path(), &runner, false, true).unwrap();
+        assert_eq!(mark, None, "{detail}");
+        assert!(detail.contains("has not loaded it"), "{detail}");
+    }
+
+    #[test]
+    fn doctor_warns_about_the_plist_the_accident_left_behind() {
+        if !cfg!(target_os = "macos") {
+            return;
+        }
+        let home = tempfile::tempdir().unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let env = Env::for_test(home.path(), &[]);
+        let runner = FakeRunner::new();
+        runner.on("launchctl print", ok(""));
+        let path = plist_path(home.path());
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, "<plist><dict><key>KeepAlive</key><dict><key>SuccessfulExit</key><false/></dict></dict></plist>").unwrap();
+        let (mark, detail) = ticker_agent_line(&env, root.path(), &runner, false, true).unwrap();
+        assert_eq!(mark, None, "{detail}");
+        assert!(detail.contains("out of date"), "{detail}");
+        assert!(detail.contains("hp doctor --fix"), "{detail}");
+
+        // `--fix` rewrites it and loads it again.
+        runner.on("launchctl bootout", ok(""));
+        runner.on("launchctl bootstrap", ok(""));
+        let (mark, detail) = ticker_agent_line(&env, root.path(), &runner, true, true).unwrap();
+        assert_eq!(mark, Some(true), "{detail}");
+        assert!(detail.contains("fixed:"), "{detail}");
+        assert!(std::fs::read_to_string(&path).unwrap().contains("<key>KeepAlive</key><true/>"));
+    }
+
+    /// A stand-in for the loop a fix starts: it takes the root's lock a moment
+    /// later, which is the only thing that shows a ticker really runs.
+    fn pretend_ticker(root: &Path) -> std::thread::JoinHandle<()> {
+        let path = root.join(".ticker.lock");
+        std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            let file = std::fs::File::options().create(true).truncate(false).read(true).write(true).open(&path).unwrap();
+            file.lock().unwrap();
+            std::thread::sleep(std::time::Duration::from_secs(3));
+            drop(file);
+        })
+    }
+
+    #[test]
+    fn doctor_fix_starts_the_loop_it_loads() {
+        if !cfg!(target_os = "macos") {
+            return;
+        }
+        let home = tempfile::tempdir().unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let env = Env::for_test(home.path(), &[]);
+        let runner = FakeRunner::new();
+        runner.on("launchctl print", ok(""));
+        runner.on("launchctl bootout", ok(""));
+        runner.on("launchctl bootstrap", ok(""));
+        installed(home.path(), root.path(), &runner);
+        // Written and loaded, and still no ticker: the second disappearance.
+        let (mark, detail) = ticker_agent_line(&env, root.path(), &runner, false, false).unwrap();
+        assert_eq!(mark, Some(true), "{detail}");
+
+        let ticker = pretend_ticker(root.path());
+        let (mark, detail) = ticker_agent_line(&env, root.path(), &runner, true, false).unwrap();
+        assert_eq!(mark, Some(true), "{detail}");
+        assert!(detail.contains("a ticker holds the lock"), "{detail}");
+        ticker.join().unwrap();
+    }
+
+    #[test]
+    fn doctor_is_happy_with_a_written_and_loaded_launch_agent() {
+        if !cfg!(target_os = "macos") {
+            return;
+        }
+        let home = tempfile::tempdir().unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let env = Env::for_test(home.path(), &[]);
+        let runner = FakeRunner::new();
+        runner.on("launchctl print", ok(""));
+        runner.on("launchctl bootout", ok(""));
+        runner.on("launchctl bootstrap", ok(""));
+        installed(home.path(), root.path(), &runner);
+        let (mark, detail) = ticker_agent_line(&env, root.path(), &runner, false, true).unwrap();
+        assert_eq!(mark, Some(true), "{detail}");
+        assert!(detail.contains("KeepAlive is unconditional"), "{detail}");
+    }
 }

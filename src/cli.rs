@@ -955,7 +955,7 @@ pub fn run() -> Result<()> {
         Command::Ticker { command } => match command {
             TickerCommand::Start => ticker::start(&ctx),
             TickerCommand::Run => ticker::run(&ctx),
-            TickerCommand::Stop => ticker::stop(&ctx.root),
+            TickerCommand::Stop => ticker::stop(&ctx),
             TickerCommand::Status => ticker::status(&ctx.root),
         },
     }
