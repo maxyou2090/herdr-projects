@@ -260,7 +260,7 @@ impl Default for Safety {
             coordinator_agent_args: Vec::new(),
             thread_agent_args: Vec::new(),
             yolo: false,
-            trust_screens: crate::trust_screen::USER.into(),
+            trust_screens: crate::safety::USER.into(),
             thread_profiles: None,
             coordinator_profiles: None,
         }
@@ -474,7 +474,7 @@ pub fn load_safety(config_dir: &Path, canonical_project_dir: &Path) -> Result<Sa
 /// Who answers trust screens when `trust_screens` is not set: the
 /// coordinator in yolo mode, the user otherwise.
 pub fn default_trust_screens(yolo: bool) -> &'static str {
-    if yolo { crate::trust_screen::COORDINATOR } else { crate::trust_screen::USER }
+    if yolo { crate::safety::COORDINATOR } else { crate::safety::USER }
 }
 
 /// The `[safety.default]` table and the project's own table, as written.

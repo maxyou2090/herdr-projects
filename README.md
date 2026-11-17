@@ -28,7 +28,7 @@ hp thread list law       # records with live state
 | `hp thread start` | A new agent in its own worktree and branch (or a tab, a checkout, a folder of its own) |
 | `hp report` | An agent's own word on what it is doing; the ticker groups threads by it |
 | `hp ticker` | One background loop per projects root: launches pending threads, sends briefs, watches reports, pull requests, routines and audits |
-| `hp agent` | A tiny wrapper core runs around an agent, so its life shows up as OSC 7501 status |
+| `hp agent` | A tiny wrapper core runs around an agent, so what it is doing shows up as OSC 7501 status: its life, plus `working`/`blocked` read from the pane for harnesses that print no status |
 
 Everything a coordinator may do is a command: there is no hidden channel, and a
 project keeps working from a terminal, a script or another agent.

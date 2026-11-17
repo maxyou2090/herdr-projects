@@ -73,26 +73,6 @@ pub(crate) fn plain_text(screen: &str) -> String {
     out
 }
 
-/// The trust-screen line in pane `pane` now, read right before typing there.
-/// A screen that cannot be read is an error: the caller does not type.
-pub fn showing(herdr: &crate::herdr::Herdr, pane: &str, kind: &str) -> Result<Option<&'static str>, crate::herdr::HerdrError> {
-    Ok(detect(kind, &herdr.agent_screen(pane)?))
-}
-
-/// Who answers trust screens in thread panes (`trust_screens`).
-pub const COORDINATOR: &str = "coordinator";
-pub const USER: &str = "user";
-
-/// The refusal for text or keys aimed at a trust screen.
-pub fn refusal(id: &str, pane: &str, phrase: &str, by_user: bool) -> String {
-    let who = if by_user {
-        "trust_screens = user: only the user answers it, in the pane; tell them in chat".to_string()
-    } else {
-        "answer it first (`thread read` shows it, `thread keys` answers it)".to_string()
-    };
-    format!("trust_screen: {id}'s pane {pane} shows a trust screen (\"{phrase}\"); nothing is typed into it; {who}")
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

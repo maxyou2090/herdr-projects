@@ -47,6 +47,20 @@ pub fn yolo_flags(kind: &str) -> Option<&'static [&'static str]> {
     })
 }
 
+/// Who answers a trust screen in a thread's pane (`trust_screens`).
+pub const COORDINATOR: &str = "coordinator";
+pub const USER: &str = "user";
+
+/// The refusal for text or keys aimed at a trust screen.
+pub fn trust_refusal(id: &str, pane: &str, phrase: &str, by_user: bool) -> String {
+    let who = if by_user {
+        "trust_screens = user: only the user answers it, in the pane; tell them in chat".to_string()
+    } else {
+        "answer it first (`thread read` shows it, `thread keys` answers it)".to_string()
+    };
+    format!("trust_screen: {id}'s pane {pane} shows a trust screen (\"{phrase}\"); nothing is typed into it; {who}")
+}
+
 /// Which table a change goes to.
 pub enum Target {
     Global,
