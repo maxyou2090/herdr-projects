@@ -74,7 +74,8 @@ agent started there that it is the coordinator), `PROJECT.md`, `TASKS.md` and
 - [`docs/getting-started.md`](docs/getting-started.md) — the first project, end to end
 - [`docs/operations.md`](docs/operations.md) — how it works, what it writes, settings, cleanup, other machines
 - [`docs/lanes.md`](docs/lanes.md) — several coordinators in one project
-- [`docs/herdr-notes.md`](docs/herdr-notes.md) — what the port verified about herdr-core
+- [`docs/herdr-core-port.md`](docs/herdr-core-port.md) — the port itself: what was kept, rebuilt and deleted, the traps, and what is still open
+- [`docs/herdr-notes.md`](docs/herdr-notes.md) — what the Herdr 1 build verified, stage by stage
 
 ## License
 

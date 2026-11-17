@@ -2,6 +2,9 @@
 
 How hp works, what it writes where, what its safety settings do and don't stop, and how to run threads on other machines.
 
+Read [`herdr-core-port.md`](herdr-core-port.md) for why the binary is shaped this way
+and what is still open.
+
 ## How it works
 
 - **It relies on herdr-core (`hc`) and nothing else.** No plugin is needed or called. Pull requests open in your browser, text files open in this terminal's `$EDITOR`.
