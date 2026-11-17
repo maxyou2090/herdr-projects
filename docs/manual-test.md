@@ -1,3 +1,7 @@
+<!-- Herdr 1 only: the steps below witness the sidebar, the popup, the action
+     menu and the tab bar, none of which exist on herdr-core. Kept as a record
+     of what the Herdr 1 build was checked against. -->
+
 # Manual test list
 
 ## 0.2.0: the Herdr-native redesign
