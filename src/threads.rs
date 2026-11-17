@@ -362,7 +362,7 @@ fn place_tab(project: &Project, view: &SessionView, record: &Thread) -> Result<T
     // thread's title counts, exactly like the recorded one.
     let own_space = if matches!(record.kind, Kind::Tab | Kind::Checkout) {
         let listed = view.herdr.workspace_list().unwrap_or_default();
-        let named = |id: &str| listed.iter().any(|w| w.workspace_id == id && w.worktree.is_none() && !w.label.ends_with(crate::grouping::HOME_MARK) && w.label == record.title);
+        let named = |id: &str| listed.iter().any(|w| w.workspace_id == id && w.worktree.is_none() && w.label == record.title);
         thread::recorded_own_space(record, &listed).filter(|w| w.workspace_id != project_home).map(|w| w.workspace_id.clone()).or_else(|| {
             view.panes
                 .iter()
@@ -1500,8 +1500,6 @@ mod tests {
         // A reused id with another label, a home Space, a worktree Space and
         // a disappeared id are all refused.
         assert!(thread::recorded_own_space(&t, &[space("w3", "mine")]).is_none());
-        let home = space("w3", &format!("Research{}", crate::grouping::HOME_MARK));
-        assert!(thread::recorded_own_space(&t, &[home]).is_none());
         let worktree = crate::herdr::Workspace { worktree: Some(crate::herdr::WorkspaceWorktree::default()), ..space("w3", "Research") };
         assert!(thread::recorded_own_space(&t, &[worktree]).is_none());
         assert!(thread::recorded_own_space(&t, &[space("w9", "Research")]).is_none());

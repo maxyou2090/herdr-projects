@@ -486,8 +486,6 @@ pub struct Sessions {
     /// default session first, then every other project's recorded socket.
     candidates: Option<Vec<(String, String)>>,
     known: Vec<String>,
-    /// Each session's projects, for the sidebar grouping.
-    parts: std::collections::BTreeMap<String, crate::grouping::Parts>,
 }
 
 impl Sessions {
@@ -500,7 +498,7 @@ impl Sessions {
             .collect();
         known.sort();
         known.dedup();
-        Sessions { lists: Default::default(), candidates: None, known, parts: Default::default() }
+        Sessions { lists: Default::default(), candidates: None, known }
     }
 
     /// `None` when the socket is gone or the session does not answer.
@@ -583,74 +581,10 @@ fn routine_pass(ctx: &Ctx, project: &Project, state: &mut steps::State, coordina
     }
 }
 
-/// A paused project is skipped, but its panes and Spaces keep their place in
-/// the sidebar grouping.
-fn mark_paused(ctx: &Ctx, project: &Project, sessions: &mut Sessions) {
-    let Some(record) = project.coordinator() else {
-        return;
-    };
-    if !crate::herdr::session_alive(&ctx.env.herdr_bin(), &record.socket, ctx.runner) {
-        return;
-    }
-    let part = part(ctx, project, &record, &coordinator::live(project), &[], true);
-    sessions.parts.entry(record.socket).or_default().insert(project.slug.clone(), part);
-}
-
 /// A project's agents and Spaces in sidebar order: coordinators, then local
 /// threads by need; the home Space, then each thread's repository Space and
 /// its own. Each agent carries its sub-line (the state line's fact and its
 /// fresh self-reported activity).
-fn part(ctx: &Ctx, project: &Project, record: &project::Coordinator, coordinators: &[coordinator::LivePane], agents: &[Agent], paused: bool) -> crate::grouping::ProjectPart {
-    let slug = &project.slug;
-    let threads = open_threads(project, false);
-    let activity = |pane: &str| -> (Option<crate::progress::Record>, String) {
-        let terminal = agents.iter().find(|a| a.pane_id == pane).map(|a| a.terminal_id.clone()).unwrap_or_default();
-        let report = crate::progress::self_report(&ctx.root, &record.socket, pane, &terminal);
-        let text = report.as_ref().filter(|r| crate::progress::fresh(r)).map(|r| r.activity.clone()).unwrap_or_default();
-        (report, text)
-    };
-    let mut panes: Vec<crate::grouping::PaneRow> = Vec::new();
-    // A closed lane takes no sidebar row (§6.4); its live pane is still on the
-    // `Coordinators:` line and in `lane list`, and is shown there, not here.
-    let recorded = (!record.pane_id.is_empty()).then(|| record.pane_id.clone());
-    for pane in coordinators
-        .iter()
-        .filter(|c| crate::lanes::coordinator_visible(project, &c.lane))
-        .map(|c| c.pane_id.clone())
-        .chain(recorded.filter(|_| crate::lanes::coordinator_visible(project, &crate::lanes::default_lane_id(project))))
-    {
-        if panes.iter().any(|p| p.pane == pane) {
-            continue;
-        }
-        let lane = coordinators
-            .iter()
-            .find(|c| c.pane_id == pane)
-            .map(|c| c.lane.clone())
-            .unwrap_or_else(|| crate::lanes::default_lane_id(project));
-        let (report, text) = activity(&pane);
-        let line = coordinators.iter().find(|c| c.pane_id == pane).map(|c| coordinator::row_state(c, report.as_ref()).1).unwrap_or_default();
-        let sub = if paused { String::new() } else { crate::sidebar::sub_line(&line, &text) };
-        let rank = crate::lanes::coordinator_rank(project, &lane);
-        panes.push(crate::grouping::PaneRow { key: crate::grouping::coordinator_key(slug, rank, &pane), pane, sub });
-    }
-    for t in threads.iter().filter(|t| crate::lanes::thread_visible(project, &t.lane)) {
-        let rank = thread::Group::from_token(&t.last_group).map(thread::Group::rank).unwrap_or(9);
-        if !t.pane_id.is_empty() {
-            let sub = if paused { String::new() } else { crate::sidebar::sub_line(&t.state_line, &activity(&t.pane_id).1) };
-            panes.push(crate::grouping::PaneRow { pane: t.pane_id.clone(), key: crate::grouping::thread_key(slug, rank, &t.id), sub });
-        }
-    }
-    let mut spaces: Vec<String> = Vec::new();
-    let home = coordinators.iter().map(|c| c.workspace_id.clone()).chain([record.workspace_id.clone()]);
-    let own = threads.iter().flat_map(|t| [t.repo_workspace.clone(), t.workspace_id.clone()]);
-    for id in home.chain(own) {
-        if !id.is_empty() && !spaces.contains(&id) {
-            spaces.push(id);
-        }
-    }
-    crate::grouping::ProjectPart { panes, home: record.workspace_id.clone(), spaces }
-}
-
 #[cfg(test)]
 pub fn tick_for_test(ctx: &Ctx, memory: &mut Memory) -> bool {
     let dir = std::env::temp_dir().join(format!("hp-test-log-{}", std::process::id()));
@@ -1007,8 +941,6 @@ fn tick_cheap_body(ctx: &Ctx, project: &Project, sessions: &mut Sessions, state:
     }
 
     let pass = thread_pass(project, &herdr, &record.socket, &open_threads(project, false), &agents, &panes, None)?;
-    // The project's part of the sidebar grouping.
-    sessions.parts.entry(record.socket.clone()).or_default().insert(slug.clone(), part(ctx, project, &record, &coordinators, &agents, false));
     // Progress records of panes that are gone are dropped; a new agent in a
     // reused pane id is told apart by its terminal id.
     let live_ids: Vec<String> = panes.iter().map(|p| p.pane_id.clone()).collect();
@@ -1278,71 +1210,6 @@ mod tests {
         assert_eq!(decide_start(&held("v0"), "v1", false), StartAction::StopThenSpawn);
         // A stop in progress: finish it, then spawn.
         assert_eq!(decide_start(&held("v1"), "v1", true), StartAction::StopThenSpawn);
-    }
-
-    #[test]
-    fn the_sidebar_part_carries_lane_rank_and_drops_a_closed_lane() {
-        let world = crate::scenarios::World::new();
-        let project = world.project("demo", "a.sock");
-        crate::lanes::Registry {
-            lanes: vec![
-                crate::lanes::Lane { id: "c-1".into(), name: "fix".into(), label: "抢修".into(), pane_id: "w1:p1".into(), ..Default::default() },
-                crate::lanes::Lane { id: "c-2".into(), name: "books".into(), label: "收藏".into(), pane_id: "w9:p9".into(), ..Default::default() },
-                crate::lanes::Lane { id: "c-3".into(), name: "old".into(), label: "归档".into(), pane_id: "w8:p8".into(), status: crate::lanes::Status::Closed, ..Default::default() },
-            ],
-            default: "c-1".into(),
-            next: 4,
-        }
-        .save(&project)
-        .unwrap();
-        let record = project.coordinator().unwrap();
-        // Deliberately not in declaration order: the keys, not the input, sort.
-        let live = vec![
-            crate::coordinator::LivePane { pane_id: "w9:p9".into(), lane: "c-2".into(), ..Default::default() },
-            crate::coordinator::LivePane { pane_id: "w1:p1".into(), lane: "c-1".into(), ..Default::default() },
-            crate::coordinator::LivePane { pane_id: "w8:p8".into(), lane: "c-3".into(), ..Default::default() },
-        ];
-        let part = part(&world.ctx(), &project, &record, &live, &[], false);
-        let mut keys: Vec<&str> = part.panes.iter().map(|row| row.key.as_str()).collect();
-        keys.sort();
-        assert_eq!(keys, ["demo!0!00!w1:p1", "demo!0!01!w9:p9"], "lane rank, then pane; the closed lane has no row");
-    }
-
-    #[test]
-    fn a_closed_lanes_live_pane_is_still_a_coordinator_but_not_a_sidebar_row() {
-        let world = crate::scenarios::World::new();
-        let project = world.project("demo", "a.sock");
-        let dir = project.canonical_dir().to_string_lossy().into_owned();
-        crate::lanes::Registry {
-            lanes: vec![
-                crate::lanes::Lane { id: "c-1".into(), name: "fix".into(), label: "抢修".into(), pane_id: "w1:p1".into(), ..Default::default() },
-                crate::lanes::Lane { id: "c-2".into(), name: "old".into(), label: "归档".into(), pane_id: "w2:p1".into(), status: crate::lanes::Status::Closed, ..Default::default() },
-            ],
-            default: "c-1".into(),
-            next: 3,
-        }
-        .save(&project)
-        .unwrap();
-        *world.agents.borrow_mut() = format!(
-            "[{},{}]",
-            crate::scenarios::agent_json_tokens("w1", "w1:p1", &dir, &[("hp_project", "demo"), ("hp_lane", "c-1")]),
-            crate::scenarios::agent_json_tokens("w2", "w2:p1", &dir, &[("hp_project", "demo"), ("hp_lane", "c-2")]),
-        );
-        *world.panes.borrow_mut() = format!("[{},{}]", crate::scenarios::pane_json("w1", "w1:t1", "w1:p1", &dir), crate::scenarios::pane_json("w2", "w2:t1", "w2:p1", &dir));
-        let ctx = world.ctx();
-        let view = crate::threads::session_view(&ctx, &project).unwrap();
-        // §6.4 + §5.4: put away but still running is a real state, and the
-        // `Coordinators:` line is the one place it stays visible.
-        let identity = crate::lanes::View::with_session(&ctx, &project, Some(&view));
-        let line = crate::lanes::identity_line(&identity);
-        assert!(line.contains("w2:p1 (token, lane c-2, closed"), "{line}");
-        assert!(line.contains("w1:p1 (token, lane c-1"), "{line}");
-        // §9: the sidebar, however, has no row for the closed lane.
-        let record = project.coordinator().unwrap();
-        let live = crate::coordinator::discover(&project, &record, &[], &view.agents, &crate::project::now());
-        let part = part(&ctx, &project, &record, &live, &view.agents, false);
-        assert!(part.panes.iter().any(|row| row.pane == "w1:p1"));
-        assert!(!part.panes.iter().any(|row| row.pane == "w2:p1"), "a closed lane takes no sidebar row: {:?}", part.panes);
     }
 
     #[test]

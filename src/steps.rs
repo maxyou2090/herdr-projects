@@ -344,7 +344,6 @@ pub struct Memory {
     pub tick: u64,
     pub machines: BTreeMap<String, MachineMemory>,
     /// The sidebar grouping tokens last sent.
-    pub grouping: crate::grouping::Sent,
     /// project slug -> the nudge-hold reason last logged, so a hold is
     /// written once per reason, not once per tick.
     pub nudge_held: std::collections::HashMap<String, String>,
@@ -360,7 +359,6 @@ impl Memory {
             outage_secs: ctx.env.var("HERDR_PROJECTS_OUTAGE_SECS").and_then(|v| v.parse().ok()).unwrap_or(DEFAULT_OUTAGE_SECS),
             tick: 0,
             machines: BTreeMap::new(),
-            grouping: Default::default(),
             nudge_held: Default::default(),
         }
     }
@@ -2238,7 +2236,7 @@ mod tests {
     }
 
     fn memory() -> Memory {
-        Memory { started: jiff::Timestamp::now(), gh: Outage::default(), gh_login: None, outage_secs: DEFAULT_OUTAGE_SECS, tick: 0, machines: BTreeMap::new(), grouping: Default::default(), nudge_held: Default::default() }
+        Memory { started: jiff::Timestamp::now(), gh: Outage::default(), gh_login: None, outage_secs: DEFAULT_OUTAGE_SECS, tick: 0, machines: BTreeMap::new(), nudge_held: Default::default() }
     }
 
     #[test]

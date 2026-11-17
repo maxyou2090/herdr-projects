@@ -106,17 +106,6 @@ pub fn display_label(project: &Project, lane_id: Option<&str>) -> Option<String>
 /// `None` when the project has no registry, so the key keeps its two-part
 /// shape. With a registry, a pane that resolved to no lane (an `Ambiguous`
 /// one) ranks after every lane: it is shown, but never claims a lane.
-pub fn coordinator_rank(project: &Project, lane_id: &str) -> Option<usize> {
-    if !split_in_use(project) {
-        return None;
-    }
-    let registry = Registry::for_project(project);
-    let default = registry.default_lane().map(|lane| lane.id.as_str());
-    let mut order: Vec<&str> = default.into_iter().collect();
-    order.extend(registry.lanes.iter().map(|lane| lane.id.as_str()).filter(|id| Some(*id) != default));
-    Some(order.iter().position(|id| *id == lane_id).unwrap_or(order.len()))
-}
-
 /// Whether a thread's `lane` field belongs to an **open** lane, for the views
 /// that leave a closed lane out (`overview`, `needs-you`, the sidebar).
 /// Without a registry every thread is visible — the pre-lane answer — and an
@@ -132,13 +121,6 @@ pub fn thread_visible(project: &Project, lane: &str) -> bool {
 /// every pane when there is no registry; with one, only panes whose lane is
 /// open. A pane with no lane is an `Ambiguous` one and stays visible — it is
 /// somebody, and `Coordinators:` says what to do about it.
-pub fn coordinator_visible(project: &Project, lane_id: &str) -> bool {
-    if !split_in_use(project) || lane_id.is_empty() {
-        return true;
-    }
-    Registry::for_project(project).get(lane_id).is_some_and(|lane| lane.is_open())
-}
-
 /// Every **open** lane's Space, for `spaces::empty`: a lane protects the Space
 /// its coordinator lives in, so the home is never offered for closing while a
 /// lane still runs there (`docs/lanes.md` §9). A closed lane protects nothing
@@ -2703,29 +2685,19 @@ mod tests {
         // `OLD_TOKENS` is the `--clear-token` list of *every* report: a token
         // that joins it is erased as fast as it is written (§5.1).
         assert!(!crate::sidebar::OLD_TOKENS.contains(&TOKEN), "{TOKEN} would be cleared on every report");
-        assert!(!crate::grouping::tokens().iter().any(|t| t == TOKEN));
-        assert!(!crate::grouping::legacy().iter().any(|t| t == TOKEN));
-        // Releasing a pane clears the claim, in both places that clear.
+        // Releasing a pane clears the claim, through labels now.
         let (_world, project) = temp_project("demo");
         Registry::ensure_written(&project).unwrap();
         let runner = crate::runner::fake::FakeRunner::new();
-        runner.on("report-metadata", crate::runner::fake::ok("{}"));
-        let herdr = crate::herdr::Herdr::new("herdr", "/s/a.sock", &runner);
+        runner.on("label", crate::runner::fake::ok("{}"));
+        let herdr = crate::herdr::Herdr::new("hc", "", &runner);
         crate::coordinator::report_tokens(&herdr, &project, "w1:p1");
-        let calls = runner.calls.borrow();
-        let report = calls.iter().find(|c| c.display().contains("report-metadata")).expect("report");
-        let text = report.display();
-        assert!(text.contains(&format!("--token {TOKEN}=c-1")), "{text}");
-        assert!(!text.contains(&format!("--clear-token {TOKEN}")), "{text}");
-        drop(calls);
+        let calls: Vec<String> = runner.calls.borrow().iter().map(|c| c.display()).collect();
+        assert!(calls.iter().any(|t| t.contains(&format!("{TOKEN}=c-1"))), "{calls:?}");
         runner.calls.borrow_mut().clear();
         crate::sidebar::clear_pane(&herdr, "w1:p1");
         let cleared: Vec<String> = runner.calls.borrow().iter().map(|c| c.display()).collect();
-        assert!(cleared.iter().any(|t| t.contains(&format!("--clear-token {TOKEN}"))), "{cleared:?}");
-        runner.calls.borrow_mut().clear();
-        crate::grouping::clear(&herdr, "pane", "w1:p1");
-        let cleared: Vec<String> = runner.calls.borrow().iter().map(|c| c.display()).collect();
-        assert!(cleared.iter().any(|t| t.contains(&format!("--clear-token {TOKEN}"))), "{cleared:?}");
+        assert!(cleared.iter().any(|t| t.contains(&format!("{TOKEN}="))), "{cleared:?}");
         assert_eq!(lane("c-1", "default").token_value(), Some("c-1"));
         assert_eq!(Lane::default().token_value(), None);
     }
@@ -2811,13 +2783,9 @@ mod tests {
         let project = world.project("demo", "a.sock");
         assert!(!split_in_use(&project));
         assert_eq!(display_label(&project, Some("c-1")), None);
-        assert_eq!(crate::sidebar::coordinator_display(&project, None), format!("Demo{}", crate::grouping::HEAD_MARK));
-        assert_eq!(coordinator_rank(&project, "c-1"), None);
-        assert_eq!(crate::grouping::coordinator_key("demo", coordinator_rank(&project, "c-1"), "w1:p1"), "demo!0!w1:p1");
+        assert_eq!(crate::sidebar::coordinator_display(&project, None), "Demo".to_string());
         assert!(thread_visible(&project, ""));
         assert!(thread_visible(&project, "c-9"), "no lane table exists to hide a thread behind");
-        assert!(coordinator_visible(&project, ""));
-        assert!(coordinator_visible(&project, "c-1"));
         assert_eq!(open_spaces(&project), ["w1"], "exactly the recorded coordinator Space");
     }
 

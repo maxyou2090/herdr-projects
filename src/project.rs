@@ -85,7 +85,7 @@ pub fn display_name(name: &str, slug: &str) -> String {
 /// [`crate::grouping::HOME_MARK`], an invisible cell by which the sidebar
 /// tells the home Space apart on every machine.
 pub fn home_label(name: &str, slug: &str) -> String {
-    format!("{}{}", display_name(name, slug), crate::grouping::HOME_MARK)
+    display_name(name, slug)
 }
 
 /// Writes through a temporary file in the same directory plus a rename. It never

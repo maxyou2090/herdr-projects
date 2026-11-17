@@ -156,7 +156,7 @@ pub fn empty(ctx: &Ctx, project: &Project, herdr: &Herdr, include_focused: bool)
         let Some(space) = workspaces.iter().find(|w| w.workspace_id == id) else {
             continue;
         };
-        if space.worktree.is_some() || label.is_empty() || space.label != label || space.label.ends_with(crate::grouping::HOME_MARK) {
+        if space.worktree.is_some() || label.is_empty() || space.label != label {
             continue;
         }
         let own_panes: Vec<_> = panes.iter().filter(|p| p.workspace_id == id).collect();
@@ -655,8 +655,8 @@ mod tests {
         let md = f.project.dir().join("PROJECT.md");
         let text = std::fs::read_to_string(&md).unwrap();
         std::fs::write(&md, text.replace(r#"name = "Demo""#, r#"name = "Beta""#)).unwrap();
-        let old = format!("Demo{}", crate::grouping::HOME_MARK);
-        let new = format!("Beta{}", crate::grouping::HOME_MARK);
+        let old = "Demo".to_string();
+        let new = "Beta".to_string();
         let label = Rc::new(RefCell::new(old));
         let shown = label.clone();
         f.world.runner.on_fn(

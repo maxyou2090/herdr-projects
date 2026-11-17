@@ -283,7 +283,7 @@ pub fn run(ctx: &Ctx, args: &Args) -> Result<Outcome> {
         step(&mut out, format!("move {approvals_to_move} routine approval(s) to the new path"));
     }
     if old_label != new_label && !record.workspace_id.is_empty() {
-        step(&mut out, format!("rename the home Space {} to `{}`", record.workspace_id, new_label.trim_end_matches(crate::grouping::HOME_MARK)));
+        step(&mut out, format!("rename the home Space {} to `{}`", record.workspace_id, new_label));
     }
     if stale_table {
         out.left.push(format!("config.toml already has a [safety.\"{new_key}\"] table (left by an earlier project at that path); it now applies to `{to}`: check it with `safety show {to}`"));

@@ -31,7 +31,6 @@ pub const CALL_TIMEOUT: Duration = Duration::from_secs(10);
 pub const AGENT_START_TIMEOUT: Duration = Duration::from_secs(20);
 /// How long `agent_prompt_confirmed` lets core watch for the turn to start.
 pub const PROMPT_WAIT: Duration = Duration::from_secs(8);
-pub const SOURCE: &str = "herdr-projects";
 
 /// Label keys this binary owns. Nothing else writes them.
 pub const L_WS: &str = "hp_ws";
@@ -861,16 +860,8 @@ impl<'a> Herdr<'a> {
     /// Herdr 1's agent view was a window feature; core draws nothing, so the
     /// projection this used to install is a no-op. Kept until the modules that
     /// call it are removed.
-    pub fn agent_view_set(&self, _params: serde_json::Value) -> Result<(), HerdrError> {
-        Ok(())
-    }
-
-    /// Herdr 1 let a Space be moved in its list. With no list, nothing to move.
-    pub fn workspace_move(&self, _workspace_id: &str, _insert_index: usize) -> Result<(), HerdrError> {
-        Ok(())
-    }
-
-    /// `hpw-<label>-<suffix>`, unique among the terminals this session has.
+        /// Herdr 1 let a Space be moved in its list. With no list, nothing to move.
+        /// `hpw-<label>-<suffix>`, unique among the terminals this session has.
     ///
     /// The suffix is random, not a count: ids outlive the terminals that carried
     /// them (thread records, coordinator records, a digest), and a count hands an

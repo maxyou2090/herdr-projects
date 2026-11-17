@@ -167,10 +167,6 @@ mod tests {
     use super::*;
     use crate::runner::fake::FakeRunner;
 
-    const SESSIONS: &str = r#"{"sessions":[
-        {"default":true,"name":"default","running":true,"session_dir":"/h/.config/herdr","socket_path":"/h/.config/herdr/herdr.sock"},
-        {"default":false,"name":"hp-dev","running":true,"session_dir":"/h/.config/herdr/sessions/hp-dev","socket_path":"/h/.config/herdr/sessions/hp-dev/herdr.sock"}]}"#;
-
     #[test]
     fn root_order_flag_env_config_default() {
         let home = tempfile::tempdir().unwrap();

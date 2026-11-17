@@ -12,7 +12,7 @@ use crate::threads::{self, ResolveArgs, StartArgs};
 use crate::{adopt, doctor, inbox, lanes, lifecycle, overview, routine, ticker};
 
 #[derive(Parser)]
-#[command(name = "herdr-projects", version = crate::VERSION, about = "Projects for herdr")]
+#[command(name = "hp", version = crate::VERSION, about = "Projects for herdr-core")]
 struct Cli {
     /// Projects root (default: $HERDR_PROJECTS_ROOT, then config.toml, then ~/.herdr-projects)
     #[arg(long, global = true, value_name = "DIR")]
@@ -60,8 +60,8 @@ enum Command {
     },
     /// List projects, archived ones marked `archived`
     List,
-    /// Open a project: start a coordinator agent in its folder, in this pane when
-    /// run from a shell pane inside Herdr, else in the project's workspace
+    /// Open a project: start a coordinator agent in its folder, in this terminal
+    /// when run from one, else in a new terminal of the project's Space
     Open {
         slug: String,
         /// The coordinator's profile, one the project allows (default: coordinator_profile in PROJECT.md); `profile list` shows them
@@ -71,7 +71,7 @@ enum Command {
         #[arg(long)]
         new: bool,
         /// Start the coordinator in a new tab even when run from a shell pane
-        /// inside Herdr (by default it starts in that pane)
+        /// inside a core terminal (by default it starts in that terminal)
         #[arg(long)]
         tab: bool,
         /// Move the project to this session when its recorded socket no longer exists
@@ -118,13 +118,6 @@ enum Command {
         #[arg(long)]
         wait: bool,
     },
-    /// Show only one project's panes in the sidebar, sorted by attention
-    Focus { slug: Option<String> },
-    /// Clear the sidebar view (herdr holds one, so this clears any tool's view)
-    Unfocus {
-        #[command(flatten)]
-        session: SessionArgs,
-    },
     /// Inbox items
     Inbox {
         #[command(subcommand)]
@@ -154,7 +147,7 @@ enum Command {
     Pause { slug: String },
     /// Make a paused project active again
     Resume { slug: String },
-    /// Archive a project: paused, hidden, tokens cleared, `open` refused
+    /// Archive a project: paused, hidden, labels cleared, `open` refused
     Archive { slug: String },
     /// Make an archived project active again
     Unarchive { slug: String },
@@ -782,8 +775,6 @@ pub fn run() -> Result<()> {
         Command::Context { slug, peek } => coordinator::context(&ctx, &slug, peek),
         Command::Assignable { slug, refresh, check } => crate::assign::run(&ctx, &slug, refresh, check.as_deref()),
         Command::Overview { slug, wait } => overview::run(&ctx, slug.as_deref(), wait),
-        Command::Focus { slug } => overview::focus(&ctx, slug.as_deref()),
-        Command::Unfocus { session } => overview::unfocus(&ctx, &session.into()),
         Command::Inbox { command } => match command {
             InboxCommand::Done { slug, ids, all } => {
                 let project = Project::load(&ctx.root, &slug)?;

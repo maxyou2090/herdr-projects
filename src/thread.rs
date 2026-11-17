@@ -729,7 +729,7 @@ pub fn recorded_own_space<'w>(record: &Thread, workspaces: &'w [Workspace]) -> O
         return None;
     }
     let space = workspaces.iter().find(|w| w.workspace_id == remembered)?;
-    (space.worktree.is_none() && !space.label.ends_with(crate::grouping::HOME_MARK) && space.label == record.title).then_some(space)
+    (space.worktree.is_none() && space.label == record.title).then_some(space)
 }
 
 /// A pane is the thread's pane only when workspace, tab and working directory

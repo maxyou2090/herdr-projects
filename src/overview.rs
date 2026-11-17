@@ -95,13 +95,6 @@ pub fn resolve_slug(ctx: &Ctx, slug: Option<&str>) -> Result<Resolved> {
 }
 
 /// The slug to act on, for commands that cannot act on "all projects".
-pub fn require_slug(ctx: &Ctx, slug: Option<&str>) -> Result<String> {
-    match resolve_slug(ctx, slug)? {
-        Resolved::Slug(slug) => Ok(slug),
-        Resolved::All => bail!("no project resolves from the current herdr workspace; pass a slug"),
-    }
-}
-
 fn visible_slugs(ctx: &Ctx) -> Vec<String> {
     project::list_slugs(&ctx.root)
         .into_iter()
@@ -199,26 +192,6 @@ pub fn run(ctx: &Ctx, slug: Option<&str>, wait: bool) -> Result<()> {
         let mut line = String::new();
         let _ = std::io::stdin().lock().read_line(&mut line);
     }
-    Ok(())
-}
-
-/// `focus`: show only this project's panes in the sidebar, by attention.
-pub fn focus(ctx: &Ctx, slug: Option<&str>) -> Result<()> {
-    let slug = require_slug(ctx, slug)?;
-    let project = Project::load(&ctx.root, &slug)?;
-    let view = threads::session_view(ctx, &project)
-        .ok_or_else(|| anyhow::anyhow!("the session of `{slug}` is not reachable; run `open {slug}` first"))?;
-    view.herdr.agent_view_set(crate::sidebar::project_view(&slug)).map_err(|e| anyhow::anyhow!("{e}"))?;
-    println!("sidebar focused on `{slug}`; `unfocus` restores the by-need order (this replaced any view another tool had set)");
-    Ok(())
-}
-
-/// `unfocus`: back to the default view, every agent sorted by need.
-pub fn unfocus(ctx: &Ctx, session: &crate::paths::SessionFlags) -> Result<()> {
-    let session = crate::paths::resolve_session(session, ctx.env, ctx.runner)?;
-    let herdr = crate::herdr::Herdr::new(ctx.env.herdr_bin(), &session.socket, ctx.runner);
-    herdr.agent_view_set(crate::sidebar::default_view()).map_err(|e| anyhow::anyhow!("{e}"))?;
-    println!("sidebar shows every agent, sorted by need");
     Ok(())
 }
 
@@ -354,7 +327,7 @@ mod tests {
         let rows = threads::rows(&world.ctx(), &project);
         let text = render(&project, &rows);
         assert!(!text.contains("t-0001"), "a closed lane's row is gone: {text}");
-        assert!(crate::sidebar::recorded_groups(&project).is_empty(), "and it is not counted as needing you");
+
 
         // The zero-change anchor: the same record in a project with no
         // registry still prints and still counts.
@@ -366,7 +339,6 @@ mod tests {
         let rows = threads::rows(&world.ctx(), &plain);
         let text = render(&plain, &rows);
         assert!(text.contains("t-0001"), "{text}");
-        assert_eq!(crate::sidebar::recorded_groups(&plain).len(), 1);
         // `needs-you` sums `recorded_groups` for every project, so the check
         // above is the filter that keeps a closed lane out of its count too.
     }
