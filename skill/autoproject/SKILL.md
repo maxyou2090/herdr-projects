@@ -72,7 +72,7 @@ Every other coordinator rule stands, including the parallel cap: before each sta
 
 ## QC
 
-- Only the TASKS.md line and `scratch/autoproject/<slug>.md` were written; nothing in `MEMORY.md`, `memory/`, instructions, `routines/`, or `~/.config/herdr-projects/`; no `hp routine approve`; no role flag other than `--profile`.
+- Only the TASKS.md line and `scratch/autoproject/<slug>.md` were written; nothing in `MEMORY.md`, `memory/`, instructions, `routines/`, or `~/.config/herdr-projects/`; no `hp routine` or `hp safety` change; no role flag other than `--profile`.
 - `## Remember` from run threads was ignored, and no run task asked for one.
 - Maker tasks carried lessons and guidance but never the rubric or success criterion; reviewer tasks carried the rubric, the success criterion, the reviewed SHA, and `BASE`, and started with `--base <SHA>`.
 - Every run thread task fixed `## Next` to `- Wait for autoproject`, and the landing prompt named the reviewed SHA and forbade new commits.

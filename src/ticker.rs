@@ -655,7 +655,7 @@ pub fn tick(ctx: &Ctx, log: &Log, memory: &mut Memory) -> bool {
     }
     // No coordinator: due routines are recorded as skipped, nothing fires.
     for project in &unreachable {
-        for error in headless_routines(ctx, project) {
+        for error in headless_routines(project) {
             log.line(&format!("{}: {error:#}", project.slug));
         }
     }
@@ -782,11 +782,11 @@ fn discover_record(ctx: &Ctx, project: &Project, sessions: &mut Sessions) -> Res
 }
 
 /// Due routines of a project whose session cannot be reached or that has no
-/// coordinator: each is recorded as skipped, with no item and no command.
-fn headless_routines(ctx: &Ctx, project: &Project) -> Vec<anyhow::Error> {
+/// coordinator: each is recorded as skipped, with no item.
+fn headless_routines(project: &Project) -> Vec<anyhow::Error> {
     let mut state = steps::load_state(project);
     let before = state.clone();
-    let mut errors = routine_pass(ctx, project, &mut state, false);
+    let mut errors = routine_pass(project, &mut state, false);
     if state != before {
         errors.extend(steps::save_state(project, &state).err());
     }
@@ -794,17 +794,14 @@ fn headless_routines(ctx: &Ctx, project: &Project) -> Vec<anyhow::Error> {
 }
 
 /// `coordinator`: the project has a live coordinator this tick.
-fn routine_pass(ctx: &Ctx, project: &Project, state: &mut steps::State, coordinator: bool) -> Vec<anyhow::Error> {
+fn routine_pass(project: &Project, state: &mut steps::State, coordinator: bool) -> Vec<anyhow::Error> {
     let zoned = jiff::Zoned::now();
     match project.read_project_md() {
-        Ok(_) => {
-            let commands = project.safety(&ctx.config_dir).map(|s| s.routine_commands).unwrap_or(false);
-            steps::routines(ctx, project, state, commands, coordinator, None, &zoned)
-        }
+        Ok(_) => steps::routines(project, state, coordinator, None, &zoned),
         Err(error) => {
             let text = std::fs::read(project.project_md()).unwrap_or_default();
             let problem = Some((thread::sha256_hex(&text), format!("{error:#}")));
-            steps::routines(ctx, project, state, false, coordinator, problem, &zoned)
+            steps::routines(project, state, coordinator, problem, &zoned)
         }
     }
 }
@@ -853,7 +850,7 @@ pub fn tick_project_with(ctx: &Ctx, project: &Project, memory: &mut Memory) -> R
             Some(error) => Err(error),
             None => Ok(true),
         },
-        None => match headless_routines(ctx, project).into_iter().next() {
+        None => match headless_routines(project).into_iter().next() {
             Some(error) => Err(error),
             None => Ok(false),
         },
@@ -943,7 +940,7 @@ fn thread_pass(project: &Project, herdr: &Herdr, socket: &str, threads: &[thread
             let note = if !live.pane_exists { "pane closed".to_string() } else if state.is_empty() { "no agent".to_string() } else { state.clone() };
             pass.transitions.push(Transition { id: t.id.clone(), to: group, note });
         }
-        let line = crate::sidebar::state_line(group, &after, &live, now);
+        let line = crate::labels::state_line(group, &after, &live, now);
         let activity = live.self_report.as_ref().map(|r| r.activity.clone()).unwrap_or_default();
         let self_changed = activity != t.activity;
         if delivered || state != t.last_state || group.token() != t.last_group || line != t.state_line || self_changed {
@@ -963,7 +960,7 @@ fn thread_pass(project: &Project, herdr: &Herdr, socket: &str, threads: &[thread
             })?;
         }
         if live.pane_exists {
-            crate::sidebar::report_pane(herdr, &t.pane_id, &crate::sidebar::thread_display(t), slug, group, None);
+            crate::labels::report_pane(herdr, &t.pane_id, &crate::labels::thread_display(t), slug, group, None);
         }
         // A thread sitting idle with a failed retry on its pane has lost its
         // turn: no report is coming, so it is reported for the coordinator
@@ -1131,7 +1128,7 @@ fn tick_cheap_body(ctx: &Ctx, project: &Project, sessions: &mut Sessions, state:
         // A pane the resolver could not place keeps no claim at all: rule 4
         // never assigns an `Ambiguous` pane a lane.
         let lane = (!c.lane.is_empty()).then(|| c.lane.clone());
-        crate::sidebar::report_pane(&herdr, &c.pane_id, &crate::sidebar::coordinator_display(project, lane.as_deref()), slug, group, lane.as_deref());
+        crate::labels::report_pane(&herdr, &c.pane_id, &crate::labels::coordinator_display(project, lane.as_deref()), slug, group, lane.as_deref());
     }
 
     let pass = thread_pass(project, &herdr, &record.socket, &open_threads(project), &agents, &panes, None)?;
@@ -1265,7 +1262,7 @@ fn tick_slow(ctx: &Ctx, project: &Project, seen: &Seen, memory: &mut Memory, log
     errors.extend(steps::write_ambiguous_lane_items(project, &mut state, &seen.ambiguous).err());
     errors.extend(steps::pull_requests(ctx, project, &mut state, memory, now));
     errors.extend(steps::resolve_merged(ctx, project, &mut state, now));
-    errors.extend(routine_pass(ctx, project, &mut state, seen.coordinator));
+    errors.extend(routine_pass(project, &mut state, seen.coordinator));
     if let Ok((settings, _)) = project.read_project_md() {
         errors.extend(steps::auto_resolve(ctx, project, &settings, memory, now));
     }

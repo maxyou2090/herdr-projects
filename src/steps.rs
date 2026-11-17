@@ -74,7 +74,7 @@ pub const IDLE_NOTE_AFTER_SECS: i64 = 10 * 60;
 /// At most this many subjects are named in one nudge line.
 const NUDGE_SUBJECTS: usize = 5;
 /// Item kinds an aged reminder covers: the coordinator's own work. Others
-/// (`routine-approval`, `config-error`, `outage`) wait on the user instead,
+/// (`config-error`, `outage`) wait on the user instead,
 /// and a `thread-error` is about a pane a person must look at, not an item the
 /// coordinator can finish.
 ///
@@ -629,7 +629,7 @@ pub fn nudge_text(items: &[inbox::Item]) -> String {
     for item in items {
         let subject = inbox::safe_subject(&item.subject);
         let who = match item.kind.as_str() {
-            "routine" | "routine-approval" => format!("routine {subject}"),
+            "routine" => format!("routine {subject}"),
             "session" | "space" => String::new(),
             _ => subject,
         };
@@ -1297,7 +1297,7 @@ pub fn auto_resolve(ctx: &Ctx, project: &Project, settings: &Settings, memory: &
 /// Item kinds a prompt-only routine ignores when it asks "did anything new
 /// need a person?", each for its own reason:
 ///
-/// - `routine`, `routine-approval`: the routine's own lifecycle. It has its
+/// - `routine`: the routine's own lifecycle. It has its
 ///   own wake paths, and its due item would change the fingerprint on every
 ///   run, defeating the quiet check at once.
 /// - `thread-state`: a restatement of a thread's own progress, not a new fact
@@ -1321,7 +1321,7 @@ pub fn auto_resolve(ctx: &Ctx, project: &Project, settings: &Settings, memory: &
 /// resolution (or claims to work with nothing written) is exactly the thing
 /// nobody else reports, and its writer holds one item per standing finding, so
 /// it cannot churn (§[`audit_items`]).
-const PROMPT_IGNORED_KINDS: [&str; 3] = ["routine", "routine-approval", "thread-state"];
+const PROMPT_IGNORED_KINDS: [&str; 2] = ["routine", "thread-state"];
 
 /// The unhandled items a prompt-only routine may have to act on, oldest
 /// first ([`inbox::unhandled`] already sorts by id).
@@ -1334,7 +1334,7 @@ fn prompt_items(project: &Project) -> Vec<inbox::Item> {
 /// What a prompt-only routine could act on, measured by the one question it
 /// asks: does anything need a person? A thread counts when the group the
 /// ticker last computed for it is one the project counts as needing the user
-/// ([`crate::sidebar::needs_you`]: waiting on you, or ready for review — a new
+/// ([`crate::labels::needs_you`]: waiting on you, or ready for review — a new
 /// report, an open pull request, a prompt on its pane, a failed or dead
 /// thread), or when its launch failed before a group was ever computed. A
 /// thread that is merely working, reporting or landing contributes nothing: a
@@ -1354,7 +1354,7 @@ fn prompt_fingerprint(project: &Project, routine: &routine::Routine) -> String {
         let needs_person = if t.status == Status::Failed {
             Some("failed")
         } else {
-            Group::from_token(&t.last_group).filter(|g| crate::sidebar::needs_you(*g)).map(Group::token)
+            Group::from_token(&t.last_group).filter(|g| crate::labels::needs_you(*g)).map(Group::token)
         };
         if let Some(group) = needs_person {
             text.push_str(&format!("{} {group}\n", t.id));
@@ -1364,11 +1364,12 @@ fn prompt_fingerprint(project: &Project, routine: &routine::Routine) -> String {
     thread::sha256_hex(text.as_bytes())
 }
 
-/// Step 3, plus `config-error` items for files that do not parse. A due
-/// scheduled routine does nothing unless the project has a live coordinator
-/// (`coordinator`): no item, no command. The run still counts as its last, so
-/// a coordinator that appears later gets the next scheduled run, not a backlog.
-pub fn routines(ctx: &Ctx, project: &Project, state: &mut State, routine_commands: bool, coordinator: bool, project_md_error: Option<(String, String)>, now: &jiff::Zoned) -> Vec<anyhow::Error> {
+/// Step 3, plus `config-error` items for files that do not parse or still
+/// carry a `command`. A due scheduled routine does nothing unless the project
+/// has a live coordinator (`coordinator`): no item. The run still counts as
+/// its last, so a coordinator that appears later gets the next scheduled run,
+/// not a backlog. A routine never runs a shell command (t-0039).
+pub fn routines(project: &Project, state: &mut State, coordinator: bool, project_md_error: Option<(String, String)>, now: &jiff::Zoned) -> Vec<anyhow::Error> {
     let mut errors = Vec::new();
     let (routines, broken) = routine::load_all(project);
 
@@ -1384,7 +1385,21 @@ pub fn routines(ctx: &Ctx, project: &Project, state: &mut State, routine_command
         }
     }
 
-    let prefix = crate::coordinator::current_prefix(&ctx.root).unwrap_or_default();
+    // A routine file that still names a `command` keeps its prompt; the line is
+    // never run. Command routines and their approval chain were removed
+    // (t-0039), so the item says so once per command text.
+    for r in &routines {
+        if r.command.is_empty() {
+            continue;
+        }
+        if state.config_errors.insert(format!("routine-command:{}", thread::sha256_hex(r.command.as_bytes()))) {
+            let summary = format!(
+                "routine `{}` has a `command`; command routines were removed, so only its prompt runs. Delete the `command` line in routines/{}.md",
+                r.name, r.name
+            );
+            errors.extend(inbox::write(project, "config-error", &r.name, "command ignored", &summary, "").err());
+        }
+    }
     for r in routines.iter().filter(|r| r.enabled) {
         let routine::Trigger::Schedule(schedule) = &r.trigger else {
             continue; // `pr` routines fire from the pull request poll
@@ -1406,60 +1421,34 @@ pub fn routines(ctx: &Ctx, project: &Project, state: &mut State, routine_command
         }
         entry.no_coordinator = 0;
 
-        if r.command.is_empty() {
-            // One unhandled item per routine: a run while it waits is counted.
-            if inbox::unhandled(project).iter().any(|i| i.kind == "routine" && i.subject == r.name) {
-                entry.skipped += 1;
-                continue;
-            }
-            // A quiet run: nothing that needs a person has changed since the
-            // item this routine last fired on, so the coordinator would only
-            // re-derive what it already knows and wait for the user again.
-            // Counted, nothing delivered; any new needs-you fact re-arms it.
-            //
-            // Items are compared by id against the set seen at the last fire,
-            // not against the current set: the coordinator answers a sweep by
-            // archiving the items it read, and archiving must not itself be
-            // news (t-0029). An item that appeared after the last fire and is
-            // still unhandled is news; one that was already there is not,
-            // whether it was archived since or not.
-            let fingerprint = prompt_fingerprint(project, r);
-            let items = prompt_items(project);
-            let unseen = items.iter().any(|i| !entry.seen_items.contains(&i.id));
-            if fingerprint == entry.output_hash && !unseen {
-                entry.quiet += 1;
-                continue;
-            }
-            entry.skipped = 0;
-            entry.quiet = 0;
-            entry.output_hash = fingerprint;
-            entry.seen_items = items.into_iter().map(|i| i.id).collect();
-            errors.extend(inbox::write(project, "routine", &r.name, "due", &format!("routine `{}` is due", r.name), &r.prompt).err());
+        // One unhandled item per routine: a run while it waits is counted.
+        if inbox::unhandled(project).iter().any(|i| i.kind == "routine" && i.subject == r.name) {
+            entry.skipped += 1;
             continue;
         }
-        if !routine_commands || !routine::is_approved(&ctx.config_dir, project, r) {
-            let hash = r.command_hash();
-            if entry.approval_item_for != hash {
-                entry.approval_item_for = hash;
-                let why = if routine_commands { "its command is not approved (or was edited since approval)" } else { "routine commands are not enabled for this project" };
-                let summary = format!(
-                    "routine `{}` did not run: {why}. The user enables them with `routine_commands = true` (see `{prefix} safety show {}`) and approves with `{prefix} routine approve {} {}` in a terminal",
-                    r.name, project.slug, project.slug, r.name
-                );
-                errors.extend(inbox::write(project, "routine-approval", &r.name, "needs approval", &summary, "").err());
-            }
+        // A quiet run: nothing that needs a person has changed since the
+        // item this routine last fired on, so the coordinator would only
+        // re-derive what it already knows and wait for the user again.
+        // Counted, nothing delivered; any new needs-you fact re-arms it.
+        //
+        // Items are compared by id against the set seen at the last fire,
+        // not against the current set: the coordinator answers a sweep by
+        // archiving the items it read, and archiving must not itself be
+        // news (t-0029). An item that appeared after the last fire and is
+        // still unhandled is news; one that was already there is not,
+        // whether it was archived since or not.
+        let fingerprint = prompt_fingerprint(project, r);
+        let items = prompt_items(project);
+        let unseen = items.iter().any(|i| !entry.seen_items.contains(&i.id));
+        if fingerprint == entry.output_hash && !unseen {
+            entry.quiet += 1;
             continue;
         }
-        match routine::run_command(ctx.runner, project, r) {
-            Ok(ran) => {
-                if ran.output_hash != entry.output_hash {
-                    entry.output_hash = ran.output_hash;
-                    let body = format!("{}\n\n{}", r.prompt, ran.block);
-                    errors.extend(inbox::write(project, "routine", &r.name, "output changed", &format!("routine `{}` ran ({}) and its output changed", r.name, ran.exit), body.trim()).err());
-                }
-            }
-            Err(error) => errors.push(error.context(format!("routine {}", r.name))),
-        }
+        entry.skipped = 0;
+        entry.quiet = 0;
+        entry.output_hash = fingerprint;
+        entry.seen_items = items.into_iter().map(|i| i.id).collect();
+        errors.extend(inbox::write(project, "routine", &r.name, "due", &format!("routine `{}` is due", r.name), &r.prompt).err());
     }
     errors
 }
@@ -1549,12 +1538,9 @@ mod tests {
     #[test]
     fn a_prompt_routine_fires_on_change_and_stays_quiet_between_changes() {
         let root = tempfile::tempdir().unwrap();
-        let runner = FakeRunner::new();
-        let env = crate::paths::Env::for_test(root.path(), &[]);
         let project = sweep_project(root.path());
-        let ctx = Ctx { env: &env, root: root.path().to_path_buf(), config_dir: root.path().join("cfg"), runner: &runner, detached_ticker: true };
         let mut state = State::default();
-        let due = |state: &mut State, t: &str| routines(&ctx, &project, state, false, true, None, &zoned(t));
+        let due = |state: &mut State, t: &str| routines(&project, state, true, None, &zoned(t));
 
         // The first look only records a last run; the first due run fires.
         assert!(due(&mut state, "2026-10-08T14:00:00Z").is_empty());
@@ -1611,12 +1597,9 @@ mod tests {
     #[test]
     fn a_thread_that_keeps_reporting_does_not_re_arm_the_sweep() {
         let root = tempfile::tempdir().unwrap();
-        let runner = FakeRunner::new();
-        let env = crate::paths::Env::for_test(root.path(), &[]);
         let project = sweep_project(root.path());
-        let ctx = Ctx { env: &env, root: root.path().to_path_buf(), config_dir: root.path().join("cfg"), runner: &runner, detached_ticker: true };
         let mut state = State::default();
-        let due = |state: &mut State, t: &str| routines(&ctx, &project, state, false, true, None, &zoned(t));
+        let due = |state: &mut State, t: &str| routines(&project, state, true, None, &zoned(t));
         assert!(due(&mut state, "2026-10-08T14:00:00Z").is_empty());
         assert!(due(&mut state, "2026-10-08T14:01:00Z").is_empty());
         take_fired(&project, "routine");
@@ -1650,12 +1633,9 @@ mod tests {
     #[test]
     fn each_new_needs_you_fact_re_arms_the_sweep_once() {
         let root = tempfile::tempdir().unwrap();
-        let runner = FakeRunner::new();
-        let env = crate::paths::Env::for_test(root.path(), &[]);
         let project = sweep_project(root.path());
-        let ctx = Ctx { env: &env, root: root.path().to_path_buf(), config_dir: root.path().join("cfg"), runner: &runner, detached_ticker: true };
         let mut state = State::default();
-        let due = |state: &mut State, t: &str| routines(&ctx, &project, state, false, true, None, &zoned(t));
+        let due = |state: &mut State, t: &str| routines(&project, state, true, None, &zoned(t));
         assert!(due(&mut state, "2026-10-08T14:00:00Z").is_empty());
         assert!(due(&mut state, "2026-10-08T14:01:00Z").is_empty());
         take_fired(&project, "routine");
@@ -1701,12 +1681,9 @@ mod tests {
     #[test]
     fn an_archived_needs_you_item_does_not_call_the_sweep_back() {
         let root = tempfile::tempdir().unwrap();
-        let runner = FakeRunner::new();
-        let env = crate::paths::Env::for_test(root.path(), &[]);
         let project = sweep_project(root.path());
-        let ctx = Ctx { env: &env, root: root.path().to_path_buf(), config_dir: root.path().join("cfg"), runner: &runner, detached_ticker: true };
         let mut state = State::default();
-        let due = |state: &mut State, t: &str| routines(&ctx, &project, state, false, true, None, &zoned(t));
+        let due = |state: &mut State, t: &str| routines(&project, state, true, None, &zoned(t));
         assert!(due(&mut state, "2026-10-08T14:00:00Z").is_empty());
         assert!(due(&mut state, "2026-10-08T14:01:00Z").is_empty());
         take_fired(&project, "routine");
@@ -1738,12 +1715,9 @@ mod tests {
     #[test]
     fn thread_state_churn_does_not_re_arm_the_sweep() {
         let root = tempfile::tempdir().unwrap();
-        let runner = FakeRunner::new();
-        let env = crate::paths::Env::for_test(root.path(), &[]);
         let project = sweep_project(root.path());
-        let ctx = Ctx { env: &env, root: root.path().to_path_buf(), config_dir: root.path().join("cfg"), runner: &runner, detached_ticker: true };
         let mut state = State::default();
-        let due = |state: &mut State, t: &str| routines(&ctx, &project, state, false, true, None, &zoned(t));
+        let due = |state: &mut State, t: &str| routines(&project, state, true, None, &zoned(t));
         assert!(due(&mut state, "2026-10-08T14:00:00Z").is_empty());
         assert!(due(&mut state, "2026-10-08T14:01:00Z").is_empty());
         take_fired(&project, "routine");
@@ -1780,7 +1754,6 @@ mod tests {
         // Restating kinds and the routine's own lifecycle are left out.
         inbox::write_in(&project, "", "thread-state", "t-0001", "idle", "s", "").unwrap();
         inbox::write_in(&project, "", "routine", "sweep", "due", "s", "").unwrap();
-        inbox::write_in(&project, "", "routine-approval", "sweep", "needs approval", "s", "").unwrap();
         assert_eq!(prompt_fingerprint(&project, &sweep(&project)), empty);
         assert!(prompt_items(&project).is_empty(), "no kind here needs a person");
 
@@ -1808,6 +1781,32 @@ mod tests {
         let edited = prompt_fingerprint(&project, &sweep(&project));
         assert_ne!(edited, before);
         assert_ne!(edited, empty);
+    }
+
+    /// A routine file that still carries a `command`: the command never runs
+    /// (command routines and the approval chain behind them were removed,
+    /// t-0039), its prompt still fires on schedule, and the ignored line is
+    /// reported once per command text as a `config-error`.
+    #[test]
+    fn a_routine_command_is_never_run_and_is_reported_once() {
+        let root = tempfile::tempdir().unwrap();
+        let runner = FakeRunner::new();
+        let project = sweep_project(root.path());
+        std::fs::write(project.dir().join("routines").join("sweep.md"), "+++\nschedule = \"every 1m\"\ncommand = \"echo hi\"\n+++\nGo.\n").unwrap();
+        let mut state = State::default();
+        // The first look only records a last run, and already reports the line.
+        assert!(routines(&project, &mut state, true, None, &zoned("2026-10-08T14:00:00Z")).is_empty());
+        let reported: Vec<_> = inbox::unhandled(&project).into_iter().filter(|i| i.kind == "config-error").collect();
+        assert_eq!(reported.len(), 1, "{reported:?}");
+        assert!(reported[0].summary.contains("command routines were removed"), "{}", reported[0].summary);
+        // An unfixed file is reported once, not on every tick.
+        assert!(routines(&project, &mut state, true, None, &zoned("2026-10-08T14:00:30Z")).is_empty());
+        assert_eq!(inbox::unhandled(&project).iter().filter(|i| i.kind == "config-error").count(), 1);
+        // Its prompt still fires on its schedule.
+        assert!(routines(&project, &mut state, true, None, &zoned("2026-10-08T14:01:00Z")).is_empty());
+        assert_eq!(inbox::unhandled(&project).iter().filter(|i| i.kind == "routine").count(), 1);
+        // Nothing was run: no shell, in any tick.
+        assert!(runner.calls.borrow().is_empty(), "{:?}", runner.calls.borrow());
     }
 
     /// A real pre-lanes `ticker.json`: the four nudge fields are scalars. They

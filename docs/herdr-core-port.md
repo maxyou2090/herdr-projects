@@ -113,7 +113,7 @@ Rules that follow from this, worth keeping:
 | `src/popup.rs` (2128 lines) | a popup only a host can show |
 | `src/actions.rs` | the action menu was a host surface |
 | `src/setup.rs` (966 lines) | `configure`/`unconfigure` existed to edit Herdr 1's config, hooks and keys |
-| `src/sidebar.rs`'s config edits, key handling and view builders | the sidebar is gone; 800 lines became ~130 of wording and labels |
+| the sidebar's config edits, key handling and view builders | the sidebar is gone; the file is `src/labels.rs` now, ~130 lines of wording and labels |
 | `src/grouping.rs` (223 lines) | it ordered the sidebar's agent and Space lists by writing `hp_group` tokens; nothing reads them now |
 | `src/scenarios.rs` (6109 lines, 213 cases) | the whole suite faked Herdr 1's CLI (`pane list` JSON, `report-metadata`, `workspace create`): it compiled, but could not have run |
 | the test modules that used that fake (`adopt`, `assign`, `brief`, `lifecycle`, `overview`, `settings`, `spaces`, parts of `lanes`/`steps`/`ticker`, `tests/cli.rs`'s `progress_hooks`) | same reason |
@@ -250,7 +250,7 @@ Ordered by what a user would notice first:
 | `src/threads.rs`, `src/thread.rs` | starting, steering, resolving threads |
 | `src/lanes.rs` | lanes: registry, resolution rules 1–5, adoption |
 | `src/progress.rs` | `hp report`, the per-pane record, `hp progress` |
-| `src/sidebar.rs` | the words (`needs you`, `review`, `12m quiet`) and the labels that carry them |
+| `src/labels.rs` (was `src/sidebar.rs`) | the words (`needs you`, `review`, `12m quiet`) and the labels that carry them |
 
 ## 10. Reproducing a development loop
 

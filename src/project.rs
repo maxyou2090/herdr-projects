@@ -242,7 +242,6 @@ pub struct Safety {
     pub start_threads: String,
     pub coordinator_agent_args: Vec<String>,
     pub thread_agent_args: Vec<String>,
-    pub routine_commands: bool,
     /// Yolo mode: threads start without asking and every agent launches with
     /// its harness's skip-permissions flag (`crate::safety::yolo_flags`).
     pub yolo: bool,
@@ -260,7 +259,6 @@ impl Default for Safety {
             start_threads: "propose".into(),
             coordinator_agent_args: Vec::new(),
             thread_agent_args: Vec::new(),
-            routine_commands: false,
             yolo: false,
             trust_screens: crate::trust_screen::USER.into(),
             thread_profiles: None,
@@ -292,7 +290,6 @@ pub struct SafetyLayer {
     pub start_threads: Option<String>,
     pub coordinator_agent_args: Option<Vec<String>>,
     pub thread_agent_args: Option<Vec<String>>,
-    pub routine_commands: Option<bool>,
     pub yolo: Option<bool>,
     pub trust_screens: Option<String>,
     pub thread_profiles: Option<Vec<String>>,
@@ -467,7 +464,6 @@ pub fn load_safety(config_dir: &Path, canonical_project_dir: &Path) -> Result<Sa
         start_threads: if yolo { "auto".into() } else { own.start_threads.or(default.start_threads).unwrap_or(base.start_threads) },
         coordinator_agent_args: own.coordinator_agent_args.or(default.coordinator_agent_args).unwrap_or_default(),
         thread_agent_args: own.thread_agent_args.or(default.thread_agent_args).unwrap_or_default(),
-        routine_commands: own.routine_commands.or(default.routine_commands).unwrap_or(base.routine_commands),
         trust_screens: own.trust_screens.or(default.trust_screens).unwrap_or_else(|| default_trust_screens(yolo).into()),
         yolo,
         thread_profiles: own.thread_profiles.or(default.thread_profiles),
@@ -976,7 +972,7 @@ mod tests {
         let safety = load_safety(config.path(), here).unwrap();
         assert_eq!(safety.start_threads, "auto");
         assert_eq!(safety.thread_agent_args, ["--x"]);
-        assert!(!safety.routine_commands);
+        assert!(safety.thread_profiles.is_none());
         assert!(safety.coordinator_agent_args.is_empty());
         assert_eq!(
             load_safety(config.path(), Path::new("/projects/other")).unwrap(),

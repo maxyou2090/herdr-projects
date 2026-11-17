@@ -155,7 +155,7 @@ fn close_workspaces(project: &Project, view: &SessionView) -> Vec<String> {
         if workspace.is_empty() || done.contains(&workspace) {
             continue;
         }
-        crate::sidebar::clear_workspace(&view.herdr, &workspace);
+        crate::labels::clear_workspace(&view.herdr, &workspace);
         close(&workspace, &what);
         done.push(workspace);
     }
@@ -186,7 +186,7 @@ pub fn set_status(ctx: &Ctx, slug: &str, status: Status) -> Result<()> {
             println!("It is marked `archived` in `list`, skipped by the projects picker, overviews and the ticker, and `open` is refused until `unarchive`. Its folder and every unresolved thread's worktree stay.");
             if let Some(view) = &view {
                 for (_, pane, _) in alive_panes(&project, view) {
-                    crate::sidebar::clear_pane(&view.herdr, &pane);
+                    crate::labels::clear_pane(&view.herdr, &pane);
                 }
                 for note in close_workspaces(&project, view) {
                     println!("  {note}");
@@ -241,18 +241,14 @@ pub fn delete(ctx: &Ctx, slug: &str, force: bool) -> Result<()> {
         }
     }
     // Only point at leftovers that actually exist: the per-project safety
-    // table and this project's routine approvals both live in the user config
-    // and would silently apply to a new project at the same path.
-    let table = crate::safety::project_table_exists(&ctx.config_dir, &canonical);
-    let path_key = canonical.to_string_lossy().into_owned();
-    let approvals = crate::routine::approvals(&ctx.config_dir).iter().any(|a| a.project == path_key);
-    if table || approvals {
-        let subject = match (table, approvals) {
-            (true, true) => format!("The `[safety.\"{}\"]` table and routine approvals for this path remain", canonical.display()),
-            (true, false) => format!("The `[safety.\"{}\"]` table for this path remains", canonical.display()),
-            (false, _) => "Routine approvals for this path remain".to_string(),
-        };
-        println!("{subject} in {} and would apply to a new project at the same path.", ctx.config_dir.display());
+    // table lives in the user config and would silently apply to a new project
+    // at the same path.
+    if crate::safety::project_table_exists(&ctx.config_dir, &canonical) {
+        println!(
+            "The `[safety.\"{}\"]` table for this path remains in {} and would apply to a new project at the same path.",
+            canonical.display(),
+            ctx.config_dir.display()
+        );
     }
     Ok(())
 }

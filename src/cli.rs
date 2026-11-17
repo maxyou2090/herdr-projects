@@ -131,7 +131,7 @@ enum Command {
         #[command(subcommand)]
         command: ThreadCommand,
     },
-    /// Routines: scheduled prompts and watched commands
+    /// Routines: scheduled prompts
     Routine {
         #[command(subcommand)]
         command: RoutineCommand,
@@ -514,9 +514,7 @@ enum RoutineCommand {
         #[arg(long)]
         off: bool,
     },
-    /// Approve a routine's command (a person at a terminal only)
-    Approve { slug: String, name: String },
-    /// List routines with their approval status
+    /// List routines with their schedules and last/next run
     List { slug: String },
 }
 
@@ -616,7 +614,7 @@ enum SafetyCommand {
         /// A project, or --global for the all-projects defaults
         #[arg(allow_hyphen_values = true)]
         target: String,
-        /// yolo, start_threads, trust_screens, coordinator_agent_args, thread_agent_args or routine_commands
+        /// yolo, start_threads, trust_screens, coordinator_agent_args or thread_agent_args
         key: String,
         /// The value (arguments for *_agent_args, none for an empty list), or `default`
         #[arg(allow_hyphen_values = true, trailing_var_arg = true)]
@@ -882,14 +880,9 @@ pub fn run() -> Result<()> {
         }
         Command::Routine { command } => match command {
             RoutineCommand::Toggle { slug, name, on, off } => crate::settings::routine_toggle(&ctx, &slug, &name, if on { Some(true) } else if off { Some(false) } else { None }),
-            RoutineCommand::Approve { slug, name } => {
-                let project = Project::load(&ctx.root, &slug)?;
-                routine::approve(&ctx.config_dir, &project, &name)
-            }
             RoutineCommand::List { slug } => {
                 let project = Project::load(&ctx.root, &slug)?;
-                let commands = project.safety(&ctx.config_dir)?.routine_commands;
-                routine::print_list(&ctx.config_dir, &project, commands);
+                routine::print_list(&project);
                 Ok(())
             }
         },
