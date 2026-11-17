@@ -1,10 +1,18 @@
 [package]
-name = "herdr-projects"
+name = "hp"
 version = "0.2.35"
 edition = "2024"
 rust-version = "1.89"
 license = "MIT"
-description = "Projects for herdr: a coordinator conversation, parallel worker threads, shared memory and an overview"
+description = "Projects for herdr-core: a coordinator conversation, parallel worker threads, shared memory and an overview"
+
+[[bin]]
+name = "hp"
+path = "src/main.rs"
+
+[[bin]]
+name = "hp-agent"
+path = "src/hp_agent.rs"
 
 [dependencies]
 anyhow = "1"

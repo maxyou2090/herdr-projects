@@ -50,9 +50,12 @@ impl Env {
         self.home.join(".config").join("herdr-projects")
     }
 
-    /// `HERDR_BIN_PATH` when set, else `herdr` on `PATH`.
+    /// `HC_BIN_PATH` when set, else `hc` on `PATH`.
+    ///
+    /// The port keeps the caller-facing name `herdr_bin` so the engine modules
+    /// change in one place; the binary it returns is herdr-core's `hc`.
     pub fn herdr_bin(&self) -> String {
-        self.var("HERDR_BIN_PATH").unwrap_or("herdr").to_string()
+        self.var("HC_BIN_PATH").unwrap_or("hc").to_string()
     }
 
     fn expand_tilde(&self, path: &str) -> PathBuf {
