@@ -61,7 +61,7 @@ Nothing writes into core's own configuration.
 
 ## 3. The mapping the adapter lives by
 
-`src/herdr.rs` is the only module that speaks to core. It presents the shapes the
+`src/core.rs` is the only module that speaks to core. It presents the shapes the
 rest of the binary uses (a Space, a tab, a pane, an agent) and builds them out of
 terminals and labels:
 
@@ -88,13 +88,13 @@ Rules that follow from this, worth keeping:
   closed the coordinator with it.
 - **A recorded session is a name, not a path.** `Session { socket }` holds the
   `HC_SESSION` value; a Herdr 1 socket path (`/…/herdr.sock`) reads as the
-  default session (`herdr::session_key`). This compatibility shim is what made
+  default session (`core::session_key`). This compatibility shim is what made
   the restored backup usable without rewriting a thousand records. `--socket`
   and `HERDR_SESSION` are gone: core never sets either, so the only sources are
   `--session` and `HC_SESSION` (`paths::resolve_session`).
 - **"Which pane am I?" is `HC_TERMINAL_ID`, and nothing else.** Core hands a
   process the *address* of its terminal; records store the *name*. The two are
-  tied by the live list (`herdr::pane_of_terminal`, `herdr::Agent::in_terminal`),
+  tied by the live list (`core::pane_of_terminal`, `core::Agent::in_terminal`),
   and `paths::Env::this_terminal` / `this_session` are the only readers. Herdr 1
   exported `HERDR_PANE_ID`, `HERDR_TAB_ID`, `HERDR_WORKSPACE_ID`,
   `HERDR_SOCKET_PATH`, `HERDR_SESSION` and `HERDR_PLUGIN_STATE_DIR`; core sets
@@ -284,7 +284,7 @@ Ordered by what a user would notice first:
 
 | File | Role |
 | --- | --- |
-| `src/herdr.rs` | the whole adapter: shapes, ids, labels, status, worktrees, app-vs-core creation |
+| `src/core.rs` | the whole adapter: shapes, ids, labels, status, worktrees, app-vs-core creation |
 | `src/app.rs` | the desktop window: `status`, `space.new`, `tab.new`, `ls`, `tab.rename`, `tab.close`, `space.close`, with retries |
 | `src/hp_agent.rs` | the OSC 7501 wrapper: `idle` at start, `done`/`error` at exit, and a two-second screen read for the harnesses that print no status |
 | `src/agent_state.rs` | the states a pane's screen proves (`working`, `blocked`, back to `idle`); compiled into `hp-agent` alone |

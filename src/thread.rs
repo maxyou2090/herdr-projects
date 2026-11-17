@@ -7,7 +7,7 @@ use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use crate::herdr::{Agent, Pane, Workspace, ready_state};
+use crate::core::{Agent, Pane, Workspace, ready_state};
 use crate::project::{self, Project, slugify, write_atomic};
 use crate::runner::{Cmd, Runner};
 

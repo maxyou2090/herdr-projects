@@ -5,7 +5,7 @@
 //! labels. This module was `sidebar.rs` until t-0039: nothing here draws a
 //! sidebar any more, only labels.
 
-use crate::herdr::Herdr;
+use crate::core::Core;
 use crate::project::{self, Project};
 use crate::thread::{Group, Live, Thread};
 
@@ -88,7 +88,7 @@ pub fn coordinator_display(project: &Project, lane: Option<&str>) -> String {
 /// whose lane the registry names — its lane claim (`docs/lanes.md` §5.1).
 /// `lane` is the id to write as `hp_lane`, or `None` for no claim: a thread
 /// pane never claims a lane, and a project with no lane registry reports none.
-pub fn report_pane(herdr: &Herdr, pane: &str, display: &str, slug: &str, _group: Group, lane: Option<&str>) {
+pub fn report_pane(herdr: &Core, pane: &str, display: &str, slug: &str, _group: Group, lane: Option<&str>) {
     if pane.is_empty() {
         return;
     }
@@ -105,7 +105,7 @@ pub fn report_pane(herdr: &Herdr, pane: &str, display: &str, slug: &str, _group:
 
 /// Clears every label this binary set on a pane: its project, display name and
 /// lane claim.
-pub fn clear_pane(herdr: &Herdr, pane: &str) {
+pub fn clear_pane(herdr: &Core, pane: &str) {
     if pane.is_empty() {
         return;
     }
@@ -116,4 +116,4 @@ pub fn clear_pane(herdr: &Herdr, pane: &str) {
 
 /// A Space is a group of terminals by label; closing its terminals is what
 /// removes it, so there is nothing left to clear.
-pub fn clear_workspace(_herdr: &Herdr, _workspace: &str) {}
+pub fn clear_workspace(_herdr: &Core, _workspace: &str) {}

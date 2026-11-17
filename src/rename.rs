@@ -372,8 +372,8 @@ pub fn run(ctx: &Ctx, args: &Args) -> Result<Outcome> {
 
     // 4. Herdr: the home Space's label (best effort; `open` also fixes it).
     if old_label != new_label && !record.workspace_id.is_empty() {
-        let herdr = crate::herdr::Herdr::new(ctx.env.herdr_bin(), &record.socket, ctx.runner);
-        if !record.socket.is_empty() && crate::herdr::session_alive(&ctx.env.herdr_bin(), &record.socket, ctx.runner)
+        let herdr = crate::core::Core::new(ctx.env.hc_bin(), &record.socket, ctx.runner);
+        if !record.socket.is_empty() && crate::core::session_alive(&ctx.env.hc_bin(), &record.socket, ctx.runner)
             && let Err(error) = herdr.workspace_rename(&record.workspace_id, &new_label)
             // Closed with the coordinator's pane: `open` makes a new one.
             && error.code != "workspace_not_found"
@@ -441,7 +441,7 @@ enum Next {
 fn advance(ctx: &Ctx, pending: &Pending) -> Result<Option<Next>> {
     let (from, to) = (pending.from.as_str(), pending.to.as_str());
     if let Some(notify) = &pending.notify {
-        let herdr = crate::herdr::Herdr::new(ctx.env.herdr_bin(), &notify.socket, ctx.runner);
+        let herdr = crate::core::Core::new(ctx.env.hc_bin(), &notify.socket, ctx.runner);
         let agent = herdr.agent_list().ok().and_then(|agents| agents.into_iter().find(|a| a.pane_id == notify.pane));
         return Ok(match agent {
             Some(agent) if agent.ready() => {
@@ -483,7 +483,7 @@ fn advance(ctx: &Ctx, pending: &Pending) -> Result<Option<Next>> {
     if pending.reopen {
         // The session the project was opened in, as a name `--session` accepts:
         // a Herdr 1 socket path in an old record means the default session.
-        let session = project.coordinator().map(|c| crate::herdr::session_key(&c.socket)).filter(|s| !s.is_empty());
+        let session = project.coordinator().map(|c| crate::core::session_key(&c.socket)).filter(|s| !s.is_empty());
         let options = crate::coordinator::OpenOptions {
             session: crate::paths::SessionFlags { session },
             rebind: false,

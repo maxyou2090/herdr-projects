@@ -69,7 +69,7 @@ pub fn same_session(a: &str, b: &str) -> bool {
 /// True when the named core answers. A session that is gone is not an error:
 /// the caller decides whether to rebind, report or ignore it.
 pub fn session_alive(bin: &str, session: &str, runner: &dyn Runner) -> bool {
-    Herdr::new(bin, session, runner).reachable()
+    Core::new(bin, session, runner).reachable()
 }
 
 /// A herdr call that does not need a session (`--version`).
@@ -91,21 +91,21 @@ pub fn version(bin: &str, runner: &dyn Runner) -> Result<Version> {
 /// never answered with one. The names Herdr 1 used for the same refusals are
 /// kept where callers match on them.
 #[derive(Debug, Clone, PartialEq)]
-pub struct HerdrError {
+pub struct CoreError {
     pub code: String,
     pub message: String,
 }
 
-impl std::fmt::Display for HerdrError {
+impl std::fmt::Display for CoreError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "herdr: {} ({})", self.message, self.code)
     }
 }
 
-impl std::error::Error for HerdrError {}
+impl std::error::Error for CoreError {}
 
 /// core refused the prompt before typing anything.
-pub fn refused_before_typing(error: &HerdrError) -> bool {
+pub fn refused_before_typing(error: &CoreError) -> bool {
     matches!(error.code.as_str(), "agent_blocked" | "pane_not_found" | "unreachable")
 }
 
@@ -292,7 +292,7 @@ impl Term {
 
 /// `hc` bound to one core session. Every call a project makes goes through this,
 /// so a project always talks to the session it was opened in.
-pub struct Herdr<'a> {
+pub struct Core<'a> {
     bin: String,
     /// The `HC_SESSION` this call runs in (empty: the default one). Herdr 1 put
     /// a socket path here; a path is read as the default session, so records
@@ -311,10 +311,10 @@ pub fn session_key(raw: &str) -> String {
     }
 }
 
-impl<'a> Herdr<'a> {
+impl<'a> Core<'a> {
     pub fn new(bin: impl Into<String>, session: impl std::fmt::Display, runner: &'a dyn Runner) -> Self {
         let raw = session.to_string();
-        Herdr {
+        Core {
             bin: bin.into(),
             session: session_key(&raw),
             runner,
@@ -342,21 +342,21 @@ impl<'a> Herdr<'a> {
     }
 
     /// Runs one `hc` command and returns its JSON result.
-    fn json(&self, args: &[&str], timeout: Duration) -> Result<serde_json::Value, HerdrError> {
+    fn json(&self, args: &[&str], timeout: Duration) -> Result<serde_json::Value, CoreError> {
         let cmd = self.cmd(timeout).arg("--json").args(args.iter().copied());
-        let out = self.runner.run(&cmd).map_err(|e| HerdrError {
+        let out = self.runner.run(&cmd).map_err(|e| CoreError {
             code: "unreachable".into(),
             message: format!("{e:#}"),
         })?;
         if out.timed_out {
-            return Err(HerdrError { code: "timeout".into(), message: format!("`hc {}` timed out", args.join(" ")) });
+            return Err(CoreError { code: "timeout".into(), message: format!("`hc {}` timed out", args.join(" ")) });
         }
         if out.success() {
             let text = out.stdout.trim();
             if text.is_empty() {
                 return Ok(serde_json::Value::Null);
             }
-            return serde_json::from_str(text).map_err(|e| HerdrError {
+            return serde_json::from_str(text).map_err(|e| CoreError {
                 code: "failed".into(),
                 message: format!("`hc {}` reply did not parse: {e}", args.join(" ")),
             });
@@ -374,14 +374,14 @@ impl<'a> Herdr<'a> {
             let message = error["message"].as_str().unwrap_or("").to_string();
             let hint = error["hint"].as_str().unwrap_or("");
             let message = if hint.is_empty() { message } else { format!("{message} ({hint})") };
-            return Err(HerdrError { code, message });
+            return Err(CoreError { code, message });
         }
-        Err(HerdrError { code: "failed".into(), message: format!("`hc {}`: {}", args.join(" "), out.error_text()) })
+        Err(CoreError { code: "failed".into(), message: format!("`hc {}`: {}", args.join(" "), out.error_text()) })
     }
 
     /// Every live terminal of this session, with its labels: `hc ls` prints one
     /// short row per terminal and leaves the labels to `hc get`.
-    fn terminals(&self) -> Result<Vec<Term>, HerdrError> {
+    fn terminals(&self) -> Result<Vec<Term>, CoreError> {
         let result = self.json(&["ls"], CALL_TIMEOUT)?;
         let rows = result["terminals"].as_array().cloned().unwrap_or_default();
         let mut out = Vec::new();
@@ -404,15 +404,15 @@ impl<'a> Herdr<'a> {
         Ok(out)
     }
 
-    fn term(&self, pane: &str) -> Result<Term, HerdrError> {
+    fn term(&self, pane: &str) -> Result<Term, CoreError> {
         let result = self.json(&["get", pane], CALL_TIMEOUT)?;
-        serde_json::from_value(result).map_err(|e| HerdrError {
+        serde_json::from_value(result).map_err(|e| CoreError {
             code: "failed".into(),
             message: format!("`hc get {pane}` reply changed: {e}"),
         })
     }
 
-    fn label(&self, pane: &str, pairs: &[(&str, &str)]) -> Result<(), HerdrError> {
+    fn label(&self, pane: &str, pairs: &[(&str, &str)]) -> Result<(), CoreError> {
         let args: Vec<String> = pairs.iter().map(|(k, v)| format!("{k}={v}")).collect();
         let mut all: Vec<&str> = vec!["label", pane];
         all.extend(args.iter().map(String::as_str));
@@ -421,7 +421,7 @@ impl<'a> Herdr<'a> {
 
     /// Writes labels onto a terminal. Herdr 1's token reports are labels here:
     /// the same names (`hp_project`, `hp_lane`, `hp_rank`), no TTL.
-    pub fn set_labels(&self, pane: &str, pairs: &[(String, String)]) -> Result<(), HerdrError> {
+    pub fn set_labels(&self, pane: &str, pairs: &[(String, String)]) -> Result<(), CoreError> {
         if pairs.is_empty() || pane.is_empty() {
             return Ok(());
         }
@@ -430,7 +430,7 @@ impl<'a> Herdr<'a> {
     }
 
     /// Removes labels from a terminal, in one call.
-    pub fn clear_labels(&self, pane: &str, keys: &[&str]) -> Result<(), HerdrError> {
+    pub fn clear_labels(&self, pane: &str, keys: &[&str]) -> Result<(), CoreError> {
         if keys.is_empty() || pane.is_empty() {
             return Ok(());
         }
@@ -438,7 +438,7 @@ impl<'a> Herdr<'a> {
         self.label(pane, &pairs)
     }
 
-    pub fn pane_list(&self) -> Result<Vec<Pane>, HerdrError> {
+    pub fn pane_list(&self) -> Result<Vec<Pane>, CoreError> {
         Ok(self
             .terminals()?
             .into_iter()
@@ -455,7 +455,7 @@ impl<'a> Herdr<'a> {
             .collect())
     }
 
-    pub fn agent_list(&self) -> Result<Vec<Agent>, HerdrError> {
+    pub fn agent_list(&self) -> Result<Vec<Agent>, CoreError> {
         Ok(self
             .terminals()?
             .into_iter()
@@ -484,7 +484,7 @@ impl<'a> Herdr<'a> {
             .collect())
     }
 
-    pub fn workspace_list(&self) -> Result<Vec<Workspace>, HerdrError> {
+    pub fn workspace_list(&self) -> Result<Vec<Workspace>, CoreError> {
         let mut out: Vec<Workspace> = Vec::new();
         for term in self.terminals()? {
             let id = term.label(L_WS);
@@ -535,7 +535,7 @@ impl<'a> Herdr<'a> {
     }
 
     /// Starts a terminal and returns it once core lists it.
-    fn start(&self, name: &str, cwd: &Path, labels: &[(&str, &str)], argv: &[String]) -> Result<Term, HerdrError> {
+    fn start(&self, name: &str, cwd: &Path, labels: &[(&str, &str)], argv: &[String]) -> Result<Term, CoreError> {
         let cwd_text = cwd.to_string_lossy().into_owned();
         let mut args: Vec<String> = vec![
             "run".into(),
@@ -557,7 +557,7 @@ impl<'a> Herdr<'a> {
         // given come back only from `hc get`.
         let id = result["name"].as_str().filter(|n| !n.is_empty()).or_else(|| result["address"].as_str()).unwrap_or_default();
         if id.is_empty() {
-            return Err(HerdrError { code: "failed".into(), message: "`hc run` reply has no terminal".into() });
+            return Err(CoreError { code: "failed".into(), message: "`hc run` reply has no terminal".into() });
         }
         self.term(id)
     }
@@ -565,7 +565,7 @@ impl<'a> Herdr<'a> {
     /// A Space in `cwd`: named `label`, and its tab named `tab_label` — a
     /// project's Space holds the `coordinator` tab, a thread's Space the
     /// thread's title — so the core label and the app's tab agree.
-    pub fn workspace_create(&self, cwd: &Path, label: &str, tab_label: &str, _focus: bool) -> Result<Created, HerdrError> {
+    pub fn workspace_create(&self, cwd: &Path, label: &str, tab_label: &str, _focus: bool) -> Result<Created, CoreError> {
         let dir = cwd.to_string_lossy().into_owned();
         // A person who works in the Herdr app has to see the project: the app
         // makes the Space, and the terminal inside it is ours — named by us, so
@@ -611,7 +611,7 @@ impl<'a> Herdr<'a> {
         Ok(self.created(&term))
     }
 
-    pub fn tab_create(&self, workspace: &str, cwd: &Path, label: &str, _focus: bool) -> Result<Created, HerdrError> {
+    pub fn tab_create(&self, workspace: &str, cwd: &Path, label: &str, _focus: bool) -> Result<Created, CoreError> {
         if workspace.starts_with("sp") && crate::app::running(self.runner) {
             let tab = format!("{}-{}", workspace, suffix());
             let name = self.next_name(label)?;
@@ -653,20 +653,20 @@ impl<'a> Herdr<'a> {
 
     /// Creates a real git worktree under `~/.herdr/worktrees/<repo>/<branch>`,
     /// the path Herdr 1 used, so a restored thread record still names it.
-    pub fn worktree_create(&self, repo: &str, branch: &str, base: &str, label: &str) -> Result<(Created, String, String), HerdrError> {
+    pub fn worktree_create(&self, repo: &str, branch: &str, base: &str, label: &str) -> Result<(Created, String, String), CoreError> {
         let path = worktree_path(repo, branch)?;
         if let Some(parent) = path.parent() {
             let _ = std::fs::create_dir_all(parent);
         }
         let path_text = path.to_string_lossy().into_owned();
-        let git = |args: &[&str]| -> Result<(), HerdrError> {
+        let git = |args: &[&str]| -> Result<(), CoreError> {
             let out = self.runner.run(&Cmd::new("git", Duration::from_secs(60)).arg("-C").arg(repo).args(args.iter().copied())).map_err(
-                |e| HerdrError { code: "failed".into(), message: format!("{e:#}") },
+                |e| CoreError { code: "failed".into(), message: format!("{e:#}") },
             )?;
             if out.success() {
                 Ok(())
             } else {
-                Err(HerdrError { code: "failed".into(), message: out.error_text() })
+                Err(CoreError { code: "failed".into(), message: out.error_text() })
             }
         };
         let base = if base.is_empty() { "HEAD" } else { base };
@@ -680,10 +680,10 @@ impl<'a> Herdr<'a> {
         Ok((created, path_text.clone(), term.cwd()))
     }
 
-    pub fn worktree_open(&self, _repo: &str, path: &str, label: &str) -> Result<(Created, String, String), HerdrError> {
+    pub fn worktree_open(&self, _repo: &str, path: &str, label: &str) -> Result<(Created, String, String), CoreError> {
         let path = PathBuf::from(path);
         if !path.is_dir() {
-            return Err(HerdrError { code: "worktree_not_found".into(), message: format!("{path:?} is not a folder") });
+            return Err(CoreError { code: "worktree_not_found".into(), message: format!("{path:?} is not a folder") });
         }
         let created = self.workspace_create(&path, label, label, false)?;
         let term = self.term(&created.pane_id)?;
@@ -693,30 +693,30 @@ impl<'a> Herdr<'a> {
 
     /// Never passes `--force`: git refuses a dirty worktree and that refusal is
     /// reported unchanged.
-    pub fn worktree_remove(&self, workspace: &str) -> Result<(), HerdrError> {
+    pub fn worktree_remove(&self, workspace: &str) -> Result<(), CoreError> {
         let term = self
             .terminals()?
             .into_iter()
             .find(|t| t.label(L_WS) == workspace)
-            .ok_or_else(|| HerdrError { code: "pane_not_found".into(), message: format!("no terminal in {workspace}") })?;
+            .ok_or_else(|| CoreError { code: "pane_not_found".into(), message: format!("no terminal in {workspace}") })?;
         let path = term.label(L_WORKTREE);
         if path.is_empty() {
-            return Err(HerdrError { code: "worktree_not_found".into(), message: format!("{workspace} is not a worktree") });
+            return Err(CoreError { code: "worktree_not_found".into(), message: format!("{workspace} is not a worktree") });
         }
         let out = self
             .runner
             .run(&Cmd::new("git", Duration::from_secs(60)).arg("-C").arg(&path).args(["worktree", "remove", &path]))
-            .map_err(|e| HerdrError { code: "failed".into(), message: format!("{e:#}") })?;
+            .map_err(|e| CoreError { code: "failed".into(), message: format!("{e:#}") })?;
         if out.success() {
             return Ok(());
         }
         let text = out.error_text();
         let code = if text.contains("modified or untracked") { "dirty_worktree_requires_force" } else { "failed" };
-        Err(HerdrError { code: code.into(), message: text })
+        Err(CoreError { code: code.into(), message: text })
     }
 
     /// One pane as this binary sees panes, or an error when it is not live.
-    pub fn pane_get(&self, pane: &str) -> Result<Pane, HerdrError> {
+    pub fn pane_get(&self, pane: &str) -> Result<Pane, CoreError> {
         let term = self.term(pane)?;
         Ok(Pane {
             pane_id: term.pane_id(),
@@ -738,7 +738,7 @@ impl<'a> Herdr<'a> {
     }
 
     /// Ends every terminal of a Space.
-    pub fn workspace_close(&self, workspace: &str) -> Result<(), HerdrError> {
+    pub fn workspace_close(&self, workspace: &str) -> Result<(), CoreError> {
         if workspace.starts_with("sp") && crate::app::running(self.runner) && crate::app::space_close(self.runner, workspace) {
             return Ok(());
         }
@@ -749,7 +749,7 @@ impl<'a> Herdr<'a> {
     }
 
     /// Ends a tab: its terminal, and any other terminal carrying the label.
-    pub fn tab_close(&self, tab: &str) -> Result<(), HerdrError> {
+    pub fn tab_close(&self, tab: &str) -> Result<(), CoreError> {
         for term in self.terminals()?.into_iter().filter(|t| t.label(L_TAB) == tab) {
             self.end(&term.pane_id())?;
         }
@@ -757,34 +757,34 @@ impl<'a> Herdr<'a> {
     }
 
     /// Ends one pane.
-    pub fn pane_close(&self, pane: &str) -> Result<(), HerdrError> {
+    pub fn pane_close(&self, pane: &str) -> Result<(), CoreError> {
         self.end(pane)
     }
 
     /// Kills a terminal and removes its record, tolerating one that is gone.
-    fn end(&self, pane: &str) -> Result<(), HerdrError> {
+    fn end(&self, pane: &str) -> Result<(), CoreError> {
         let _ = self.json(&["kill", pane], CALL_TIMEOUT);
         let _ = self.json(&["rm", pane], CALL_TIMEOUT);
         Ok(())
     }
 
     /// A Space's label, as the overview shows it.
-    pub fn workspace_label(&self, workspace: &str) -> Result<String, HerdrError> {
+    pub fn workspace_label(&self, workspace: &str) -> Result<String, CoreError> {
         self.terminals()?
             .into_iter()
             .find(|t| t.label(L_WS) == workspace)
             .map(|t| t.label(L_WS_LABEL))
-            .ok_or_else(|| HerdrError { code: "pane_not_found".into(), message: format!("no Space {workspace}") })
+            .ok_or_else(|| CoreError { code: "pane_not_found".into(), message: format!("no Space {workspace}") })
     }
 
-    pub fn workspace_rename(&self, workspace: &str, label: &str) -> Result<(), HerdrError> {
+    pub fn workspace_rename(&self, workspace: &str, label: &str) -> Result<(), CoreError> {
         for term in self.terminals()?.into_iter().filter(|t| t.label(L_WS) == workspace) {
             self.label(&term.pane_id(), &[(L_WS_LABEL, label)])?;
         }
         Ok(())
     }
 
-    pub fn tab_rename(&self, tab: &str, label: &str) -> Result<(), HerdrError> {
+    pub fn tab_rename(&self, tab: &str, label: &str) -> Result<(), CoreError> {
         for term in self.terminals()?.into_iter().filter(|t| t.label(L_TAB) == tab) {
             self.label(&term.pane_id(), &[(L_TAB_LABEL, label)])?;
         }
@@ -792,14 +792,14 @@ impl<'a> Herdr<'a> {
     }
 
     /// The working directory core reports for a pane.
-    pub fn pane_cwd(&self, pane: &str) -> Result<String, HerdrError> {
+    pub fn pane_cwd(&self, pane: &str) -> Result<String, CoreError> {
         Ok(self.term(pane)?.cwd())
     }
 
     /// Starts an agent in a pane. core has no `agent start`: the agent is a
     /// program typed into the pane's shell, and "ready" is its first status
     /// report, so a trust dialog shows up as `blocked` rather than a timeout.
-    pub fn agent_start(&self, name: &str, kind: &str, pane: &str, agent_args: &[String]) -> Result<Agent, HerdrError> {
+    pub fn agent_start(&self, name: &str, kind: &str, pane: &str, agent_args: &[String]) -> Result<Agent, CoreError> {
         self.label(pane, &[(L_AGENT, name), (L_KIND, kind)])?;
         let line = agent_command(kind, agent_args);
         self.json(&["send", pane, &line], AGENT_START_TIMEOUT)?;
@@ -807,7 +807,7 @@ impl<'a> Herdr<'a> {
         loop {
             let agent = self.agent(pane)?;
             if agent.reported_status_blocked() {
-                return Err(HerdrError {
+                return Err(CoreError {
                     code: "agent_not_ready".into(),
                     message: format!("{name} is blocked during startup"),
                 });
@@ -816,14 +816,14 @@ impl<'a> Herdr<'a> {
                 return Ok(agent);
             }
             if std::time::Instant::now() > deadline {
-                return Err(HerdrError { code: "timeout".into(), message: format!("{name} did not report ready in time") });
+                return Err(CoreError { code: "timeout".into(), message: format!("{name} did not report ready in time") });
             }
             std::thread::sleep(Duration::from_millis(300));
         }
     }
 
     /// One agent by pane id.
-    fn agent(&self, pane: &str) -> Result<Agent, HerdrError> {
+    fn agent(&self, pane: &str) -> Result<Agent, CoreError> {
         let term = self.term(pane)?;
         let status = term.status.clone().unwrap_or_default();
         Ok(Agent {
@@ -848,18 +848,18 @@ impl<'a> Herdr<'a> {
 
     /// Submits a prompt. core refuses to type into a `blocked` program unless
     /// forced, which is what the caller wants to hear about.
-    pub fn agent_prompt(&self, target: &str, text: &str) -> Result<(), HerdrError> {
+    pub fn agent_prompt(&self, target: &str, text: &str) -> Result<(), CoreError> {
         self.json(&["send", target, text], CALL_TIMEOUT).map(|_| ())
     }
 
     /// Submits a prompt and returns core's word on whether the turn started.
-    pub fn agent_prompt_confirmed(&self, target: &str, text: &str) -> Result<(), HerdrError> {
+    pub fn agent_prompt_confirmed(&self, target: &str, text: &str) -> Result<(), CoreError> {
         let result = self.json(&["send", target, text], PROMPT_WAIT + Duration::from_secs(5))?;
         match result["started"].as_bool() {
             Some(true) => Ok(()),
             // The program does not report status, or it took the text without
             // starting: the caller must not type it again blindly.
-            _ => Err(HerdrError {
+            _ => Err(CoreError {
                 code: "agent_prompt_stalled".into(),
                 message: format!("{target} did not start working after the prompt"),
             }),
@@ -867,29 +867,29 @@ impl<'a> Herdr<'a> {
     }
 
     /// The agent's screen and history as core keeps it.
-    pub fn agent_read(&self, target: &str, lines: Option<usize>) -> Result<String, HerdrError> {
+    pub fn agent_read(&self, target: &str, lines: Option<usize>) -> Result<String, CoreError> {
         self.agent_read_as(target, lines, "text")
     }
 
     /// `format` is kept for the call sites; core only prints plain text.
-    pub fn agent_read_as(&self, target: &str, lines: Option<usize>, _format: &str) -> Result<String, HerdrError> {
+    pub fn agent_read_as(&self, target: &str, lines: Option<usize>, _format: &str) -> Result<String, CoreError> {
         let lines = lines.map(|n| n.to_string()).unwrap_or_else(|| "0".into());
         let result = self.json(&["read", target, "--lines", &lines], CALL_TIMEOUT)?;
         Ok(result["text"].as_str().unwrap_or_default().to_string())
     }
 
-    pub fn agent_screen(&self, target: &str) -> Result<String, HerdrError> {
+    pub fn agent_screen(&self, target: &str) -> Result<String, CoreError> {
         let result = self.json(&["read", target], CALL_TIMEOUT)?;
         Ok(result["text"].as_str().unwrap_or_default().to_string())
     }
 
     /// The trust-screen line on the pane's screen now, read right before typing
     /// there. A screen that cannot be read is an error: the caller does not type.
-    pub fn trust_screen(&self, target: &str, kind: &str) -> Result<Option<&'static str>, HerdrError> {
+    pub fn trust_screen(&self, target: &str, kind: &str) -> Result<Option<&'static str>, CoreError> {
         Ok(crate::trust_screen::detect(kind, &self.agent_screen(target)?))
     }
 
-    pub fn agent_send_keys(&self, target: &str, keys: &[String]) -> Result<(), HerdrError> {
+    pub fn agent_send_keys(&self, target: &str, keys: &[String]) -> Result<(), CoreError> {
         let keys: Vec<String> = keys.iter().map(|k| key_name(k)).collect();
         let mut args: Vec<&str> = vec!["keys", target];
         args.extend(keys.iter().map(String::as_str));
@@ -898,17 +898,17 @@ impl<'a> Herdr<'a> {
 
     /// Pasting text without a submit is not something core offers: `send` is
     /// paste plus Enter, and that is what every caller here wants.
-    pub fn pane_send_text(&self, pane: &str, text: &str) -> Result<(), HerdrError> {
+    pub fn pane_send_text(&self, pane: &str, text: &str) -> Result<(), CoreError> {
         self.json(&["send", pane, text], CALL_TIMEOUT).map(|_| ())
     }
 
     /// With no windows to focus, the honest answer is how to reach the pane.
-    pub fn agent_focus(&self, target: &str) -> Result<(), HerdrError> {
+    pub fn agent_focus(&self, target: &str) -> Result<(), CoreError> {
         println!("hc attach {target}");
         Ok(())
     }
 
-    pub fn agent_rename(&self, pane: &str, name: &str) -> Result<(), HerdrError> {
+    pub fn agent_rename(&self, pane: &str, name: &str) -> Result<(), CoreError> {
         self.label(pane, &[(L_AGENT, name)])
     }
 
@@ -922,7 +922,7 @@ impl<'a> Herdr<'a> {
     /// them (thread records, coordinator records, a digest), and a count hands an
     /// old id to a new terminal the moment one closes — which is how closing a
     /// thread's tab once closed the coordinator in the same tab id.
-    fn next_id(&self, prefix: &str, label: &str) -> Result<String, HerdrError> {
+    fn next_id(&self, prefix: &str, label: &str) -> Result<String, CoreError> {
         let used: Vec<String> = self.terminals()?.iter().map(|t| t.label(L_WS)).collect();
         let mut id = format!("{prefix}-{}-{}", slug(label), suffix());
         while used.iter().any(|u| u == &id) {
@@ -932,7 +932,7 @@ impl<'a> Herdr<'a> {
     }
 
     /// A terminal name core accepts: 1-32 of a-z 0-9 - _ .
-    fn next_name(&self, label: &str) -> Result<String, HerdrError> {
+    fn next_name(&self, label: &str) -> Result<String, CoreError> {
         let used: Vec<String> = self.terminals()?.iter().map(|t| t.pane_id()).collect();
         let mut name = truncate_name(&format!("hp-{}-{}", slug(label), suffix()));
         while used.contains(&name) {
@@ -962,8 +962,8 @@ impl Agent {
 
 /// `<repo's folder name>/<branch>` under `~/.herdr/worktrees`, as Herdr 1 laid
 /// it out, so a restored record's path still resolves.
-fn worktree_path(repo: &str, branch: &str) -> Result<PathBuf, HerdrError> {
-    let home = std::env::var_os("HOME").map(PathBuf::from).ok_or_else(|| HerdrError {
+fn worktree_path(repo: &str, branch: &str) -> Result<PathBuf, CoreError> {
+    let home = std::env::var_os("HOME").map(PathBuf::from).ok_or_else(|| CoreError {
         code: "failed".into(),
         message: "HOME is not set".into(),
     })?;

@@ -15,7 +15,7 @@
 
 use anyhow::Result;
 
-use crate::herdr::{Agent, Herdr};
+use crate::core::{Agent, Core};
 use crate::project::{self, Project};
 use crate::prompt_box;
 use crate::thread::{self, Thread};
@@ -74,7 +74,7 @@ fn claim(project: &Project, id: &str, now: jiff::Timestamp) -> Result<Option<Thr
 
 /// One delivery step for a thread whose brief is pending, `agent` being its
 /// agent as just listed.
-pub fn deliver(project: &Project, herdr: &Herdr, record: &Thread, agent: &Agent, sender: Sender) -> Result<Outcome> {
+pub fn deliver(project: &Project, herdr: &Core, record: &Thread, agent: &Agent, sender: Sender) -> Result<Outcome> {
     let now = jiff::Timestamp::now();
     let Some(mut t) = claim(project, &record.id, now)? else {
         return Ok(Outcome::Taken);
@@ -95,7 +95,7 @@ pub fn deliver(project: &Project, herdr: &Herdr, record: &Thread, agent: &Agent,
     outcome
 }
 
-fn step(project: &Project, herdr: &Herdr, t: &mut Thread, agent: &Agent, sender: Sender, now: jiff::Timestamp) -> Result<Outcome> {
+fn step(project: &Project, herdr: &Core, t: &mut Thread, agent: &Agent, sender: Sender, now: jiff::Timestamp) -> Result<Outcome> {
     let state = agent.agent_status.as_str();
     if matches!(state, "blocked" | "") {
         t.brief_seen.clear();
@@ -178,7 +178,7 @@ fn step(project: &Project, herdr: &Herdr, t: &mut Thread, agent: &Agent, sender:
     bump(project, t)?;
     match herdr.agent_prompt_confirmed(&t.pane_id, &thread::launch_prompt(&project.slug, &t.id)) {
         Ok(()) => Ok(Outcome::Delivered),
-        Err(error) if crate::herdr::refused_before_typing(&error) => {
+        Err(error) if crate::core::refused_before_typing(&error) => {
             t.brief_attempts -= 1;
             Ok(Outcome::Waiting(format!("{error}")))
         }

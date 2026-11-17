@@ -10,7 +10,7 @@ mod fake_hc;
 mod command_link;
 mod coordinator;
 mod doctor;
-mod herdr;
+mod core;
 mod inbox;
 mod lanes;
 mod lifecycle;
