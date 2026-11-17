@@ -99,9 +99,10 @@ pub fn clean(input: &str, columns: usize) -> String {
         .to_string()
 }
 
-/// The calling pane, when this process runs inside a core terminal: the id
-/// core shows for it (a moved pane keeps its launch-time `HERDR_PANE_ID`),
-/// its terminal id. `None` outside herdr-core.
+/// The calling pane, when this process runs inside a core terminal: its
+/// terminal address (`HC_TERMINAL_ID`) and the pane id core shows for it (a moved
+/// pane keeps its launch-time name), plus the session. `None` outside a core
+/// terminal.
 pub struct Current {
     pub socket: String,
     pub pane_id: String,

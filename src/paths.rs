@@ -1,4 +1,4 @@
-//! Root, config directory, herdr binary and socket resolution.
+//! Root, config directory, herdr binary and session resolution.
 //!
 //! Nothing here reads the process environment directly: callers pass an `Env`,
 //! so resolution order is testable and never depends on plugin variables.
@@ -6,7 +6,7 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result};
 use serde::Deserialize;
 
 use crate::runner::Runner;
@@ -61,6 +61,26 @@ impl Env {
     /// change in one place; the binary it returns is herdr-core's `hc`.
     pub fn herdr_bin(&self) -> String {
         self.var("HC_BIN_PATH").unwrap_or("hc").to_string()
+    }
+
+    /// The core terminal this process runs in: `HC_TERMINAL_ID`, the address
+    /// core gives every terminal it starts. `None` outside one — the ticker,
+    /// the app, a test.
+    ///
+    /// This is the only answer to "which pane am I?" after the port. Herdr 1
+    /// exported the pane and tab ids as `HERDR_PANE_ID` / `HERDR_TAB_ID`, and
+    /// herdr-core never sets them: every check that read them was permanently
+    /// false, which is how `open --here`, the lane a `context` reads and
+    /// `thread resolve`'s coordinator check silently stopped working.
+    pub fn this_terminal(&self) -> Option<&str> {
+        self.var("HC_TERMINAL_ID")
+    }
+
+    /// The core session this process runs in: `HC_SESSION`, empty for the
+    /// default core. The same name [`crate::herdr::Herdr::cmd`] hands its
+    /// children, so a command and the `hc` it runs always agree on the session.
+    pub fn this_session(&self) -> &str {
+        self.var("HC_SESSION").unwrap_or("")
     }
 
     fn expand_tilde(&self, path: &str) -> PathBuf {
@@ -125,8 +145,6 @@ fn absolute(path: &Path) -> Result<PathBuf> {
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct SessionFlags {
     pub session: Option<String>,
-    /// Herdr 1's `--socket`; kept so old scripts still parse.
-    pub socket: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -139,24 +157,22 @@ pub struct Session {
     pub name: Option<String>,
 }
 
-/// `--session`, then `HC_SESSION`, then `HERDR_SESSION`. herdr-core has one core
-/// per session and no session registry, so a name is used as given and there is
-/// nothing to ask.
+/// `--session`, then `HC_SESSION`. herdr-core has one core per session and no
+/// session registry, so a name is used as given (a name that was never started
+/// is started on first use) and there is nothing to ask.
 ///
-/// `--socket` and `HERDR_SOCKET_PATH` were Herdr 1's way to pick a session; both
-/// now mean "the default core", which is the only such session that exists
-/// unless a name is given.
+/// Herdr 1's `--socket` and `HERDR_SESSION` are gone rather than translated:
+/// core sets `HC_SESSION` for every command it starts and never sets either of
+/// those, so reading them could only ever name a session the command is not in
+/// (a recorded socket path still reads as the default session, see [`Session`]).
 pub fn resolve_session(flags: &SessionFlags, env: &Env, _runner: &dyn Runner) -> Result<Session> {
-    if flags.session.is_some() && flags.socket.is_some() {
-        bail!("pass --session or --socket, not both");
-    }
     if let Some(name) = &flags.session {
         return Ok(Session {
             socket: name.clone(),
             name: Some(name.clone()),
         });
     }
-    if let Some(name) = env.var("HC_SESSION").or_else(|| env.var("HERDR_SESSION")) {
+    if let Some(name) = env.var("HC_SESSION") {
         return Ok(Session {
             socket: name.to_string(),
             name: Some(name.to_string()),
@@ -227,7 +243,7 @@ mod tests {
     #[test]
     fn session_order_flag_then_hc_session_then_default() {
         let runner = FakeRunner::new();
-        let by_flag = SessionFlags { session: Some("explicit".into()), socket: None };
+        let by_flag = SessionFlags { session: Some("explicit".into()) };
         let env = Env::for_test(Path::new("/h"), &[("HC_SESSION", "hp-dev")]);
         let got = resolve_session(&by_flag, &env, &runner).unwrap();
         assert_eq!(got, Session { socket: "explicit".into(), name: Some("explicit".into()) });
@@ -235,29 +251,22 @@ mod tests {
         let got = resolve_session(&SessionFlags::default(), &env, &runner).unwrap();
         assert_eq!(got, Session { socket: "hp-dev".into(), name: Some("hp-dev".into()) });
 
-        // Herdr 1's `--socket` and `HERDR_SESSION` still parse; a socket path
-        // means the default core, and a name is a name.
-        let by_socket = SessionFlags { session: None, socket: Some("/flag.sock".into()) };
-        let env = Env::for_test(Path::new("/h"), &[]);
-        let got = resolve_session(&by_socket, &env, &runner).unwrap();
-        assert_eq!(got, Session { socket: String::new(), name: None });
-
-        let env = Env::for_test(Path::new("/h"), &[("HERDR_SESSION", "hp-dev")]);
-        assert_eq!(resolve_session(&SessionFlags::default(), &env, &runner).unwrap().name.as_deref(), Some("hp-dev"));
-
         // Nothing set: the default core, which has no name to pass on.
         let env = Env::for_test(Path::new("/h"), &[]);
+        assert_eq!(resolve_session(&SessionFlags::default(), &env, &runner).unwrap(), Session { socket: String::new(), name: None });
+
+        // Herdr 1's variable no longer selects a session: core never sets it.
+        let env = Env::for_test(Path::new("/h"), &[("HERDR_SESSION", "hp-dev")]);
         assert_eq!(resolve_session(&SessionFlags::default(), &env, &runner).unwrap(), Session { socket: String::new(), name: None });
     }
 
     #[test]
-    fn session_and_socket_together_are_refused() {
-        let runner = FakeRunner::new();
-        let env = Env::for_test(Path::new("/h"), &[]);
-        let flags = SessionFlags {
-            session: Some("a".into()),
-            socket: Some("/b".into()),
-        };
-        assert!(resolve_session(&flags, &env, &runner).is_err());
+    fn the_calling_terminal_and_session_are_read_from_core_only() {
+        let env = Env::for_test(Path::new("/h"), &[("HC_TERMINAL_ID", "t44"), ("HERDR_PANE_ID", "w1:p1")]);
+        assert_eq!(env.this_terminal(), Some("t44"));
+        assert_eq!(env.this_session(), "");
+        let env = Env::for_test(Path::new("/h"), &[("HC_TERMINAL_ID", ""), ("HC_SESSION", "hp-dev")]);
+        assert_eq!(env.this_terminal(), None);
+        assert_eq!(env.this_session(), "hp-dev");
     }
 }

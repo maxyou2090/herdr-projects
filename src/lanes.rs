@@ -768,11 +768,11 @@ pub fn orphan_lanes(project: &Project, agents: &[Agent]) -> Vec<(Lane, usize)> {
         .collect()
 }
 
-/// The lane a **new** thread record inherits: the lane the pane that ran
+/// The lane a **new** thread record inherits: the lane the terminal that ran
 /// `thread start` / `thread adopt` belongs to (`docs/lanes.md` §4.2). Only a
-/// `Known` answer writes a lane id; an ambiguous pane, an unknown pane and no
-/// pane at all all write the empty string, which reads as the default lane.
-/// `agents` is the whole agent list of the session `HERDR_PANE_ID` lives in —
+/// `Known` answer writes a lane id; an ambiguous terminal, an unknown one and
+/// no terminal at all all write the empty string, which reads as the default
+/// lane. `agents` is the whole agent list of the session the project records —
 /// the caller already has it from `threads::session_view` / `adopt`.
 pub fn lane_of_initiator(ctx: &Ctx, project: &Project, agents: &[Agent]) -> String {
     // A project that never used lanes keeps writing no lane at all: its new
@@ -781,21 +781,20 @@ pub fn lane_of_initiator(ctx: &Ctx, project: &Project, agents: &[Agent]) -> Stri
     if !split_in_use(project) {
         return String::new();
     }
-    let Some(pane) = ctx.env.var("HERDR_PANE_ID").filter(|pane| !pane.is_empty()) else {
+    let Some(terminal) = ctx.env.this_terminal() else {
         return String::new();
     };
-    // `HERDR_SOCKET_PATH` is the session the pane belongs to; read the agent
-    // list there rather than trusting a view from another session. A command
-    // run outside Herdr has no socket and keeps the caller's `agents`.
+    // `HC_SESSION` is the session the terminal belongs to; read the agent list
+    // there rather than trusting a view from another session. A command run
+    // outside a core session has no `HC_SESSION` and keeps the caller's `agents`.
     let listed: Vec<Agent>;
-    let agents: &[Agent] = match ctx.env.var("HERDR_SOCKET_PATH") {
-        Some(socket) => {
-            listed = crate::herdr::Herdr::new(ctx.env.herdr_bin(), socket, ctx.runner).agent_list().unwrap_or_default();
-            &listed
-        }
-        None => agents,
+    let agents: &[Agent] = if ctx.env.this_session().is_empty() {
+        agents
+    } else {
+        listed = crate::herdr::Herdr::new(ctx.env.herdr_bin(), ctx.env.this_session(), ctx.runner).agent_list().unwrap_or_default();
+        &listed
     };
-    let Some(agent) = agents.iter().find(|agent| agent.pane_id == pane && ours(agent, &project.slug)) else {
+    let Some(agent) = agents.iter().find(|agent| agent.in_terminal(terminal) && ours(agent, &project.slug)) else {
         return String::new();
     };
     match resolve_in_project(project, agent) {
@@ -804,8 +803,9 @@ pub fn lane_of_initiator(ctx: &Ctx, project: &Project, agents: &[Agent]) -> Stri
     }
 }
 
-/// The lane a `context` is being read from — `HERDR_PANE_ID` resolved through
-/// §5.2, else the default lane — plus the lane an empty `lane` field means.
+/// The lane a `context` is being read from — the reader's terminal
+/// (`HC_TERMINAL_ID`) resolved through §5.2, else the default lane — plus the
+/// lane an empty `lane` field means.
 /// `None` only when the project has no `lanes.json`: then nothing may be split
 /// (the zero-change promise for pre-lane projects).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -878,11 +878,11 @@ pub struct Sighting {
 
 /// The `Coordinators:` line (§5.4): one entry per pane that claims a lane or
 /// sits in the project folder, then any lane whose recorded pane is alive but
-/// recognizable by no rule, then the default lane. `this_pane` is
-/// `HERDR_PANE_ID`, so a coordinator reading its own digest sees which entry
-/// is itself. Every branch prints: an ambiguous entry carries the reason and
-/// the command that fixes it, and an unreachable session says so instead of
-/// printing nothing.
+/// recognizable by no rule, then the default lane. `this_pane` is the reader's
+/// own pane (resolved from `HC_TERMINAL_ID`), so a coordinator reading its own
+/// digest sees which entry is itself. Every branch prints: an ambiguous entry
+/// carries the reason and the command that fixes it, and an unreachable session
+/// says so instead of printing nothing.
 pub fn identity_line(view: &View) -> String {
     let mut parts: Vec<String> = view.entries();
     if !view.reachable {
@@ -959,6 +959,8 @@ pub struct View {
     pub agents: Vec<Agent>,
     pub home: String,
     pub slug: String,
+    /// The pane the reader sits in, resolved from `HC_TERMINAL_ID` against the
+    /// session's agents and panes. Empty outside a core terminal.
     pub this_pane: String,
     /// False when Herdr could not be asked at all. A line is printed either
     /// way: "nothing printed" is how the week-long stall hid.
@@ -994,7 +996,9 @@ impl View {
             agents: session.map(|view| view.agents.clone()).unwrap_or_default(),
             home: project_home(project),
             slug: project.slug.clone(),
-            this_pane: ctx.env.var("HERDR_PANE_ID").unwrap_or("").to_string(),
+            this_pane: session
+                .map(|view| crate::herdr::pane_of_terminal(ctx.env.this_terminal().unwrap_or(""), &view.agents, &view.panes))
+                .unwrap_or_default(),
             reachable: session.is_some(),
             counts: BTreeMap::new(),
         }
@@ -1411,28 +1415,34 @@ pub fn ambiguous_panes(project: &Project, record: &Coordinator, agents: &[Agent]
         .collect()
 }
 
-/// `hp lane adopt <name>` (§6.2): the current pane becomes lane `<name>`'s
-/// coordinator. The pane is read from `HERDR_PANE_ID` / `HERDR_SOCKET_PATH`,
-/// run through `adopt::adoptable_agent` (which rejects another project's
-/// coordinator, a thread, or a pane with no agent), and must work in the
-/// project home — a thread-like pane belongs to `hp thread adopt`.
+/// `hp lane adopt <name>` (§6.2): the terminal this command runs in becomes
+/// lane `<name>`'s coordinator. The terminal is `HC_TERMINAL_ID` in the session
+/// `HC_SESSION` names, run through `adopt::adoptable_agent` (which rejects
+/// another project's coordinator, a thread, or a terminal with no agent), and
+/// its agent must work in the project home — a thread-like one belongs to
+/// `hp thread adopt`.
 pub fn lane_adopt(ctx: &Ctx, project: Option<&str>, handle: &str) -> Result<()> {
-    if ctx.env.var("HERDR_PLUGIN_STATE_DIR").is_some() {
-        bail!("a plugin popup pane can never become a coordinator; run `hp lane adopt {handle}` from the pane that should coordinate the lane");
-    }
-    let pane = ctx.env.var("HERDR_PANE_ID").context("HERDR_PANE_ID is not set; `lane adopt` must run in the pane it adopts")?.to_string();
-    let socket = ctx.env.var("HERDR_SOCKET_PATH").context("HERDR_SOCKET_PATH is not set; `lane adopt` must run inside Herdr")?.to_string();
+    let terminal = ctx
+        .env
+        .this_terminal()
+        .context("this is not a core terminal; `lane adopt` must run in the terminal it adopts")?
+        .to_string();
+    let socket = ctx.env.this_session().to_string();
+    let herdr = crate::herdr::Herdr::new(ctx.env.herdr_bin(), &socket, ctx.runner);
+    let listed = herdr.agent_list().map_err(|error| anyhow::anyhow!("the herdr session at {socket} is not reachable: {error}"))?;
+    let early = listed
+        .iter()
+        .find(|agent| agent.in_terminal(&terminal))
+        .with_context(|| format!("no agent is detected in terminal {terminal} of the session at {socket}"))?;
+    let pane = early.pane_id.clone();
     let project = match project {
         Some(slug) => Project::load(&ctx.root, slug)?,
         None => project_for_pane(ctx, &socket, &pane)?,
     };
-    let herdr = crate::herdr::Herdr::new(ctx.env.herdr_bin(), &socket, ctx.runner);
     let home = project_home(&project);
     let canonical = project.canonical_dir().to_string_lossy().into_owned();
     // Check the directory before the adoption path's "already thread" refusal,
     // so a thread pane always gets the command that belongs to it.
-    let listed = herdr.agent_list().map_err(|error| anyhow::anyhow!("the herdr session at {socket} is not reachable: {error}"))?;
-    let early = listed.iter().find(|agent| agent.pane_id == pane).with_context(|| format!("no agent is detected in pane {pane} of the session at {socket}"))?;
     let dir = crate::herdr::own_dir(&early.cwd, &early.foreground_cwd);
     if !early.works_in(&home) && !early.works_in(&canonical) {
         bail!(
@@ -1485,7 +1495,7 @@ pub fn lane_adopt(ctx: &Ctx, project: Option<&str>, handle: &str) -> Result<()> 
     project.update_coordinator(|record| {
         *record = Coordinator {
             socket: socket.clone(),
-            session: ctx.env.var("HERDR_SESSION").unwrap_or("").to_string(),
+            session: ctx.env.this_session().to_string(),
             workspace_id: agent.workspace_id.clone(),
             tab_id: agent.tab_id.clone(),
             pane_id: pane.clone(),
@@ -1772,6 +1782,9 @@ mod tests {
             pane_id: pane.into(),
             tab_id: "t1".into(),
             workspace_id: "w1".into(),
+            // Core addresses a terminal by something other than its pane id;
+            // tests name it after the pane so a case can point at it.
+            terminal_id: format!("term-{pane}"),
             cwd: cwd.into(),
             agent: "claude".into(),
             agent_status: "idle".into(),
@@ -2022,7 +2035,7 @@ mod tests {
     // ------------------------------------------------------ ownership input
 
     #[test]
-    fn a_new_thread_inherits_the_lane_of_the_pane_that_started_it() {
+    fn a_new_thread_inherits_the_lane_of_the_terminal_that_started_it() {
         let (world, project) = temp_project("demo");
         let mut registry = Registry::synthesized(&project);
         registry.create("books", "收藏");
@@ -2030,8 +2043,8 @@ mod tests {
         let mut worker = agent("w2:p1", "/elsewhere");
         worker.tokens.insert(TOKEN.into(), "c-2".into());
         let runner = crate::runner::fake::FakeRunner::new();
-        let with_pane = |pane: &str| {
-            let env = crate::paths::Env::for_test(world.path(), &[("HERDR_PANE_ID", pane)]);
+        let with_terminal = |terminal: &str| {
+            let env = crate::paths::Env::for_test(world.path(), &[("HC_TERMINAL_ID", terminal)]);
             Ctx {
                 env: Box::leak(Box::new(env)) as &crate::paths::Env,
                 root: world.path().join("root"),
@@ -2041,15 +2054,62 @@ mod tests {
             }
         };
         // A known token names the lane.
-        assert_eq!(lane_of_initiator(&with_pane("w2:p1"), &project, &[worker.clone()]), "c-2");
-        // No `HERDR_PANE_ID`: the default lane.
-        assert_eq!(lane_of_initiator(&with_pane(""), &project, &[worker.clone()]), "");
-        // A pane the session does not list: the default lane.
-        assert_eq!(lane_of_initiator(&with_pane("w9:p9"), &project, &[worker]), "");
-        // Ambiguous (two open lanes, pane in the folder, no token): empty,
+        assert_eq!(lane_of_initiator(&with_terminal("term-w2:p1"), &project, &[worker.clone()]), "c-2");
+        // No `HC_TERMINAL_ID`: the default lane.
+        assert_eq!(lane_of_initiator(&with_terminal(""), &project, &[worker.clone()]), "");
+        // A terminal the session does not list: the default lane.
+        assert_eq!(lane_of_initiator(&with_terminal("term-w9:p9"), &project, &[worker]), "");
+        // Ambiguous (two open lanes, an agent in the folder, no token): empty,
         // never a guess.
         let folder_pane = agent("w3:p1", HOME);
-        assert_eq!(lane_of_initiator(&with_pane("w3:p1"), &project, &[folder_pane]), "");
+        assert_eq!(lane_of_initiator(&with_terminal("term-w3:p1"), &project, &[folder_pane]), "");
+    }
+
+    #[test]
+    fn a_context_read_from_a_coordinators_terminal_sees_that_lane() {
+        // Two lanes, both working in the project folder: the folder says nothing,
+        // a token says everything. The reader is the second lane's coordinator,
+        // whose terminal id is the only thing a process is told about itself.
+        let (world, project) = temp_project("demo");
+        let mut registry = Registry::synthesized(&project);
+        let books = registry.create("books", "收藏").id.clone();
+        registry.save(&project).unwrap();
+        let mut shares = agent("w1:p1", HOME);
+        shares.tokens.insert(TOKEN.into(), "c-1".into());
+        let mut books_pane = agent("w1:p2", HOME);
+        books_pane.tokens.insert(TOKEN.into(), books.clone());
+        let runner = crate::runner::fake::FakeRunner::new();
+        let env = crate::paths::Env::for_test(world.path(), &[("HC_TERMINAL_ID", "term-w1:p2")]);
+        let ctx = Ctx {
+            env: Box::leak(Box::new(env)) as &crate::paths::Env,
+            root: world.path().join("root"),
+            config_dir: world.path().join("cfg"),
+            runner: &runner,
+            detached_ticker: false,
+        };
+        let session = crate::threads::SessionView {
+            herdr: crate::herdr::Herdr::new("hc", "", &runner),
+            socket: String::new(),
+            agents: vec![shares, books_pane],
+            panes: Vec::new(),
+        };
+        let view = View::with_session(&ctx, &project, Some(&session));
+        assert_eq!(view.this_pane, "w1:p2", "the terminal names the pane, not the other way round");
+        let scope = reader_scope(&project, &view).unwrap();
+        assert_eq!(scope.lane, books);
+        assert_ne!(scope.lane, scope.default_lane, "a reader in a second lane must not read the default lane");
+        // The same project read from a terminal no agent occupies: the default
+        // lane, as §8 specifies for a reader with no lane.
+        let other = crate::paths::Env::for_test(world.path(), &[("HC_TERMINAL_ID", "term-gone")]);
+        let ctx = Ctx {
+            env: Box::leak(Box::new(other)) as &crate::paths::Env,
+            root: world.path().join("root"),
+            config_dir: world.path().join("cfg"),
+            runner: &runner,
+            detached_ticker: false,
+        };
+        let view = View::with_session(&ctx, &project, Some(&session));
+        assert_eq!(reader_scope(&project, &view).unwrap().lane, view.registry.default_lane().unwrap().id);
     }
 
     // ---------------------------------------------------------- the store

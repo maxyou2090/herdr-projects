@@ -195,6 +195,13 @@ impl Agent {
         !dir.is_empty() && own_dir(&self.cwd, &self.foreground_cwd) == dir
     }
 
+    /// Whether this agent runs in the core terminal `terminal` — the address
+    /// `HC_TERMINAL_ID` names. A pane id is not it: a pane keeps the name it was
+    /// given, while the terminal address is what core hands the processes in it.
+    pub fn in_terminal(&self, terminal: &str) -> bool {
+        !terminal.is_empty() && self.terminal_id == terminal
+    }
+
     pub fn session_id(&self) -> &str {
         self.agent_session.as_ref().map(|s| s.value.as_str()).unwrap_or("")
     }
@@ -203,6 +210,21 @@ impl Agent {
 /// The directory a pane's agent works in.
 pub fn own_dir<'a>(cwd: &'a str, foreground_cwd: &'a str) -> &'a str {
     if foreground_cwd.is_empty() { cwd } else { foreground_cwd }
+}
+
+/// The pane id of the terminal a command runs in: the agent's pane when one
+/// occupies it, else the plain terminal's. Empty when the terminal is in neither
+/// list — a command from another session, or about a terminal that is gone.
+pub fn pane_of_terminal(terminal: &str, agents: &[Agent], panes: &[Pane]) -> String {
+    if terminal.is_empty() {
+        return String::new();
+    }
+    agents
+        .iter()
+        .find(|agent| agent.terminal_id == terminal)
+        .map(|agent| agent.pane_id.clone())
+        .or_else(|| panes.iter().find(|pane| pane.terminal_id == terminal).map(|pane| pane.pane_id.clone()))
+        .unwrap_or_default()
 }
 
 pub fn ready_state(state: &str) -> bool {

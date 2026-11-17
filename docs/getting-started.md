@@ -57,7 +57,9 @@ hp open billing
 ```
 
 This starts an agent in a new terminal of the project's own Space, in the project
-folder. Run it again and it focuses the running coordinator instead (`hp open
+folder — or right in the terminal you ran it from, when that is a core terminal
+with no agent in it (`--tab` always asks for a new tab). Run it again and it
+focuses the running coordinator instead (`hp open
 --new` starts a second one). `--lane <name>` opens another line of work with its
 own coordinator, task sections and inbox.
 

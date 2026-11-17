@@ -120,7 +120,7 @@ fn report(
     let _ = writeln!(out);
 
     if let Some(latest) = crate::update::newer_release(runner, crate::update::own_root().as_deref()) {
-        check(&mut out, None, "update", format!("a newer version is available ({latest}): run `herdr-projects update`"));
+        check(&mut out, None, "update", format!("a newer version is available ({latest}): run `hp update`"));
     }
 
     let app = env.herdr_app_bin();
@@ -154,14 +154,18 @@ fn report(
     match paths::resolve_session(session, env, runner) {
         Ok(found) => {
             let reachable = Herdr::new(&bin, &found.socket, runner).reachable();
-            let name = found.name.as_deref().unwrap_or("-");
+            // Never print an empty name: the default core is a real session, it
+            // just has no `HC_SESSION` to be named by.
+            let (label, origin) = match found.name.as_deref() {
+                Some(name) => (name.to_string(), "named session"),
+                None => ("default".to_string(), "the default core; --session or HC_SESSION names another"),
+            };
             check(
                 &mut out,
                 if reachable { Some(true) } else { None },
                 "session",
                 format!(
-                    "{} (name: {name}){}",
-                    found.socket,
+                    "{label} ({origin}){}",
                     if reachable { "" } else { "; not reachable" }
                 ),
             );
