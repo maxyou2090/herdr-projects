@@ -1,4 +1,3 @@
-mod actions;
 mod adopt;
 mod agents;
 mod assign;
@@ -17,7 +16,6 @@ mod names;
 mod notify;
 mod overview;
 mod paths;
-mod popup;
 mod pr;
 mod profiles;
 mod progress;
@@ -32,7 +30,6 @@ mod skills;
 #[cfg(test)]
 mod scenarios;
 mod settings;
-mod setup;
 mod sidebar;
 mod spaces;
 mod steps;

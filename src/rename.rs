@@ -476,7 +476,7 @@ fn advance(ctx: &Ctx, pending: &Pending) -> Result<Option<Next>> {
             }
             for l in &live {
                 crate::sidebar::clear_pane(&view.herdr, &l.pane);
-                let _ = view.herdr.call(&["pane", "close", &l.pane], crate::herdr::CALL_TIMEOUT);
+                let _ = view.herdr.pane_close(&l.pane);
             }
             // The next tick sees them gone.
             return Ok(None);

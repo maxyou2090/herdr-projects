@@ -583,7 +583,7 @@ pub const SUBDIRS: [&str; 9] = ["memory", "scratch", "routines", "threads", "inb
 pub fn agents_md(name: &str, slug: &str, prefix: &str) -> String {
     format!(
         "# {name}\n\n\
-         This folder is the home of the Herdr project \"{name}\" (`{slug}`). Written by herdr-projects; `doctor --fix` refreshes it.\n\n\
+         This folder is the home of the project \"{name}\" (`{slug}`). Written by hp; `doctor --fix` refreshes it.\n\n\
          If your working directory is exactly this folder, you are the coordinator of {name}: run `{prefix} skill` now and follow what it prints, and run `{prefix} context {slug}` now and whenever you need project state.\n\n\
          If your working directory is under `threads/`, you are a thread: your brief is in your own folder (`.herdr-project/{slug}-<id>/brief.md`); ignore the rest of this file.\n"
     )
@@ -654,7 +654,7 @@ pub fn write_priming(project: &Project, prefix: &str, source: &str) -> Result<()
     let name = display_name(&settings.name, &project.slug);
     let agents = dir.join("AGENTS.md");
     if let Ok(existing) = std::fs::read_to_string(&agents)
-        && !existing.contains("Written by herdr-projects")
+        && !existing.contains("Written by hp") && !existing.contains("Written by herdr-projects")
     {
         // Someone else's AGENTS.md: keep its text beside ours, once.
         let kept = dir.join("AGENTS.md.before-herdr-projects");

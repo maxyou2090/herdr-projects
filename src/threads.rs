@@ -398,7 +398,7 @@ fn place_tab(project: &Project, view: &SessionView, record: &Thread) -> Result<T
             Some(id) => view.herdr.tab_create(&id, &folder, &record.title, false)?,
             None => {
                 let created = view.herdr.workspace_create(&folder, &record.title, false)?;
-                let _ = view.herdr.call(&["tab", "rename", &created.tab_id, &record.title], crate::herdr::CALL_TIMEOUT);
+                let _ = view.herdr.tab_rename(&created.tab_id, &record.title);
                 created
             }
         },
@@ -1059,7 +1059,7 @@ pub fn clean(ctx: &Ctx, project: &Project, t: &Thread, options: &Clean) -> Clean
             Some(view) if !t.pane_id.is_empty() && thread::live_state(t, &view.agents, &view.panes, jiff::Timestamp::now()).pane_exists => {
                 // The live pane's tab, not the recorded one: ids move after a restart.
                 let tab = view.panes.iter().find(|p| thread::pane_matches(t, p)).map(|p| p.tab_id.clone()).or_else(|| view.agents.iter().find(|a| thread::agent_matches(t, a)).map(|a| a.tab_id.clone())).unwrap_or_else(|| t.tab_id.clone());
-                match view.herdr.call(&["tab", "close", &tab], crate::herdr::CALL_TIMEOUT) {
+                match view.herdr.tab_close(&tab) {
                     Ok(_) => notes.push("its tab was closed".into()),
                     Err(error) => notes.push(format!("its tab could not be closed ({error})")),
                 }
@@ -1257,7 +1257,7 @@ pub fn remove_worktree(ctx: &Ctx, project: &Project, record: &Thread, view: Opti
     if worktree_gone(record) {
         let _ = git(ctx.runner, &record.repo, &["worktree", "prune"], GIT_TIMEOUT);
         let closed = match view.and_then(|v| own_workspace(record, &v.panes).map(|w| (v, w))) {
-            Some((view, workspace)) => match view.herdr.call(&["workspace", "close", &workspace], crate::herdr::CALL_TIMEOUT) {
+            Some((view, workspace)) => match view.herdr.workspace_close(&workspace) {
                 Ok(_) => "its workspace closed".to_string(),
                 Err(error) => format!("its workspace {workspace} could not be closed ({error})"),
             },

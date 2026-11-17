@@ -651,6 +651,71 @@ impl<'a> Herdr<'a> {
         Err(HerdrError { code: code.into(), message: text })
     }
 
+    /// One pane as this binary sees panes, or an error when it is not live.
+    pub fn pane_get(&self, pane: &str) -> Result<Pane, HerdrError> {
+        let term = self.term(pane)?;
+        Ok(Pane {
+            pane_id: term.pane_id(),
+            tab_id: term.label(L_TAB),
+            workspace_id: term.label(L_WS),
+            cwd: term.cwd(),
+            foreground_cwd: term.cwd(),
+            terminal_id: term.address.clone(),
+            focused: false,
+        })
+    }
+
+    /// The kind of agent a pane runs, from the label this binary writes.
+    pub fn agent_kind(&self, pane: &str) -> Option<String> {
+        let kind = self.term(pane).ok()?.label(L_KIND);
+        (!kind.is_empty()).then_some(kind)
+    }
+
+    /// Ends every terminal of a Space.
+    pub fn workspace_close(&self, workspace: &str) -> Result<(), HerdrError> {
+        for term in self.terminals()?.into_iter().filter(|t| t.label(L_WS) == workspace) {
+            self.end(&term.pane_id())?;
+        }
+        Ok(())
+    }
+
+    /// Ends a tab: its terminal, and any other terminal carrying the label.
+    pub fn tab_close(&self, tab: &str) -> Result<(), HerdrError> {
+        for term in self.terminals()?.into_iter().filter(|t| t.label(L_TAB) == tab) {
+            self.end(&term.pane_id())?;
+        }
+        Ok(())
+    }
+
+    /// Ends one pane.
+    pub fn pane_close(&self, pane: &str) -> Result<(), HerdrError> {
+        self.end(pane)
+    }
+
+    /// Kills a terminal and removes its record, tolerating one that is gone.
+    fn end(&self, pane: &str) -> Result<(), HerdrError> {
+        let _ = self.json(&["kill", pane], CALL_TIMEOUT);
+        let _ = self.json(&["rm", pane], CALL_TIMEOUT);
+        Ok(())
+    }
+
+    /// The pane this process runs in, from core's own `HC_TERMINAL_ID`, as the
+    /// name the rest of the binary stores. None outside a core terminal.
+    pub fn pane_current(&self) -> Option<String> {
+        let address = std::env::var("HC_TERMINAL_ID").ok().filter(|id| !id.is_empty())?;
+        self.term(&address).ok().map(|term| term.pane_id())
+    }
+
+    /// Types a line into a pane's shell and submits it.
+    pub fn pane_run(&self, pane: &str, command: &str) -> Result<(), HerdrError> {
+        self.json(&["send", pane, command], CALL_TIMEOUT).map(|_| ())
+    }
+
+    /// core reloads its config by itself; there is nothing to ask.
+    pub fn reload_config(&self) -> Result<(), HerdrError> {
+        Ok(())
+    }
+
     /// A Space's label, as the overview shows it.
     pub fn workspace_label(&self, workspace: &str) -> Result<String, HerdrError> {
         self.terminals()?

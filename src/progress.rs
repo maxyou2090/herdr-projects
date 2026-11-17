@@ -131,30 +131,18 @@ pub fn current(env: &Env, runner: &dyn Runner) -> Option<Current> {
 }
 
 /// The hook uses a short timeout: a slow server must not stall every tool call.
-pub fn current_within(env: &Env, runner: &dyn Runner, timeout: std::time::Duration) -> Option<Current> {
-    if env.var("HERDR_ENV") != Some("1") {
-        return None;
-    }
-    env.var("HERDR_PANE_ID")?;
-    let socket = env.var("HERDR_SOCKET_PATH")?.to_string();
+pub fn current_within(env: &Env, runner: &dyn Runner, _timeout: std::time::Duration) -> Option<Current> {
+    // core names the terminal in `HC_TERMINAL_ID`; `HERDR_*` was Herdr 1's.
+    let address = env.var("HC_TERMINAL_ID")?.to_string();
+    let socket = env.var("HC_SESSION").unwrap_or("").to_string();
     let herdr = Herdr::new(env.herdr_bin(), &socket, runner);
-    let result = herdr.call(&["pane", "current", "--current"], timeout).ok()?;
-    let reply = &result["pane"];
-    let pane_id = reply["pane_id"].as_str()?.to_string();
-    let pane = crate::herdr::Pane {
-        pane_id: pane_id.clone(),
-        tab_id: reply["tab_id"].as_str().unwrap_or("").to_string(),
-        workspace_id: reply["workspace_id"].as_str().unwrap_or("").to_string(),
-        cwd: reply["cwd"].as_str().unwrap_or("").to_string(),
-        foreground_cwd: reply["foreground_cwd"].as_str().unwrap_or("").to_string(),
-        terminal_id: reply["terminal_id"].as_str().unwrap_or("").to_string(),
-        focused: false,
-    };
+    let pane = herdr.pane_get(&address).ok()?;
+    let agent = herdr.agent_kind(&address).unwrap_or_default();
     Some(Current {
         socket,
-        pane_id,
+        pane_id: pane.pane_id.clone(),
         terminal_id: pane.terminal_id.clone(),
-        agent: reply["agent"].as_str().unwrap_or("").to_string(),
+        agent,
         pane,
     })
 }
@@ -201,11 +189,7 @@ fn managed(ctx: &Ctx, current: &Current) -> bool {
         return true;
     }
     let herdr = Herdr::new(ctx.env.herdr_bin(), &current.socket, ctx.runner);
-    let Some(agents) = herdr
-        .call(&["agent", "list"], std::time::Duration::from_secs(2))
-        .ok()
-        .and_then(|reply| serde_json::from_value::<Vec<crate::herdr::Agent>>(reply["agents"].clone()).ok())
-    else {
+    let Ok(agents) = herdr.agent_list() else {
         return false;
     };
     let mut agents: Vec<_> = agents.into_iter().filter(|a| a.pane_id == pane.pane_id && a.workspace_id == pane.workspace_id && a.tab_id == pane.tab_id && a.terminal_id == pane.terminal_id).collect();
@@ -363,92 +347,6 @@ pub fn foreign_session(record: &Record, event: &serde_json::Value) -> bool {
 
 /// The event under its Claude Code name, which the rest of the reporter
 /// uses: `hook_event_name` rewritten from the harness's own name.
-pub fn normalize(harness: &crate::setup::Harness, mut event: serde_json::Value) -> serde_json::Value {
-    let native = event["hook_event_name"].as_str().unwrap_or("");
-    if let Some(i) = harness.events.iter().position(|e| *e == native) {
-        event["hook_event_name"] = ["SessionStart", "UserPromptSubmit", "PostToolUse"][i].into();
-    }
-    event
-}
-
-/// The hook's answer in the shape the harness reads.
-pub fn output(harness: &crate::setup::Harness, native: &str, text: &str) -> serde_json::Value {
-    if harness.top_level_output {
-        serde_json::json!({"additionalContext": text})
-    } else {
-        serde_json::json!({"hookSpecificOutput": {"hookEventName": native, "additionalContext": text}})
-    }
-}
-
-/// `hook --agent <harness>`, the entry point the harness hooks run. Silent
-/// (exit 0, no output, no record) outside a project's coordinator and local
-/// thread panes, so the same hooks may sit in the user's settings for every
-/// session on the machine.
-pub fn hook(ctx: &Ctx, agent: &str) -> Result<()> {
-    if ctx.env.var("HERDR_ENV") != Some("1") || ctx.env.var("HERDR_PANE_ID").is_none() {
-        return Ok(());
-    }
-    use std::io::Read;
-    let mut input = String::new();
-    std::io::stdin().take(1_048_576).read_to_string(&mut input)?;
-    let Ok(event) = serde_json::from_str::<serde_json::Value>(&input) else {
-        return Ok(());
-    };
-    let Some(harness) = crate::setup::harness(agent) else {
-        return Ok(());
-    };
-    let native = event["hook_event_name"].as_str().unwrap_or("").to_string();
-    let event = normalize(harness, event);
-    if !eligible(&event) {
-        return Ok(());
-    }
-    let kind = event["hook_event_name"].as_str().unwrap_or("").to_string();
-    // Codex runs hooks for nested threads too; only the pane's own thread reports.
-    if agent == "codex"
-        && let Some(native) = event["session_id"].as_str()
-        && ctx.env.var("CODEX_THREAD_ID").is_some_and(|id| id != native)
-    {
-        return Ok(());
-    }
-    // At SessionStart Herdr may not have detected the agent yet: wait briefly.
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
-    let pane = loop {
-        match current_within(ctx.env, ctx.runner, std::time::Duration::from_secs(2)) {
-            Some(p) if kind != "SessionStart" || !p.agent.is_empty() => break p,
-            Some(p) if std::time::Instant::now() >= deadline => break p,
-            None if kind != "SessionStart" || std::time::Instant::now() >= deadline => return Ok(()),
-            _ => std::thread::sleep(std::time::Duration::from_millis(100)),
-        }
-    };
-    if !pane.agent.is_empty() && pane.agent != agent {
-        return Ok(()); // another harness's hook fired in a pane that is not its own
-    }
-    if !managed(ctx, &pane) {
-        return Ok(());
-    }
-    let mut record = load(&ctx.root, &pane.socket, &pane.pane_id).unwrap_or_default();
-    if kind != "SessionStart" && foreign_session(&record, &event) {
-        return Ok(());
-    }
-    record.socket = pane.socket.clone();
-    record.pane_id = pane.pane_id.clone();
-    record.terminal_id = pane.terminal_id.clone();
-    record.agent = if pane.agent.is_empty() { agent.to_string() } else { pane.agent.clone() };
-    let prefix = crate::coordinator::current_prefix(&ctx.root)?;
-    let before = record.clone();
-    let text = respond(&mut record, &kind, &prefix, now());
-    if kind == "SessionStart" {
-        record.session_id = event["session_id"].as_str().unwrap_or("").to_string();
-    }
-    if record != before {
-        save(&ctx.root, &record)?;
-    }
-    if let Some(text) = text {
-        println!("{}", output(harness, &native, &text));
-    }
-    Ok(())
-}
-
 /// The record's contribution to a thread's live state, or nothing when the
 /// record is missing or describes an earlier pane with the same id.
 pub fn self_report(root: &Path, socket: &str, pane_id: &str, terminal_id: &str) -> Option<Record> {
@@ -460,10 +358,10 @@ pub fn self_report(root: &Path, socket: &str, pane_id: &str, terminal_id: &str) 
 }
 
 /// Drops records whose pane is no longer listed in the session they belong to.
-/// Only records of `socket` are judged: other sessions' records are theirs.
-pub fn prune(root: &Path, socket: &str, live_pane_ids: &[String]) {
+/// Only records of `session` are judged: other sessions' records are theirs.
+pub fn prune(root: &Path, session: &str, live_pane_ids: &[String]) {
     for record in all(root) {
-        if record.socket == socket && !live_pane_ids.contains(&record.pane_id) {
+        if record.socket == session && !live_pane_ids.contains(&record.pane_id) {
             remove(root, &record.socket, &record.pane_id);
         }
     }

@@ -178,11 +178,11 @@ fn remove(ctx: &Ctx, project: &Project, orphan: &Orphan) -> Result<()> {
         Orphan::Branch { repo, branch } => git(ctx, repo, &["branch", "-D", branch]).map(|_| ()).ok_or_else(|| anyhow::anyhow!("git refused to delete {branch}")),
         Orphan::Tab { tab, .. } => {
             let view = threads::session_view(ctx, project).ok_or_else(|| anyhow::anyhow!("the session is not reachable"))?;
-            view.herdr.call(&["tab", "close", tab], crate::herdr::CALL_TIMEOUT).map(|_| ()).map_err(|e| anyhow::anyhow!("{e}"))
+            view.herdr.tab_close(tab).map_err(|e| anyhow::anyhow!("{e}"))
         }
         Orphan::Workspace { id, workspace } => {
             let view = threads::session_view(ctx, project).ok_or_else(|| anyhow::anyhow!("the session is not reachable"))?;
-            view.herdr.call(&["workspace", "close", workspace], crate::herdr::CALL_TIMEOUT).map_err(|e| anyhow::anyhow!("{e}"))?;
+            view.herdr.workspace_close(workspace).map_err(|e| anyhow::anyhow!("{e}"))?;
             thread::update(project, id, |t| t.worktree_path.clear())?;
             Ok(())
         }

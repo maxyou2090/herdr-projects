@@ -9,7 +9,7 @@ use crate::paths::{self, Ctx, Env, SessionFlags};
 use crate::project::{self, Project, Status};
 use crate::runner::RealRunner;
 use crate::threads::{self, ResolveArgs, StartArgs};
-use crate::{actions, adopt, doctor, inbox, lanes, lifecycle, overview, routine, ticker};
+use crate::{adopt, doctor, inbox, lanes, lifecycle, overview, routine, ticker};
 
 #[derive(Parser)]
 #[command(name = "herdr-projects", version = crate::VERSION, about = "Projects for herdr")]
@@ -197,12 +197,6 @@ enum Command {
         #[command(flatten)]
         session: SessionArgs,
     },
-    /// Run by herdr's action menu
-    #[command(hide = true)]
-    Action { id: String },
-    /// Run inside a plugin popup pane
-    #[command(hide = true)]
-    Pane { id: String },
     /// Agent profiles: named launch setups (harness, model, effort, flags) and which ones threads and coordinators may use
     Profile {
         #[command(subcommand)]
@@ -244,40 +238,6 @@ enum Command {
     },
     /// Open a URL (a pull request) in the browser
     OpenUrl { url: String },
-    /// The projects popup, in this terminal
-    Popup {
-        /// Scope it to one project (default: the current workspace's, else all)
-        slug: Option<String>,
-    },
-    /// Install the plugin's progress hooks (Claude Code, Codex, Droid, Gemini CLI, Copilot CLI) and its `autoproject` skill (Claude Code, Codex)
-    Configure {
-        /// Harnesses to configure, comma-separated: claude, codex, droid, gemini, copilot (default: those installed)
-        #[arg(long, value_delimiter = ',', value_parser = crate::setup::AGENTS)]
-        clients: Vec<String>,
-        #[arg(long, value_name = "DIR")]
-        claude_home: Option<PathBuf>,
-        #[arg(long, value_name = "DIR")]
-        codex_home: Option<PathBuf>,
-        /// Print what would change and change nothing
-        #[arg(long)]
-        dry_run: bool,
-        /// The key that opens the projects popup (default: prefix+a)
-        #[arg(long, value_name = "KEY")]
-        key: Option<String>,
-        /// Only the hooks: leave Herdr's config.toml alone
-        #[arg(long)]
-        hooks_only: bool,
-    },
-    /// Print `projects: N need you` for the tab bar (nothing when none, or when the ticker is not running)
-    NeedsYou {
-        #[arg(long)]
-        line: bool,
-    },
-    /// Run by Herdr at startup: the ticker and the default sidebar order
-    #[command(hide = true)]
-    Startup,
-    /// Remove exactly what `configure` added
-    Unconfigure,
     /// Report your progress (run by an agent in its own Herdr pane)
     Report {
         #[arg(long, value_parser = clap::value_parser!(u8).range(0..=100), required_unless_present = "unknown", conflicts_with = "unknown")]
@@ -286,12 +246,6 @@ enum Command {
         unknown: bool,
         #[arg(long)]
         activity: String,
-    },
-    /// Harness hook entry point (installed by `configure`)
-    #[command(hide = true)]
-    Hook {
-        #[arg(long, value_parser = crate::setup::AGENTS)]
-        agent: String,
     },
     /// Print the progress record of this pane, or of --pane
     Progress {
@@ -974,17 +928,6 @@ pub fn run() -> Result<()> {
             }
             crate::settings::system_open(&ctx, &url)
         }
-        Command::Popup { slug } => {
-            let scope = match slug {
-                Some(slug) => Some(slug),
-                None => match overview::resolve_slug_quiet(&ctx) {
-                    Some(slug) => Some(slug),
-                    None => None,
-                },
-            };
-            let workspace = ctx.env.var("HERDR_WORKSPACE_ID").unwrap_or("").to_string();
-            crate::popup::run(&ctx, scope, workspace)
-        }
         Command::Routine { command } => match command {
             RoutineCommand::Toggle { slug, name, on, off } => crate::settings::routine_toggle(&ctx, &slug, &name, if on { Some(true) } else if off { Some(false) } else { None }),
             RoutineCommand::Approve { slug, name } => {
@@ -1014,8 +957,6 @@ pub fn run() -> Result<()> {
         Command::AdoptWorkspace { name, goal, pane, workspace_cwd, session } => {
             adopt::adopt_workspace(&ctx, &adopt::AdoptWorkspace { name, goal, pane, workspace_cwd, session: session.into() })
         }
-        Command::Action { id } => actions::run_action(&ctx, &id),
-        Command::Pane { id } => actions::run_pane(&ctx, &id),
         Command::Profile { command } => {
             if let ProfileCommand::Resolve { name } = &command {
                 println!("{}", crate::profiles::resolve_json(&ctx, name.as_deref())?);
@@ -1059,52 +1000,7 @@ pub fn run() -> Result<()> {
             }
             Ok(())
         }
-        Command::Configure { clients, claude_home, codex_home, dry_run, key, hooks_only } => {
-            let options = crate::setup::ConfigureOptions { clients, claude_home, codex_home, dry_run, hooks: true, sidebar: !hooks_only, key, herdr_config: None, skill: crate::setup::skill_source() };
-            for note in crate::setup::configure(&ctx, &options)? {
-                println!("{note}");
-            }
-            if dry_run {
-                println!("dry run: nothing was changed");
-                return Ok(());
-            }
-            println!("configured. `unconfigure` removes exactly these entries.");
-            if !hooks_only {
-                crate::setup::apply_live(&ctx);
-            }
-            Ok(())
-        }
-        Command::NeedsYou { line: _ } => {
-            if let Some(line) = crate::sidebar::needs_you_line(&ctx.root) {
-                println!("{line}");
-            }
-            Ok(())
-        }
-        Command::Startup => {
-            // Herdr may reinstall into another folder: keep the command's link current.
-            // The journal decides who may, as it does for the hooks.
-            if let Ok(binary) = crate::paths::binary()
-                && crate::command_link::installable(&binary)
-            {
-                let _ = crate::command_link::ensure(ctx.env, &binary, &ctx.root);
-            }
-            ticker::start(&ctx)?;
-            crate::setup::apply_view(&ctx);
-            Ok(())
-        }
-        Command::Unconfigure => {
-            for note in crate::setup::unconfigure(&ctx)? {
-                println!("{note}");
-            }
-            crate::setup::reload_config(&ctx);
-            Ok(())
-        }
         Command::Report { percent, unknown: _, activity } => crate::progress::report(&ctx, percent, &activity),
-        Command::Hook { agent } => {
-            // A hook must never fail the harness: errors are swallowed.
-            let _ = crate::progress::hook(&ctx, &agent);
-            Ok(())
-        }
         Command::Progress { pane } => crate::progress::print(&ctx, pane.as_deref()),
         Command::Update { check } => crate::update::run(&ctx, check),
         Command::Ticker { command } => match command {

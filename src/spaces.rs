@@ -177,7 +177,7 @@ pub fn empty(ctx: &Ctx, project: &Project, herdr: &Herdr, include_focused: bool)
 /// Closes a Space. Never `--group`: herdr refuses a Space with worktree
 /// Spaces under it.
 pub fn close(herdr: &Herdr, space: &Space) -> Result<(), crate::herdr::HerdrError> {
-    herdr.call(&["workspace", "close", &space.id], crate::herdr::CALL_TIMEOUT).map(|_| ())
+    herdr.workspace_close(&space.id)
 }
 
 /// Forgets a Space on every thread of `project` that recorded it. A tab or

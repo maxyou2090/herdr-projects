@@ -112,7 +112,7 @@ fn coordinator_workspaces(project: &Project, view: &SessionView) -> Vec<(String,
 /// and Herdr's refusal (`workspace_group_close_required`) is reported.
 fn close_workspaces(project: &Project, view: &SessionView) -> Vec<String> {
     let mut notes = Vec::new();
-    let mut close = |workspace: &str, what: &str| match view.herdr.call(&["workspace", "close", workspace], crate::herdr::CALL_TIMEOUT) {
+    let mut close = |workspace: &str, what: &str| match view.herdr.workspace_close(workspace) {
         Ok(_) => notes.push(format!("closed {what} (workspace {workspace})")),
         Err(error) if error.code == "workspace_group_close_required" => notes.push(format!("left {what} open: it is a repository's primary workspace")),
         Err(error) => notes.push(format!("could not close {what}: {error}")),

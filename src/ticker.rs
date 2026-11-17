@@ -94,6 +94,72 @@ pub fn decide_start(lock: &LockState, my_version: &str, stop_file_exists: bool) 
     }
 }
 
+/// The LaunchAgent that keeps the ticker alive across reboots and crashes.
+pub const AGENT_LABEL: &str = "dev.hp.ticker";
+
+fn agent_path() -> Option<PathBuf> {
+    let home = std::env::var_os("HOME").map(PathBuf::from)?;
+    Some(home.join("Library/LaunchAgents").join(format!("{AGENT_LABEL}.plist")))
+}
+
+/// Writes the plist and loads it, so a stopped or rebooted machine brings the
+/// ticker back without anybody running a command.
+pub fn install_agent(root: &Path) -> Result<()> {
+    let Some(path) = agent_path() else {
+        return Ok(());
+    };
+    let binary = crate::paths::binary()?;
+    let escape = |text: &str| text.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;");
+    let log = log_path(root);
+    let plist = format!(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
+<!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n\
+<plist version=\"1.0\">\n<dict>\n\
+  <key>Label</key><string>{AGENT_LABEL}</string>\n\
+  <key>ProgramArguments</key>\n  <array>\n\
+    <string>{binary}</string>\n    <string>--root</string>\n    <string>{root}</string>\n    <string>ticker</string>\n    <string>run</string>\n\
+  </array>\n\
+  <key>RunAtLoad</key><true/>\n\
+  <key>KeepAlive</key><dict><key>SuccessfulExit</key><false/></dict>\n\
+  <key>ProcessType</key><string>Background</string>\n\
+  <key>StandardOutPath</key><string>{log}</string>\n\
+  <key>StandardErrorPath</key><string>{log}</string>\n\
+</dict>\n</plist>\n",
+        binary = escape(&binary.to_string_lossy()),
+        root = escape(&root.to_string_lossy()),
+        log = escape(&log.to_string_lossy()),
+    );
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
+    std::fs::write(&path, plist).with_context(|| format!("could not write {}", path.display()))?;
+    let uid = unsafe { libc_getuid() };
+    // `bootout` first: loading a label that is already loaded fails.
+    let _ = Command::new("launchctl").args(["bootout", &format!("gui/{uid}/{AGENT_LABEL}")]).output();
+    let loaded = Command::new("launchctl").args(["bootstrap", &format!("gui/{uid}"), &path.to_string_lossy()]).output();
+    match loaded {
+        Ok(out) if out.status.success() => Ok(()),
+        Ok(out) => bail!("launchctl bootstrap failed: {}", String::from_utf8_lossy(&out.stderr).trim()),
+        Err(error) => Err(error).context("could not run launchctl"),
+    }
+}
+
+/// Unloads the agent and removes its plist: `ticker stop` means stopped.
+pub fn remove_agent() -> Result<()> {
+    let Some(path) = agent_path() else {
+        return Ok(());
+    };
+    let uid = unsafe { libc_getuid() };
+    let _ = Command::new("launchctl").args(["bootout", &format!("gui/{uid}/{AGENT_LABEL}")]).output();
+    let _ = std::fs::remove_file(&path);
+    Ok(())
+}
+
+unsafe extern "C" {
+    #[link_name = "getuid"]
+    fn libc_getuid() -> u32;
+}
+
 /// Spawns the detached loop unless there is nothing to watch. It creates
 /// nothing when the root does not exist or contains no projects, so a linked
 /// plugin's `[[startup]]` is harmless in sessions that have no projects.
@@ -108,6 +174,9 @@ pub fn start(ctx: &Ctx) -> Result<()> {
         StartAction::Spawn => {
             // A leftover stop file would make the new ticker exit at once.
             let _ = std::fs::remove_file(stop_path(root));
+            if cfg!(target_os = "macos") && install_agent(root).is_ok() {
+                return Ok(());
+            }
             spawn(root)
         }
         StartAction::StopThenSpawn => {
@@ -136,7 +205,7 @@ fn spawn(root: &Path) -> Result<()> {
         .stderr(Stdio::null());
     // Pane variables belong to whoever started us, not to the ticker: every
     // project carries its own recorded socket.
-    for key in ["HERDR_SOCKET_PATH", "HERDR_SESSION", "HERDR_PANE_ID", "HERDR_TAB_ID", "HERDR_WORKSPACE_ID"] {
+    for key in ["HERDR_SOCKET_PATH", "HERDR_SESSION", "HERDR_PANE_ID", "HERDR_TAB_ID", "HERDR_WORKSPACE_ID", "HC_TERMINAL_ID"] {
         command.env_remove(key);
     }
     // SAFETY: setsid is async-signal-safe and touches no memory.
@@ -152,6 +221,7 @@ fn spawn(root: &Path) -> Result<()> {
 
 /// Asks the running ticker to exit and waits for the lock to be released.
 pub fn stop(root: &Path) -> Result<()> {
+    let _ = remove_agent();
     if lock_state(root) == LockState::Free {
         let _ = std::fs::remove_file(stop_path(root));
         return Ok(());

@@ -1,11 +1,6 @@
-//! The `herdr-projects` command on `PATH`: a link in `~/.local/bin` (or
-//! `$XDG_BIN_HOME`) to the plugin's binary, made at every plugin start and by
-//! `doctor --fix`, so a reinstall into another folder never leaves it broken.
-//! Only a missing entry, or a link that is dangling or points into Herdr's
-//! plugin folder, is ever considered for a rewrite; a file or anyone else's
-//! link is left alone.
-//! Like the hooks, a write consults the journal: only the installation recorded
-//! there may relink, so a throwaway release build cannot take the link over.
+//! The `hp` command on `PATH`: a link in `~/.local/bin` (or `$XDG_BIN_HOME`)
+//! to this binary, made by `doctor --fix`, so a rebuild or a moved checkout
+//! never leaves a broken command. A file, or anyone else's link, is left alone.
 
 use std::path::{Path, PathBuf};
 
@@ -13,7 +8,7 @@ use anyhow::{Context, Result, bail};
 
 use crate::paths::Env;
 
-pub const NAME: &str = "herdr-projects";
+pub const NAME: &str = "hp";
 
 /// The folder the link goes in: `$XDG_BIN_HOME`, else `~/.local/bin`.
 pub fn bin_dir(env: &Env) -> PathBuf {
@@ -24,8 +19,8 @@ pub fn link_path(env: &Env) -> PathBuf {
     bin_dir(env).join(NAME)
 }
 
-/// Whether `binary` is an installed build (`target/release/herdr-projects`),
-/// not a test or debug binary that must never become the user's command.
+/// Whether `binary` is an installed build (`target/release/hp`), not a test or
+/// debug binary that must never become the user's command.
 pub fn installable(binary: &Path) -> bool {
     binary.ends_with(Path::new("release").join(NAME))
 }
@@ -35,10 +30,9 @@ pub enum State {
     /// A link that resolves to `binary`.
     Ours,
     Missing,
-    /// A link that is dangling or points to another build inside Herdr's
-    /// plugin folder: a candidate for replacement, if the journal allows it.
+    /// A link that is dangling: a candidate for replacement.
     Stale(PathBuf),
-    /// A file, or a link somewhere else (a checkout of the user's own): never touched.
+    /// A file, or a link somewhere else (a checkout of the user's own).
     Foreign(String),
 }
 
@@ -58,35 +52,14 @@ pub fn state(env: &Env, binary: &Path) -> State {
     match std::fs::canonicalize(&target) {
         Ok(resolved) if resolved == binary => State::Ours,
         Err(_) => State::Stale(target),
-        Ok(_) if target.starts_with(plugins_dir(env)) => State::Stale(target),
         Ok(_) => State::Foreign(format!("a link to {}", target.display())),
     }
 }
 
-/// Herdr's plugin installs live under `<herdr config dir>/plugins`.
-fn plugins_dir(env: &Env) -> PathBuf {
-    let config = crate::setup::herdr_config_path(env);
-    config.parent().unwrap_or(Path::new("/")).join("plugins")
-}
-
-/// The journal's installation, when it is not `binary` at `root`. The journal
-/// is the record of what the installation is, so the link follows the same
-/// rule as the hooks: a build at another root says so instead of relinking.
-fn refusal(env: &Env, binary: &Path, root: &Path) -> Option<String> {
-    let journal = crate::setup::load_journal(&env.config_dir());
-    let here = crate::setup::Installation { binary: binary.to_path_buf(), root: root.to_path_buf() };
-    crate::setup::may_repair(&journal, &here).err()
-}
-
-/// Makes the link when it is missing or stale; returns the state found. A
-/// journal naming another installation refuses the write, as it does for the
-/// hooks; `configure` is the deliberate way to point it here.
-pub fn ensure(env: &Env, binary: &Path, root: &Path) -> Result<State> {
+/// Makes the link when it is missing or stale; returns the state found.
+pub fn ensure(env: &Env, binary: &Path) -> Result<State> {
     let found = state(env, binary);
     if matches!(&found, State::Missing | State::Stale(_)) {
-        if let Some(refusal) = refusal(env, binary, root) {
-            bail!("{refusal}");
-        }
         let link = link_path(env);
         let dir = bin_dir(env);
         std::fs::create_dir_all(&dir).with_context(|| format!("could not create {}", dir.display()))?;
@@ -102,33 +75,22 @@ pub fn ensure(env: &Env, binary: &Path, root: &Path) -> Result<State> {
     Ok(found)
 }
 
-/// What a shell with `path_var` runs for `herdr-projects`, if anything.
+/// What a shell with `path_var` runs for `hp`, if anything.
 pub fn resolves_to(path_var: &str) -> Option<PathBuf> {
     std::env::split_paths(path_var).map(|dir| dir.join(NAME)).find(|candidate| candidate.is_file())
 }
 
 /// The `doctor` line: `(ok, detail)` where `None` is a warning.
-pub fn check(env: &Env, binary: &Path, root: &Path, path_var: &str, fix: bool) -> (Option<bool>, String) {
+pub fn check(env: &Env, binary: &Path, path_var: &str, fix: bool) -> (Option<bool>, String) {
     let link = link_path(env);
     if !installable(binary) {
         return (None, format!("{} is not an installed build, so {} was not checked", binary.display(), link.display()));
     }
-    let found = state(env, binary);
-    if matches!(&found, State::Missing | State::Stale(_))
-        && let Some(refusal) = refusal(env, binary, root)
-    {
-        let detail = match &found {
-            State::Missing => format!("{} is missing; {refusal}", link.display()),
-            State::Stale(old) => format!("{} links {}, not this binary; {refusal}", link.display(), old.display()),
-            _ => unreachable!(),
-        };
-        return (None, detail);
-    }
     let (found, fixed) = if fix {
-        match ensure(env, binary, root) {
+        match ensure(env, binary) {
             Ok(found) => {
                 let fixed = matches!(found, State::Missing | State::Stale(_));
-                (found, fixed)
+                (state(env, binary), fixed)
             }
             Err(error) => return (Some(false), format!("could not fix: {error:#}")),
         }
@@ -137,8 +99,8 @@ pub fn check(env: &Env, binary: &Path, root: &Path, path_var: &str, fix: bool) -
     };
     let mut detail = match &found {
         State::Foreign(what) => return (None, format!("{} is {what}, so it was left alone; move it away and run `doctor --fix` to link this binary there", link.display())),
-        State::Missing if !fix => return (None, format!("{} is missing; `doctor --fix` (or restarting Herdr) links it", link.display())),
-        State::Stale(old) if !fix => return (None, format!("{} links {}, not this binary; `doctor --fix` (or restarting Herdr) relinks it", link.display(), old.display())),
+        State::Missing if !fix => return (None, format!("{} is missing; `doctor --fix` links it", link.display())),
+        State::Stale(old) if !fix => return (None, format!("{} links {}, not this binary; `doctor --fix` relinks it", link.display(), old.display())),
         _ if fixed => format!("fixed: {} now links this binary", link.display()),
         _ => format!("{} links this binary", link.display()),
     };

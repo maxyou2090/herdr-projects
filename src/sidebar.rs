@@ -1,8 +1,7 @@
-//! What the Herdr sidebar shows for projects: per agent row a name
-//! (`--display-agent`); the project grouping of `grouping` (order and a bold
-//! head row) in the agents and the Spaces list; a tab-bar count; the default
-//! agent view, grouped by project.
-//! Also the `config.toml` edit `configure` makes to render them.
+//! How a project's threads read: the words of a group, a row's one-line
+//! display, and the labels that carry them. Herdr 1 drew these into its
+//! sidebar and tab bar; herdr-core draws nothing, so the same strings are what
+//! `overview`, `list` and the digest print.
 
 use std::path::Path;
 
