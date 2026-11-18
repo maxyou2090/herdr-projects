@@ -129,24 +129,24 @@ pub fn empty(ctx: &Ctx, project: &Project, herdr: &Core, include_focused: bool) 
         }
         found.push(Space { id, label: space.label.clone() });
     }
-    // Orphan home Spaces: plain Spaces still carrying the project's label (its
-    // slug) that no open thread and no coordinator uses — the twins left
+    // Orphan home Spaces: plain Spaces still carrying the project's home
+    // label that no open thread and no coordinator uses — the twins left
     // behind when a tab thread reopened the project's workspace next to its
     // old one. Worktree-backed Spaces belong to the primary logic above.
-    for w in workspaces
-        .iter()
-        .filter(|w| w.worktree.is_none() && w.label == project.slug && !in_use.contains(&w.workspace_id) && !coordinators.contains(&w.workspace_id))
-    {
-        let own: Vec<_> = panes.iter().filter(|p| p.workspace_id == w.workspace_id).collect();
-        if own.is_empty()
-            || own.len() != w.pane_count
-            || agents.iter().any(|a| a.workspace_id == w.workspace_id)
-            || (!include_focused && (w.focused || own.iter().any(|p| p.focused)))
-            || !own.iter().all(|p| herdr.pane_idle_shell(&p.pane_id))
-        {
-            continue;
+    if let Ok((settings, _)) = project.read_project_md() {
+        let home = project::home_label(&settings.name, &project.slug);
+        for w in workspaces.iter().filter(|w| w.worktree.is_none() && w.label == home && !in_use.contains(&w.workspace_id) && !coordinators.contains(&w.workspace_id)) {
+            let own: Vec<_> = panes.iter().filter(|p| p.workspace_id == w.workspace_id).collect();
+            if own.is_empty()
+                || own.len() != w.pane_count
+                || agents.iter().any(|a| a.workspace_id == w.workspace_id)
+                || (!include_focused && (w.focused || own.iter().any(|p| p.focused)))
+                || !own.iter().all(|p| herdr.pane_idle_shell(&p.pane_id))
+            {
+                continue;
+            }
+            found.push(Space { id: w.workspace_id.clone(), label: w.label.clone() });
         }
-        found.push(Space { id: w.workspace_id.clone(), label: w.label.clone() });
     }
     // Threads' own Spaces, once nothing uses them: a plain Space still
     // carrying the thread's title (herdr reuses ids after a server restart,
@@ -156,7 +156,7 @@ pub fn empty(ctx: &Ctx, project: &Project, herdr: &Core, include_focused: bool) 
         let Some(space) = workspaces.iter().find(|w| w.workspace_id == id) else {
             continue;
         };
-        if space.worktree.is_some() || label.is_empty() || space.label != label {
+        if space.worktree.is_some() || label.is_empty() || !crate::labels::thread_space_matches(&space.label, &label) {
             continue;
         }
         let own_panes: Vec<_> = panes.iter().filter(|p| p.workspace_id == id).collect();
@@ -234,10 +234,10 @@ pub fn close_empty(ctx: &Ctx, project: &Project, herdr: &Core) -> Vec<anyhow::Er
     errors
 }
 
-/// Renames the project's home Space to the project's slug when the label
-/// drifted (a project renamed outside `hp rename`, or one opened before the
-/// slug rule); it would otherwise keep the old label until the next `open`.
-/// Silent, so a ticker tick never prints.
+/// Renames the project's home Space to the label its `PROJECT.md` name spells:
+/// a name changed outside `herdr-projects rename` would otherwise leave the
+/// old label in the sidebar until the next `open`. Silent, so a ticker tick
+/// never prints.
 pub fn sync_home_label(project: &Project, herdr: &Core) {
     let Some(record) = project.coordinator() else {
         return;
@@ -245,8 +245,73 @@ pub fn sync_home_label(project: &Project, herdr: &Core) {
     if record.workspace_id.is_empty() {
         return;
     }
-    let label = project.slug.clone();
+    let Ok((settings, _)) = project.read_project_md() else {
+        return;
+    };
+    let label = project::home_label(&settings.name, &project.slug);
     if herdr.workspace_label(&record.workspace_id).unwrap_or_default() != label {
         let _ = herdr.name_space(&record.workspace_id, &label);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::core::L_WS_LABEL;
+    use crate::fake_hc::{FakeApp, FakeCore};
+
+    /// The home Space is named by the project's display name (`REXA`), and on a
+    /// Space the Herdr app draws the rename goes through the app — PR #41's host
+    /// rule — as well as through hp's label, which is the record.
+    #[test]
+    fn a_drifted_home_space_is_renamed_to_the_display_name_on_the_app_that_draws_it() {
+        let root = tempfile::tempdir().unwrap();
+        let project = crate::project::create(root.path(), "REXA", "", vec![]).unwrap();
+        let dir = project.canonical_dir().to_string_lossy().into_owned();
+        let core = FakeCore::new();
+        let app = FakeApp::new(&core);
+        let space = app.shown_space("rexa");
+        core.terminal("hpc-rexa", &dir, &[("hp_ws", space.as_str()), (L_WS_LABEL, "rexa")]);
+        project
+            .update_coordinator(|c| {
+                c.socket = "fake-session".into();
+                c.workspace_id = space.clone();
+                c.cwd = dir.clone();
+            })
+            .unwrap();
+
+        let herdr = Core::new("hc", "", &app);
+        sync_home_label(&project, &herdr);
+
+        assert_eq!(app.spaces.borrow()[0].1, "REXA", "the app draws the display name");
+        let labels = core.terminals.borrow()[0].labels.clone();
+        assert_eq!(labels.get(L_WS_LABEL).map(String::as_str), Some("REXA"), "hp's label says the same, so one name");
+        assert_eq!(project.display_name(), "REXA", "not the slug");
+    }
+
+    /// A Space already showing the display name is left alone: the ticker runs
+    /// this every tick.
+    #[test]
+    fn a_home_space_already_named_right_is_not_renamed() {
+        let root = tempfile::tempdir().unwrap();
+        let project = crate::project::create(root.path(), "herdr-projects", "", vec![]).unwrap();
+        let dir = project.canonical_dir().to_string_lossy().into_owned();
+        let core = FakeCore::new();
+        let app = FakeApp::new(&core);
+        let space = app.shown_space("Herdr Projects");
+        core.terminal("hpc-herdr-projects", &dir, &[("hp_ws", space.as_str()), (L_WS_LABEL, "Herdr Projects")]);
+        project
+            .update_coordinator(|c| {
+                c.socket = "fake-session".into();
+                c.workspace_id = space.clone();
+                c.cwd = dir.clone();
+            })
+            .unwrap();
+
+        let herdr = Core::new("hc", "", &app);
+        sync_home_label(&project, &herdr);
+
+        let calls = app.calls.borrow().clone();
+        assert!(!calls.iter().any(|c| c.contains("space.rename")), "nothing to rename: {calls:?}");
     }
 }

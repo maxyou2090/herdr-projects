@@ -56,6 +56,37 @@ pub fn slug_from_name(name: &str) -> Result<String> {
     Ok(slug)
 }
 
+/// Words split on `-` and `_`, each with its first letter upper-cased:
+/// `herdr-projects` becomes `Herdr Projects`. Plain title case, so `gtm-ai`
+/// becomes `Gtm Ai`; a user who wants `GTM AI` sets `name` in PROJECT.md.
+pub fn humanize(slug: &str) -> String {
+    slug.split(['-', '_'])
+        .filter(|word| !word.is_empty())
+        .map(|word| {
+            let mut chars = word.chars();
+            chars.next().map(|first| first.to_uppercase().chain(chars).collect::<String>()).unwrap_or_default()
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// The name a project shows: `name` as given unless it is empty or looks like
+/// a slug (lower-case letters, digits, `-` and `_` only), else the humanized
+/// form of it or of `slug`. A herdr workspace never shows a bare slug, which
+/// would read the same as a repository's own workspace.
+pub fn display_name(name: &str, slug: &str) -> String {
+    let name = name.trim();
+    let base = if name.is_empty() { slug } else { name };
+    let slug_like = base.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-' || c == '_');
+    if slug_like { humanize(base) } else { base.to_string() }
+}
+
+/// The label of a project's home Space: the name a person reads, which is the
+/// same string its row and its briefs carry ([`display_name`]).
+pub fn home_label(name: &str, slug: &str) -> String {
+    display_name(name, slug)
+}
+
 /// Writes through a temporary file in the same directory plus a rename. It never
 /// creates parent directories: only `new` creates a project's directories.
 pub fn write_atomic(path: &Path, contents: &[u8]) -> Result<()> {
@@ -98,6 +129,7 @@ pub struct Repo {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(default)]
 pub struct Settings {
+    pub name: String,
     pub goal: String,
     /// The profile `open` starts a coordinator with (`coordinator_agent`
     /// before profiles; a Herdr kind is a built-in profile).
@@ -114,6 +146,7 @@ pub struct Settings {
 impl Default for Settings {
     fn default() -> Self {
         Settings {
+            name: String::new(),
             goal: String::new(),
             coordinator_profile: "claude".into(),
             thread_profile: "claude".into(),
@@ -300,6 +333,16 @@ impl Project {
     /// `[safety]` table and of its routine approvals.
     pub fn canonical_dir(&self) -> PathBuf {
         std::fs::canonicalize(self.dir()).unwrap_or_else(|_| self.dir())
+    }
+
+    /// The name this project shows wherever a person reads it: `name` from
+    /// `PROJECT.md` when it has one, else its slug humanized (`herdr-projects`
+    /// reads `Herdr Projects`). A `PROJECT.md` that cannot be read falls back to
+    /// the humanized slug, so a Space label is never empty.
+    pub fn display_name(&self) -> String {
+        self.read_project_md()
+            .map(|(settings, _)| display_name(&settings.name, &self.slug))
+            .unwrap_or_else(|_| humanize(&self.slug))
     }
 
     /// Takes the per-project lock. The lock file is opened without creating
@@ -515,11 +558,11 @@ pub const SUBDIRS: [&str; 9] = ["memory", "scratch", "routines", "threads", "inb
 /// working directory, and tab threads run under `threads/<id>/`, so it says
 /// who is who by working directory. `prefix` is `<absolute binary> --root
 /// <root>`: bare `hp` is on no harness's `PATH`.
-pub fn agents_md(slug: &str, prefix: &str) -> String {
+pub fn agents_md(name: &str, slug: &str, prefix: &str) -> String {
     format!(
-        "# {slug}\n\n\
-         This folder is the home of the project `{slug}`. Written by hp; `doctor --fix` refreshes it.\n\n\
-         If your working directory is exactly this folder, you are the coordinator of {slug}: run `{prefix} skill` now and follow what it prints, and run `{prefix} context {slug}` now and whenever you need project state.\n\n\
+        "# {name}\n\n\
+         This folder is the home of the project \"{name}\" (`{slug}`). Written by hp; `doctor --fix` refreshes it.\n\n\
+         If your working directory is exactly this folder, you are the coordinator of {name}: run `{prefix} skill` now and follow what it prints, and run `{prefix} context {slug}` now and whenever you need project state.\n\n\
          If your working directory is under `threads/`, you are a thread: your brief is in your own folder (`.herdr-project/{slug}-<id>/brief.md`); ignore the rest of this file.\n"
     )
 }
@@ -585,6 +628,8 @@ fn write_default_routine_locked(project: &Project, source: &str) -> Result<bool>
 /// creates `uploads/`. Idempotent; used by `open` and by `doctor --fix`.
 pub fn write_priming(project: &Project, prefix: &str, source: &str) -> Result<()> {
     let dir = project.dir();
+    let (settings, _) = project.read_project_md()?;
+    let name = display_name(&settings.name, &project.slug);
     let agents = dir.join("AGENTS.md");
     if let Ok(existing) = std::fs::read_to_string(&agents)
         && !existing.contains("Written by hp") && !existing.contains("Written by herdr-projects")
@@ -595,7 +640,7 @@ pub fn write_priming(project: &Project, prefix: &str, source: &str) -> Result<()
             std::fs::rename(&agents, &kept)?;
         }
     }
-    write_atomic(&agents, agents_md(&project.slug, prefix).as_bytes())?;
+    write_atomic(&agents, agents_md(&name, &project.slug, prefix).as_bytes())?;
     let claude = dir.join("CLAUDE.md");
     let link_ok = std::fs::read_link(&claude).is_ok_and(|target| target == Path::new("AGENTS.md"));
     if !link_ok {
@@ -650,8 +695,7 @@ pub fn priming_problems(project: &Project, prefix: &str) -> Vec<String> {
 }
 
 /// Creates the folder and skeleton files. The only code path that creates a
-/// project's directories. `name` is only the source of the slug: a project has
-/// no other name. Fails if the slug exists.
+/// project's directories. Fails if the slug exists.
 pub fn create(root: &Path, name: &str, goal: &str, repos: Vec<Repo>) -> Result<Project> {
     let slug = slug_from_name(name)?;
     let project = Project {
@@ -672,6 +716,7 @@ pub fn create(root: &Path, name: &str, goal: &str, repos: Vec<Repo>) -> Result<P
         })
         .collect();
     let settings = Settings {
+        name: display_name(name, &slug),
         goal: goal.to_string(),
         repos,
         ..Settings::default()
@@ -727,15 +772,39 @@ mod tests {
     }
 
     #[test]
-    fn create_takes_the_slug_from_the_name_and_stores_no_display_name() {
+    fn a_slug_like_name_is_humanized_and_a_typed_name_is_kept() {
+        assert_eq!(humanize("herdr-projects"), "Herdr Projects");
+        assert_eq!(humanize("gtm_ai"), "Gtm Ai");
+        assert_eq!(humanize("-v2--api-"), "V2 Api");
+        assert_eq!(display_name("herdr-projects", "herdr-projects"), "Herdr Projects");
+        assert_eq!(display_name("", "herdr-projects"), "Herdr Projects");
+        assert_eq!(display_name("  ", "demo"), "Demo");
+        for typed in ["GTM AI", "my project", "Demo", "herdr-Projects"] {
+            assert_eq!(display_name(typed, "x"), typed);
+        }
+    }
+
+    #[test]
+    fn create_stores_a_display_name_and_keeps_the_slug() {
         let root = tempfile::tempdir().unwrap();
         let project = create(root.path(), "herdr-projects", "", vec![]).unwrap();
         assert_eq!(project.slug, "herdr-projects");
-        assert_eq!(project.read_project_md().unwrap().0, Settings { goal: String::new(), ..Settings::default() });
-        let front = std::fs::read_to_string(project.project_md()).unwrap();
-        assert!(!front.contains("name ="), "{front}");
+        assert_eq!(project.read_project_md().unwrap().0.name, "Herdr Projects");
         let project = create(root.path(), "GTM AI", "", vec![]).unwrap();
-        assert_eq!(project.slug, "gtm-ai", "the name is only the source of the slug");
+        assert_eq!(project.slug, "gtm-ai");
+        assert_eq!(project.read_project_md().unwrap().0.name, "GTM AI");
+    }
+
+    #[test]
+    fn a_project_shows_the_name_it_has_and_else_the_humanized_slug() {
+        let root = tempfile::tempdir().unwrap();
+        let project = create(root.path(), "herdr-projects", "", vec![]).unwrap();
+        assert_eq!(project.display_name(), "Herdr Projects", "the name `new` wrote into PROJECT.md");
+        // A PROJECT.md with no `name`: an older hp's, or one a person trimmed.
+        write_atomic(&project.project_md(), b"+++\ngoal = \"\"\n+++\n# Instructions\n").unwrap();
+        assert_eq!(project.display_name(), "Herdr Projects", "no name line: the slug, humanized");
+        write_atomic(&project.project_md(), b"+++\nname = \"REXA\"\n+++\n").unwrap();
+        assert_eq!(project.display_name(), "REXA", "a typed name is used as it is");
     }
 
     #[test]
@@ -760,6 +829,7 @@ mod tests {
         assert!(project.dir().join("MEMORY.md").is_file());
         assert!(project.dir().join("TASKS.md").is_file());
         let (settings, body) = project.read_project_md().unwrap();
+        assert_eq!(settings.name, "Demo");
         assert_eq!(settings.goal, "Ship \"it\"");
         assert_eq!(settings.coordinator_profile, "claude");
         assert_eq!(settings.auto_resolve_days, 7);
@@ -835,7 +905,7 @@ mod tests {
         let prefix = format!("{} --root {}", std::env::current_exe().unwrap().display(), root.path().display());
         write_priming(&project, &prefix, "open").unwrap();
         let text = std::fs::read_to_string(project.dir().join("AGENTS.md")).unwrap();
-        assert!(text.contains("you are the coordinator of demo-project"), "{text}");
+        assert!(text.contains("you are the coordinator of Demo Project"));
         assert!(text.contains(&format!("`{prefix} skill`")));
         assert!(text.contains(&format!("`{prefix} context demo-project`")));
         assert!(text.contains("under `threads/`, you are a thread"));
@@ -846,7 +916,7 @@ mod tests {
 
         // Idempotent, and a stale binary path is reported.
         write_priming(&project, &prefix, "open").unwrap();
-        let stale = agents_md("demo-project", "/no/such/binary --root /r");
+        let stale = agents_md("Demo Project", "demo-project", "/no/such/binary --root /r");
         std::fs::write(project.dir().join("AGENTS.md"), stale).unwrap();
         let problems = priming_problems(&project, &prefix);
         assert_eq!(problems.len(), 1, "{problems:?}");
@@ -870,15 +940,15 @@ mod tests {
     #[test]
     fn front_matter_parsing() {
         let (settings, body) =
-            parse_project_md("+++\ngoal = \"X\"\nnudge = true\n+++\n\nBody\n+++\nmore\n").unwrap();
-        assert_eq!(settings.goal, "X");
+            parse_project_md("+++\nname = \"X\"\nnudge = true\n+++\n\nBody\n+++\nmore\n").unwrap();
+        assert_eq!(settings.name, "X");
         assert!(settings.nudge);
         assert_eq!(settings.thread_profile, "claude");
         assert_eq!(body, "Body\n+++\nmore\n");
         assert!(parse_project_md("no front matter").is_err());
-        assert!(parse_project_md("+++\ngoal = \n+++\n").is_err());
-        assert!(parse_project_md("+++\ngoal = \"X\"\n").is_err());
-        let (_, body) = parse_project_md("+++\ngoal = \"X\"\n+++").unwrap();
+        assert!(parse_project_md("+++\nname = \n+++\n").is_err());
+        assert!(parse_project_md("+++\nname = \"X\"\n").is_err());
+        let (_, body) = parse_project_md("+++\nname = \"X\"\n+++").unwrap();
         assert_eq!(body, "");
     }
 
@@ -888,26 +958,12 @@ mod tests {
         // read as an ordinary project, not as an error.
         let text = "+++\nname = \"Old\"\nmute = true\nnudge = true\n+++\n\nBody\n";
         let (settings, body) = parse_project_md(text).unwrap();
-        assert_eq!((settings.nudge, body.as_str()), (true, "Body\n"));
+        assert_eq!((settings.name.as_str(), settings.nudge, body.as_str()), ("Old", true, "Body\n"));
         // And a `set` on such a file leaves the stale line alone rather than
         // failing on it.
         let edited = crate::settings::set_in(text, "goal", "Later").unwrap();
         let (settings, _) = parse_project_md(&edited).unwrap();
-        assert_eq!(settings.goal, "Later");
-    }
-
-    #[test]
-    fn a_leftover_display_name_is_ignored_and_left_in_place() {
-        // Projects made before the display-name mechanism was removed carry
-        // `name = "Law Office"`; it must read as an ordinary project and survive
-        // an edit of another key verbatim.
-        let text = "+++\nname = \"Law Office\"\ngoal = \"Ship\"\n+++\n\nBody\n";
-        let (settings, body) = parse_project_md(text).unwrap();
-        assert_eq!((settings.goal.as_str(), body.as_str()), ("Ship", "Body\n"));
-        let edited = crate::settings::set_in(text, "goal", "Later").unwrap();
-        assert!(edited.contains("name = \"Law Office\"\n"), "{edited}");
-        let (settings, _) = parse_project_md(&edited).unwrap();
-        assert_eq!(settings.goal, "Later");
+        assert_eq!((settings.name.as_str(), settings.goal.as_str()), ("Old", "Later"));
     }
 
     #[test]

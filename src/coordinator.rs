@@ -644,8 +644,7 @@ pub fn open(ctx: &Ctx, slug: &str, options: &OpenOptions) -> Result<()> {
             report_tokens(&herdr, &project, &lane.pane_id);
         }
     }
-    // The home Space carries the slug: a project has no other name.
-    let label = slug.to_string();
+    let label = crate::project::home_label(&settings.name, slug);
     // Canonical, because herdr reports a pane's physical working directory and
     // the identity check compares against it.
     let dir = project.canonical_dir();
@@ -955,7 +954,7 @@ pub fn report_tokens(herdr: &Core, project: &Project, pane_id: &str) {
     crate::labels::report_pane(herdr, pane_id, &display, &project.slug, crate::thread::Group::Idle, lane.as_deref());
 }
 
-/// Renames a Space whose label is not the project's slug — the recorded one, or
+/// Renames a Space whose label is not the project's name — the recorded one, or
 /// the one a pane `open` runs in — so an adopted Space drops the label it was
 /// made with. A Space the app draws is renamed by the app
 /// (`Core::name_space`); a failure is a printed line, never a silent no-op.
@@ -981,9 +980,9 @@ pub fn keep_names(herdr: &Core, project: &Project, pane: &str) -> (String, Strin
     if pane.is_empty() {
         return (String::new(), String::new());
     }
-    // The Space a project owns is named by its slug (t-0050); only the host that
-    // draws it, and hp's labels, are this thread's business.
-    let label = project.slug.clone();
+    // The Space a project owns is named by its display name (`REXA`, `Herdr
+    // Projects`), and the host that draws it is `name_place`'s business.
+    let label = project.display_name();
     let (space, tab, notes) = herdr.name_place(pane, &label, crate::labels::coordinator_tab_label());
     for note in notes {
         println!("{note}");
@@ -1123,6 +1122,7 @@ fn digest_for(ctx: &Ctx, project: &Project, prefix: &str) -> Result<(String, Vec
 
     match project.read_project_md() {
         Ok((settings, _)) => {
+            let _ = writeln!(out, "Name: {}", project.display_name());
             let _ = writeln!(out, "Goal: {}", if settings.goal.is_empty() { "(none set)" } else { &settings.goal });
             let _ = writeln!(
                 out,
@@ -1326,7 +1326,7 @@ mod tests {
         let (found_space, found_tab) = keep_names(&herdr, &project, &term.address);
         assert_eq!(found_space, space, "the record gets the Space the pane is really in");
         assert_eq!(found_tab, tab, "and the tab, from the app since hp wrote none");
-        assert_eq!(app.spaces.borrow()[0].1, "rexa", "the Space is the project's slug");
+        assert_eq!(app.spaces.borrow()[0].1, "REXA", "the Space is the project's display name");
         assert_eq!(app.tab_names.borrow()[&tab], "coordinator", "the tab is the coordinator's");
         let labels = fake.terminals.borrow()[0].labels.clone();
         assert_eq!(labels.get(crate::core::L_WS).map(String::as_str), Some(space.as_str()), "hp's labels are the record now");
@@ -1357,7 +1357,7 @@ mod tests {
         assert_eq!(labels["hp_project"], "rexa");
         assert_eq!(labels[crate::core::L_TAB_LABEL], "coordinator");
         assert_eq!(app.tab_names.borrow()[&format!("apptab-{}", term.address)], "coordinator");
-        assert_eq!(app.spaces.borrow()[0].1, "rexa");
+        assert_eq!(app.spaces.borrow()[0].1, "REXA");
     }
 
     /// The ticker runs `keep_names` on every tick, so a coordinator that was
@@ -1377,7 +1377,7 @@ mod tests {
         let renames = app.renamed.borrow().len();
         keep_names(&herdr, &project, &term.address);
         assert_eq!(app.renamed.borrow().len(), renames, "an already named tab is not renamed again");
-        assert_eq!(app.spaces.borrow()[0].1, "rexa");
+        assert_eq!(app.spaces.borrow()[0].1, "REXA");
     }
 
     #[test]
