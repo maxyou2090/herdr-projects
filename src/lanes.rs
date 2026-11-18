@@ -396,12 +396,21 @@ impl Registry {
     /// The lane `--lane <handle>` names: by `id` first (an id is a handle that
     /// never changes), then by `name`, then by `label`.
     pub fn find(&self, handle: &str) -> Option<&Lane> {
-        self.get(handle).or_else(|| {
-            self.lanes
-                .iter()
-                .find(|l| l.name == handle)
-                .or_else(|| self.lanes.iter().find(|l| l.label == handle))
-        })
+        self.position(handle).map(|index| &self.lanes[index])
+    }
+
+    /// The **position** of the lane `handle` names, in [`Registry::find`]'s
+    /// order. Positions, not ids, identify one lane: two lanes can share an id
+    /// (law has two `c-1` since 2026-11-17, the second empty and created later),
+    /// and every operation that compared ids landed on the first of them — so
+    /// `lane close coordinator2` counted the default lane's threads and refused,
+    /// and `lane open coordinator2` flipped the wrong record.
+    pub fn position(&self, handle: &str) -> Option<usize> {
+        self.lanes
+            .iter()
+            .position(|lane| lane.id == handle)
+            .or_else(|| self.lanes.iter().position(|lane| lane.name == handle))
+            .or_else(|| self.lanes.iter().position(|lane| lane.label == handle))
     }
 
     pub fn is_default(&self, id: &str) -> bool {
@@ -424,10 +433,21 @@ impl Registry {
 
     /// The next id. The counter moves past it even if the lane is then thrown
     /// away: an allocated id never comes back.
+    ///
+    /// An id the registry already holds is skipped, whatever the counter says: a
+    /// registry whose counter was never moved on (`"next": 0` beside a live
+    /// `c-1`, which `ensure_written` used to leave behind) handed out `c-1` a
+    /// second time — law's `lanes.json` has two of them since 2026-11-17, and
+    /// `lane list` printed the same lane twice and `routes` nudged it twice.
     pub fn alloc_id(&mut self) -> String {
-        let n = self.next.max(1);
-        self.next = n.saturating_add(1);
-        format!("c-{n}")
+        loop {
+            let n = self.next.max(1);
+            self.next = n.saturating_add(1);
+            let id = format!("c-{n}");
+            if !self.lanes.iter().any(|lane| lane.id == id) {
+                return id;
+            }
+        }
     }
 
     /// The `Coordinator` a lane's pane is recorded as: the instance fields
@@ -1149,7 +1169,11 @@ impl View {
             for status in self.lane_statuses().into_iter().filter(|s| s.orphan) {
                 let _ = write!(out, "lane {} ({}) has no live coordinator", status.lane_id, self.lane_label(&status.lane_id));
                 if let Some(pane) = status.pane_id {
-                    let _ = write!(out, "; the pane it last ran in, {pane}, is gone");
+                    // Not "is gone": core may still list that terminal with a live
+                    // program that hp cannot see as an agent (a missing
+                    // `hp_agent` label, t-0053). What is true either way is that
+                    // no agent of this project is listed there.
+                    let _ = write!(out, "; core lists no agent in the pane it last ran in, {pane}");
                 }
                 let _ = writeln!(out, " — start one with `open {} --lane {}`", self.slug, status.lane_id);
             }
@@ -1291,11 +1315,24 @@ fn require_registry(project: &Project) -> Result<Registry> {
 /// The lane a `hp lane ...` command names, with a message that lists the
 /// existing handles instead of guessing.
 fn require_lane(registry: &Registry, handle: &str) -> Result<Lane> {
-    registry.find(handle).cloned().with_context(|| {
-        let handles: Vec<String> = registry.lanes.iter().map(|lane| if lane.name.is_empty() { lane.id.clone() } else { lane.name.clone() }).collect();
-        let shown = if handles.is_empty() { "none".to_string() } else { handles.join(", ") };
-        format!("no lane `{handle}`; lanes: {shown}")
-    })
+    registry.find(handle).cloned().with_context(|| no_such_lane(registry, handle))
+}
+
+/// The refusal `require_lane` and the positional lookups share, so a missing
+/// handle always reads the same.
+fn no_such_lane(registry: &Registry, handle: &str) -> String {
+    let handles: Vec<String> = registry.lanes.iter().map(|lane| if lane.name.is_empty() { lane.id.clone() } else { lane.name.clone() }).collect();
+    let shown = if handles.is_empty() { "none".to_string() } else { handles.join(", ") };
+    format!("no lane `{handle}`; lanes: {shown}")
+}
+
+/// The position of the lane a thread's `lane` field means: the default lane for
+/// an empty field, else the record the handle names. A position, because two
+/// lanes can share an id and an id cannot tell them apart (see
+/// [`Registry::position`]).
+fn thread_lane_position(registry: &Registry, field: &str) -> Option<usize> {
+    let lane = if field.is_empty() { registry.default_lane()? } else { registry.find(field)? };
+    registry.lanes.iter().position(|record| std::ptr::eq(record, lane))
 }
 
 /// The project a lane command means: `--project`, else the project of the
@@ -1683,12 +1720,12 @@ fn running_pane_for(view: &View, lane: &Lane) -> Option<String> {
 pub fn lane_close(ctx: &Ctx, project: &Project, handle: &str) -> Result<()> {
     let _lock = project.lock()?;
     let mut registry = require_registry(project)?;
-    let lane = require_lane(&registry, handle)?;
-    let index = registry.lanes.iter().position(|record| record.id == lane.id).expect("require_lane found it");
+    let index = registry.position(handle).with_context(|| no_such_lane(&registry, handle))?;
+    let lane = registry.lanes[index].clone();
     let open = crate::ticker::open_threads(project);
     let blockers: Vec<String> = open
         .iter()
-        .filter(|thread| registry.lane_of(&thread.lane).map(|record| record.id.as_str()) == Some(lane.id.as_str()))
+        .filter(|thread| thread_lane_position(&registry, &thread.lane) == Some(index))
         .map(|thread| thread.id.clone())
         .collect();
     if !blockers.is_empty() {
@@ -1707,10 +1744,17 @@ pub fn lane_close(ctx: &Ctx, project: &Project, handle: &str) -> Result<()> {
     registry.lanes[index].closed = project::now();
     let mut elected = None;
     if registry.default.is_empty() || registry.default == lane.id {
-        elected = Some(registry.elect_default(project));
+        // Whether an election *reopened* c-1 is a fact about the registry
+        // before the election, not after: afterwards c-1 is open either way, and
+        // asking then said "no lane was left open" right after electing one
+        // that was open all along.
+        let had_open = registry.lanes.iter().any(|lane| lane.is_open());
+        elected = Some((registry.elect_default(project), !had_open));
     }
     registry.save(project)?;
-    let closed = registry.get(&lane.id).cloned().unwrap_or_else(|| lane.clone());
+    // By position: `get(lane.id)` would answer with the *first* lane of that id,
+    // which is another lane when two of them share one.
+    let closed = registry.lanes[index].clone();
     drop(_lock);
     let session = crate::threads::session_view(ctx, project);
     let view = View::with_session(ctx, project, session.as_ref());
@@ -1723,9 +1767,9 @@ pub fn lane_close(ctx: &Ctx, project: &Project, handle: &str) -> Result<()> {
     } else {
         println!();
     }
-    if let Some(id) = elected {
+    if let Some((id, reopened)) = elected {
         let label = registry.get(&id).map(|lane| lane.label.clone()).unwrap_or_default();
-        if id == FALLBACK_ID && registry.lanes.iter().filter(|lane| lane.is_open()).count() == 1 {
+        if reopened && id == FALLBACK_ID {
             println!("no lane was left open, so {id} was reopened as the default lane");
         } else {
             println!("default lane is now `{label}` ({id})");
@@ -1740,8 +1784,7 @@ pub fn lane_close(ctx: &Ctx, project: &Project, handle: &str) -> Result<()> {
 pub fn lane_open(ctx: &Ctx, project: &Project, handle: &str) -> Result<()> {
     let _lock = project.lock()?;
     let mut registry = require_registry(project)?;
-    let lane = require_lane(&registry, handle)?;
-    let index = registry.lanes.iter().position(|record| record.id == lane.id).expect("require_lane found it");
+    let index = registry.position(handle).with_context(|| no_such_lane(&registry, handle))?;
     let was_open = registry.lanes[index].is_open();
     registry.lanes[index].status = Status::Open;
     registry.save(project)?;
@@ -2110,6 +2153,78 @@ mod tests {
         assert_eq!(reader_scope(&project, &view).unwrap().lane, view.registry.default_lane().unwrap().id);
     }
 
+    /// A context whose session is a fake core: `lane close`/`lane open` read it
+    /// back after the registry write, to say whether the pane is still running.
+    fn fake_ctx<'a>(world: &tempfile::TempDir, core: &'a crate::fake_hc::FakeCore) -> Ctx<'a> {
+        Ctx {
+            env: Box::leak(Box::new(crate::paths::Env::for_test(world.path(), &[]))),
+            root: world.path().join("root"),
+            config_dir: world.path().join("cfg"),
+            runner: core,
+            detached_ticker: false,
+        }
+    }
+
+    /// law's shape since 2026-11-17: two lanes with the id `c-1`, the second
+    /// empty and created later. `lane close` used to compare **ids**, so the
+    /// default lane's threads counted as the empty lane's and it could never be
+    /// closed (`still has 6 open threads: t-0334, …` for a lane with none).
+    #[test]
+    fn closing_one_of_two_lanes_that_share_an_id_counts_only_its_own_threads() {
+        let world = tempfile::tempdir().unwrap();
+        let project = project::create(&world.path().join("root"), "law", "", vec![]).unwrap();
+        // The real record, whose `default` is empty: the default lane is then
+        // the newest `last_active`, which is law's live lane and not the empty
+        // one created later.
+        let mut live = lane_at("c-1", "default", "t5h", "");
+        live.last_active = "2026-11-18T03:12:43Z".into();
+        reg(
+            vec![live, Lane { created: "2026-11-17T09:45:32Z".into(), ..lane("c-1", "coordinator2") }],
+            "",
+            2,
+        )
+        .save(&project)
+        .unwrap();
+        let blocking = crate::thread::allocate(&project, |t| {
+            t.title = "the default lane's".into();
+            t.status = crate::thread::Status::Open;
+        })
+        .unwrap();
+        let core = crate::fake_hc::FakeCore::new();
+        let ctx = fake_ctx(&world, &core);
+
+        // The empty duplicate goes: the open thread is not its own.
+        lane_close(&ctx, &project, "coordinator2").unwrap();
+        let after = Registry::load(&project).unwrap();
+        assert!(!after.lanes[1].is_open(), "the empty duplicate is closed");
+        assert!(after.lanes[0].is_open(), "the lane that really has the thread stays open");
+
+        // And the lane the thread *does* belong to is still refused, with the id.
+        let error = lane_close(&ctx, &project, "default").unwrap_err().to_string();
+        assert!(error.contains("still has 1 open threads"), "{error}");
+        assert!(error.contains(&blocking.id), "{error}");
+    }
+
+    /// The regression the guard above must not break: one lane, one open thread,
+    /// refused, and nothing written.
+    #[test]
+    fn a_lane_with_an_open_thread_is_still_refused() {
+        let world = tempfile::tempdir().unwrap();
+        let project = project::create(&world.path().join("root"), "demo", "", vec![]).unwrap();
+        reg(vec![lane("c-1", "default")], "c-1", 2).save(&project).unwrap();
+        let open = crate::thread::allocate(&project, |t| {
+            t.title = "still going".into();
+            t.status = crate::thread::Status::Starting;
+        })
+        .unwrap();
+        let core = crate::fake_hc::FakeCore::new();
+        let ctx = fake_ctx(&world, &core);
+        let error = lane_close(&ctx, &project, "c-1").unwrap_err().to_string();
+        assert!(error.contains("still has 1 open threads"), "{error}");
+        assert!(error.contains(&open.id), "{error}");
+        assert!(Registry::load(&project).unwrap().lanes[0].is_open(), "nothing was closed");
+    }
+
     // ---------------------------------------------------------- the store
 
     #[test]
@@ -2189,6 +2304,12 @@ mod tests {
         assert_eq!(fresh.alloc_id(), "c-1");
         assert_eq!(fresh.alloc_id(), "c-2");
         assert_eq!(fresh.next, 3);
+        // A registry whose counter was never moved on (how law got two `c-1`
+        // lanes on 2026-11-17) skips the id it already holds instead of handing
+        // it out twice.
+        let mut stale = reg(vec![lane("c-1", "default")], "c-1", 0);
+        assert_eq!(stale.alloc_id(), "c-2");
+        assert_eq!(stale.next, 3);
     }
 
     #[test]
@@ -2527,7 +2648,10 @@ mod tests {
         // note appears.
         let gone = view(&registry, vec![with_session("w9:p9", "/elsewhere", "sess-9")], "w9:p9", true);
         let text = gone.list_text();
-        assert!(text.contains("lane c-1 (default) has no live coordinator; the pane it last ran in, w1:p1, is gone — start one with `open demo --lane c-1`"), "{text}");
+        assert!(
+            text.contains("lane c-1 (default) has no live coordinator; core lists no agent in the pane it last ran in, w1:p1 — start one with `open demo --lane c-1`"),
+            "{text}"
+        );
         assert_eq!(list_json(&gone)[0]["orphan"], serde_json::json!(true));
         // Never started: no recorded pane, and no claim that one was lost.
         let fresh = view(&reg(vec![lane("c-1", "default")], "c-1", 2), vec![], "", true);

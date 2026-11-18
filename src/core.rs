@@ -271,12 +271,86 @@ struct Term {
     state: String,
     #[serde(default)]
     reported: bool,
+    /// Why core ended the program (`killed`, `exited`, `signal`); **null** while
+    /// it runs. Present on a finished terminal, which `ls` hides.
+    ///
+    /// `Option`, not `String` with a default: core writes an explicit `null`
+    /// here, and a `String` field refuses that — which made every `hc get` in
+    /// `agent list` fail, and an empty agent list look like "no coordinator
+    /// anywhere" (caught against the real core, not the fake).
+    #[serde(default)]
+    reason: Option<String>,
+    #[serde(default)]
+    pid: Option<u32>,
+    #[serde(default)]
+    exit_code: Option<i32>,
+}
+
+/// One terminal as `hc get` reports it, **live or finished**.
+///
+/// `hc ls` leaves finished terminals out (`hidden_finished`), and both
+/// [`Core::agent_list`] and [`Core::pane_list`] are built from it — so a
+/// record that still names a terminal core has ended is invisible to every
+/// list-based check. That blindness is what made a coordinator whose terminal
+/// was reaped look like a coordinator that was merely not idle: the ticker held
+/// every notification with `no coordinator is idle long enough` and never said
+/// anything (2026-11-18, t-0053). This is how to ask about that terminal by
+/// name or address anyway.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct TerminalFate {
+    /// The name the record stores (core keeps the name when it restarts), else
+    /// the address.
+    pub pane_id: String,
+    pub address: String,
+    pub state: String,
+    pub reason: String,
+    pub pid: Option<u32>,
+    pub exit_code: Option<i32>,
+    /// True when a program in the terminal has reported a status over OSC 7501.
+    /// A shell never does, so this is what tells an agent's terminal from the
+    /// bare prompt it falls back to.
+    pub reported: bool,
+    /// The program that reported it (`pi`, `claude`, …), empty when none did.
+    pub status_app: String,
+    /// Every label the terminal carries: how a pane says whose coordinator it is
+    /// when the agent list cannot see it.
+    pub labels: std::collections::BTreeMap<String, String>,
+}
+
+impl TerminalFate {
+    pub fn live(&self) -> bool {
+        self.state != "finished"
+    }
+
+    /// What ended it, in a few words this binary chose: `killed (pid 2515,
+    /// exit 1)`, `exited`, or the bare state.
+    pub fn why(&self) -> String {
+        let mut parts: Vec<String> = Vec::new();
+        if !self.reason.is_empty() {
+            parts.push(self.reason.clone());
+        }
+        if let Some(pid) = self.pid {
+            parts.push(format!("pid {pid}"));
+        }
+        if let Some(code) = self.exit_code {
+            parts.push(format!("exit {code}"));
+        }
+        if parts.is_empty() {
+            return if self.state.is_empty() { "no state reported".to_string() } else { self.state.clone() };
+        }
+        parts.join(", ")
+    }
 }
 
 #[derive(Debug, Clone, Deserialize, Default)]
 struct TermStatus {
     #[serde(default)]
     state: String,
+    /// The program that reported the status (`pi`, `claude`, …): core's own
+    /// word for what runs there, which is what `hp_kind` must say when that
+    /// label went missing. `Option` because core can answer `null`.
+    #[serde(default)]
+    app: Option<String>,
 }
 
 impl Term {
@@ -727,6 +801,25 @@ impl<'a> Core<'a> {
         let text = out.error_text();
         let code = if text.contains("modified or untracked") { "dirty_worktree_requires_force" } else { "failed" };
         Err(CoreError { code: code.into(), message: text })
+    }
+
+    /// One terminal as core has it, live or **finished**. `Err` only when core
+    /// does not know the id at all (it was removed, or belongs to another
+    /// session); a finished one answers normally, which is the whole point.
+    pub fn terminal_fate(&self, pane: &str) -> Result<TerminalFate, CoreError> {
+        let term = self.term(pane)?;
+        let status = term.status.clone().unwrap_or_default();
+        Ok(TerminalFate {
+            pane_id: term.pane_id(),
+            address: term.address.clone(),
+            state: term.state.clone(),
+            reason: term.reason.clone().unwrap_or_default(),
+            pid: term.pid,
+            exit_code: term.exit_code,
+            reported: term.reported,
+            status_app: if term.reported { status.app.unwrap_or_default() } else { String::new() },
+            labels: term.labels.clone(),
+        })
     }
 
     /// One pane as this binary sees panes, or an error when it is not live.

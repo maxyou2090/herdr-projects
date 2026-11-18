@@ -641,6 +641,9 @@ pub fn tick(ctx: &Ctx, log: &Log, memory: &mut Memory) -> bool {
                     }
                     _ => {}
                 }
+                for fixed in &seen.repaired {
+                    log.line(&format!("{slug}: lane {}'s coordinator repaired on pane {}: {}", fixed.lane, fixed.pane, fixed.why));
+                }
                 reachable.push((project, seen))
             }
             Ok(None) => unreachable.push(project),
@@ -826,6 +829,12 @@ pub struct Seen {
     /// verdict on one lane cannot hide behind another lane's delivery (§12
     /// commit 3, the shape of the 2026-10-18 stall).
     nudge_held: std::collections::BTreeMap<String, String>,
+    /// lane id -> one line about a coordinator whose recorded terminal is gone
+    /// and whose agent could not be found either, for the `coordinator` item.
+    lost_coordinators: std::collections::BTreeMap<String, String>,
+    /// The lanes the repair pass put right (a record moved to the pane its
+    /// agent ran in, or a missing `hp_agent`/`hp_kind` written back).
+    repaired: Vec<crate::coordinator::Fixed>,
     /// Every `Ambiguous` pane this tick with the resolver's reason, for the
     /// once-per-state `lane` item of §5.4.
     ambiguous: Vec<(String, String)>,
@@ -1087,12 +1096,29 @@ fn tick_cheap_body(ctx: &Ctx, project: &Project, sessions: &mut Sessions, state:
             None => return Ok(None),
         },
     };
-    let Some((agents, panes)) = sessions.get(ctx, &record.socket).cloned() else {
+    let Some((mut agents, panes)) = sessions.get(ctx, &record.socket).cloned() else {
         return Ok(None);
     };
     let herdr = Core::new(ctx.env.hc_bin(), &record.socket, ctx.runner);
     let slug = &project.slug;
     let mut first_error = None;
+
+    // Before anything is read from the records: a coordinator whose terminal
+    // core has reaped while its agent still runs is moved to that pane, and one
+    // that is gone outright is named. Without this the tick sees no coordinator
+    // at all and holds every notification with the generic "not idle long
+    // enough" (2026-11-18, t-0053).
+    let repair = coordinator::repair(project, &herdr, &agents, &project::now())?;
+    if let Some(refreshed) = &repair.agents {
+        // The list was read before the repair wrote a label: take core's word
+        // for it now, so `discover` sees the repaired coordinator on this tick
+        // and not the next one.
+        agents = refreshed.clone();
+    }
+    // The record the repair rewrote is the one to read from here on: `discover`
+    // asks it who is a coordinator, and the answer before the repair was "the
+    // pane that is gone".
+    let record = if repair.fixed.is_empty() { record } else { project.coordinator().unwrap_or(record) };
 
     // The coordinators: every agent in the project folder. Nothing is
     // launched or primed here; `open` starts them and AGENTS.md primes them.
@@ -1167,6 +1193,10 @@ fn tick_cheap_body(ctx: &Ctx, project: &Project, sessions: &mut Sessions, state:
             match steps::nudge(project, state, &settings, &herdr, &lane, target, now) {
                 Ok(steps::NudgeOutcome::Delivered) | Ok(steps::NudgeOutcome::Quiet) => state.released(&lane),
                 Ok(steps::NudgeOutcome::Held(why)) => {
+                    // "No coordinator is idle enough" is the wrong reason when
+                    // the coordinator's terminal is gone: nothing will ever
+                    // become idle. Name it, so the digest says what to do.
+                    let why = if why == steps::NO_COORDINATOR && repair.lost.contains_key(&lane) { steps::NO_COORDINATOR_GONE } else { why };
                     nudge_held.insert(lane.clone(), why.to_string());
                     state.hold(&lane, why, now);
                 }
@@ -1188,6 +1218,8 @@ fn tick_cheap_body(ctx: &Ctx, project: &Project, sessions: &mut Sessions, state:
             coordinator: !coordinators.is_empty(),
             session_lost: recorded_panes >= 2 && missing_panes == recorded_panes,
             nudge_held,
+            lost_coordinators: repair.lost,
+            repaired: repair.fixed,
             ambiguous,
         })),
     }
@@ -1251,9 +1283,9 @@ fn tick_slow(ctx: &Ctx, project: &Project, seen: &Seen, memory: &mut Memory, log
     // goes unnoticed. It runs before the routines so a new finding is already
     // in the inbox when this tick decides whether a sweep has news. The lists
     // are the ones this tick already made.
-    match steps::audit_items(project, &mut state, &seen.socket, now, &seen.agents, &seen.panes) {
+    match steps::audit_items(project, &mut state, &herdr, &seen.socket, now, &seen.agents, &seen.panes) {
         Ok(written) if !written.is_empty() => {
-            let what: Vec<String> = written.iter().map(|f| format!("{} {}", f.thread, f.kind)).collect();
+            let what: Vec<String> = written.iter().map(|f| format!("{} {}", f.subject(), f.kind)).collect();
             log.line(&format!("{}: audit wrote {} item(s): {}", project.slug, written.len(), what.join(", ")));
         }
         Ok(_) => {}
@@ -1266,6 +1298,10 @@ fn tick_slow(ctx: &Ctx, project: &Project, seen: &Seen, memory: &mut Memory, log
     // §5.4: every `Ambiguous` pane gets one `lane` item, so a project whose
     // inspector is not open still reports the refusal somewhere visible.
     errors.extend(steps::write_ambiguous_lane_items(project, &mut state, &seen.ambiguous).err());
+    // A coordinator whose recorded terminal is gone and whose agent could not
+    // be found anywhere: one `coordinator` item per lane, so a project nobody is
+    // watching still says that no prompt can reach it. Nothing restarts it.
+    errors.extend(steps::write_coordinator_lost_items(project, &mut state, &seen.lost_coordinators).err());
     errors.extend(steps::pull_requests(ctx, project, &mut state, memory, now));
     errors.extend(steps::resolve_merged(ctx, project, &mut state, now));
     errors.extend(routine_pass(project, &mut state, seen.coordinator));
@@ -1654,6 +1690,99 @@ mod tests {
         let current = thread::load(&f.project, &claimed.id).unwrap();
         assert_eq!(current.status, thread::Status::Open);
         assert!(current.prompt_pending);
+    }
+
+    /// The 2026-11-18 incident, end to end: a coordinator whose terminal core
+    /// reaped, found again by its name, and the nudge that then goes out. Before
+    /// the repair pass this tick could only hold, with a reason that reads as
+    /// "the coordinator is busy".
+    #[test]
+    fn a_coordinator_whose_terminal_was_reaped_is_found_again_and_nudged() {
+        let home = tempfile::tempdir().unwrap();
+        let root = home.path().join("root");
+        let project = project::create(&root, "demo", "", vec![]).unwrap();
+        let core = crate::fake_hc::FakeCore::new();
+        let dir = project.canonical_dir().to_string_lossy().into_owned();
+        let labels = [("hp_agent", "hpc-demo"), ("hp_kind", "pi")];
+        core.terminal("hp-demo-1", &dir, &labels);
+        core.finish("hp-demo-1", "killed");
+        core.terminal("hp-demo-2", "/Users/someone", &labels);
+        core.set_status("hp-demo-2", "idle");
+        // Pi's editor between its two rules: an empty box, so the nudge has
+        // nothing to fear from a draft.
+        let rule = "─".repeat(70);
+        core.set_screen("hp-demo-2", &format!("{rule}\n\n{rule}\n"));
+        project
+            .update_coordinator(|c| {
+                c.pane_id = "hp-demo-1".into();
+                c.agent_name = "hpc-demo".into();
+                c.cwd = dir;
+            })
+            .unwrap();
+        inbox::write(&project, "thread-state", "t-0001", "finished", "t-0001 finished", "").unwrap();
+
+        let env = Env::for_test(home.path(), &[]);
+        let ctx = Ctx { env: &env, root: root.clone(), config_dir: home.path().join("cfg"), runner: &core, detached_ticker: false };
+        let _ = tick_project(&ctx, &project);
+
+        assert_eq!(project.coordinator().unwrap().pane_id, "hp-demo-2", "the record followed the agent");
+        // Both waits the nudge asks for, already satisfied: an idle coordinator
+        // whose box has been empty for a while.
+        let long_ago = "2025-01-01T00:00:00Z";
+        let path = project.state_dir().join("coordinators.json");
+        let mut panes: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        for pane in panes.as_array_mut().unwrap() {
+            pane["pair_since"] = long_ago.into();
+        }
+        std::fs::write(&path, panes.to_string()).unwrap();
+        let path = project.state_dir().join("ticker.json");
+        let mut state: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        state["box_pane"] = "hp-demo-2".into();
+        state["box_empty_since"] = long_ago.into();
+        std::fs::write(&path, state.to_string()).unwrap();
+
+        let _ = tick_project(&ctx, &project);
+        let calls = core.calls.borrow();
+        assert_eq!(calls.iter().filter(|call| call.contains("send hp-demo-2")).count(), 1, "{calls:?}");
+        assert!(calls.iter().any(|call| call.contains("[hp inbox] t-0001 finished")), "{calls:?}");
+    }
+
+    /// The other half: nothing to repair means an item and a named hold, not
+    /// silence. `no coordinator is idle long enough` would send a reader
+    /// looking for a busy coordinator that does not exist.
+    #[test]
+    fn a_coordinator_that_is_gone_outright_leaves_one_item_and_a_named_hold() {
+        let home = tempfile::tempdir().unwrap();
+        let root = home.path().join("root");
+        let project = project::create(&root, "demo", "", vec![]).unwrap();
+        let core = crate::fake_hc::FakeCore::new();
+        let dir = project.canonical_dir().to_string_lossy().into_owned();
+        core.terminal("hp-demo-1", &dir, &[("hp_agent", "hpc-demo")]);
+        core.finish("hp-demo-1", "killed");
+        project
+            .update_coordinator(|c| {
+                c.pane_id = "hp-demo-1".into();
+                c.agent_name = "hpc-demo".into();
+                c.cwd = dir;
+            })
+            .unwrap();
+        inbox::write(&project, "thread-state", "t-0001", "finished", "t-0001 finished", "").unwrap();
+
+        let env = Env::for_test(home.path(), &[]);
+        let ctx = Ctx { env: &env, root: root.clone(), config_dir: home.path().join("cfg"), runner: &core, detached_ticker: false };
+        let _ = tick_project(&ctx, &project);
+        let _ = tick_project(&ctx, &project);
+
+        let items = inbox::unhandled(&project);
+        let lost: Vec<&crate::inbox::Item> = items.iter().filter(|item| item.kind == "coordinator").collect();
+        assert_eq!(lost.len(), 1, "one item per loss, not one per tick: {items:?}");
+        assert_eq!((lost[0].subject.as_str(), lost[0].event.as_str()), ("demo", "coordinator terminal gone"));
+        assert!(lost[0].summary.contains("hp-demo-1"), "{}", lost[0].summary);
+        assert!(lost[0].summary.contains("finished"), "{}", lost[0].summary);
+        assert!(lost[0].summary.contains("hp open demo"), "{}", lost[0].summary);
+        let state = steps::load_state(&project);
+        let (reason, _) = state.held("").expect("the hold is recorded");
+        assert_eq!(reason, steps::NO_COORDINATOR_GONE);
     }
 
     #[test]

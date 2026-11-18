@@ -140,6 +140,13 @@ pub struct State {
     /// ambiguity is written once and a changed reason is news again.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub ambiguous_items: BTreeMap<String, String>,
+    /// lane id -> the line the `coordinator` item was written for, when the
+    /// coordinator's recorded terminal is gone and its agent could not be found
+    /// either. One item per episode: kept while the loss stands (so archiving it
+    /// does not write it again), dropped when a coordinator runs again, so a
+    /// later loss is news again.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub coordinator_lost: BTreeMap<String, String>,
     pub session_item_written: bool,
     /// thread id -> the retry-failure line last reported from its pane.
     pub error_seen: BTreeMap<String, String>,
@@ -261,6 +268,7 @@ pub fn save_state(project: &Project, state: &State) -> Result<()> {
         held_since: String,
         audited: &'a BTreeMap<String, String>,
         last_audit: &'a str,
+        coordinator_lost: &'a BTreeMap<String, String>,
     }
     project::write_json(
         &path,
@@ -285,6 +293,7 @@ pub fn save_state(project: &Project, state: &State) -> Result<()> {
             held_since: value(&state.held_since),
             audited: &state.audited,
             last_audit: &state.last_audit,
+            coordinator_lost: &state.coordinator_lost,
         },
     )
 }
@@ -438,11 +447,13 @@ pub fn write_thread_items(project: &Project, state: &mut State, transitions: &[T
 /// cannot archive away the finding that says it outlived its resolution.
 ///
 /// `socket` is the herdr session, for the agent's own progress record, and
-/// `agents`/`panes` its lists as this tick already made them. Returns the
+/// `agents`/`panes` its lists as this tick already made them; `hc` is that
+/// session, for the one terminal the lists cannot describe. Returns the
 /// findings written this run (for the ticker's log).
 pub fn audit_items(
     project: &Project,
     state: &mut State,
+    hc: &crate::core::Core,
     socket: &str,
     now: jiff::Timestamp,
     agents: &[crate::core::Agent],
@@ -461,23 +472,25 @@ pub fn audit_items(
         return Ok(Vec::new());
     }
     state.last_audit = now.to_string();
-    let run = crate::audit::findings_with(project, socket, now, agents, panes);
+    let run = crate::audit::findings_with(project, socket, now, agents, panes, hc);
     let mut written = Vec::new();
     for finding in &run.found {
-        if state.audited.get(&finding.thread).map(String::as_str) == Some(finding.kind) {
+        let subject = finding.subject();
+        if state.audited.get(&subject).map(String::as_str) == Some(finding.kind) {
             continue;
         }
-        let label = thread::load(project, &finding.thread).map(|t| thread_label(&t)).unwrap_or_else(|_| finding.thread.clone());
+        let label = thread::load(project, &finding.thread).map(|t| thread_label(&t)).unwrap_or_else(|_| subject.clone());
         let summary = format!(
             "{label} {}. This is written once per finding and reported again only if it goes away and comes back; `thread audit {}` prints the same, and the check itself changes nothing.",
             finding.detail, project.slug
         );
-        inbox::write_in(project, &inbox::lane_of_thread(project, &finding.thread), AUDIT_KIND, &finding.thread, finding.event(), &summary, "")?;
-        state.audited.insert(finding.thread.clone(), finding.kind.to_string());
+        let lane = if finding.lane.is_empty() { inbox::lane_of_thread(project, &finding.thread) } else { finding.lane.clone() };
+        inbox::write_in(project, &lane, AUDIT_KIND, &subject, finding.event(), &summary, "")?;
+        state.audited.insert(subject, finding.kind.to_string());
         written.push(finding.clone());
     }
     // Forget the findings that are gone, so one that comes back is news again.
-    state.audited.retain(|thread, kind| run.found.iter().any(|f| &f.thread == thread && f.kind == kind.as_str()));
+    state.audited.retain(|subject, kind| run.found.iter().any(|f| &f.subject() == subject && f.kind == kind.as_str()));
     Ok(written)
 }
 
@@ -663,6 +676,11 @@ pub enum NudgeOutcome {
 }
 
 pub(crate) const NO_COORDINATOR: &str = "items wait but no coordinator is idle long enough";
+/// The same hold, when the coordinator's own terminal is gone. "Not idle"
+/// would be a lie there — nothing will ever become idle — so the digest names
+/// the one action that helps instead of repeating the generic sentence
+/// forever (2026-11-18, t-0053).
+pub(crate) const NO_COORDINATOR_GONE: &str = "items wait because the coordinator's terminal is gone; restart it with `open` in the project";
 pub(crate) const BOX_NOT_QUIET: &str = "items wait for the coordinator's input box to look empty";
 const WAITING_FOR_READ: &str = "items were announced and wait for the coordinator to read them";
 const NOT_AGED: &str = "shown items sit unhandled but none is old enough for a reminder";
@@ -829,7 +847,7 @@ pub fn held_note(project: &Project, lane: &str, waiting: usize, now: jiff::Times
     // The aged-reminder reasons (`WAITING_FOR_READ`, `NOT_AGED`, `REMINDED`)
     // all describe items a coordinator was already told about: those keep the
     // usual heading, because an announced item costs no space.
-    if reason != NO_COORDINATOR && reason != BOX_NOT_QUIET {
+    if reason != NO_COORDINATOR && reason != BOX_NOT_QUIET && reason != NO_COORDINATOR_GONE {
         return None;
     }
     let tick_age = thread::seconds_since(&state.tick_at, now);
@@ -946,6 +964,36 @@ pub fn write_ambiguous_lane_items(project: &Project, state: &mut State, ambiguou
         );
         inbox::write_in(project, &default_lane, "lane", pane, "ambiguous coordinator", &summary, "")?;
         state.ambiguous_items.insert(pane.clone(), reason.clone());
+    }
+    Ok(())
+}
+
+/// The `coordinator` items: one per lane whose recorded coordinator terminal is
+/// gone and whose agent could not be found either (`coordinator::repair`'s
+/// `lost`, lane id -> one line).
+///
+/// This is the visibility half of t-0053: the ticker used to hold every
+/// notification with `no coordinator is idle long enough` and say nothing
+/// anywhere, so "all threads finished and nobody told me" was indistinguishable
+/// from "no thread finished". An item per loss, written once and kept while the
+/// loss stands (a re-run after the coordinator archives it writes nothing), and
+/// dropped when a coordinator runs again, so a later loss is news again.
+/// Nothing here restarts, kills or adopts anything: `open <slug>` is a
+/// person's call.
+pub fn write_coordinator_lost_items(project: &Project, state: &mut State, lost: &BTreeMap<String, String>) -> Result<()> {
+    state.coordinator_lost.retain(|lane, _| lost.contains_key(lane));
+    let default_lane = crate::lanes::default_lane_id(project);
+    for (lane, detail) in lost {
+        if state.coordinator_lost.get(lane) == Some(detail) {
+            continue;
+        }
+        let named = if crate::lanes::split_in_use(project) { format!("Lane {lane}'s coordinator") } else { "The coordinator".to_string() };
+        let summary = format!(
+            "{named} of `{}` has no terminal to be prompted in: {detail}. Inbox items are held (not lost) until a coordinator runs again: run `hp open {}` in the project's session, and `hp context` shows what waited. This is written once per loss and `thread audit {}` reports the same. Nothing was restarted, killed or moved.",
+            project.slug, project.slug, project.slug
+        );
+        inbox::write_in(project, &default_lane, "coordinator", &project.slug, "coordinator terminal gone", &summary, "")?;
+        state.coordinator_lost.insert(lane.clone(), detail.clone());
     }
     Ok(())
 }
@@ -2022,6 +2070,12 @@ mod tests {
         assert_eq!(
             heading(44 * 60, NO_COORDINATOR).as_deref(),
             Some("no prompt reached a coordinator for 44m: items wait but no coordinator is idle long enough")
+        );
+        // A coordinator whose terminal is gone must not be announced as one
+        // that is merely busy: nothing will ever make it idle (t-0053).
+        assert_eq!(
+            heading(HELD_NOTE_AFTER_SECS, NO_COORDINATOR_GONE).as_deref(),
+            Some("no prompt reached a coordinator for 40s: items wait because the coordinator's terminal is gone; restart it with `open` in the project")
         );
     }
 
