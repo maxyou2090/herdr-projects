@@ -679,9 +679,12 @@ pub fn open(ctx: &Ctx, slug: &str, options: &OpenOptions) -> Result<()> {
     if let Some(agent) = running.iter().max_by_key(|a| a.state_change_seq)
         && !options.new
     {
-        // The Space the coordinator is really in: the record may name a stale
-        // one, and this is the Space the record is rewritten to just below.
-        sync_label(&herdr, &agent.workspace_id, &label);
+        // The Space and tab the coordinator is really in: the record may name a
+        // stale one, and these are what it is rewritten to just below. The
+        // pane's own labels come first, the app's `herdr.space`/`herdr.tab` when
+        // hp never wrote any — a coordinator started in a terminal the window
+        // made has only those (t-0051).
+        let (space, tab) = keep_names(&herdr, &project, &agent.pane_id);
         let _ = herdr.agent_focus(&agent.pane_id);
         let session_name = session.name.clone().unwrap_or_default();
         let record = project.update_coordinator(|c| {
@@ -691,8 +694,8 @@ pub fn open(ctx: &Ctx, slug: &str, options: &OpenOptions) -> Result<()> {
             }
             c.socket = socket.clone();
             c.session = session_name;
-            c.workspace_id = agent.workspace_id.clone();
-            c.tab_id = agent.tab_id.clone();
+            c.workspace_id = if space.is_empty() { agent.workspace_id.clone() } else { space };
+            c.tab_id = if tab.is_empty() { agent.tab_id.clone() } else { tab };
             c.pane_id = agent.pane_id.clone();
             c.agent_name = agent.name.clone();
             c.cwd = cwd.clone();
@@ -740,27 +743,33 @@ pub fn open(ctx: &Ctx, slug: &str, options: &OpenOptions) -> Result<()> {
     });
     let (workspace_id, tab_id, pane_id) = if let Some(terminal) = &here {
         let pane = panes.iter().find(|p| &p.terminal_id == terminal).with_context(|| format!("the terminal {terminal} is not listed by the herdr session at {socket}"))?;
-        // This pane's Space becomes the project's recorded home: its label
-        // follows, like every other path that adopts or creates one.
-        sync_label(&herdr, &pane.workspace_id, &label);
-        name_tab(&herdr, &pane.tab_id);
-        (pane.workspace_id.clone(), pane.tab_id.clone(), pane.pane_id.clone())
+        // This pane's Space becomes the project's recorded home: its names
+        // follow, like every other path that adopts or creates one. The pane may
+        // be one the window made — a person typing `open` in a terminal they
+        // just opened — and then its Space and tab are the app's, not hp's
+        // labels (t-0051).
+        let (space, tab) = keep_names(&herdr, &project, &pane.pane_id);
+        (
+            if space.is_empty() { pane.workspace_id.clone() } else { space },
+            if tab.is_empty() { pane.tab_id.clone() } else { tab },
+            pane.pane_id.clone(),
+        )
     } else if let Some(record) = reusable {
-        sync_label(&herdr, &record.workspace_id, &label);
-        name_tab(&herdr, &record.tab_id);
-        (record.workspace_id.clone(), record.tab_id.clone(), record.pane_id.clone())
+        let (space, tab) = keep_names(&herdr, &project, &record.pane_id);
+        (
+            if space.is_empty() { record.workspace_id.clone() } else { space },
+            if tab.is_empty() { record.tab_id.clone() } else { tab },
+            record.pane_id.clone(),
+        )
     } else {
         let created = match home_space(&herdr, previous.as_ref(), &panes) {
             Some(id) => {
                 sync_label(&herdr, &id, &label);
-                herdr.tab_create(&id, &dir, "coordinator", true)?
+                herdr.tab_create(&id, &dir, crate::labels::coordinator_tab_label(), true)?
             }
-            None => {
-                let created = herdr.workspace_create(&dir, &label, "coordinator", true)?;
-                name_tab(&herdr, &created.tab_id);
-                created
-            }
+            None => herdr.workspace_create(&dir, &label, crate::labels::coordinator_tab_label(), true)?,
         };
+        keep_names(&herdr, &project, &created.pane_id);
         (created.workspace_id, created.tab_id, created.pane_id)
     };
 
@@ -946,33 +955,40 @@ pub fn report_tokens(herdr: &Core, project: &Project, pane_id: &str) {
     crate::labels::report_pane(herdr, pane_id, &display, &project.slug, crate::thread::Group::Idle, lane.as_deref());
 }
 
-/// Renames a workspace whose label is not the project's display name — the
-/// recorded one, or the one a pane `open` runs in — so a `name` edited in
-/// PROJECT.md shows on the next `open` and an adopted Space drops the label
-/// it was made with. Never fails: a wrong label is cosmetic.
+/// Renames a Space whose label is not the project's slug — the recorded one, or
+/// the one a pane `open` runs in — so an adopted Space drops the label it was
+/// made with. A Space the app draws is renamed by the app
+/// (`Core::name_space`); a failure is a printed line, never a silent no-op.
 fn sync_label(herdr: &Core, workspace_id: &str, label: &str) {
     if workspace_id.is_empty() {
         return;
     }
-    match herdr.workspace_label(workspace_id) {
-        Ok(current) if current != label => {
-            if let Err(error) = herdr.workspace_rename(workspace_id, label) {
-                println!("could not rename workspace {workspace_id} to `{label}` ({error})");
-            }
-        }
-        _ => {}
+    if herdr.workspace_label(workspace_id).is_ok_and(|current| current == label) {
+        return;
+    }
+    for note in herdr.name_space(workspace_id, label) {
+        println!("{note}");
     }
 }
 
-/// Labels the tab a coordinator starts in `coordinator`, like the tab and
-/// workspace creation paths do. Never fails: a wrong label is cosmetic.
-fn name_tab(herdr: &Core, tab_id: &str) {
-    if tab_id.is_empty() {
-        return;
+/// The names a coordinator's Space and tab must show, put on whichever host
+/// draws them, and the ids it found: hp's own `hp_ws`/`hp_tab`, else the app's
+/// `herdr.space`/`herdr.tab`. `open` records those ids; the ticker runs this for
+/// every coordinator on every tick, so a name that never landed — a coordinator
+/// started in a terminal the window made carries no `hp_ws` at all (t-0051) — is
+/// repaired without anyone typing another command.
+pub fn keep_names(herdr: &Core, project: &Project, pane: &str) -> (String, String) {
+    if pane.is_empty() {
+        return (String::new(), String::new());
     }
-    if let Err(error) = herdr.tab_rename(tab_id, "coordinator") {
-        println!("could not rename tab {tab_id} to `coordinator` ({error})");
+    // The Space a project owns is named by its slug (t-0050); only the host that
+    // draws it, and hp's labels, are this thread's business.
+    let label = project.slug.clone();
+    let (space, tab, notes) = herdr.name_place(pane, &label, crate::labels::coordinator_tab_label());
+    for note in notes {
+        println!("{note}");
     }
+    (space, tab)
 }
 
 /// `coordinator prompt`: a sentence to a coordinator (a person or a script
@@ -1288,6 +1304,80 @@ mod tests {
         };
         registry.save(project).unwrap();
         registry
+    }
+
+    /// The pane a person typed `open` in is a terminal the window made: no
+    /// `hp_ws`, no `hp_tab`, only the app's copies. `keep_names` is what `open`
+    /// and the ticker call, and it must name that Space and tab and hand back
+    /// the ids the record needs (t-0051).
+    #[test]
+    fn a_coordinator_in_a_terminal_the_app_made_is_named_and_its_ids_returned() {
+        let root = tempfile::tempdir().unwrap();
+        let project = crate::project::create(root.path(), "REXA", "", vec![]).unwrap();
+        let fake = crate::fake_hc::FakeCore::new();
+        let app = crate::fake_hc::FakeApp::new(&fake);
+        let herdr = Core::new("hc", "", &app);
+        let space = app.shown_space("old name");
+        let term = fake.terminal("t52", "/r/rexa", &[(crate::core::L_APP_SPACE, space.as_str())]);
+        let tab = format!("apptab-{}", term.address);
+        fake.terminals.borrow_mut().iter_mut().find(|t| t.address == term.address).unwrap().labels.insert(crate::core::L_APP_TAB.into(), tab.clone());
+        app.tab_names.borrow_mut().insert(tab.clone(), "1".into());
+
+        let (found_space, found_tab) = keep_names(&herdr, &project, &term.address);
+        assert_eq!(found_space, space, "the record gets the Space the pane is really in");
+        assert_eq!(found_tab, tab, "and the tab, from the app since hp wrote none");
+        assert_eq!(app.spaces.borrow()[0].1, "rexa", "the Space is the project's slug");
+        assert_eq!(app.tab_names.borrow()[&tab], "coordinator", "the tab is the coordinator's");
+        let labels = fake.terminals.borrow()[0].labels.clone();
+        assert_eq!(labels.get(crate::core::L_WS).map(String::as_str), Some(space.as_str()), "hp's labels are the record now");
+        assert_eq!(labels.get(crate::core::L_TAB).map(String::as_str), Some(tab.as_str()));
+    }
+
+    /// What `open` leaves on a coordinator pane in a terminal the window made:
+    /// all five labels — the record every reader uses — and the app's names.
+    /// `report_tokens` writes the identity, `keep_names` the place.
+    #[test]
+    fn an_opened_coordinator_carries_every_label_its_space_and_tab_need() {
+        let root = tempfile::tempdir().unwrap();
+        let project = crate::project::create(root.path(), "REXA", "", vec![]).unwrap();
+        let fake = crate::fake_hc::FakeCore::new();
+        let app = crate::fake_hc::FakeApp::new(&fake);
+        let herdr = Core::new("hc", "", &app);
+        let space = app.shown_space("old name");
+        let term = fake.terminal("t52", "/r/rexa", &[(crate::core::L_APP_SPACE, space.as_str()), ("hp_lane", "c-1")]);
+        app.tab_names.borrow_mut().insert(format!("apptab-{}", term.address), "1".into());
+
+        report_tokens(&herdr, &project, &term.address);
+        keep_names(&herdr, &project, &term.address);
+
+        let labels = fake.terminals.borrow()[0].labels.clone();
+        for key in [crate::core::L_WS, crate::core::L_TAB, crate::core::L_TAB_LABEL, "hp_project", "hp_display"] {
+            assert!(!labels.get(key).unwrap_or(&String::new()).is_empty(), "{key} is missing: {labels:?}");
+        }
+        assert_eq!(labels["hp_project"], "rexa");
+        assert_eq!(labels[crate::core::L_TAB_LABEL], "coordinator");
+        assert_eq!(app.tab_names.borrow()[&format!("apptab-{}", term.address)], "coordinator");
+        assert_eq!(app.spaces.borrow()[0].1, "rexa");
+    }
+
+    /// The ticker runs `keep_names` on every tick, so a coordinator that was
+    /// never named repairs itself: the second call finds nothing to do.
+    #[test]
+    fn a_second_pass_finds_the_names_already_right() {
+        let root = tempfile::tempdir().unwrap();
+        let project = crate::project::create(root.path(), "REXA", "", vec![]).unwrap();
+        let fake = crate::fake_hc::FakeCore::new();
+        let app = crate::fake_hc::FakeApp::new(&fake);
+        let herdr = Core::new("hc", "", &app);
+        let space = app.shown_space("old name");
+        let term = fake.terminal("t52", "/r/rexa", &[(crate::core::L_APP_SPACE, space.as_str())]);
+        app.tab_names.borrow_mut().insert(format!("apptab-{}", term.address), "coordinator".into());
+
+        keep_names(&herdr, &project, &term.address);
+        let renames = app.renamed.borrow().len();
+        keep_names(&herdr, &project, &term.address);
+        assert_eq!(app.renamed.borrow().len(), renames, "an already named tab is not renamed again");
+        assert_eq!(app.spaces.borrow()[0].1, "rexa");
     }
 
     #[test]

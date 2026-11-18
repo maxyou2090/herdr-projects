@@ -407,6 +407,12 @@ fn report(
         }
     }
 
+    // What the window draws, read once: a coordinator's Space and tab names are
+    // the app's to set, and a name that never landed is silent otherwise
+    // (t-0051). The ticker renames both on every tick, so this warns rather
+    // than fails.
+    let app_view = crate::app::running(runner).then(|| crate::app::ls(runner)).flatten();
+
     for slug in &slugs {
         let Ok(project) = project::Project::load(root, slug) else {
             continue;
@@ -456,6 +462,11 @@ fn report(
                     &label,
                     format!("{}; {}", project.status(), notes.join("; ")),
                 );
+                if let Some(view) = &app_view {
+                    for note in coordinator_name_notes(&herdr, &project, view, record.as_ref()) {
+                        check(&mut out, None, &format!("names {slug}"), note);
+                    }
+                }
                 // §5.4: a lane pane that is alive but unrecognizable is a
                 // warning, never a FAIL — the project still works, but the
                 // alternative is the silent stall this line exists to end.
@@ -488,10 +499,92 @@ fn report(
     (out, healthy)
 }
 
+/// The app's names against the ones a coordinator's Space and tab must show.
+/// `Core::name_space_and_tab` (run by `open` and by the ticker every tick) is
+/// what makes them match, so a line here means the rename keeps failing, or the
+/// terminal is not in the window at all — a warning with the command that
+/// redoes it, never a FAIL.
+fn coordinator_name_notes(
+    herdr: &Core,
+    project: &project::Project,
+    view: &serde_json::Value,
+    record: Option<&project::Coordinator>,
+) -> Vec<String> {
+    // What a coordinator's Space and tab must be called: the project's slug
+    // (t-0050) and one word (t-0051). Only where those go is checked here.
+    let label = project.slug.clone();
+    let tab_label = crate::labels::coordinator_tab_label();
+    let mut panes: Vec<String> = record.map(|record| record.pane_id.clone()).into_iter().filter(|pane| !pane.is_empty()).collect();
+    if let Some(registry) = crate::lanes::Registry::load(project) {
+        panes.extend(registry.lanes.iter().map(|lane| lane.pane_id.clone()).filter(|pane| !pane.is_empty()));
+    }
+    panes.sort();
+    panes.dedup();
+    let mut notes = Vec::new();
+    for pane in panes {
+        let (Ok((space, tab)), Ok(address)) = (herdr.locate(&pane), herdr.pane_get(&pane).map(|p| p.terminal_id)) else {
+            continue;
+        };
+        if space.is_empty() || tab.is_empty() {
+            notes.push(format!(
+                "coordinator {pane} carries no `hp_ws`/`hp_tab` and the app knows no Space for it; `open {}` names it",
+                project.slug
+            ));
+            continue;
+        }
+        match crate::app::shown_in(view, &space, &address) {
+            Some(shown) if shown.space == label && shown.tab_name == tab_label => {}
+            Some(shown) => notes.push(format!(
+                "coordinator {pane} sits in the app's Space `{}` tab `{}`, not `{label}` / `{tab_label}`; `open {}` renames both (the ticker does it every tick too)",
+                shown.space, shown.tab_name, project.slug
+            )),
+            None => notes.push(format!(
+                "the app does not show coordinator {pane} ({address}) in Space {space}; `open {}` puts its Space and tab names on it",
+                project.slug
+            )),
+        }
+    }
+    notes
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::runner::fake::{FakeRunner, fail, ok};
+
+    /// A coordinator the window shows under its own default names: the Space
+    /// keeps whatever name the person gave it and the tab is `1`, because hp
+    /// never wrote `hp_ws`/`hp_tab` for it (t-0051). Doctor says so, with the
+    /// command that renames both.
+    #[test]
+    fn doctor_warns_about_a_coordinator_whose_app_tab_is_not_named() {
+        let home = tempfile::tempdir().unwrap();
+        let project = project::create(home.path(), "REXA", "", vec![]).unwrap();
+        let fake = crate::fake_hc::FakeCore::new();
+        let app = crate::fake_hc::FakeApp::new(&fake);
+        let herdr = Core::new("hc", "", &app);
+        let space = app.shown_space("rexa");
+        let term = fake.terminal("t52", "/r/rexa", &[(crate::core::L_APP_SPACE, space.as_str())]);
+        let tab = format!("apptab-{}", term.address);
+        fake.terminals.borrow_mut().iter_mut().find(|t| t.address == term.address).unwrap().labels.insert(crate::core::L_APP_TAB.into(), tab.clone());
+        app.tab_names.borrow_mut().insert(tab.clone(), "1".into());
+        let record = project.update_coordinator(|c| {
+            c.pane_id = term.address.clone();
+            c.workspace_id = space.clone();
+            c.tab_id = tab.clone();
+        }).unwrap();
+        let view = crate::app::ls(&app).unwrap();
+
+        let notes = coordinator_name_notes(&herdr, &project, &view, Some(&record));
+        assert!(notes.iter().any(|note| note.contains("tab `1`") && note.contains("coordinator") && note.contains("open rexa")), "{notes:?}");
+
+        // Once the names are put right the line is gone: the check is about a
+        // name that is wrong, not about the app being used.
+        let (found_space, found_tab) = crate::coordinator::keep_names(&herdr, &project, &term.address);
+        assert_eq!((found_space.as_str(), found_tab.as_str()), (space.as_str(), tab.as_str()));
+        let view = crate::app::ls(&app).unwrap();
+        assert!(coordinator_name_notes(&herdr, &project, &view, Some(&record)).is_empty());
+    }
 
     /// A plist written by `install_agent`, under a temporary HOME, and the root
     /// it points at. `print` answers whether launchd has the job loaded.

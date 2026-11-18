@@ -34,14 +34,25 @@ pub struct Placed {
 
 /// `herdr-app do <command> <args...>`, its JSON reply.
 fn call(runner: &dyn Runner, command: &str, args: &[String]) -> Option<serde_json::Value> {
+    call_strict(runner, command, args).ok()
+}
+
+/// [`call`], with the app's own words when it refuses: a rename that did not
+/// happen is then a line a person reads, not a silent `false` (t-0051).
+fn call_strict(runner: &dyn Runner, command: &str, args: &[String]) -> Result<serde_json::Value, String> {
     let mut cmd = Cmd::new(bin(), Duration::from_secs(20)).args(["do", command]);
     cmd = cmd.args(args.iter().cloned());
-    let out = runner.run(&cmd).ok()?;
-    if !out.success() {
-        return None;
+    let out = runner.run(&cmd).map_err(|error| format!("{error:#}"))?;
+    let text = out.stdout.trim();
+    let reply: serde_json::Value = serde_json::from_str(text).map_err(|_| match out.success() {
+        true => format!("{command}: {text}"),
+        false => format!("{command}: {}", out.error_text()),
+    })?;
+    match reply.get("error") {
+        Some(error) => Err(error.as_str().map(str::to_string).unwrap_or_else(|| error.to_string())),
+        None if out.success() => Ok(reply),
+        None => Err(format!("{command}: {text}")),
     }
-    let reply: serde_json::Value = serde_json::from_str(out.stdout.trim()).ok()?;
-    reply.get("error").is_none().then_some(reply)
 }
 
 fn placed(reply: &serde_json::Value) -> Option<Placed> {
@@ -108,8 +119,61 @@ pub fn retry(mut attempt: impl FnMut() -> bool) -> bool {
 }
 
 pub fn tab_rename(runner: &dyn Runner, tab: &str, name: &str) -> bool {
+    tab_name(runner, tab, name).is_ok()
+}
+
+/// `tab.rename`, with the app's own words when it refuses.
+pub fn tab_name(runner: &dyn Runner, tab: &str, name: &str) -> Result<(), String> {
     let args = vec!["--id".to_string(), tab.to_string(), "--name".to_string(), name.to_string()];
-    call(runner, "tab.rename", &args).is_some()
+    call_strict(runner, "tab.rename", &args).map(|_| ())
+}
+
+/// Names a Space: the name a person reads above its tabs.
+pub fn space_rename(runner: &dyn Runner, space: &str, name: &str) -> Result<(), String> {
+    let args = vec!["--id".to_string(), space.to_string(), "--name".to_string(), name.to_string()];
+    call_strict(runner, "space.rename", &args).map(|_| ())
+}
+
+/// What the window shows for a Space and the terminal in it: the Space's own
+/// name, the tab the terminal sits in, and that tab's name. `None` while the
+/// window does not know the Space, or does not show that terminal yet — a Space
+/// hp made in the app is materialised a moment after the reply.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Shown {
+    pub space: String,
+    pub tab: String,
+    pub tab_name: String,
+}
+
+/// [`shown_in`] over the window's current view.
+pub fn shown(runner: &dyn Runner, space: &str, terminal: &str) -> Option<Shown> {
+    shown_in(&ls(runner)?, space, terminal)
+}
+
+/// The name the window draws for a Space, as `herdr-app ls` has it.
+pub fn space_name(runner: &dyn Runner, space: &str) -> Option<String> {
+    space_name_in(&ls(runner)?, space)
+}
+
+/// [`space_name`] over a view already read.
+pub fn space_name_in(view: &serde_json::Value, space: &str) -> Option<String> {
+    let found = view["spaces"].as_array()?.iter().find(|s| s["id"] == space)?;
+    Some(found["name"].as_str().unwrap_or_default().to_string())
+}
+
+/// [`shown`] over a view already read (`herdr-app ls`).
+pub fn shown_in(view: &serde_json::Value, space: &str, terminal: &str) -> Option<Shown> {
+    let space = view["spaces"].as_array()?.iter().find(|s| s["id"] == space)?;
+    let tab = space["tabs"].as_array()?.iter().find(|tab| {
+        tab["terminals"]
+            .as_array()
+            .is_some_and(|terminals| terminals.iter().any(|t| t["terminal"] == terminal))
+    })?;
+    Some(Shown {
+        space: space["name"].as_str().unwrap_or_default().to_string(),
+        tab: tab["id"].as_str()?.to_string(),
+        tab_name: tab["name"].as_str().unwrap_or_default().to_string(),
+    })
 }
 
 pub fn tab_close(runner: &dyn Runner, tab: &str) -> bool {

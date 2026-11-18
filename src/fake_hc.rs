@@ -262,12 +262,41 @@ pub struct FakeApp<'a> {
     pub spaces: RefCell<Vec<(String, String)>>,
     /// Every `tab.rename` it was asked for: (tab id, name).
     pub renamed: RefCell<Vec<(String, String)>>,
+    /// The name each tab shows; a tab it never named is called `shell`, like
+    /// the placeholder tab of a Space it made.
+    pub tab_names: RefCell<std::collections::BTreeMap<String, String>>,
+    /// A command the window refuses, by name: how a failed rename is tested.
+    pub refuse: RefCell<Option<String>>,
     next: RefCell<u32>,
 }
 
 impl<'a> FakeApp<'a> {
     pub fn new(core: &'a FakeCore) -> Self {
-        FakeApp { core, calls: RefCell::new(Vec::new()), spaces: RefCell::new(Vec::new()), renamed: RefCell::new(Vec::new()), next: RefCell::new(0) }
+        FakeApp {
+            core,
+            calls: RefCell::new(Vec::new()),
+            spaces: RefCell::new(Vec::new()),
+            renamed: RefCell::new(Vec::new()),
+            tab_names: RefCell::new(std::collections::BTreeMap::new()),
+            refuse: RefCell::new(None),
+            next: RefCell::new(0),
+        }
+    }
+
+    /// A Space the window already shows, the way a person made it: a name and a
+    /// terminal in it, with none of hp's labels on that terminal.
+    pub fn shown_space(&self, name: &str) -> String {
+        let mut next = self.next.borrow_mut();
+        *next += 1;
+        let space = format!("sp{next}");
+        drop(next);
+        self.spaces.borrow_mut().push((space.clone(), name.to_string()));
+        space
+    }
+
+    /// The name each tab shows.
+    fn tab_name(&self, tab: &str) -> String {
+        self.tab_names.borrow().get(tab).cloned().unwrap_or_else(|| "shell".to_string())
     }
 
     /// The tab the window ties each core terminal to.
@@ -282,20 +311,21 @@ impl<'a> FakeApp<'a> {
             .spaces
             .borrow()
             .iter()
-            .map(|(space, _)| {
+            .map(|(space, name)| {
                 let mut tabs = vec![serde_json::json!({
                     "id": format!("placeholder-{space}"),
-                    "name": "shell",
+                    "name": self.tab_name(&format!("placeholder-{space}")),
                     "terminals": [],
                 })];
                 for term in terminals.iter().filter(|t| t.labels.get("herdr.space") == Some(space)) {
+                    let tab = Self::tab_for(&term.address);
                     tabs.push(serde_json::json!({
-                        "id": Self::tab_for(&term.address),
-                        "name": "shell",
+                        "id": tab,
+                        "name": self.tab_name(&tab),
                         "terminals": [{"terminal": term.address}],
                     }));
                 }
-                serde_json::json!({"id": space, "tabs": tabs})
+                serde_json::json!({"id": space, "name": name, "tabs": tabs})
             })
             .collect();
         serde_json::json!({"spaces": spaces}).to_string()
@@ -303,6 +333,11 @@ impl<'a> FakeApp<'a> {
 
     fn dispatch(&self, args: &[String]) -> Result<Output> {
         let args: Vec<&str> = args.iter().map(String::as_str).collect();
+        if let Some(refused) = self.refuse.borrow().as_deref()
+            && args.get(1) == Some(&refused)
+        {
+            return fail("refused", &format!("the window did not run {refused}"));
+        }
         match args.as_slice() {
             ["status"] => ok("{\"version\":\"0.1.16\"}"),
             ["ls"] => ok(self.ls_json()),
@@ -315,10 +350,22 @@ impl<'a> FakeApp<'a> {
                 self.spaces.borrow_mut().push((space.clone(), name));
                 ok(serde_json::json!({"space": space, "tab": format!("placeholder-{space}"), "terminal": "tshell"}).to_string())
             }
+            ["do", "space.rename", rest @ ..] => {
+                let id = flag(rest, "--id");
+                let name = flag(rest, "--name");
+                match self.spaces.borrow_mut().iter_mut().find(|(space, _)| *space == id) {
+                    Some(entry) => {
+                        entry.1 = name;
+                        ok("{}")
+                    }
+                    None => fail("not_found", &format!("no space {id}")),
+                }
+            }
             ["do", "tab.close", _rest @ ..] => ok("{}"),
             ["do", "tab.rename", rest @ ..] => {
                 let id = flag(rest, "--id");
                 let name = flag(rest, "--name");
+                self.tab_names.borrow_mut().insert(id.clone(), name.clone());
                 self.renamed.borrow_mut().push((id, name));
                 ok("{}")
             }
