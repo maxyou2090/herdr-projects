@@ -246,9 +246,7 @@ pub fn sync_home_label(project: &Project, herdr: &Core) {
         return;
     }
     let label = project.slug.clone();
-    if let Ok(current) = herdr.workspace_label(&record.workspace_id)
-        && current != label
-    {
-        let _ = herdr.workspace_rename(&record.workspace_id, &label);
+    if herdr.workspace_label(&record.workspace_id).unwrap_or_default() != label {
+        let _ = herdr.name_space(&record.workspace_id, &label);
     }
 }

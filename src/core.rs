@@ -41,6 +41,12 @@ pub const L_AGENT: &str = "hp_agent";
 pub const L_KIND: &str = "hp_kind";
 pub const L_SESSION: &str = "hp_session";
 pub const L_WORKTREE: &str = "hp_worktree";
+/// The app's own copies on a terminal it made. Nothing here writes them: a
+/// coordinator started in such a terminal (a person typed `open` in a pane the
+/// window made) has neither `hp_ws` nor `hp_tab` until hp writes one, and these
+/// are then the only way to find the Space and tab it sits in (t-0051).
+pub const L_APP_SPACE: &str = "herdr.space";
+pub const L_APP_TAB: &str = "herdr.tab";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub struct Version(pub u64, pub u64, pub u64);
@@ -288,6 +294,13 @@ impl Term {
     fn cwd(&self) -> String {
         if self.cwd.is_empty() { self.last_cwd.clone().unwrap_or_default() } else { self.cwd.clone() }
     }
+}
+
+/// The Space and tab a terminal sits in: hp's labels, else the app's copies.
+fn space_and_tab(term: &Term) -> (String, String) {
+    let space = [term.label(L_WS), term.label(L_APP_SPACE)].into_iter().find(|value| !value.is_empty()).unwrap_or_default();
+    let tab = [term.label(L_TAB), term.label(L_APP_TAB)].into_iter().find(|value| !value.is_empty()).unwrap_or_default();
+    (space, tab)
 }
 
 /// `hc` bound to one core session. Every call a project makes goes through this,
@@ -778,18 +791,151 @@ impl<'a> Core<'a> {
             .ok_or_else(|| CoreError { code: "pane_not_found".into(), message: format!("no Space {workspace}") })
     }
 
+    /// Writes a Space's label on every terminal of it, skipping the ones that
+    /// already say it: the ticker names a coordinator on every tick and must not
+    /// relabel a correct Space each time.
     pub fn workspace_rename(&self, workspace: &str, label: &str) -> Result<(), CoreError> {
-        for term in self.terminals()?.into_iter().filter(|t| t.label(L_WS) == workspace) {
+        for term in self.terminals()?.into_iter().filter(|t| t.label(L_WS) == workspace && t.label(L_WS_LABEL) != label) {
             self.label(&term.pane_id(), &[(L_WS_LABEL, label)])?;
         }
         Ok(())
     }
 
     pub fn tab_rename(&self, tab: &str, label: &str) -> Result<(), CoreError> {
-        for term in self.terminals()?.into_iter().filter(|t| t.label(L_TAB) == tab) {
+        for term in self.terminals()?.into_iter().filter(|t| t.label(L_TAB) == tab && t.label(L_TAB_LABEL) != label) {
             self.label(&term.pane_id(), &[(L_TAB_LABEL, label)])?;
         }
         Ok(())
+    }
+
+    /// The Space and tab a terminal really sits in: hp's own labels, else the
+    /// app's (`L_APP_SPACE`, `L_APP_TAB`) on a terminal the window made. Such a
+    /// terminal is a normal place for a coordinator to start — `open` runs the
+    /// agent in the pane the person typed in — and reading only hp's labels made
+    /// `open` rename nothing and record no ids for it (t-0051).
+    pub fn locate(&self, pane: &str) -> Result<(String, String), CoreError> {
+        Ok(space_and_tab(&self.term(pane)?))
+    }
+
+    /// Names a Space for every reader: hp's label on each of its terminals (that
+    /// is the record), and the app's own name while the window shows an `sp…`
+    /// Space — a Space the app made is the app's to draw. Returns one line per
+    /// name that did not land.
+    pub fn name_space(&self, space: &str, label: &str) -> Vec<String> {
+        let mut notes = Vec::new();
+        if space.is_empty() {
+            return notes;
+        }
+        if let Err(error) = self.workspace_rename(space, label) {
+            notes.push(format!("could not name Space {space} `{label}` ({error})"));
+        }
+        if !space.starts_with("sp") || !crate::app::running(self.runner) {
+            return notes;
+        }
+        match crate::app::space_name(self.runner, space) {
+            Some(name) if name == label => {}
+            Some(name) => match crate::app::space_rename(self.runner, space, label) {
+                Ok(()) => match crate::app::space_name(self.runner, space) {
+                    Some(name) if name == label => {}
+                    Some(name) => notes.push(format!("the app still shows Space `{name}` instead of `{label}`")),
+                    None => notes.push(format!("the app no longer shows Space {space} after renaming it")),
+                },
+                Err(error) => notes.push(format!("could not rename the app's Space `{name}` to `{label}` ({error})")),
+            },
+            None => notes.push(format!("the app does not show Space {space}: it keeps the name it has")),
+        }
+        notes
+    }
+
+    /// Names the tab a terminal is in. The app's tab id is read from the window
+    /// when the app owns the Space: for a Space hp made, `hp_tab` is hp's own id
+    /// (`sp…-ab12`) while the window knows a `tb…` one.
+    pub fn name_tab(&self, pane: &str, space: &str, tab: &str, label: &str) -> Vec<String> {
+        let mut notes = Vec::new();
+        if tab.is_empty() {
+            return notes;
+        }
+        if let Err(error) = self.tab_rename(tab, label) {
+            notes.push(format!("could not name tab {tab} `{label}` ({error})"));
+        }
+        if space.is_empty() || !space.starts_with("sp") || !crate::app::running(self.runner) {
+            return notes;
+        }
+        let address = self.term(pane).map(|term| term.address).unwrap_or_default();
+        match crate::app::shown(self.runner, space, &address) {
+            Some(shown) if shown.tab_name == label => {}
+            Some(shown) => match crate::app::tab_name(self.runner, &shown.tab, label) {
+                Ok(()) => match crate::app::shown(self.runner, space, &address) {
+                    Some(now) if now.tab_name == label => {}
+                    Some(now) => notes.push(format!("the app still shows tab `{}` instead of `{label}`", now.tab_name)),
+                    None => notes.push(format!("the app no longer shows {address} after renaming its tab")),
+                },
+                Err(error) => notes.push(format!("could not rename the app's tab `{}` to `{label}` ({error})", shown.tab_name)),
+            },
+            None => notes.push(format!(
+                "the app does not show {address} yet: its tab keeps the name it has (the ticker tries again every tick)"
+            )),
+        }
+        notes
+    }
+
+    /// Names the Space and tab a terminal sits in, on whichever host draws them,
+    /// and answers the ids it found — the ones a record keeps. hp's labels are
+    /// written first, and only where they are missing or say something else:
+    /// they are the record every reader uses (`workspace_list`, `agent_list`,
+    /// the overview). Then the display name is the app's for an `sp…`/`tb…`
+    /// Space while its window is open, and core's labels' otherwise. Returns one
+    /// line per name that did not land, so a failed rename is visible instead of
+    /// silent (t-0051).
+    pub fn name_place(&self, pane: &str, space_label: &str, tab_label: &str) -> (String, String, Vec<String>) {
+        let mut notes = Vec::new();
+        let term = match self.term(pane) {
+            Ok(term) => term,
+            Err(error) => {
+                notes.push(format!("could not read {pane} to name its Space and tab ({error})"));
+                return (String::new(), String::new(), notes);
+            }
+        };
+        let (space, mut tab) = space_and_tab(&term);
+        // A Space the app made can show a terminal before it copies the tab onto
+        // it (`herdr.tab`); the window itself is then the only source of the tab
+        // id, and hp's record needs one either way.
+        if tab.is_empty()
+            && space.starts_with("sp")
+            && crate::app::running(self.runner)
+            && let Some(shown) = crate::app::shown(self.runner, &space, &term.address)
+        {
+            tab = shown.tab.clone();
+        }
+        if space.is_empty() && tab.is_empty() {
+            return (space, tab, notes);
+        }
+        let mut pairs: Vec<(&str, &str)> = Vec::new();
+        if !space.is_empty() {
+            if term.label(L_WS) != space {
+                pairs.push((L_WS, space.as_str()));
+            }
+            if term.label(L_WS_LABEL) != space_label {
+                pairs.push((L_WS_LABEL, space_label));
+            }
+        }
+        if !tab.is_empty() {
+            if term.label(L_TAB) != tab {
+                pairs.push((L_TAB, tab.as_str()));
+            }
+            if term.label(L_TAB_LABEL) != tab_label {
+                pairs.push((L_TAB_LABEL, tab_label));
+            }
+        }
+        if !pairs.is_empty()
+            && let Err(error) = self.label(pane, &pairs)
+        {
+            notes.push(format!("could not write {pane}'s Space and tab labels ({error})"));
+            return (space, tab, notes);
+        }
+        notes.extend(self.name_space(&space, space_label));
+        notes.extend(self.name_tab(pane, &space, &tab, tab_label));
+        (space, tab, notes)
     }
 
     /// The working directory core reports for a pane.
@@ -1038,6 +1184,79 @@ mod tests {
         assert_eq!(session_key("/h/.config/herdr/herdr.sock"), "");
         assert_eq!(session_key("-"), "");
         assert_eq!(session_key("hp-dev"), "hp-dev");
+    }
+
+    /// A terminal the window made: the app's `herdr.space`/`herdr.tab` and
+    /// nothing of hp's — which is what `open` finds when a person types it in a
+    /// terminal they opened themselves (t-0051's rexa).
+    fn app_made(core: &crate::fake_hc::FakeCore, app: &crate::fake_hc::FakeApp, cwd: &str, tab_name: &str) -> (String, String, String) {
+        let space = app.shown_space("rexa");
+        let term = core.terminal("t52", cwd, &[(L_APP_SPACE, space.as_str())]);
+        let tab = format!("apptab-{}", term.address);
+        core.terminals.borrow_mut().iter_mut().find(|t| t.address == term.address).unwrap().labels.insert(L_APP_TAB.into(), tab.clone());
+        app.tab_names.borrow_mut().insert(tab.clone(), tab_name.to_string());
+        (space, tab, term.address)
+    }
+
+    #[test]
+    fn a_terminal_the_app_made_is_named_through_the_app() {
+        let home = tempfile::tempdir().unwrap();
+        let core = crate::fake_hc::FakeCore::new();
+        let app = crate::fake_hc::FakeApp::new(&core);
+        let herdr = Core::new("hc", "", &app);
+        let dir = home.path().to_string_lossy().into_owned();
+        let (space, tab, address) = app_made(&core, &app, &dir, "1");
+
+        // What `open` reads: the app's ids, because hp wrote none.
+        assert_eq!(herdr.locate(&address).unwrap(), (space.clone(), tab.clone()));
+        let (found_space, found_tab, notes) = herdr.name_place(&address, "REXA", "coordinator");
+        assert_eq!((found_space.as_str(), found_tab.as_str()), (space.as_str(), tab.as_str()), "the ids the record keeps");
+        assert!(notes.is_empty(), "every name landed: {notes:?}");
+
+        // The Space and tab the window draws are renamed by the app.
+        assert_eq!(app.spaces.borrow()[0], (space.clone(), "REXA".to_string()), "the Space is the project's name");
+        assert_eq!(app.tab_names.borrow()[&tab], "coordinator", "the tab says what runs in it");
+        assert!(app.calls.borrow().iter().any(|call| call.contains("space.rename") && call.contains(&space)), "{:?}", app.calls.borrow());
+
+        // And hp's labels — the record every reader uses — are all there.
+        let labels = core.terminals.borrow()[0].labels.clone();
+        assert_eq!(labels.get(L_WS).map(String::as_str), Some(space.as_str()));
+        assert_eq!(labels.get(L_WS_LABEL).map(String::as_str), Some("REXA"));
+        assert_eq!(labels.get(L_TAB).map(String::as_str), Some(tab.as_str()));
+        assert_eq!(labels.get(L_TAB_LABEL).map(String::as_str), Some("coordinator"));
+    }
+
+    #[test]
+    fn a_rename_the_window_refuses_is_a_line_not_silence() {
+        let home = tempfile::tempdir().unwrap();
+        let core = crate::fake_hc::FakeCore::new();
+        let app = crate::fake_hc::FakeApp::new(&core);
+        let herdr = Core::new("hc", "", &app);
+        let dir = home.path().to_string_lossy().into_owned();
+        let (_space, tab, address) = app_made(&core, &app, &dir, "1");
+        app.refuse.replace(Some("space.rename".into()));
+
+        let (_, _, notes) = herdr.name_place(&address, "REXA", "coordinator");
+        assert!(notes.iter().any(|note| note.contains("Space") && note.contains("REXA")), "the failed rename is reported: {notes:?}");
+        assert_eq!(app.spaces.borrow()[0].1, "rexa", "the window kept its name");
+        assert_eq!(app.tab_names.borrow()[&tab], "coordinator", "the tab was still renamed");
+    }
+
+    #[test]
+    fn a_space_hp_made_is_named_by_core_labels() {
+        let home = tempfile::tempdir().unwrap();
+        let fake = crate::fake_hc::FakeCore::new();
+        let herdr = Core::new("hc", "", &fake);
+        let term = fake.terminal("hp-law-1", home.path().to_str().unwrap(), &[(L_WS, "hpw-law-1"), (L_TAB, "hpw-law-1-t1")]);
+
+        assert_eq!(herdr.locate("hp-law-1").unwrap(), ("hpw-law-1".into(), "hpw-law-1-t1".into()));
+        let (found_space, found_tab, notes) = herdr.name_place("hp-law-1", "REXA", "coordinator");
+        assert_eq!((found_space.as_str(), found_tab.as_str()), ("hpw-law-1", "hpw-law-1-t1"));
+        assert!(notes.is_empty(), "{notes:?}");
+        let labels = fake.terminals.borrow().iter().find(|t| t.address == term.address).unwrap().labels.clone();
+        assert_eq!(labels.get(L_WS_LABEL).map(String::as_str), Some("REXA"));
+        assert_eq!(labels.get(L_TAB_LABEL).map(String::as_str), Some("coordinator"));
+        assert!(!fake.calls.borrow().iter().any(|call| call.contains("space.rename")), "core owns this Space: no app call");
     }
 
     #[test]

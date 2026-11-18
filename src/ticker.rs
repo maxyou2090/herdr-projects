@@ -1129,6 +1129,12 @@ fn tick_cheap_body(ctx: &Ctx, project: &Project, sessions: &mut Sessions, state:
         // never assigns an `Ambiguous` pane a lane.
         let lane = (!c.lane.is_empty()).then(|| c.lane.clone());
         crate::labels::report_pane(&herdr, &c.pane_id, &crate::labels::coordinator_display(project, lane.as_deref()), slug, group, lane.as_deref());
+        // The names that pane's Space and tab must show, repaired here rather
+        // than on demand: the ticker already visits every coordinator, so one
+        // that was never named — a coordinator started in a terminal the app
+        // made carries no `hp_ws` (t-0051) — is put right on the next tick.
+        // `keep_names` prints a line only when a name did not land.
+        crate::coordinator::keep_names(&herdr, project, &c.pane_id);
     }
 
     let pass = thread_pass(project, &herdr, &record.socket, &open_threads(project), &agents, &panes, None)?;

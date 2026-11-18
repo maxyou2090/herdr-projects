@@ -80,6 +80,13 @@ pub fn thread_space_label(title: &str) -> &str {
     title
 }
 
+/// A coordinator's tab name, in the Space the project owns. That Space is
+/// called by the project's slug (t-0050); the tab is the one word that says
+/// what runs there.
+pub fn coordinator_tab_label() -> &'static str {
+    "coordinator"
+}
+
 /// Row 1 of a thread, as `hp_display` carries it: its id and its title, one
 /// space between (no `·`: a person reads `t-0047 线程命名 tab 用 id`).
 pub fn thread_display(thread: &Thread) -> String {
