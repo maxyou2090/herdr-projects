@@ -6,7 +6,7 @@
 //! sidebar any more, only labels.
 
 use crate::core::Core;
-use crate::project::{self, Project};
+use crate::project::Project;
 use crate::thread::{Group, Live, Thread};
 
 /// Tokens this binary wrote in Herdr 1's layouts; cleared on every report.
@@ -86,16 +86,15 @@ pub fn thread_display(thread: &Thread) -> String {
     format!("{} {}", thread.id, thread.title)
 }
 
-/// A coordinator's row name: the project's name, plus ` · <lane label>` when
+/// A coordinator's row name: the project's slug, plus ` · <lane label>` when
 /// the project has a lane registry (`docs/lanes.md` §9). The gate is the
 /// registry, not the lane count: a project that never wrote `lanes.json` reads
 /// as before, and a project with lanes shows them even for one lane — including
 /// the default — so two coordinators are never two identical rows.
 pub fn coordinator_display(project: &Project, lane: Option<&str>) -> String {
-    let name = project.read_project_md().map(|(s, _)| project::display_name(&s.name, &project.slug)).unwrap_or_else(|_| project.slug.clone());
     match crate::lanes::display_label(project, lane) {
-        Some(label) => format!("{name} · {label}"),
-        None => name,
+        Some(label) => format!("{} · {label}", project.slug),
+        None => project.slug.clone(),
     }
 }
 
@@ -149,9 +148,9 @@ mod tests {
     #[test]
     fn a_coordinators_row_still_reads_project_dot_lane() {
         // The thread rework left the coordinator's names alone: its row is the
-        // project's display name, joined to a lane label with ` · `.
+        // project's slug, joined to a lane label with ` · `.
         let root = tempfile::tempdir().unwrap();
         let project = crate::project::create(&root.path().join("root"), "demo", "", vec![]).unwrap();
-        assert_eq!(coordinator_display(&project, None), "Demo", "a project with no lane registry reads as before");
+        assert_eq!(coordinator_display(&project, None), "demo", "the row is the slug, not a capitalized name");
     }
 }

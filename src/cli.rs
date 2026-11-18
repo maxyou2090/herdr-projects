@@ -39,6 +39,8 @@ impl From<SessionArgs> for SessionFlags {
 enum Command {
     /// Create a project folder with its skeleton files
     New {
+        /// The project's name; it only makes the slug (folder name), which is
+        /// what every Space, row and brief shows
         name: String,
         #[arg(long, default_value = "")]
         goal: String,
@@ -151,16 +153,14 @@ enum Command {
         #[arg(long)]
         force: bool,
     },
-    /// Give a project a new slug (its folder name), and with --name a new display name.
+    /// Give a project a new slug (its folder name): its home Space, its
+    /// coordinator's row and its threads follow it.
     /// Refused while a thread is not resolved. While agents run in the project folder
     /// (its coordinator too) the ticker does it once they are idle: it closes their
     /// panes, renames, and reopens the coordinator in the new folder
     Rename {
         slug: String,
         new_slug: String,
-        /// The new display name (default: keep it)
-        #[arg(long, value_name = "NAME")]
-        name: Option<String>,
         /// Print the plan and change nothing
         #[arg(long)]
         dry_run: bool,
@@ -197,7 +197,7 @@ enum Command {
         #[arg(long)]
         yes: bool,
     },
-    /// Change one setting in PROJECT.md (name, goal, coordinator_profile, thread_profile, auto_resolve_days, nudge, repos.add, repos.remove)
+    /// Change one setting in PROJECT.md (goal, coordinator_profile, thread_profile, auto_resolve_days, nudge, repos.add, repos.remove)
     Set { slug: String, key: String, value: String },
     /// Open a file: a text file in an editor in this terminal ($VISUAL, else $EDITOR), anything else with the system opener
     OpenFile {
@@ -896,8 +896,8 @@ pub fn run() -> Result<()> {
         Command::Archive { slug } => lifecycle::set_status(&ctx, &slug, Status::Archived),
         Command::Unarchive { slug } => lifecycle::set_status(&ctx, &slug, Status::Active),
         Command::Delete { slug, force } => lifecycle::delete(&ctx, &slug, force),
-        Command::Rename { slug, new_slug, name, dry_run, session } => {
-            crate::rename::cli(&ctx, &crate::rename::Args { from: &slug, to: &new_slug, name: name.as_deref(), dry_run, by_ticker: false }, &session.into())
+        Command::Rename { slug, new_slug, dry_run, session } => {
+            crate::rename::cli(&ctx, &crate::rename::Args { from: &slug, to: &new_slug, dry_run, by_ticker: false }, &session.into())
         }
         Command::Profile { command } => {
             if let ProfileCommand::Resolve { name } = &command {

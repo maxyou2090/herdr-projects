@@ -200,7 +200,8 @@ pub struct Lane {
     pub id: String,
     /// The CLI handle (`--lane fix`). Unique per project among open lanes.
     pub name: String,
-    /// The display name: sidebar, tab, Space label.
+    /// The display label: sidebar, tab, Space label. A synthesized lane (no
+    /// `lanes.json`) carries the project's slug.
     pub label: String,
     pub goal: String,
     /// The lane's default coordinator profile. Empty falls back to the
@@ -273,8 +274,8 @@ impl Registry {
         Registry::from_coordinator(project, read_coordinator(project).as_ref())
     }
 
-    /// `c-1`, named `default`, labelled with the project's display name,
-    /// holding the recorded coordinator's instance hints.
+    /// `c-1`, named `default`, labelled with the project's slug, holding the
+    /// recorded coordinator's instance hints.
     pub fn from_coordinator(project: &Project, record: Option<&Coordinator>) -> Registry {
         let record = record.cloned().unwrap_or_default();
         Registry {
@@ -492,13 +493,10 @@ pub(crate) fn read_coordinator(project: &Project) -> Option<Coordinator> {
     project::read_json(&project.state_dir().join(COORDINATOR_FILE))
 }
 
-/// The label the synthesized lane shows: the project's display name, the same
-/// one `labels::coordinator_display` and the home Space label use.
+/// The label the synthesized lane shows: the project's slug, the same one
+/// `labels::coordinator_display` and the home Space label use.
 fn project_label(project: &Project) -> String {
-    project
-        .read_project_md()
-        .map(|(settings, _)| project::display_name(&settings.name, &project.slug))
-        .unwrap_or_else(|_| project.slug.clone())
+    project.slug.clone()
 }
 
 /// The rule [`resolve`] answered with.
@@ -2131,7 +2129,7 @@ mod tests {
         let lane = &registry.lanes[0];
         assert_eq!(lane.id, "c-1");
         assert_eq!(lane.name, DEFAULT_NAME);
-        assert_eq!(lane.label, "Demo", "the display name, not the slug");
+        assert_eq!(lane.label, "demo", "the slug, not a capitalized display name");
         assert_eq!(lane.status, Status::Open);
         assert_eq!(lane.pane_id, "w1:p1");
         assert_eq!(lane.agent_session, "sess-1");
@@ -2643,7 +2641,7 @@ mod tests {
             counts,
         };
         let text = rendered.list_text();
-        assert!(text.contains("c-1\tdefault\topen\tdefault\tDemo\tlast_active=-\tpanes=-\tthreads=0\tinbox=1"), "{text}");
+        assert!(text.contains("c-1\tdefault\topen\tdefault\tdemo\tlast_active=-\tpanes=-\tthreads=0\tinbox=1"), "{text}");
         assert!(text.contains("c-2\t\topen\tbooks\t收藏\tlast_active=-\tpanes=-\tthreads=2\tinbox=1"), "{text}");
         let json = list_json(&rendered);
         assert_eq!(json[1]["threads"], 2);

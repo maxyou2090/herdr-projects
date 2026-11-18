@@ -129,24 +129,24 @@ pub fn empty(ctx: &Ctx, project: &Project, herdr: &Core, include_focused: bool) 
         }
         found.push(Space { id, label: space.label.clone() });
     }
-    // Orphan home Spaces: plain Spaces still carrying the project's home
-    // label that no open thread and no coordinator uses — the twins left
+    // Orphan home Spaces: plain Spaces still carrying the project's label (its
+    // slug) that no open thread and no coordinator uses — the twins left
     // behind when a tab thread reopened the project's workspace next to its
     // old one. Worktree-backed Spaces belong to the primary logic above.
-    if let Ok((settings, _)) = project.read_project_md() {
-        let home = project::home_label(&settings.name, &project.slug);
-        for w in workspaces.iter().filter(|w| w.worktree.is_none() && w.label == home && !in_use.contains(&w.workspace_id) && !coordinators.contains(&w.workspace_id)) {
-            let own: Vec<_> = panes.iter().filter(|p| p.workspace_id == w.workspace_id).collect();
-            if own.is_empty()
-                || own.len() != w.pane_count
-                || agents.iter().any(|a| a.workspace_id == w.workspace_id)
-                || (!include_focused && (w.focused || own.iter().any(|p| p.focused)))
-                || !own.iter().all(|p| herdr.pane_idle_shell(&p.pane_id))
-            {
-                continue;
-            }
-            found.push(Space { id: w.workspace_id.clone(), label: w.label.clone() });
+    for w in workspaces
+        .iter()
+        .filter(|w| w.worktree.is_none() && w.label == project.slug && !in_use.contains(&w.workspace_id) && !coordinators.contains(&w.workspace_id))
+    {
+        let own: Vec<_> = panes.iter().filter(|p| p.workspace_id == w.workspace_id).collect();
+        if own.is_empty()
+            || own.len() != w.pane_count
+            || agents.iter().any(|a| a.workspace_id == w.workspace_id)
+            || (!include_focused && (w.focused || own.iter().any(|p| p.focused)))
+            || !own.iter().all(|p| herdr.pane_idle_shell(&p.pane_id))
+        {
+            continue;
         }
+        found.push(Space { id: w.workspace_id.clone(), label: w.label.clone() });
     }
     // Threads' own Spaces, once nothing uses them: a plain Space still
     // carrying the thread's title (herdr reuses ids after a server restart,
@@ -234,10 +234,10 @@ pub fn close_empty(ctx: &Ctx, project: &Project, herdr: &Core) -> Vec<anyhow::Er
     errors
 }
 
-/// Renames the project's home Space to the label its `PROJECT.md` name spells:
-/// a name changed outside `herdr-projects rename` would otherwise leave the
-/// old label in the sidebar until the next `open`. Silent, so a ticker tick
-/// never prints.
+/// Renames the project's home Space to the project's slug when the label
+/// drifted (a project renamed outside `hp rename`, or one opened before the
+/// slug rule); it would otherwise keep the old label until the next `open`.
+/// Silent, so a ticker tick never prints.
 pub fn sync_home_label(project: &Project, herdr: &Core) {
     let Some(record) = project.coordinator() else {
         return;
@@ -245,10 +245,7 @@ pub fn sync_home_label(project: &Project, herdr: &Core) {
     if record.workspace_id.is_empty() {
         return;
     }
-    let Ok((settings, _)) = project.read_project_md() else {
-        return;
-    };
-    let label = project::home_label(&settings.name, &project.slug);
+    let label = project.slug.clone();
     if let Ok(current) = herdr.workspace_label(&record.workspace_id)
         && current != label
     {

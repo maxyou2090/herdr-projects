@@ -212,7 +212,7 @@ default lane (§10).
     {
       "id": "c-1",                 // stable, never reused, never renumbered
       "name": "fix",               // CLI handle: `--lane fix`; unique per project
-      "label": "抢修",              // display name: Space and tab labels, hp_display
+      "label": "抢修",              // the lane's label: Space and tab labels, hp_display
       "goal": "production incidents only",
       "profile": "pi-deepseek-flash-high",   // default profile for this lane
       "status": "open",            // "open" or "closed" (§6.4); closed is reversible
@@ -911,7 +911,7 @@ reaches a named lane's coordinator.
 > `lanes::display_label` for the label suffix.
 
 - **Display name.** `labels::coordinator_display()` (`src/labels.rs`)
-  returns `"<project name>␣"` + `HEAD_MARK` for every coordinator, so two
+  returns `"<project slug>␣"` + `HEAD_MARK` for every coordinator, so two
   coordinators are two identical rows. It becomes `"<project> · <lane label>"` +
   `HEAD_MARK`. The gate is whether the project has a registry, not how many
   lanes it has: no `lanes.json` keeps today's row byte for byte, while a project
@@ -966,7 +966,7 @@ reaches a named lane's coordinator.
   incremental (§12, the commit plan).
 - **`lanes.json` is created lazily.** First `open` on a project with no lane
   registry writes
-  `{"lanes":[{"id":"c-1","name":"default","label":"<project name>","status":"open",…}],"default":"c-1","next":2}`
+  `{"lanes":[{"id":"c-1","name":"default","label":"<project slug>","status":"open",…}],"default":"c-1","next":2}`
   from the existing `coordinator.json` (`pane_id`, `agent_session`, `profile`).
   Nothing to run, nothing to migrate, nothing that can half-finish.
 - **The old CLI is unchanged.** `open`, `context`, `thread`, `inbox`,
@@ -1125,7 +1125,7 @@ the lane series moves them. `rg` the symbol to find it.
 | `coordinator::open()`'s reuse branch (`src/coordinator.rs`) | newest of the `running` set | the target lane's live pane only |
 | `coordinator::open()`'s record write (`src/coordinator.rs`) | `*c = Coordinator{…}` replaces the record | write that lane's entry in `lanes.json` |
 | `spaces::empty()` (`src/spaces.rs`) | excludes `coordinator().workspace_id` | excludes every lane's Space |
-| `labels::coordinator_display()` (`src/labels.rs`) | project name for every coordinator | `<project> · <lane>` |
+| `labels::coordinator_display()` (`src/labels.rs`) | the project's slug for every coordinator | `<project slug> · <lane>` |
 | `grouping::coordinator_key()` (`src/grouping.rs`) | `<slug>!0!<pane>` | dropped by the port (`src/grouping.rs` is gone) |
 | `coordinator::digest()` (`src/coordinator.rs`), reached through `coordinator::context()` | prints state, never says who the coordinator is | first line is the §5.4 `Coordinators:` line, every turn |
 | `tick_cheap()`'s `coordinator_missing` (`src/ticker.rs`) | a missing coordinator only feeds `session_lost`; nothing is logged or written | an ambiguous pane is logged as a held reason and written as one `lane` item |
