@@ -26,6 +26,10 @@ pub struct Terminal {
     pub state: String,
     pub screen: String,
     pub argv: Vec<String>,
+    /// Why core ended it, once it is `finished`; empty while it runs.
+    pub reason: String,
+    pub pid: Option<u32>,
+    pub exit_code: Option<i32>,
 }
 
 #[derive(Default)]
@@ -48,7 +52,7 @@ fn fail(kind: &str, message: &str) -> Result<Output> {
 fn short(term: &Terminal) -> serde_json::Value {
     serde_json::json!({
         "address": term.address,
-        "name": term.name,
+        "name": (!term.name.is_empty()).then(|| term.name.clone()),
         "cwd": term.cwd,
         "state": term.state,
         "status": term.status,
@@ -59,7 +63,8 @@ fn short(term: &Terminal) -> serde_json::Value {
 fn full(term: &Terminal) -> serde_json::Value {
     serde_json::json!({
         "address": term.address,
-        "name": term.name,
+        // core reports no name for a terminal it did not name itself
+        "name": (!term.name.is_empty()).then(|| term.name.clone()),
         "labels": term.labels,
         "cwd": term.cwd,
         "last_cwd": term.cwd,
@@ -68,6 +73,9 @@ fn full(term: &Terminal) -> serde_json::Value {
         "turn": term.turn,
         "reported": term.status.is_some(),
         "argv": term.argv,
+        "reason": term.reason,
+        "pid": term.pid,
+        "exit_code": term.exit_code,
     })
 }
 
@@ -91,9 +99,24 @@ impl FakeCore {
             state: "live".into(),
             screen: String::new(),
             argv: vec!["/bin/zsh".into()],
+            reason: String::new(),
+            pid: None,
+            exit_code: None,
         };
         self.terminals.borrow_mut().push(term.clone());
         term
+    }
+
+    /// Ends a terminal the way core does when the program dies: `ls` stops
+    /// listing it, `get` keeps answering with `state: finished` and why.
+    pub fn finish(&self, name: &str, reason: &str) {
+        if let Some(mut term) = self.find_mut(name) {
+            term.state = "finished".into();
+            term.status = None;
+            term.reason = reason.to_string();
+            term.pid = Some(2515);
+            term.exit_code = Some(1);
+        }
     }
 
     pub fn set_status(&self, name: &str, status: &str) {
@@ -139,7 +162,8 @@ impl FakeCore {
                     .filter(|t| t.state == "live")
                     .map(short)
                     .collect();
-                ok(serde_json::json!({"terminals": live, "hidden_finished": 0}).to_string())
+                let finished = self.terminals.borrow().iter().filter(|t| t.state != "live").count();
+                ok(serde_json::json!({"terminals": live, "hidden_finished": finished}).to_string())
             }
             ("get", [id]) => match self.find(id) {
                 Some(term) => ok(full(&term).to_string()),
@@ -228,6 +252,7 @@ impl FakeCore {
                 Some(mut term) => {
                     term.state = "finished".into();
                     term.status = None;
+                    term.reason = "killed".into();
                     ok("{\"removed\":\"\"}".to_string())
                 }
                 None => fail("not_found", &format!("no terminal {id}")),

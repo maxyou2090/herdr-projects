@@ -439,16 +439,40 @@ fn report(
         match (herdr.pane_list(), herdr.agent_list()) {
             (Ok(panes), Ok(agents)) => {
                 let dir = project.canonical_dir().to_string_lossy().into_owned();
-                let coordinators: Vec<String> = agents
-                    .iter()
-                    .filter(|a| a.works_in(&dir))
-                    .map(|a| if a.name.starts_with("hpc-") { format!("{} ({})", a.pane_id, a.agent) } else { format!("{} ({}, started by hand)", a.pane_id, a.agent) })
-                    .collect();
+                let coordinators = coordinator_rows(&project, record.as_ref(), &agents, &dir);
                 if let Some(record) = &record {
                     let workspace = crate::coordinator::workspace_open(record, &panes);
                     notes.push(format!("socket {}; workspace {} {}", record.socket, record.workspace_id, if workspace { "open" } else { "closed" }));
                 }
                 if coordinators.is_empty() {
+                    // Why it is empty matters: a coordinator whose terminal core
+                    // reaped is invisible to every list, and the difference
+                    // between "you closed the tab" and "the ticker can never
+                    // prompt it again" is the whole 2026-11-18 incident.
+                    if let Some(record) = &record
+                        && !record.pane_id.is_empty()
+                        && let fate = crate::coordinator::fate(&herdr, &project, record, &agents, &crate::lanes::default_lane_id(&project))
+                        && !matches!(fate, crate::coordinator::Fate::Running)
+                    {
+                        let detail = match &fate {
+                            // Named pane and named missing labels on purpose: "no
+                            // coordinator running" sends a person to `open`, which
+                            // would start a second coordinator beside this live one.
+                            crate::coordinator::Fate::Unlabeled { .. } => format!(
+                                "pane {} belongs to `{slug}` and its program reports a status, but it carries no `hp_agent`/`hp_kind`, so it does not count as an agent anywhere in hp. The ticker writes both labels on its next tick (about 15 seconds); do not `open` a second coordinator before that",
+                                record.pane_id
+                            ),
+                            crate::coordinator::Fate::Lost { detail } => format!(
+                                "{detail}; the ticker holds its inbox items instead of prompting, so `open {slug}` is the fix (its records are not rewritten here)"
+                            ),
+                            crate::coordinator::Fate::Moved(agent) => format!(
+                                "its agent is running in pane {} while the record still names {}; the ticker follows it on its next tick",
+                                agent.pane_id, record.pane_id
+                            ),
+                            crate::coordinator::Fate::Running => String::new(),
+                        };
+                        notes.push(detail);
+                    }
                     notes.push(none);
                 } else {
                     notes.push(format!("coordinator: {}", coordinators.join(", ")));
@@ -497,6 +521,35 @@ fn report(
     }
 
     (out, healthy)
+}
+
+/// The coordinators of one project, as its `project <slug>` line names them:
+/// the lane resolver's answer first (token, record + session, folder), then a
+/// hand-started agent working in the project folder that claims no other
+/// project.
+///
+/// **Not** the folder alone. A coordinator's shell sits wherever it last `cd`-ed
+/// to: law's pane t5h has a shell in rexa's folder while the pane says
+/// `hp_project=law`, and judging by the folder put law's coordinator in rexa's
+/// row and left law's own row saying "no coordinator running" — two lies from
+/// one line, each pointing at the wrong fix (2026-11-18, t-0053). A pane whose
+/// `hp_project` names another project is that project's, whatever its shell's
+/// directory says; the folder stays only as the weakest signal, for an agent hp
+/// never labelled at all.
+fn coordinator_rows(project: &project::Project, record: Option<&project::Coordinator>, agents: &[crate::core::Agent], dir: &str) -> Vec<String> {
+    let identity = crate::lanes::classify_all(project, &record.cloned().unwrap_or_default(), agents);
+    agents
+        .iter()
+        .zip(&identity)
+        .filter(|(agent, resolution)| resolution.counts_as_coordinator() || (agent.works_in(dir) && crate::lanes::ours(agent, &project.slug)))
+        .map(|(agent, _)| {
+            if agent.name.starts_with("hpc-") {
+                format!("{} ({})", agent.pane_id, agent.agent)
+            } else {
+                format!("{} ({}, started by hand)", agent.pane_id, agent.agent)
+            }
+        })
+        .collect()
 }
 
 /// The app's names against the ones a coordinator's Space and tab must show.
@@ -595,6 +648,45 @@ mod tests {
 
     fn plist_path(home: &Path) -> std::path::PathBuf {
         home.join(format!("Library/LaunchAgents/{}.plist", crate::ticker::AGENT_LABEL))
+    }
+
+    /// 2026-11-18: law's coordinator pane (t5h) has a shell sitting in rexa's
+    /// folder while the pane says `hp_project=law`. Judging by the folder put it
+    /// in rexa's row and left law's row saying "no coordinator running".
+    #[test]
+    fn a_coordinator_is_named_by_its_own_claim_not_by_its_shells_folder() {
+        let root = tempfile::tempdir().unwrap();
+        let rexa = project::create(root.path(), "rexa", "", vec![]).unwrap();
+        let law = project::create(root.path(), "law", "", vec![]).unwrap();
+        let rexa_dir = rexa.canonical_dir().to_string_lossy().into_owned();
+        let law_dir = law.canonical_dir().to_string_lossy().into_owned();
+        let mut agent = crate::core::Agent {
+            pane_id: "t5h".into(),
+            cwd: rexa_dir.clone(),
+            name: "hpc-law".into(),
+            agent: "pi".into(),
+            ..Default::default()
+        };
+        agent.tokens.insert(crate::labels::PROJECT_TOKEN.into(), "law".into());
+        agent.tokens.insert(crate::lanes::TOKEN.into(), "c-1".into());
+        let law_record = law
+            .update_coordinator(|c| {
+                c.pane_id = "t5h".into();
+                c.cwd = law_dir.clone();
+            })
+            .unwrap();
+
+        let one = std::slice::from_ref(&agent);
+        assert!(
+            coordinator_rows(&rexa, None, one, &rexa_dir).is_empty(),
+            "another project's agent is not rexa's, whatever its shell's directory says"
+        );
+        assert_eq!(coordinator_rows(&law, Some(&law_record), one, &law_dir), vec!["t5h (pi)".to_string()]);
+
+        // A hand-started agent in the folder, claiming no project, is still
+        // worth showing: nothing else would name it.
+        let hand = crate::core::Agent { pane_id: "t9".into(), cwd: rexa_dir.clone(), agent: "claude".into(), ..Default::default() };
+        assert_eq!(coordinator_rows(&rexa, None, std::slice::from_ref(&hand), &rexa_dir), vec!["t9 (claude, started by hand)".to_string()]);
     }
 
     #[test]

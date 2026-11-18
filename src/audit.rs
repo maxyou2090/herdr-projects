@@ -17,7 +17,7 @@
 use anyhow::{Result, bail};
 use serde::Serialize;
 
-use crate::core::{Agent, Pane};
+use crate::core::{Agent, Core, Pane};
 use crate::paths::Ctx;
 use crate::project::Project;
 use crate::thread::{self, Status, Thread};
@@ -32,6 +32,12 @@ pub const REGISTERED_PANE_MISSING: &str = "registered-pane-missing";
 /// An agent that has said `working` for a long time while neither its state
 /// nor its report moved.
 pub const WORKING_BUT_STALE: &str = "working-but-stale";
+/// The project's coordinator record names a terminal core has finished, and no
+/// live agent of the project took its place.
+pub const COORDINATOR_TERMINAL_FINISHED: &str = "coordinator-terminal-finished";
+/// The recorded coordinator terminal is alive and its program reports a status,
+/// but it carries no `hp_agent`/`hp_kind`, so core's agent list cannot see it.
+pub const COORDINATOR_LABELS_MISSING: &str = "coordinator-labels-missing";
 
 /// How long an agent may sit in `working` with nothing written before the
 /// audit calls it stale. Three aged-reminder windows
@@ -57,20 +63,39 @@ pub struct Findings {
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct Finding {
     /// One of [`RESOLVED_BUT_RUNNING`], [`REGISTERED_PANE_MISSING`],
-    /// [`WORKING_BUT_STALE`]: stable, so a sweep can grep for it.
+    /// [`WORKING_BUT_STALE`], [`COORDINATOR_TERMINAL_FINISHED`]: stable, so a
+    /// sweep can grep for it.
     pub kind: &'static str,
+    /// The thread this is about, empty for a finding about the project's
+    /// coordinator.
     pub thread: String,
+    /// The lane id, for a finding about a coordinator; empty for a thread's.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub lane: String,
     /// One line: what was seen, and what it means for the reader.
     pub detail: String,
 }
 
 impl Finding {
+    /// What the finding is about, as one safe subject: the thread id, or
+    /// `coordinator-<lane>` for the project's own. It is the dedup key of the
+    /// once-per-finding item, so the two kinds never shadow each other.
+    pub fn subject(&self) -> String {
+        if !self.thread.is_empty() {
+            return self.thread.clone();
+        }
+        let lane = if self.lane.is_empty() { "default" } else { self.lane.as_str() };
+        format!("coordinator-{lane}")
+    }
+
     /// A few words for the nudge line and the notification: this binary's own
     /// phrase, never text from a report.
     pub fn event(&self) -> &'static str {
         match self.kind {
             RESOLVED_BUT_RUNNING => "still running after it was resolved",
             REGISTERED_PANE_MISSING => "pane gone and it cannot restart itself",
+            COORDINATOR_TERMINAL_FINISHED => "its coordinator's terminal is gone",
+            COORDINATOR_LABELS_MISSING => "its coordinator's pane carries no `hp_agent` label",
             _ => "working but nothing written",
         }
     }
@@ -78,13 +103,52 @@ impl Finding {
 
 /// Every mismatch in one project, in thread-id order, from this session's
 /// lists. `socket` is the herdr session they belong to, for the agent's own
-/// progress record.
-pub fn findings_with(project: &Project, socket: &str, now: jiff::Timestamp, agents: &[Agent], panes: &[Pane]) -> Findings {
+/// progress record; `hc` is that same session, for the one question the lists
+/// cannot answer — what became of the coordinator's recorded terminal
+/// (`hc ls` hides finished terminals, see [`crate::core::TerminalFate`]).
+pub fn findings_with(project: &Project, socket: &str, now: jiff::Timestamp, agents: &[Agent], panes: &[Pane], hc: &Core) -> Findings {
     let mut found = Vec::new();
     for t in thread::list(project) {
         found.extend(thread_findings(&t, agents, panes, now, &project.root, socket));
     }
+    found.extend(coordinator_findings(project, agents, hc));
     Findings { found }
+}
+
+/// The project's own coordinator, when its record names a terminal that is gone
+/// and nothing took its place: the 2026-11-18 incident, where every
+/// notification was held as "no coordinator is idle long enough" while the
+/// coordinator was in fact unreachable, and this audit said `nothing unusual`
+/// because it only looked at threads.
+fn coordinator_findings(project: &Project, agents: &[Agent], hc: &Core) -> Vec<Finding> {
+    let Some(record) = project.coordinator() else {
+        return Vec::new();
+    };
+    let lane = crate::lanes::default_lane_id(project);
+    match crate::coordinator::fate(hc, project, &record, agents, &lane) {
+        crate::coordinator::Fate::Lost { detail } => vec![Finding {
+            kind: COORDINATOR_TERMINAL_FINISHED,
+            thread: String::new(),
+            lane,
+            detail: format!(
+                "the record still names pane {}, but {detail}; inbox items are held (not lost) until a coordinator runs again, and `open {}` starts one",
+                record.pane_id, project.slug
+            ),
+        }],
+        // The 2026-11-18 shape on rexa and law: the pane was healthy all along
+        // and only the two labels hp reads an agent from were missing, so every
+        // list said "no coordinator" and every nudge held.
+        crate::coordinator::Fate::Unlabeled { .. } => vec![Finding {
+            kind: COORDINATOR_LABELS_MISSING,
+            thread: String::new(),
+            lane,
+            detail: format!(
+                "pane {} is alive and reports a status but carries no `hp_agent`/`hp_kind`, so core's agent list cannot see the coordinator; the ticker writes both labels on its next tick, and `open {}` does it now",
+                record.pane_id, project.slug
+            ),
+        }],
+        _ => Vec::new(),
+    }
 }
 
 /// The three checks for one thread, against this session's lists.
@@ -98,12 +162,14 @@ fn thread_findings(t: &Thread, agents: &[Agent], panes: &[Pane], now: jiff::Time
                 found.push(Finding {
                     kind: RESOLVED_BUT_RUNNING,
                     thread: t.id.clone(),
+                    lane: String::new(),
                     detail: format!("resolved, but its agent is still listed in pane {} ({state}): nothing stopped it", t.pane_id),
                 });
             } else if live.pane_exists {
                 found.push(Finding {
                     kind: RESOLVED_BUT_RUNNING,
                     thread: t.id.clone(),
+                    lane: String::new(),
                     detail: format!("resolved, but pane {} is still open on its working directory", t.pane_id),
                 });
             }
@@ -121,6 +187,7 @@ fn thread_findings(t: &Thread, agents: &[Agent], panes: &[Pane], now: jiff::Time
                     found.push(Finding {
                         kind: REGISTERED_PANE_MISSING,
                         thread: t.id.clone(),
+                        lane: String::new(),
                         detail: format!("its pane {} is gone and it cannot restart itself: {refusal}", t.pane_id),
                     });
                 }
@@ -136,6 +203,7 @@ fn thread_findings(t: &Thread, agents: &[Agent], panes: &[Pane], now: jiff::Time
                     found.push(Finding {
                         kind: WORKING_BUT_STALE,
                         thread: t.id.clone(),
+                        lane: String::new(),
                         detail: format!("working, but nothing was written for {} (since {newest}): no report, no record change", duration_text(silent)),
                     });
                 }
@@ -157,7 +225,7 @@ pub fn findings(ctx: &Ctx, project: &Project) -> Result<Vec<Finding>> {
             project.slug
         )
     })?;
-    Ok(findings_with(project, &view.socket, jiff::Timestamp::now(), &view.agents, &view.panes).found)
+    Ok(findings_with(project, &view.socket, jiff::Timestamp::now(), &view.agents, &view.panes, &view.herdr).found)
 }
 
 /// The newest moment the agent is known to have done anything: the record's
@@ -226,7 +294,7 @@ pub fn run(ctx: &Ctx, slug: Option<&str>, json: bool) -> Result<()> {
     }
     println!("{}: {} finding(s)", project.slug, found.len());
     for finding in found {
-        println!("  {}  {}  {}", finding.kind, finding.thread, finding.detail);
+        println!("  {}  {}  {}", finding.kind, finding.subject(), finding.detail);
     }
     Ok(())
 }

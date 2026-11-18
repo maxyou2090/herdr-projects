@@ -424,10 +424,21 @@ impl Registry {
 
     /// The next id. The counter moves past it even if the lane is then thrown
     /// away: an allocated id never comes back.
+    ///
+    /// An id the registry already holds is skipped, whatever the counter says: a
+    /// registry whose counter was never moved on (`"next": 0` beside a live
+    /// `c-1`, which `ensure_written` used to leave behind) handed out `c-1` a
+    /// second time — law's `lanes.json` has two of them since 2026-11-17, and
+    /// `lane list` printed the same lane twice and `routes` nudged it twice.
     pub fn alloc_id(&mut self) -> String {
-        let n = self.next.max(1);
-        self.next = n.saturating_add(1);
-        format!("c-{n}")
+        loop {
+            let n = self.next.max(1);
+            self.next = n.saturating_add(1);
+            let id = format!("c-{n}");
+            if !self.lanes.iter().any(|lane| lane.id == id) {
+                return id;
+            }
+        }
     }
 
     /// The `Coordinator` a lane's pane is recorded as: the instance fields
@@ -1149,7 +1160,11 @@ impl View {
             for status in self.lane_statuses().into_iter().filter(|s| s.orphan) {
                 let _ = write!(out, "lane {} ({}) has no live coordinator", status.lane_id, self.lane_label(&status.lane_id));
                 if let Some(pane) = status.pane_id {
-                    let _ = write!(out, "; the pane it last ran in, {pane}, is gone");
+                    // Not "is gone": core may still list that terminal with a live
+                    // program that hp cannot see as an agent (a missing
+                    // `hp_agent` label, t-0053). What is true either way is that
+                    // no agent of this project is listed there.
+                    let _ = write!(out, "; core lists no agent in the pane it last ran in, {pane}");
                 }
                 let _ = writeln!(out, " — start one with `open {} --lane {}`", self.slug, status.lane_id);
             }
@@ -2189,6 +2204,12 @@ mod tests {
         assert_eq!(fresh.alloc_id(), "c-1");
         assert_eq!(fresh.alloc_id(), "c-2");
         assert_eq!(fresh.next, 3);
+        // A registry whose counter was never moved on (how law got two `c-1`
+        // lanes on 2026-11-17) skips the id it already holds instead of handing
+        // it out twice.
+        let mut stale = reg(vec![lane("c-1", "default")], "c-1", 0);
+        assert_eq!(stale.alloc_id(), "c-2");
+        assert_eq!(stale.next, 3);
     }
 
     #[test]
@@ -2527,7 +2548,10 @@ mod tests {
         // note appears.
         let gone = view(&registry, vec![with_session("w9:p9", "/elsewhere", "sess-9")], "w9:p9", true);
         let text = gone.list_text();
-        assert!(text.contains("lane c-1 (default) has no live coordinator; the pane it last ran in, w1:p1, is gone — start one with `open demo --lane c-1`"), "{text}");
+        assert!(
+            text.contains("lane c-1 (default) has no live coordinator; core lists no agent in the pane it last ran in, w1:p1 — start one with `open demo --lane c-1`"),
+            "{text}"
+        );
         assert_eq!(list_json(&gone)[0]["orphan"], serde_json::json!(true));
         // Never started: no recorded pane, and no claim that one was lost.
         let fresh = view(&reg(vec![lane("c-1", "default")], "c-1", 2), vec![], "", true);
