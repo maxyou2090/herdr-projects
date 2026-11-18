@@ -470,8 +470,8 @@ mod tests {
         let herdr = Core::new("hc", "", &fake);
         let title = "线程命名 tab 用 id";
         let tab = crate::labels::thread_tab_label("t-0047");
-        let created = herdr.workspace_create(home.path(), crate::labels::thread_space_label(title), &tab, false).unwrap();
-        assert_eq!(fake.spaces.borrow()[0].1, title, "the Space carries the thread's title, not its id");
+        let created = herdr.workspace_create(home.path(), &crate::labels::thread_space_label(title), &tab, false).unwrap();
+        assert_eq!(fake.spaces.borrow()[0].1, "线程命名tab用id", "the Space carries the thread's title, tightened, not its id");
         let address = &child.terminals.borrow()[0].address;
         assert_eq!(fake.renamed.borrow().last(), Some(&(FakeApp::tab_for(address), tab.clone())), "the app's tab carries the id too");
         let label = child.terminals.borrow()[0].labels.get(L_TAB_LABEL).cloned();

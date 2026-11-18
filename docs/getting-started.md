@@ -50,8 +50,8 @@ hp new billing --goal "monthly invoices" --repo ~/dev/app
 
 - `AGENTS.md` — read by any agent started in the folder: it is the coordinator,
   and it primes itself with `hp skill` and `hp context`
-- `PROJECT.md` — goal, repositories, profiles, how long a finished thread
-  waits before it is resolved, whether the ticker nudges
+- `PROJECT.md` — name, goal, repositories, profiles, how long a finished
+  thread waits before it is resolved, whether the ticker nudges
 - `TASKS.md` — the task list, written only through `hp task`
 - `MEMORY.md` and `memory/` — what the project keeps between threads
 

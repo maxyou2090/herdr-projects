@@ -217,7 +217,7 @@ fn place_and_brief(ctx: &Ctx, project: &Project, view: &SessionView, id: &str, r
                 &record.repo,
                 &branch,
                 &base,
-                crate::labels::thread_space_label(&record.title),
+                &crate::labels::thread_space_label(&record.title),
                 &crate::labels::thread_tab_label(&record.id),
             )?;
             let repo_workspace = repo_space(&view.herdr, &record.repo);
@@ -294,11 +294,12 @@ fn place_tab(project: &Project, view: &SessionView, record: &Thread) -> Result<T
     // folder. A checkout thread's folder is the repository's main checkout,
     // which other panes may work in too, so there only a Space carrying the
     // thread's title counts, exactly like the recorded one. The title is the
-    // Space's label (`labels::thread_space_label`); the tab inside is the id.
+    // Space's label (`labels::thread_space_label`, which tightens a Chinese
+    // title); the tab inside is the id.
     let title = crate::labels::thread_space_label(&record.title);
     let own_space = if matches!(record.kind, Kind::Tab | Kind::Checkout) {
         let listed = view.herdr.workspace_list().unwrap_or_default();
-        let named = |id: &str| listed.iter().any(|w| w.workspace_id == id && w.worktree.is_none() && w.label == title);
+        let named = |id: &str| listed.iter().any(|w| w.workspace_id == id && w.worktree.is_none() && crate::labels::thread_space_matches(&w.label, &record.title));
         thread::recorded_own_space(record, &listed).filter(|w| w.workspace_id != project_home).map(|w| w.workspace_id.clone()).or_else(|| {
             view.panes
                 .iter()
@@ -333,11 +334,19 @@ fn place_tab(project: &Project, view: &SessionView, record: &Thread) -> Result<T
         // opens one only when that is really gone. A checkout thread is
         // placed the same way, on the repo's main checkout.
         Kind::Tab | Kind::Checkout => match own_space {
-            Some(id) => view.herdr.tab_create(&id, &folder, &crate::labels::thread_tab_label(&record.id), false)?,
+            Some(id) => {
+                // A Space made before the Chinese-tightening rule still carries
+                // the title as written: reuse it and name it the current way,
+                // rather than open a second Space and leave the old one behind.
+                for note in view.herdr.name_space(&id, &title) {
+                    eprintln!("warning: {note}");
+                }
+                view.herdr.tab_create(&id, &folder, &crate::labels::thread_tab_label(&record.id), false)?
+            }
             None => {
                 // Its own Space, its tab named after the thread's id, in the core
                 // label and in the app alike: `workspace_create` writes both.
-                view.herdr.workspace_create(&folder, title, &crate::labels::thread_tab_label(&record.id), false)?
+                view.herdr.workspace_create(&folder, &title, &crate::labels::thread_tab_label(&record.id), false)?
             }
         },
         Kind::Worktree | Kind::Adopted => bail!("a {:?} thread is not placed in a tab", record.kind),
@@ -489,7 +498,7 @@ pub fn restart(ctx: &Ctx, slug: &str, id: &str, profile: Option<&str>) -> Result
             RestartPlan::Reopen => match record.kind {
                 Kind::Worktree => {
                     let (created, path, cwd) =
-                        view.herdr.worktree_open(&record.repo, &record.worktree_path, crate::labels::thread_space_label(&record.title), &crate::labels::thread_tab_label(&record.id))?;
+                        view.herdr.worktree_open(&record.repo, &record.worktree_path, &crate::labels::thread_space_label(&record.title), &crate::labels::thread_tab_label(&record.id))?;
                     let repo_workspace = repo_space(&view.herdr, &record.repo);
                     thread::update(&project, id, |t| {
                         if !repo_workspace.is_empty() {
@@ -1466,14 +1475,15 @@ mod tests {
         std::fs::create_dir_all(&folder).unwrap();
         let folder = std::fs::canonicalize(&folder).unwrap().to_string_lossy().into_owned();
         // Its own Space as a restart finds it: the recorded id, the thread's
-        // title as the label, and no pane inside.
+        // title as the label (as made before the Chinese-tightening rule), and
+        // no pane inside.
         world.core.terminal("hp-own", &folder, &[("hp_ws", "wthread"), ("hp_ws_label", title)]);
         let view = world.view();
         let placed = place_tab(&world.project, &view, &record).unwrap();
         assert_eq!(placed.workspace_id, "wthread", "the recorded Space is reused: no twin is made");
         let labels = world.labels_of(&placed.pane_id);
         assert_eq!(labels.get("hp_tab_label").map(String::as_str), Some(record.id.as_str()), "the tab is the thread's id");
-        assert_eq!(labels.get("hp_ws_label").map(String::as_str), Some(title), "the Space keeps the thread's title");
+        assert_eq!(labels.get("hp_ws_label").map(String::as_str), Some("线程命名tab用id"), "the reused Space is renamed the current way: no space beside Chinese");
         assert!(!world.spaces().iter().any(|w| w.workspace_id.starts_with("hpw-")), "no second Space");
     }
 

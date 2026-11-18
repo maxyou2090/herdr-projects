@@ -406,6 +406,7 @@ pub fn launch_prompt(slug: &str, id: &str) -> String {
 // ---------------------------------------------------------------- briefs
 
 pub struct BriefInput<'a> {
+    pub project_name: &'a str,
     pub slug: &'a str,
     pub goal: &'a str,
     pub repos: &'a [project::Repo],
@@ -427,7 +428,7 @@ pub struct BriefInput<'a> {
 /// the coordinator's or the ticker's settings.
 fn brief_header(input: &BriefInput) -> String {
     let mut out = String::from("# Project\n\n");
-    out.push_str(&format!("- Project: {}\n", input.slug));
+    out.push_str(&format!("- Project: {} (`{}`)\n", input.project_name, input.slug));
     out.push_str(&format!("- Goal: {}\n", if input.goal.trim().is_empty() { "(none set)" } else { input.goal.trim() }));
     if input.repos.is_empty() {
         out.push_str("- Repos: (none)\n");
@@ -496,6 +497,7 @@ pub fn compose_brief(input: &BriefInput) -> String {
 /// Reads the project's instructions and memory and composes the brief.
 pub fn brief_for(project: &Project, thread: &Thread, task: &str, restart: bool) -> Result<String> {
     let (settings, instructions) = project.read_project_md()?;
+    let project_name = project::display_name(&settings.name, &project.slug);
     let uploads = project.dir().join("uploads").to_string_lossy().into_owned();
     let prefix = crate::coordinator::current_prefix(&project.root).unwrap_or_default();
     let memory_index = std::fs::read_to_string(project.dir().join("MEMORY.md")).unwrap_or_default();
@@ -519,6 +521,7 @@ pub fn brief_for(project: &Project, thread: &Thread, task: &str, restart: bool) 
         })
         .collect();
     Ok(compose_brief(&BriefInput {
+        project_name: &project_name,
         slug: &project.slug,
         goal: &settings.goal,
         repos: &settings.repos,
@@ -698,16 +701,15 @@ pub fn own_space_id(record: &Thread) -> &str {
 
 /// The Space a tab thread recorded as its own, when the recorded id still
 /// names it. Herdr reuses workspace ids after a server restart, so the id
-/// alone proves nothing: the Space must be plain, carry the thread's title
-/// (its label at creation), and not be a project home (which ends with
-/// [`crate::grouping::HOME_MARK`]).
+/// alone proves nothing: the Space must be plain and carry the thread's title
+/// (its label at creation, [`crate::labels::thread_space_label`]).
 pub fn recorded_own_space<'w>(record: &Thread, workspaces: &'w [Workspace]) -> Option<&'w Workspace> {
     let remembered = own_space_id(record);
     if remembered.is_empty() || record.title.is_empty() {
         return None;
     }
     let space = workspaces.iter().find(|w| w.workspace_id == remembered)?;
-    (space.worktree.is_none() && space.label == record.title).then_some(space)
+    (space.worktree.is_none() && crate::labels::thread_space_matches(&space.label, &record.title)).then_some(space)
 }
 
 /// A pane is the thread's pane only when workspace, tab and working directory
@@ -1236,6 +1238,7 @@ mod tests {
         ];
         let repos = vec![project::Repo { path: "/srv/app".into() }, project::Repo { path: "/home/me/lib".into() }];
         let input = BriefInput {
+            project_name: "Demo",
             slug: "demo",
             goal: "Ship it",
             repos: &repos,
@@ -1252,7 +1255,7 @@ mod tests {
         let brief = compose_brief(&input);
         let pos = |needle: &str| brief.find(needle).unwrap_or_else(|| panic!("missing {needle}"));
         // The header comes first: name, goal, repos, uploads, library, report.
-        assert!(brief.starts_with("# Project\n\n- Project: demo\n- Goal: Ship it\n"));
+        assert!(brief.starts_with("# Project\n\n- Project: Demo (`demo`)\n- Goal: Ship it\n"));
         assert!(pos("- Repos:\n  - /srv/app\n  - /home/me/lib\n") < pos("- Uploads"));
         assert!(pos("Uploads, files from the user: `/root/demo/uploads`") < pos("# Thread brief"));
         assert!(pos("# Thread brief") < pos("previous attempt"));

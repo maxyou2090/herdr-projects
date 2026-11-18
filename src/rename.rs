@@ -1,6 +1,5 @@
-//! `rename <slug> <new-slug> [--dry-run]`: gives a project a new slug. The slug
-//! is the only name a project has, so the home Space, the coordinator's row and
-//! the briefs all follow it.
+//! `rename <slug> <new-slug> [--name NAME] [--dry-run]`: gives a project a
+//! new slug, and with `--name` a new display name.
 //!
 //! Refused while a thread is not resolved: its pane, agent name and brief
 //! carry the slug and the path. While agents run in the project folder (the
@@ -29,6 +28,7 @@ use crate::thread::{self, Status};
 pub struct Args<'a> {
     pub from: &'a str,
     pub to: &'a str,
+    pub name: Option<&'a str>,
     pub dry_run: bool,
     /// The ticker runs it once the agents are closed: live agents are an
     /// error to retry, never a reason to schedule.
@@ -58,6 +58,8 @@ pub const IDLE_WAIT: Duration = Duration::from_secs(5 * 60);
 pub struct Pending {
     pub from: String,
     pub to: String,
+    #[serde(default)]
+    pub name: Option<String>,
     pub requested: String,
     /// A coordinator ran: open one in the new folder afterwards.
     #[serde(default)]
@@ -185,7 +187,7 @@ pub fn run(ctx: &Ctx, args: &Args) -> Result<Outcome> {
     validate_slug(from)?;
     validate_slug(to)?;
     if from == to {
-        bail!("`{from}` already has that slug");
+        bail!("`{from}` already has that slug; `set {from} name <name>` changes only the display name");
     }
     let old_dir = ctx.root.join(from);
     let new_dir = ctx.root.join(to);
@@ -202,6 +204,11 @@ pub fn run(ctx: &Ctx, args: &Args) -> Result<Outcome> {
             }
         }
     }
+    let (settings, _) = project.read_project_md()?;
+    let edited_md = match args.name {
+        Some(name) => Some(crate::settings::set_in(&std::fs::read_to_string(project.project_md())?, "name", name)?),
+        None => None,
+    };
 
     let open: Vec<String> = thread::list(&project).into_iter().filter(|t| t.status != Status::Resolved).map(|t| t.id).collect();
     if !open.is_empty() {
@@ -225,9 +232,9 @@ pub fn run(ctx: &Ctx, args: &Args) -> Result<Outcome> {
     }
 
     let old_paths = vec![canonical_old.clone(), old_dir.clone()];
-    // The home Space is labelled with the slug: a rename always relabels it.
-    let old_label = from.to_string();
-    let new_label = to.to_string();
+    let old_label = project::home_label(&settings.name, from);
+    let new_name = args.name.map(str::to_string).unwrap_or(settings.name.clone());
+    let new_label = project::home_label(&new_name, to);
     let config_path = ctx.config_dir.join("config.toml");
     let config_text = std::fs::read_to_string(&config_path).ok();
     let (old_key, new_key) = (canonical_old.to_string_lossy().into_owned(), canonical_new.to_string_lossy().into_owned());
@@ -250,6 +257,9 @@ pub fn run(ctx: &Ctx, args: &Args) -> Result<Outcome> {
         step(&mut out, format!("move {} to {}", old_dir.display(), new_dir.display()));
     }
     step(&mut out, format!("record `{from}` as a former slug (sweep keeps finding hp/{from}/ branches)"));
+    if let Some(name) = args.name {
+        step(&mut out, format!("set the display name to `{name}`"));
+    }
     step(&mut out, "rewrite AGENTS.md (CLAUDE.md links to it)".into());
     let threads = thread::list(&project);
     let rewritten = threads.iter().filter(|t| [&t.cwd, &t.worktree_path, &t.thread_dir].iter().any(|p| moved(p, &old_paths, &canonical_new).is_some())).count();
@@ -299,7 +309,7 @@ pub fn run(ctx: &Ctx, args: &Args) -> Result<Outcome> {
         return Ok(out);
     }
     if !live.is_empty() {
-        let pending = Pending { from: from.into(), to: to.into(), requested: project::now(), reopen, notify: None };
+        let pending = Pending { from: from.into(), to: to.into(), name: args.name.map(str::to_string), requested: project::now(), reopen, notify: None };
         let path = pending_path(&ctx.root, from);
         std::fs::create_dir_all(path.parent().unwrap_or(&ctx.root))?;
         project::write_json(&path, &pending)?;
@@ -324,6 +334,10 @@ pub fn run(ctx: &Ctx, args: &Args) -> Result<Outcome> {
     project.add_former_slug(from).with_context(|| finish.clone())?;
 
     // 2. Inside the folder.
+    if let Some(text) = &edited_md {
+        let _lock = project.lock()?;
+        write_atomic(&project.project_md(), text.as_bytes()).with_context(|| finish.clone())?;
+    }
     project::write_priming(&project, &crate::coordinator::current_prefix(&ctx.root)?, "rename").with_context(|| finish.clone())?;
     for t in threads.iter() {
         thread::update(&project, &t.id, |t| {
@@ -359,16 +373,21 @@ pub fn run(ctx: &Ctx, args: &Args) -> Result<Outcome> {
     // 4. Herdr: the home Space's label (best effort; `open` also fixes it).
     if old_label != new_label && !record.workspace_id.is_empty() {
         let herdr = crate::core::Core::new(ctx.env.hc_bin(), &record.socket, ctx.runner);
-        if !record.socket.is_empty() && crate::core::session_alive(&ctx.env.hc_bin(), &record.socket, ctx.runner)
-            && let Err(error) = herdr.workspace_rename(&record.workspace_id, &new_label)
-            // Closed with the coordinator's pane: `open` makes a new one.
-            && error.code != "workspace_not_found"
-        {
-            out.left.push(format!("the home Space {} keeps its old label ({error}); `open {to}` renames it", record.workspace_id));
+        if !record.socket.is_empty() && crate::core::session_alive(&ctx.env.hc_bin(), &record.socket, ctx.runner) {
+            // A Space closed with the coordinator's pane is not an error: `open`
+            // makes a new one, and the ticker's `sync_home_label` names it.
+            if herdr.workspace_label(&record.workspace_id).is_ok() {
+                // The app's own name too: a Space the window draws is renamed by
+                // the app (`Core::name_space`), not by hp's label alone.
+                for note in herdr.name_space(&record.workspace_id, &new_label) {
+                    out.left.push(format!("{note}; `open {to}` names it again"));
+                }
+            }
         }
     }
     Ok(out)
 }
+
 
 /// The ticker's part: for each rename in `<root>/.renames/`, waits while an
 /// agent in the folder is working (at most `IDLE_WAIT`), closes their panes,
@@ -458,7 +477,7 @@ fn advance(ctx: &Ctx, pending: &Pending) -> Result<Option<Next>> {
             return Ok(None);
         }
     }
-    let args = Args { from, to, dry_run: false, by_ticker: true };
+    let args = Args { from, to, name: pending.name.as_deref(), dry_run: false, by_ticker: true };
     let outcome = run(ctx, &args)?;
     let project = Project::load(&ctx.root, to)?;
     let mut summary = format!("this project was renamed from `{from}` to `{to}`; its folder is now {}", project.canonical_dir().display());
@@ -540,14 +559,14 @@ mod tests {
     use super::*;
 
     #[test]
-    fn a_rename_relabels_the_home_space_with_the_new_slug() {
+    fn a_rename_relabels_the_home_space_with_the_display_name() {
         let home = tempfile::tempdir().unwrap();
         let root = home.path().join("root");
-        let project = crate::project::create(&root, "Demo", "", vec![]).unwrap();
+        let project = crate::project::create(&root, "Rexa", "", vec![]).unwrap();
         let dir = project.canonical_dir().to_string_lossy().into_owned();
-        // The home Space, as `open` left it: the old slug as the label.
+        // The home Space, as `open` left it: the old display name as the label.
         let core = crate::fake_hc::FakeCore::new();
-        core.terminal("hpc-demo", &dir, &[("hp_ws", "whome"), ("hp_ws_label", "demo")]);
+        core.terminal("hpc-rexa", &dir, &[("hp_ws", "whome"), ("hp_ws_label", "Rexa")]);
         project
             .update_coordinator(|c| {
                 c.socket = "fake-session".into();
@@ -557,12 +576,12 @@ mod tests {
             .unwrap();
         let env = crate::paths::Env::for_test(home.path(), &[]);
         let ctx = Ctx { env: &env, root: root.clone(), config_dir: home.path().join("cfg"), runner: &core, detached_ticker: false };
-        let outcome = run(&ctx, &Args { from: "demo", to: "renamed", dry_run: false, by_ticker: false }).unwrap();
+        let outcome = run(&ctx, &Args { from: "rexa", to: "rex-two", name: Some("Rex Two"), dry_run: false, by_ticker: false }).unwrap();
         assert!(!outcome.scheduled, "no agent runs in the folder: it is not handed to the ticker");
-        assert!(outcome.steps.iter().any(|s| s.contains("rename the home Space whome to `renamed`")), "{:?}", outcome.steps);
-        let label = core.terminals.borrow().iter().find(|t| t.name == "hpc-demo").and_then(|t| t.labels.get("hp_ws_label").cloned());
-        assert_eq!(label.as_deref(), Some("renamed"), "the home Space is labelled with the new slug");
-        assert!(root.join("renamed/PROJECT.md").is_file());
-        assert!(!root.join("demo").exists());
+        let label = core.terminals.borrow().iter().find(|t| t.name == "hpc-rexa").and_then(|t| t.labels.get("hp_ws_label").cloned());
+        assert_eq!(label.as_deref(), Some("Rex Two"), "the home Space is labelled with the new display name, not the new slug");
+        let renamed = crate::project::Project::load(&root, "rex-two").unwrap();
+        assert_eq!(renamed.display_name(), "Rex Two", "and PROJECT.md says the same");
+        assert!(!root.join("rexa").exists(), "the folder moved");
     }
 }

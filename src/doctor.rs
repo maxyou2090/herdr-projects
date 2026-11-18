@@ -510,9 +510,9 @@ fn coordinator_name_notes(
     view: &serde_json::Value,
     record: Option<&project::Coordinator>,
 ) -> Vec<String> {
-    // What a coordinator's Space and tab must be called: the project's slug
-    // (t-0050) and one word (t-0051). Only where those go is checked here.
-    let label = project.slug.clone();
+    // What a coordinator's Space and tab must be called: the project's display
+    // name and one word (t-0051). Only where those go is checked here.
+    let label = project.display_name();
     let tab_label = crate::labels::coordinator_tab_label();
     let mut panes: Vec<String> = record.map(|record| record.pane_id.clone()).into_iter().filter(|pane| !pane.is_empty()).collect();
     if let Some(registry) = crate::lanes::Registry::load(project) {
