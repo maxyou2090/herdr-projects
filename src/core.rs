@@ -271,10 +271,15 @@ struct Term {
     state: String,
     #[serde(default)]
     reported: bool,
-    /// Why core ended the program (`killed`, `exited`, `signal`); empty while
+    /// Why core ended the program (`killed`, `exited`, `signal`); **null** while
     /// it runs. Present on a finished terminal, which `ls` hides.
+    ///
+    /// `Option`, not `String` with a default: core writes an explicit `null`
+    /// here, and a `String` field refuses that — which made every `hc get` in
+    /// `agent list` fail, and an empty agent list look like "no coordinator
+    /// anywhere" (caught against the real core, not the fake).
     #[serde(default)]
-    reason: String,
+    reason: Option<String>,
     #[serde(default)]
     pid: Option<u32>,
     #[serde(default)]
@@ -343,9 +348,9 @@ struct TermStatus {
     state: String,
     /// The program that reported the status (`pi`, `claude`, …): core's own
     /// word for what runs there, which is what `hp_kind` must say when that
-    /// label went missing.
+    /// label went missing. `Option` because core can answer `null`.
     #[serde(default)]
-    app: String,
+    app: Option<String>,
 }
 
 impl Term {
@@ -808,11 +813,11 @@ impl<'a> Core<'a> {
             pane_id: term.pane_id(),
             address: term.address.clone(),
             state: term.state.clone(),
-            reason: term.reason.clone(),
+            reason: term.reason.clone().unwrap_or_default(),
             pid: term.pid,
             exit_code: term.exit_code,
             reported: term.reported,
-            status_app: if term.reported { status.app } else { String::new() },
+            status_app: if term.reported { status.app.unwrap_or_default() } else { String::new() },
             labels: term.labels.clone(),
         })
     }

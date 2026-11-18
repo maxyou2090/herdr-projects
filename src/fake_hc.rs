@@ -69,11 +69,14 @@ fn full(term: &Terminal) -> serde_json::Value {
         "cwd": term.cwd,
         "last_cwd": term.cwd,
         "state": term.state,
-        "status": term.status.as_ref().map(|state| serde_json::json!({"state": state})),
+        "status": term.status.as_ref().map(|state| serde_json::json!({"app": "pi", "state": state})),
         "turn": term.turn,
         "reported": term.status.is_some(),
         "argv": term.argv,
-        "reason": term.reason,
+        // The real core writes an explicit `null` here while the terminal runs:
+        // a fake that answers `""` would let a `String` field pass a test the
+        // real reply fails.
+        "reason": (!term.reason.is_empty()).then(|| term.reason.clone()),
         "pid": term.pid,
         "exit_code": term.exit_code,
     })

@@ -1222,8 +1222,22 @@ fn row(t: &Thread, root: &Path, view: Option<&SessionView>, now: jiff::Timestamp
     // Before the first poll a thread that is waiting for its launch is Working.
     let recorded = Group::from_token(&t.last_group).unwrap_or(if t.prompt_pending { Group::Working } else { Group::Idle });
     if t.status == Status::Resolved {
+        // `stray_agent` is what the resolve saw at that moment, kept on the
+        // record. It goes stale: an agent that outlived its cleanup is often
+        // ended a minute later, and the note then says "is still in pane X"
+        // about a pane `hc ls` no longer has (t-0052). Ask the live lists which
+        // it is, and say the agent exited rather than repeat a claim nobody can
+        // act on. A session that cannot be reached leaves the record's word
+        // alone: guessing "gone" would be the same mistake in reverse.
+        let exited = !t.stray_agent.is_empty()
+            && view.is_some_and(|view| {
+                let live = thread::live_state(t, &view.agents, &view.panes, now);
+                live.agent_state.is_none() && !live.pane_exists
+            });
         let note = if t.stray_agent.is_empty() {
             t.resolved_reason.clone()
+        } else if exited {
+            format!("{}; the agent the resolve left behind has since exited", t.resolved_reason)
         } else {
             format!("{}; {}", t.resolved_reason, t.stray_agent)
         };
@@ -1458,6 +1472,36 @@ mod tests {
         fn spaces(&self) -> Vec<crate::core::Workspace> {
             Core::new("hc", "", &self.core).workspace_list().unwrap()
         }
+    }
+
+    /// t-0052: resolved with a stray agent on its record, and by the time anyone
+    /// read the row the pane was gone from `hc ls` too. `thread audit` said
+    /// `nothing unusual`; the row still said the agent "is still in pane X".
+    #[test]
+    fn a_resolved_rows_stray_agent_note_stops_claiming_it_is_still_running() {
+        let world = FakeProject::new();
+        let dir = world.project.canonical_dir().to_string_lossy().into_owned();
+        let stale = thread::allocate(&world.project, |t| {
+            t.kind = Kind::Tab;
+            t.status = Status::Resolved;
+            t.title = "resolved and gone".into();
+            t.resolved_reason = "manual".into();
+            t.pane_id = "hp-space-b13f3d".into();
+            t.cwd = dir.clone();
+            t.agent_name = "hp-herdr-projects-t-0052".into();
+            t.stray_agent = "agent hp-herdr-projects-t-0052 is still in pane hp-space-b13f3d (done)".into();
+        })
+        .unwrap();
+        let note = |world: &FakeProject| {
+            let view = world.view();
+            rows_with_view(&world.project, Some(&view)).into_iter().find(|row| row.thread.id == stale.id).map(|row| row.note).unwrap()
+        };
+        assert_eq!(note(&world), "manual; the agent the resolve left behind has since exited");
+
+        // While the agent and its pane really are there, the resolve's own line
+        // is still the truth and is printed unchanged.
+        world.core.terminal("hp-space-b13f3d", &dir, &[("hp_agent", "hp-herdr-projects-t-0052")]);
+        assert_eq!(note(&world), "manual; agent hp-herdr-projects-t-0052 is still in pane hp-space-b13f3d (done)");
     }
 
     #[test]
