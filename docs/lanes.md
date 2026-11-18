@@ -601,6 +601,27 @@ What the check deliberately does **not** do:
   it only stops the silent second start, and `lane adopt` remains how a lost
   coordinator is brought back.
 
+**`open` also sees the coordinator core's agent list cannot.** Every check above
+starts from `core::agent_list()`, which lists only terminals that carry
+`hp_agent` — so a live coordinator whose `hp_agent`/`hp_kind` labels went missing
+is invisible to all of them (t-0053 found this shape on rexa and law, t-0054
+closed the hole in `open`). Before it starts anything, `open` asks core about
+the pane the lane's **own record** names: while that terminal is alive, its
+program reports a status, its name is not a thread's, and its `hp_project`/
+`hp_lane` labels do not deny this project and this lane, it *is* the lane's
+coordinator — the record naming it is what makes that a fact, not a guess.
+`open` then focuses it, writes `hp_agent` (the record's `agent_name`, else
+`hpc-<slug>`) and `hp_kind` (the record's `agent`, else core's `status.app`)
+back, and returns. This is the ticker's [`coordinator::repair`] applied on the
+spot instead of on the next tick.
+
+What it deliberately does not do: adopt a pane the record does not name (a
+stray unlabeled pane is left alone, and a pane carrying `hp_agent` with no lane
+still hits the refusal above), take a pane whose labels name another project or
+the wrong lane (the record is then reported as lost, never rewritten), or
+override `--new` (which always starts a second coordinator). An explicit
+`--profile` other than the record's also still starts one beside it.
+
 ### 6.2 `hp lane adopt <name> [--project <slug>]`
 
 For the case where the user opened a tab and started an agent by hand. Adopt

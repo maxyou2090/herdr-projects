@@ -1033,6 +1033,55 @@ pub fn open(ctx: &Ctx, slug: &str, options: &OpenOptions) -> Result<()> {
         return Ok(());
     }
 
+    // Both checks above read `core::agent_list()`, which lists only terminals
+    // that carry `hp_agent`. A coordinator whose `hp_agent`/`hp_kind` labels
+    // went missing is therefore invisible to them, and `open` used to type a
+    // second launch into the live coordinator's own input box (or make a second
+    // pane when its shell had drifted out of the folder) — the accident §1.6
+    // records, one layer deeper (t-0054).
+    //
+    // The record's own pane is the evidence the agent list cannot give: it is
+    // alive, its program reports a status, and its labels do not deny this
+    // project and this lane ([`fate`] -> [`live_without_labels`]). That is not a
+    // guess — the record names that very pane — so focus it and write the two
+    // labels back, the same repair the ticker makes every tick. A pane that is
+    // not the recorded one is never adopted here, and `--new` still starts a
+    // second coordinator unconditionally.
+    if !options.new
+        && let Some(record) = previous.as_ref().filter(|r| options.profile.is_none() || recorded_profile(r) == profile.name)
+        && let Fate::Unlabeled { name, kind } = fate(&herdr, &project, record, &agents, &target_lane.id)
+    {
+        let mut pairs: Vec<(String, String)> = vec![(crate::core::L_AGENT.to_string(), name.clone())];
+        if !kind.is_empty() {
+            pairs.push((crate::core::L_KIND.to_string(), kind.clone()));
+        }
+        herdr
+            .set_labels(&record.pane_id, &pairs)
+            .with_context(|| format!("could not write the agent labels of pane {}", record.pane_id))?;
+        let (space, tab) = keep_names(&herdr, &project, &record.pane_id);
+        let _ = herdr.agent_focus(&record.pane_id);
+        let session_name = session.name.clone().unwrap_or_default();
+        let record = project.update_coordinator(|c| {
+            c.socket = socket.clone();
+            c.session = session_name;
+            c.workspace_id = if space.is_empty() { c.workspace_id.clone() } else { space };
+            c.tab_id = if tab.is_empty() { c.tab_id.clone() } else { tab };
+            c.pane_id = record.pane_id.clone();
+            c.agent_name = name.clone();
+            c.cwd = cwd.clone();
+            c.agent = kind.clone();
+        })?;
+        crate::lanes::sync_instance(&project, &target_lane.id, &record.pane_id, &record.agent_session, &record.profile, &project::now())?;
+        report_tokens(&herdr, &project, &record.pane_id);
+        ticker::start(ctx)?;
+        println!(
+            "coordinator is running in pane {} (its `hp_agent`/`hp_kind` labels were missing and are written back)",
+            record.pane_id
+        );
+        println!("Commands: {prefix}");
+        return Ok(());
+    }
+
     // The last line of defence before a second coordinator. Everything above
     // asks "which lane is this pane?", and a pane none of the rules can name
     // is treated as nobody — which is how a running coordinator came to be
@@ -1599,6 +1648,39 @@ mod tests {
         (root, project)
     }
 
+    /// A context whose session is a fake core and whose ticker never spawns, so
+    /// `open` runs end to end without a real Herdr beside it.
+    fn open_ctx<'a>(home: &Path, root: &Path, core: &'a crate::fake_hc::FakeCore) -> Ctx<'a> {
+        let env: &'static crate::paths::Env = Box::leak(Box::new(crate::paths::Env::for_test(home, &[])));
+        Ctx { env, root: root.to_path_buf(), config_dir: home.join("cfg"), runner: core, detached_ticker: false }
+    }
+
+    /// A project whose default lane records `pane`, and whose coordinator record
+    /// points at the same pane: the shape every lane write leaves behind.
+    fn recorded_lane(project: &Project, pane: &str, agent_name: &str, agent: &str) {
+        crate::lanes::Registry {
+            lanes: vec![crate::lanes::Lane {
+                id: "c-1".into(),
+                name: "default".into(),
+                label: "Demo".into(),
+                pane_id: pane.into(),
+                ..Default::default()
+            }],
+            default: "c-1".into(),
+            next: 2,
+        }
+        .save(project)
+        .unwrap();
+        project
+            .update_coordinator(|c| {
+                c.pane_id = pane.into();
+                c.agent_name = agent_name.into();
+                c.agent = agent.into();
+                c.cwd = project.canonical_dir().to_string_lossy().into_owned();
+            })
+            .unwrap();
+    }
+
     /// A registry with two open lanes, each recording its own pane and native
     /// session — the shape `open --lane` will leave behind (§12 commit 4).
     fn two_lanes(project: &Project) -> crate::lanes::Registry {
@@ -1921,6 +2003,161 @@ mod tests {
         let record = project.coordinator().unwrap();
         let found = discover(&project, &record, &[], &refreshed, "2026-11-18T02:41:00Z");
         assert_eq!(found.len(), 1, "the coordinator is found on the next tick");
+    }
+
+    /// The blind spot left by the label repair: `open`'s two guards — "focus the
+    /// coordinator that is already running" and `unclaimed` — are both built on
+    /// `core::agent_list()`, which filters on `hp_agent`. A live coordinator
+    /// whose `hp_agent`/`hp_kind` are gone is then invisible to both, and `open`
+    /// started a second coordinator beside the first (t-0054).
+    ///
+    /// The record's own pane is the evidence: alive, reporting as an agent, and
+    /// its labels do not deny this project or this lane. `open` must focus and
+    /// relabel that pane instead.
+    #[test]
+    fn open_focuses_the_recorded_coordinator_whose_agent_labels_are_gone() {
+        let home = tempfile::tempdir().unwrap();
+        let root = home.path().join("root");
+        let project = crate::project::create(&root, "demo", "", vec![]).unwrap();
+        let dir = project.canonical_dir().to_string_lossy().into_owned();
+        let fake = crate::fake_hc::FakeCore::new();
+        // Alive, reporting as an agent, claiming project and lane — and carrying
+        // no `hp_agent`, the one label core's agent list filters on. Its shell
+        // has drifted out of the project folder, as it does in production.
+        let term = fake.terminal("", "/Users/someone", &[(crate::labels::PROJECT_TOKEN, "demo"), (crate::lanes::TOKEN, "c-1")]);
+        fake.set_status("", "done");
+        let pane = term.address.clone();
+        crate::lanes::Registry {
+            lanes: vec![crate::lanes::Lane {
+                id: "c-1".into(),
+                name: "default".into(),
+                label: "Demo".into(),
+                pane_id: pane.clone(),
+                ..Default::default()
+            }],
+            default: "c-1".into(),
+            next: 2,
+        }
+        .save(&project)
+        .unwrap();
+        project
+            .update_coordinator(|c| {
+                c.pane_id = pane.clone();
+                c.agent_name = "hpc-demo".into();
+                c.agent = "pi".into();
+                c.cwd = dir.clone();
+            })
+            .unwrap();
+        let ctx = open_ctx(home.path(), &root, &fake);
+
+        open(&ctx, "demo", &OpenOptions::default()).unwrap();
+
+        assert_eq!(
+            fake.terminals.borrow().len(),
+            1,
+            "open started a second coordinator beside the running one; calls: {:?}",
+            fake.calls.borrow()
+        );
+        assert_eq!(project.coordinator().unwrap().pane_id, pane, "the record stays on the pane that really runs");
+        let labels = fake.terminals.borrow()[0].labels.clone();
+        assert_eq!(
+            labels.get(crate::core::L_AGENT).map(String::as_str),
+            Some("hpc-demo"),
+            "the record's agent name is written back: {labels:?}"
+        );
+        assert_eq!(labels.get(crate::core::L_KIND).map(String::as_str), Some("pi"), "and the kind the record knows: {labels:?}");
+    }
+
+    /// `--new` is the explicit "I want a second one": a live coordinator whose
+    /// labels are gone does not veto it.
+    #[test]
+    fn new_still_starts_a_second_coordinator_beside_the_unlabeled_one() {
+        let home = tempfile::tempdir().unwrap();
+        let root = home.path().join("root");
+        let project = crate::project::create(&root, "demo", "", vec![]).unwrap();
+        let fake = crate::fake_hc::FakeCore::new();
+        let term = fake.terminal("", "/Users/someone", &[(crate::labels::PROJECT_TOKEN, "demo"), (crate::lanes::TOKEN, "c-1")]);
+        fake.set_status("", "done");
+        let pane = term.address.clone();
+        recorded_lane(&project, &pane, "hpc-demo", "pi");
+        let ctx = open_ctx(home.path(), &root, &fake);
+
+        open(&ctx, "demo", &OpenOptions { new: true, ..OpenOptions::default() }).unwrap();
+
+        assert_eq!(fake.terminals.borrow().len(), 2, "`--new` starts another even beside an invisible one: {:?}", fake.calls.borrow());
+        assert_ne!(project.coordinator().unwrap().pane_id, pane, "and the record follows the new coordinator");
+    }
+
+    /// The other side of the same judgement: a live unlabeled pane that the
+    /// record does **not** name is not this lane's coordinator, and `open` must
+    /// not write agent labels onto it. It starts its own coordinator instead.
+    #[test]
+    fn open_does_not_adopt_an_unlabeled_pane_the_record_does_not_name() {
+        let home = tempfile::tempdir().unwrap();
+        let root = home.path().join("root");
+        let project = crate::project::create(&root, "demo", "", vec![]).unwrap();
+        let fake = crate::fake_hc::FakeCore::new();
+        // The recorded terminal is finished: the record has nothing live to name.
+        fake.terminal("hp-demo-old", "/Users/someone", &[("hp_agent", "hpc-demo"), ("hp_kind", "pi")]);
+        fake.finish("hp-demo-old", "killed");
+        // A live terminal that claims the project and the lane but has no agent
+        // label, and is not the pane the record names.
+        let stray = fake.terminal("hp-demo-stray", "/Users/someone", &[(crate::labels::PROJECT_TOKEN, "demo"), (crate::lanes::TOKEN, "c-1")]);
+        fake.set_status("hp-demo-stray", "done");
+        recorded_lane(&project, "hp-demo-old", "hpc-demo", "pi");
+        let ctx = open_ctx(home.path(), &root, &fake);
+
+        open(&ctx, "demo", &OpenOptions::default()).unwrap();
+
+        let terms = fake.terminals.borrow().clone();
+        assert_eq!(terms.iter().filter(|t| t.state == "live").count(), 2, "the stray is left alone and a coordinator starts: {:?}", fake.calls.borrow());
+        let stray = terms.iter().find(|t| t.name == stray.name).expect("the stray terminal");
+        assert!(!stray.labels.contains_key(crate::core::L_AGENT), "no agent label is invented for a pane the record does not name: {:?}", stray.labels);
+        assert_ne!(project.coordinator().unwrap().pane_id, "hp-demo-stray");
+    }
+
+    /// A recorded pane whose own labels name another project is not this
+    /// project's coordinator, whatever the record says: nothing is guessed and
+    /// nothing is written onto it.
+    #[test]
+    fn open_does_not_take_a_recorded_pane_that_claims_another_project() {
+        let home = tempfile::tempdir().unwrap();
+        let root = home.path().join("root");
+        let project = crate::project::create(&root, "demo", "", vec![]).unwrap();
+        let fake = crate::fake_hc::FakeCore::new();
+        let term = fake.terminal("", "/Users/someone", &[(crate::labels::PROJECT_TOKEN, "other"), (crate::lanes::TOKEN, "c-1")]);
+        fake.set_status("", "done");
+        let pane = term.address.clone();
+        recorded_lane(&project, &pane, "hpc-demo", "pi");
+        let ctx = open_ctx(home.path(), &root, &fake);
+
+        open(&ctx, "demo", &OpenOptions::default()).unwrap();
+
+        assert_eq!(fake.terminals.borrow().len(), 2, "a pane that says it belongs elsewhere is not taken: {:?}", fake.calls.borrow());
+        let claimed = fake.terminals.borrow().iter().find(|t| t.address == pane).cloned().unwrap();
+        assert!(!claimed.labels.contains_key(crate::core::L_AGENT), "its labels are left as they were: {:?}", claimed.labels);
+        assert_eq!(claimed.labels[crate::labels::PROJECT_TOKEN], "other");
+    }
+
+    /// The guard this change must not weaken: a pane that *carries* `hp_agent`
+    /// and no lane claims still stops `open` with a refusal rather than a second
+    /// coordinator.
+    #[test]
+    fn open_still_refuses_a_pane_that_carries_hp_agent_and_claims_no_lane() {
+        let home = tempfile::tempdir().unwrap();
+        let root = home.path().join("root");
+        let project = crate::project::create(&root, "demo", "", vec![]).unwrap();
+        let fake = crate::fake_hc::FakeCore::new();
+        fake.terminal("hp-demo-1", "/Users/someone", &[("hp_agent", "hpc-demo"), ("hp_kind", "pi")]);
+        fake.set_status("hp-demo-1", "done");
+        recorded_lane(&project, "", "", "");
+        let ctx = open_ctx(home.path(), &root, &fake);
+
+        let error = open(&ctx, "demo", &OpenOptions::default()).unwrap_err().to_string();
+
+        assert!(error.contains("refusing to start a coordinator"), "{error}");
+        assert_eq!(fake.terminals.borrow().len(), 1, "nothing was started: {:?}", fake.calls.borrow());
+        assert!(!fake.terminals.borrow()[0].labels.contains_key(crate::lanes::TOKEN), "and no lane was invented for it");
     }
 
     /// A terminal whose agent exited keeps the labels but reports nothing, so
