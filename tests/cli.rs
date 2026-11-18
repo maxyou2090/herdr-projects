@@ -109,7 +109,7 @@ fn lane_list_prints_the_identity_line_and_creates_no_state() {
     let lines: Vec<&str> = text.lines().collect();
     assert_eq!(lines.len(), 2, "{lines:?}");
     assert_eq!(lines[0], "Coordinators: session unreachable (no pane checked) · default lane c-1");
-    assert_eq!(lines[1], "c-1\tdefault\topen\tdefault\tDemo\tlast_active=-\tpanes=-\tthreads=0\tinbox=0");
+    assert_eq!(lines[1], "c-1\tdefault\topen\tdefault\tdemo\tlast_active=-\tpanes=-\tthreads=0\tinbox=0");
 
     // --json answers the same facts.
     let out = hp(home.path(), &["--root", root_arg, "lane", "list", "demo", "--json"]);
@@ -117,7 +117,7 @@ fn lane_list_prints_the_identity_line_and_creates_no_state() {
     let value: serde_json::Value = serde_json::from_str(&String::from_utf8(out.stdout).unwrap()).unwrap();
     assert_eq!(value[0]["id"], "c-1");
     assert_eq!(value[0]["name"], "default");
-    assert_eq!(value[0]["label"], "Demo");
+    assert_eq!(value[0]["label"], "demo", "a lane's default label is the project's slug");
     assert_eq!(value[0]["status"], "open");
     assert_eq!(value[0]["default"], true);
     assert_eq!(value[0]["threads"], 0);

@@ -11,8 +11,7 @@ use crate::paths::Ctx;
 use crate::project::{self, Project, Settings};
 
 /// The keys `set` accepts, with what they hold.
-pub const KEYS: [(&str, &str); 8] = [
-    ("name", "text"),
+pub const KEYS: [(&str, &str); 7] = [
     ("goal", "text"),
     ("coordinator_profile", "profile name"),
     ("thread_profile", "profile name"),
@@ -74,10 +73,8 @@ pub fn set_in(text: &str, key: &str, value: &str) -> Result<String> {
     let mut doc = front.parse::<DocumentMut>().context("PROJECT.md front matter does not parse")?;
     let value = value.trim();
     match key {
-        "name" | "goal" => {
-            if key == "name" && value.is_empty() {
-                bail!("the name may not be empty");
-            }
+        "name" => bail!("`name` is gone: a project shows its slug, so `rename <slug> <new-slug>` is the only way to change it"),
+        "goal" => {
             doc[key] = toml_edit::value(value);
         }
         "coordinator_profile" | "thread_profile" | "coordinator_agent" | "thread_agent" => {
@@ -142,10 +139,6 @@ pub fn set(ctx: &Ctx, slug: &str, key: &str, value: &str) -> Result<()> {
     {
         let _lock = project.lock()?;
         project::write_atomic(&project.project_md(), edited.as_bytes())?;
-    }
-    if key == "name" {
-        // The priming file names the project.
-        let _ = project::write_priming(&project, &crate::coordinator::current_prefix(&ctx.root)?, "set");
     }
     println!("{slug}: {key} = {value}");
     Ok(())
@@ -236,6 +229,7 @@ mod tests {
         assert_eq!(project::parse_project_md(&set_in(MD, "auto_resolve_days", "0").unwrap()).unwrap().0.auto_resolve_days, 0, "0 = never");
         assert!(set_in(MD, "auto_resolve_days", "many").is_err());
         assert!(set_in(MD, "max_parallel_threads", "5").is_err(), "the setting is gone");
+        assert!(set_in(MD, "name", "Law Office").is_err(), "a display name is gone too");
         assert!(set_in(MD, "thread_profile", "not a name").is_err());
         // The old key is replaced by the new one, never duplicated.
         let old = set_in("+++\nthread_agent = \"claude\"\n+++\n", "thread_agent", "luna").unwrap();
@@ -250,7 +244,7 @@ mod tests {
     fn a_project_left_with_max_parallel_threads_still_reads_and_sets() {
         // The line is not a setting any more: it must not fail the parse…
         let (settings, body) = project::parse_project_md(MD).unwrap();
-        assert_eq!((settings.name.as_str(), settings.auto_resolve_days), ("Demo", 3));
+        assert_eq!((settings.auto_resolve_days, settings.goal.as_str()), (3, ""));
         assert_eq!(body, "# Instructions\nBody with +++ inside\n");
         // …nor `hp set`, which leaves the dead line where it is.
         let goal = set_in(MD, "goal", "Ship it").unwrap();

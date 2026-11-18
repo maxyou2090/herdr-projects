@@ -644,7 +644,8 @@ pub fn open(ctx: &Ctx, slug: &str, options: &OpenOptions) -> Result<()> {
             report_tokens(&herdr, &project, &lane.pane_id);
         }
     }
-    let label = crate::project::home_label(&settings.name, slug);
+    // The home Space carries the slug: a project has no other name.
+    let label = slug.to_string();
     // Canonical, because herdr reports a pane's physical working directory and
     // the identity check compares against it.
     let dir = project.canonical_dir();
@@ -1106,7 +1107,6 @@ fn digest_for(ctx: &Ctx, project: &Project, prefix: &str) -> Result<(String, Vec
 
     match project.read_project_md() {
         Ok((settings, _)) => {
-            let _ = writeln!(out, "Name: {}", settings.name);
             let _ = writeln!(out, "Goal: {}", if settings.goal.is_empty() { "(none set)" } else { &settings.goal });
             let _ = writeln!(
                 out,
