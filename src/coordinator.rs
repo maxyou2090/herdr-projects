@@ -150,6 +150,29 @@ fn pane_in_project(record: &Coordinator, pane: &Pane) -> bool {
     }
 }
 
+/// True when `pane` is a coordinator's of this project: it carries a lane token,
+/// or its `hp_agent` name is one [`crate::names::coordinator`] gives this slug
+/// (`hpc-<slug>[-N]`). A pane with neither of those labels is left to its folder
+/// (an older pane, a shell the window made, a terminal another tool started),
+/// and a thread's pane — its name is `hp-<slug>-t-<n>` and it never carries
+/// `hp_lane` — is never a coordinator's.
+///
+/// Only the fallback of [`project_workspace`] asks this. The recorded Space
+/// itself is open when any pane of the project is in it, thread or not, because
+/// that is what "the project's Space is open" means.
+fn pane_is_coordinator(record: &Coordinator, pane: &Pane) -> bool {
+    let Some(slug) = recorded_slug(record) else {
+        return false;
+    };
+    if pane.tokens.get(crate::lanes::TOKEN).is_some_and(|lane| !lane.is_empty()) {
+        return true;
+    }
+    match pane.tokens.get(crate::core::L_AGENT).map(String::as_str) {
+        Some(name) if !name.is_empty() => crate::names::is_coordinator_name(slug, name),
+        _ => true,
+    }
+}
+
 /// The project's workspace is open when a listed pane of it belongs to the
 /// project (`pane_in_project`: its label, or its folder with no label).
 /// Workspace ids repeat after a server restart, so the pane is what proves the
@@ -159,29 +182,40 @@ pub fn workspace_open(record: &Coordinator, panes: &[Pane]) -> bool {
 }
 
 /// The workspace thread tabs go to: the recorded one while open, else any
-/// workspace with a pane belonging to the project (where earlier thread tabs
-/// run, so the threads stay together). A coordinator `open` started in some
-/// other workspace's pane leaves the record pointing there. The recorded
-/// one also counts, last, while its pane still runs the recorded coordinator
-/// session: the id is then no recycled one, only the pane's directory left
-/// the project folder (a deleted folder strands its shell at the home
-/// directory), and a second home workspace would split the project across
-/// two same-named spaces.
+/// workspace with a **coordinator** of the project in it (a coordinator `open`
+/// started in another Space's pane leaves the record pointing there). A thread's
+/// pane never names the home: its Space is its own, and with the project's Space
+/// closed a thread tab left in another Space would otherwise become the home
+/// again (the rexa shape: t-0584 in Law Office). A pane with no name label is
+/// left to the folder, as before. The recorded one also counts, last, while its
+/// pane still runs the recorded coordinator session: the id is then no recycled
+/// one, only the pane's directory left the project folder (a deleted folder
+/// strands its shell at the home directory), and a second home workspace would
+/// split the project across two same-named spaces.
 pub fn project_workspace(record: &Coordinator, panes: &[Pane], agents: &[Agent]) -> Option<String> {
     if workspace_open(record, panes) {
         return Some(record.workspace_id.clone());
     }
-    if let Some(found) = panes.iter().find(|p| pane_in_project(record, p)).map(|p| p.workspace_id.clone()) {
+    if let Some(found) = panes.iter().find(|p| pane_in_project(record, p) && pane_is_coordinator(record, p)).map(|p| p.workspace_id.clone()) {
         return Some(found);
     }
     (!record.workspace_id.is_empty() && agents.iter().any(|a| session_matches(record, a))).then(|| record.workspace_id.clone())
 }
 
 /// The record `open` would write for the most recently active agent working
-/// in the project folder. `None` when no agent in `agents` works there.
+/// in the project folder — or, for an agent that carries no label, working
+/// anywhere. `None` when no agent in `agents` is this project's.
+///
+/// A pane that says another project is that project's, whatever its folder, the
+/// same rule [`pane_in_project`] follows: another coordinator can drift into
+/// this folder (law's sat in rexa's), and this function's answer is written to
+/// `coordinator.json` by the ticker.
 pub fn found(project: &Project, socket: &str, session: &str, agents: &[Agent]) -> Option<Coordinator> {
     let cwd = project.canonical_dir().to_string_lossy().into_owned();
-    let agent = agents.iter().filter(|a| a.works_in(&cwd)).max_by_key(|a| a.state_change_seq)?;
+    let agent = agents
+        .iter()
+        .filter(|a| a.works_in(&cwd) && crate::lanes::ours(a, &project.slug))
+        .max_by_key(|a| a.state_change_seq)?;
     Some(Coordinator {
         socket: socket.to_string(),
         session: session.to_string(),
@@ -1916,15 +1950,83 @@ mod tests {
         assert_eq!(project_workspace(&recorded, &[], &[reused]), None);
     }
 
-    fn labelled_pane(pane: &str, space: &str, cwd: &str, owner: &str) -> Pane {
+    fn pane_with(pane: &str, space: &str, cwd: &str, labels: &[(&str, &str)]) -> Pane {
         Pane {
             pane_id: pane.into(),
             workspace_id: space.into(),
             cwd: cwd.into(),
             foreground_cwd: cwd.into(),
-            tokens: [(crate::labels::PROJECT_TOKEN.to_string(), owner.to_string())].into_iter().collect(),
+            tokens: labels.iter().map(|(key, value)| (key.to_string(), value.to_string())).collect(),
             ..Pane::default()
         }
+    }
+
+    fn labelled_pane(pane: &str, space: &str, cwd: &str, owner: &str) -> Pane {
+        pane_with(pane, space, cwd, &[(crate::labels::PROJECT_TOKEN, owner)])
+    }
+
+    /// The fallback that finds the project's Space when the recorded one is
+    /// gone must take a **coordinator's** Space, not a thread's: with REXA closed
+    /// and t-0584 still sitting in Law Office, rexa's own thread tab would
+    /// otherwise make Law Office rexa's home again, and a worktree thread's
+    /// Space is no home either.
+    #[test]
+    fn the_fallback_workspace_is_a_coordinators_space_not_a_threads() {
+        let record = Coordinator { cwd: "/r/rexa".into(), workspace_id: "sp-rexa".into(), ..Coordinator::default() };
+        // rexa's t-0584, as it really is: the project's label, a thread's name.
+        let thread = pane_with("hp-t-0584-50b7cd", "sp-law", "/r/rexa/threads/t-0584", &[("hp_project", "rexa"), ("hp_agent", "hp-rexa-t-0584")]);
+        assert_eq!(
+            project_workspace(&record, std::slice::from_ref(&thread), &[]),
+            None,
+            "a thread tab is not the project's home, however it is labelled"
+        );
+        // A worktree thread's own Space is a thread's too.
+        let worktree = pane_with(
+            "hp-first-seen-means-recently-upd",
+            "sp-thread",
+            "/wt/rexa-t-0585",
+            &[("hp_project", "rexa"), ("hp_agent", "hp-rexa-t-0585")],
+        );
+        assert_eq!(project_workspace(&record, &[thread.clone(), worktree], &[]), None);
+        // What the layer is for: a coordinator `open` started in another Space's
+        // pane. Its name is the project's coordinator name.
+        let coordinator = pane_with("hpc-rexa", "sp-elsewhere", "/home/me", &[("hp_project", "rexa"), ("hp_agent", "hpc-rexa")]);
+        assert_eq!(
+            project_workspace(&record, &[thread, coordinator], &[]).as_deref(),
+            Some("sp-elsewhere"),
+            "a coordinator in another Space still names the project's workspace"
+        );
+        // A lane token says "a coordinator" whatever the name is.
+        let laned = pane_with("w9:p9", "sp-lane", "/home/me", &[("hp_project", "rexa"), ("hp_lane", "c-1")]);
+        assert_eq!(project_workspace(&record, std::slice::from_ref(&laned), &[]).as_deref(), Some("sp-lane"));
+    }
+
+    /// `found` writes a coordinator from "who works in this folder", the same
+    /// folder-only judgement `pane_in_project` had: another project's
+    /// coordinator that drifted in would be recorded as this project's, and on a
+    /// project without lanes nudged as one. The folder fallback stays for an
+    /// agent that carries no label.
+    #[test]
+    fn found_leaves_an_agent_labelled_for_another_project_alone() {
+        let (_root, project) = project();
+        let cwd = project.canonical_dir().to_string_lossy().into_owned();
+        let theirs = Agent {
+            tokens: [(crate::labels::PROJECT_TOKEN.to_string(), "other".to_string())].into_iter().collect(),
+            ..agent("w2:p1", &cwd, "idle", 9)
+        };
+        assert!(
+            found(&project, "sock", "s", std::slice::from_ref(&theirs)).is_none(),
+            "another project's pane is not this project's coordinator, whatever its folder"
+        );
+        // No label at all: still found by its folder, as for panes.
+        let unlabelled = agent("w1:p1", &cwd, "idle", 1);
+        assert_eq!(found(&project, "sock", "s", std::slice::from_ref(&unlabelled)).map(|c| c.pane_id), Some("w1:p1".into()));
+        // One that names this project is found too, and still by activity.
+        let mine = Agent {
+            tokens: [(crate::labels::PROJECT_TOKEN.to_string(), "demo".to_string())].into_iter().collect(),
+            ..agent("w3:p1", &cwd, "idle", 2)
+        };
+        assert_eq!(found(&project, "sock", "s", &[theirs, mine]).map(|c| c.pane_id), Some("w3:p1".into()));
     }
 
     /// The label decides, but a pane without one still says where it is by its
