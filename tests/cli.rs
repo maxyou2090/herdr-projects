@@ -288,6 +288,59 @@ fn overview_lists_the_projects_in_use_and_all_lists_every_one() {
     assert!(text.contains("beta\n"), "--all lists every project: {text}");
 }
 
+/// `list --json` answers the same numbers as the text, keyed by the group's
+/// stable token instead of its prose label: a script reads tokens, never
+/// English. Reading writes nothing, as the text form does.
+#[test]
+fn list_json_carries_the_same_counts_as_the_text() {
+    let home = tempfile::tempdir().unwrap();
+    let root = home.path().join("root");
+    let root_arg = root.to_str().unwrap();
+    assert!(hp(home.path(), &["--root", root_arg, "new", "Alpha"]).status.success());
+    assert!(hp(home.path(), &["--root", root_arg, "new", "Beta"]).status.success());
+    // Alpha has one open thread; beta has nothing at all.
+    let record = "id = \"t-0001\"\ntitle = \"Do it\"\nstatus = \"open\"\nkind = \"home\"\n";
+    std::fs::write(root.join("alpha/threads/t-0001.toml"), record).unwrap();
+
+    let text = hp(home.path(), &["--root", root_arg, "list"]);
+    assert!(text.status.success(), "{}", String::from_utf8_lossy(&text.stderr));
+    let text = String::from_utf8(text.stdout).unwrap();
+    let out = hp(home.path(), &["--root", root_arg, "list", "--json"]);
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    let value: serde_json::Value = serde_json::from_str(&String::from_utf8(out.stdout).unwrap()).unwrap();
+    let projects = value.as_array().expect("--json is one array of projects");
+    assert_eq!(projects.len(), 2, "{value}");
+
+    // Every project the text prints, with the same summary it prints, is here:
+    // the groups' labels and counts in rank order join to the text's column.
+    for line in text.lines() {
+        let (slug, summary) = line.split_once('\t').expect("slug and summary, tab separated");
+        let project = projects.iter().find(|p| p["slug"] == slug).unwrap_or_else(|| panic!("`{slug}` is in the text but not in the JSON"));
+        assert_eq!(project["folder"], root.join(slug).to_string_lossy().as_ref());
+        assert!(!project["name"].as_str().unwrap().is_empty(), "a project says the name a person reads");
+        assert_eq!(project["name"], if slug == "alpha" { "Alpha" } else { "Beta" });
+        let groups = project["groups"].as_array().unwrap();
+        let joined: Vec<String> = groups
+            .iter()
+            .map(|g| format!("{}: {}", g["label"].as_str().unwrap(), g["count"].as_u64().unwrap()))
+            .collect();
+        let joined = if joined.is_empty() { "no threads".to_string() } else { joined.join(", ") };
+        assert_eq!(joined, summary, "the JSON must answer what the text answers");
+        for g in groups {
+            assert!(!g["token"].as_str().unwrap().contains(' '), "a token is never prose: {g}");
+            assert!(!g["token"].as_str().unwrap().is_empty(), "every group has a token: {g}");
+        }
+        let total: u64 = groups.iter().map(|g| g["count"].as_u64().unwrap()).sum();
+        assert_eq!(project["threads"].as_u64().unwrap(), total);
+    }
+    assert_eq!(projects[0]["threads"], 1, "{value}");
+    assert_eq!(projects[1]["threads"], 0, "{value}");
+    assert_eq!(projects[1]["groups"].as_array().unwrap().len(), 0, "{value}");
+
+    // Reading marks nothing seen and writes no state: `list` is a look.
+    assert!(!root.join("alpha/.state/inbox-seen.json").exists());
+}
+
 /// `PROJECT.md` written by an older `hp` may carry a `status` line (and the old
 /// state file a `status` key). Both must read as an ordinary, in-use project.
 #[test]
