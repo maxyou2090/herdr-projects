@@ -76,6 +76,18 @@ fn home_space(herdr: &Core, record: Option<&Coordinator>, panes: &[Pane]) -> Opt
     listed.iter().any(|space| space.workspace_id == id).then_some(id)
 }
 
+/// The Space ids this project's coordinators live in — the recorded one and every
+/// open lane's — as far as they can be named without listing panes.
+pub fn coordinator_space_ids(project: &Project) -> Vec<String> {
+    let mut ids = crate::lanes::open_spaces(project);
+    if let Some(record) = project.coordinator()
+        && !record.workspace_id.is_empty()
+    {
+        ids.push(record.workspace_id.clone());
+    }
+    ids
+}
+
 /// True when `pane` is the pane the record describes: same workspace, tab and
 /// working directory (see `core::own_dir`). Ids are only unique within one
 /// server, so callers only ever compare panes listed through the project's

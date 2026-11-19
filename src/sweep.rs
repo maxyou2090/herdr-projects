@@ -1,9 +1,9 @@
 //! `sweep`: what a project left behind and nothing uses any more. Worktrees
 //! on `hp/<slug>/` branches (or a former slug's) with no open thread, local branches of resolved
-//! threads whose pull request merged, tabs of resolved threads, their
-//! workspaces still open on a worktree that is gone, working
+//! threads whose pull request merged, tabs of resolved threads, tabs still
+//! open on a worktree that is gone, working
 //! folders of long-resolved tab threads, handled inbox items older than 30
-//! days, and empty repository Spaces herdr grouped their worktrees under.
+//! days, and Spaces nothing is left in.
 //! `--dry-run` lists; otherwise each is removed after a confirmation.
 
 use std::path::{Path, PathBuf};
@@ -21,11 +21,11 @@ use crate::threads;
 pub enum Orphan {
     /// `thread` is the resolved thread that still owns it, if any: its files
     /// are copied home again, completely, before the worktree may go.
-    Worktree { repo: String, path: String, workspace: Option<String>, branch: String, thread: Option<String> },
+    Worktree { repo: String, path: String, pane: Option<String>, branch: String, thread: Option<String> },
     Branch { repo: String, branch: String },
     Tab { id: String, tab: String },
-    /// A resolved thread's workspace, still open on a worktree folder that is gone.
-    Workspace { id: String, workspace: String },
+    /// A resolved worktree thread's tab, still open on a worktree folder that is gone.
+    Pane { id: String, pane: String },
     Folder { id: String, path: PathBuf },
     Space(crate::spaces::Space),
     DoneItems { count: usize },
@@ -34,12 +34,12 @@ pub enum Orphan {
 impl Orphan {
     pub fn describe(&self) -> String {
         match self {
-            Orphan::Worktree { path, branch, workspace, .. } => format!("worktree {path} ({branch}){} with no open thread", if workspace.is_some() { ", workspace open" } else { "" }),
+            Orphan::Worktree { path, branch, pane, .. } => format!("worktree {path} ({branch}){} with no open thread", if pane.is_some() { ", tab open" } else { "" }),
             Orphan::Branch { branch, .. } => format!("branch {branch}: its thread is resolved and its pull request merged"),
             Orphan::Tab { id, tab } => format!("tab {tab} of resolved thread {id}"),
-            Orphan::Workspace { id, workspace } => format!("workspace {workspace} of resolved thread {id}, its worktree already gone"),
+            Orphan::Pane { id, pane } => format!("tab of resolved thread {id} (pane {pane}), its worktree already gone"),
             Orphan::Folder { id, path } => format!("working folder {} of {id}, resolved long ago (its report is home)", path.display()),
-            Orphan::Space(space) => format!("empty Space {} ({}) its threads' worktrees were grouped under", space.label, space.id),
+            Orphan::Space(space) => format!("empty Space {} ({}), nothing left in it", space.label, space.id),
             Orphan::DoneItems { count } => format!("{count} handled inbox item(s) older than 30 days"),
         }
     }
@@ -97,9 +97,11 @@ pub fn find(ctx: &Ctx, project: &Project) -> Vec<Orphan> {
             if owner.is_some_and(|t| t.kept_worktree) {
                 continue; // resolved with --keep-worktree
             }
-            // A workspace whose root is this worktree (herdr opens it there).
-            let workspace = view.as_ref().and_then(|v| v.panes.iter().find(|p| p.cwd == path).map(|p| p.workspace_id.clone()));
-            orphans.push(Orphan::Worktree { repo: repo.clone(), path, workspace, branch, thread: owner.map(|t| t.id.clone()) });
+            // The pane standing in this worktree, by its own label: a project's
+            // threads share one Space, so the Space says nothing about which
+            // worktree a pane is in (`docs/thread-space.md`).
+            let pane = view.as_ref().and_then(|v| v.panes.iter().find(|p| p.tokens.get(crate::core::L_WORKTREE).is_some_and(|at| *at == path)).map(|p| p.pane_id.clone()));
+            orphans.push(Orphan::Worktree { repo: repo.clone(), path, pane, branch, thread: owner.map(|t| t.id.clone()) });
         }
         let refs: Vec<String> = prefixes.iter().map(|p| format!("refs/heads/{p}")).collect();
         let args: Vec<&str> = ["for-each-ref", "--format=%(refname:short)"].into_iter().chain(refs.iter().map(String::as_str)).collect();
@@ -130,9 +132,9 @@ pub fn find(ctx: &Ctx, project: &Project) -> Vec<Orphan> {
         }
         if t.kind == Kind::Worktree
             && threads::worktree_gone(t)
-            && let Some(workspace) = view.as_ref().and_then(|v| threads::own_workspace(t, &v.panes))
+            && let Some(pane) = view.as_ref().and_then(|v| threads::worktree_pane(t, &v.panes))
         {
-            orphans.push(Orphan::Workspace { id: t.id.clone(), workspace });
+            orphans.push(Orphan::Pane { id: t.id.clone(), pane: pane.pane_id.clone() });
         }
         let folder = project.dir().join("threads").join(&t.id);
         if matches!(t.kind, Kind::Tab | Kind::Home) && folder.is_dir() && older_than(&t.updated, settings.auto_resolve_days.max(1), now) && thread::home_report_path(project, &t.id).is_file() {
@@ -156,7 +158,7 @@ pub fn find(ctx: &Ctx, project: &Project) -> Vec<Orphan> {
 
 fn remove(ctx: &Ctx, project: &Project, orphan: &Orphan) -> Result<()> {
     match orphan {
-        Orphan::Worktree { repo, path, workspace, thread: owner, .. } => {
+        Orphan::Worktree { repo, path, pane, thread: owner, .. } => {
             if let Some(id) = owner {
                 let t = thread::load(project, id)?;
                 let copied = threads::final_copy(ctx, project, &Thread { thread_dir: t.thread_dir.clone(), ..t });
@@ -167,8 +169,8 @@ fn remove(ctx: &Ctx, project: &Project, orphan: &Orphan) -> Result<()> {
             // The shared `.agents` link must not count as work for either
             // non-forced removal, as in `threads::remove_worktree`.
             let _ = crate::skills::exclude_shared_link_if_present(Path::new(repo), Path::new(path));
-            if let (Some(workspace), Some(view)) = (workspace, threads::session_view(ctx, project)) {
-                return view.herdr.worktree_remove(workspace).map_err(|e| anyhow::anyhow!("{e}"));
+            if let (Some(pane), Some(view)) = (pane, threads::session_view(ctx, project)) {
+                return view.herdr.worktree_remove(pane).map_err(|e| anyhow::anyhow!("{e}"));
             }
             git(ctx, repo, &["worktree", "remove", path]).ok_or_else(|| anyhow::anyhow!("git refused to remove {path} (uncommitted changes?)"))?;
             let _ = git(ctx, repo, &["worktree", "prune"]);
@@ -179,9 +181,9 @@ fn remove(ctx: &Ctx, project: &Project, orphan: &Orphan) -> Result<()> {
             let view = threads::session_view(ctx, project).ok_or_else(|| anyhow::anyhow!("the session is not reachable"))?;
             view.herdr.tab_close(tab).map_err(|e| anyhow::anyhow!("{e}"))
         }
-        Orphan::Workspace { id, workspace } => {
+        Orphan::Pane { id, pane } => {
             let view = threads::session_view(ctx, project).ok_or_else(|| anyhow::anyhow!("the session is not reachable"))?;
-            view.herdr.workspace_close(workspace).map_err(|e| anyhow::anyhow!("{e}"))?;
+            view.herdr.pane_close(pane).map_err(|e| anyhow::anyhow!("{e}"))?;
             thread::update(project, id, |t| t.worktree_path.clear())?;
             Ok(())
         }

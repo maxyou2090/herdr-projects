@@ -492,19 +492,62 @@ mod tests {
     }
 
     #[test]
-    fn a_thread_space_keeps_its_title_and_names_its_tab_after_the_id() {
+    fn a_thread_space_is_the_project_s_and_its_tabs_are_the_thread_ids() {
         let (home, child) = core();
         let fake = FakeApp::new(&child);
         let herdr = Core::new("hc", "", &fake);
-        let title = "线程命名 tab 用 id";
+        let space = crate::labels::threads_space_label("Herdr Projects");
         let tab = crate::labels::thread_tab_label("t-0047");
-        let created = herdr.workspace_create(home.path(), &crate::labels::thread_space_label(title), &tab).unwrap();
-        assert_eq!(fake.spaces.borrow()[0].1, "线程命名tab用id", "the Space carries the thread's title, tightened, not its id");
+        let created = herdr.workspace_create(home.path(), &space, &tab).unwrap();
+        assert_eq!(fake.spaces.borrow()[0].1, "Herdr Projects Threads", "the Space is the project's, not the thread's");
         let address = &child.terminals.borrow()[0].address;
         assert_eq!(fake.renamed.borrow().last(), Some(&(FakeApp::tab_for(address), tab.clone())), "the app's tab carries the id too");
         let label = child.terminals.borrow()[0].labels.get(L_TAB_LABEL).cloned();
         assert_eq!(label.as_deref(), Some("t-0047"), "the core label says the same, so there is one name");
         assert!(!created.pane_id.is_empty() && !created.tab_id.is_empty());
+    }
+
+    /// A second thread joins the Space through `tab_create`, on a Space the app
+    /// made: the new terminal has to carry the Space's name as well, or
+    /// `workspace_list` reports the Space under an empty label as soon as it
+    /// lists that terminal first, and the next thread opens a second Space.
+    #[test]
+    fn a_tab_created_in_an_app_space_carries_the_space_s_name() {
+        let (home, child) = core();
+        let fake = FakeApp::new(&child);
+        let herdr = Core::new("hc", "", &fake);
+        let space = crate::labels::threads_space_label("REXA");
+        let first = herdr.workspace_create(home.path(), &space, "t-0001").unwrap();
+        let second = herdr.tab_create(&first.workspace_id, home.path(), "t-0002").unwrap();
+        let listed = herdr.workspace_list().unwrap();
+        assert_eq!(listed.len(), 1, "{listed:?}");
+        assert_eq!(listed[0].label, "REXA Threads", "the second terminal says the name too");
+        assert_eq!(listed[0].pane_count, 2);
+        assert!(listed[0].worktree.is_none());
+        assert_eq!(second.workspace_id, first.workspace_id);
+        assert_ne!(second.tab_id, first.tab_id);
+    }
+
+    /// Two worktrees in one Space: the Space is not a worktree Space, and a
+    /// removal keyed on a pane takes that pane's worktree and no other.
+    #[test]
+    fn a_space_holding_two_worktrees_is_not_a_worktree_space() {
+        let (_home, fake) = core();
+        let herdr = Core::new("hc", "", &fake);
+        let one = herdr.workspace_create(std::path::Path::new("/tmp"), "Demo Threads", "t-0001").unwrap();
+        let two = herdr.tab_create(&one.workspace_id, std::path::Path::new("/tmp"), "t-0002").unwrap();
+        herdr.worktree_mark(&one.pane_id, "/wt/a").unwrap();
+        herdr.worktree_mark(&two.pane_id, "/wt/b").unwrap();
+        let listed = herdr.workspace_list().unwrap();
+        assert_eq!(listed.len(), 1);
+        assert!(listed[0].worktree.is_none(), "many worktrees at once, so this Space is not one of them");
+        // One worktree alone: still a worktree Space, as before.
+        let alone = core().1;
+        let herdr = Core::new("hc", "", &alone);
+        herdr.workspace_create(std::path::Path::new("/tmp"), "old", "t-0001").unwrap();
+        let pane = herdr.pane_list().unwrap()[0].pane_id.clone();
+        herdr.worktree_mark(&pane, "/wt/only").unwrap();
+        assert!(herdr.workspace_list().unwrap()[0].worktree.is_some());
     }
 
     #[test]

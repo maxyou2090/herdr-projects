@@ -1310,8 +1310,10 @@ fn tick_slow(ctx: &Ctx, project: &Project, seen: &Seen, memory: &mut Memory, log
     // Repository Spaces: recorded when first seen, closed once empty.
     crate::spaces::record(project, &herdr);
     errors.extend(crate::spaces::close_empty(ctx, project, &herdr));
-    // The home Space's label follows the project's name without an `open`.
+    // The home Space's label and the thread Space's follow the project's name
+    // without an `open`.
     crate::spaces::sync_home_label(project, &herdr);
+    crate::spaces::sync_threads_label(project, &herdr);
     inbox::prune_done(project, steps::DONE_RETENTION_DAYS);
     if state != before {
         errors.extend(steps::save_state(project, &state).err());

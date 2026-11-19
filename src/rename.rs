@@ -370,7 +370,11 @@ pub fn run(ctx: &Ctx, args: &Args) -> Result<Outcome> {
         write_atomic(&config_path, text.as_bytes()).with_context(|| finish.clone())?;
     }
 
-    // 4. Herdr: the home Space's label (best effort; `open` also fixes it).
+    // 4. Herdr: the home Space's label and the thread Space's (best effort;
+    // `open` and the ticker also fix them).
+    if let Some(view) = &view {
+        crate::spaces::sync_threads_label(&project, &view.herdr);
+    }
     if old_label != new_label && !record.workspace_id.is_empty() {
         let herdr = crate::core::Core::new(ctx.env.hc_bin(), &record.socket, ctx.runner);
         if !record.socket.is_empty() && crate::core::session_alive(&ctx.env.hc_bin(), &record.socket, ctx.runner) {

@@ -17,6 +17,7 @@
 //! So a project's panes are whatever carries its labels, and losing them is
 //! losing the Space — the same thing core means by a finished terminal.
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -586,33 +587,40 @@ impl<'a> Core<'a> {
 
     pub fn workspace_list(&self) -> Result<Vec<Workspace>, CoreError> {
         let mut out: Vec<Workspace> = Vec::new();
+        // The `hp_worktree` label of every terminal, per Space: one Space holds
+        // a single worktree only when every terminal in it names that same one.
+        let mut worktrees: BTreeMap<String, Vec<String>> = BTreeMap::new();
         for term in self.terminals()? {
             let id = term.label(L_WS);
             if id.is_empty() {
                 continue;
             }
-            let worktree = {
-                let path = term.label(L_WORKTREE);
-                (!path.is_empty()).then(|| WorkspaceWorktree {
-                    repo_key: String::new(),
-                    checkout_path: path,
-                    is_linked_worktree: true,
-                })
-            };
+            worktrees.entry(id.clone()).or_default().push(term.label(L_WORKTREE));
+            let label = term.label(L_WS_LABEL);
             match out.iter_mut().find(|w| w.workspace_id == id) {
                 Some(space) => {
                     space.pane_count += 1;
-                    if space.worktree.is_none() {
-                        space.worktree = worktree;
+                    // Any terminal of the Space that names it will do, not only
+                    // the first one core happens to list: a Space the app made
+                    // can hold terminals started by `tab_create`, which does not
+                    // rewrite the label on the others (t-0062).
+                    if space.label.is_empty() {
+                        space.label = label;
                     }
                 }
-                None => out.push(Workspace {
-                    workspace_id: id,
-                    label: term.label(L_WS_LABEL),
-                    focused: false,
-                    pane_count: 1,
-                    worktree,
-                }),
+                None => out.push(Workspace { workspace_id: id, label, focused: false, pane_count: 1, worktree: None }),
+            }
+        }
+        // A Space is a worktree Space only when **every** terminal in it names
+        // the same worktree. Every thread of a project now shares one Space
+        // (`docs/thread-space.md`), so a Space holds many worktrees at once, and
+        // reading that as "this Space is one worktree" would let the cleanup
+        // code treat the shared Space as a repository's own.
+        for space in out.iter_mut() {
+            let paths = worktrees.get(&space.workspace_id).cloned().unwrap_or_default();
+            let first = paths.first().cloned().unwrap_or_default();
+            if !first.is_empty() && paths.iter().all(|path| path == &first) {
+                space.worktree = Some(WorkspaceWorktree { repo_key: String::new(), checkout_path: first, is_linked_worktree: true });
             }
         }
         Ok(out)
@@ -713,6 +721,15 @@ impl<'a> Core<'a> {
     }
 
     pub fn tab_create(&self, workspace: &str, cwd: &Path, label: &str) -> Result<Created, CoreError> {
+        // The Space's own name, as the other terminals of it carry it: every
+        // terminal has to say it, or `workspace_list` reads the Space under an
+        // empty label as soon as it lists one of ours first (t-0062).
+        let existing = self.terminals()?;
+        let ws_label = existing
+            .iter()
+            .find(|t| t.label(L_WS) == workspace && !t.label(L_WS_LABEL).is_empty())
+            .map(|t| t.label(L_WS_LABEL))
+            .unwrap_or_default();
         if workspace.starts_with("sp") && crate::app::running(self.runner) {
             let tab = format!("{}-{}", workspace, suffix());
             let name = self.next_name(label)?;
@@ -721,6 +738,7 @@ impl<'a> Core<'a> {
                 cwd,
                 &[
                     (L_WS, workspace),
+                    (L_WS_LABEL, ws_label.as_str()),
                     (L_TAB, tab.as_str()),
                     (L_TAB_LABEL, label),
                     ("herdr.space", workspace),
@@ -734,13 +752,6 @@ impl<'a> Core<'a> {
             });
             return Ok(self.created(&term));
         }
-        let existing = self.terminals()?;
-        let ws_label = existing
-            .iter()
-            .find(|t| t.label(L_WS) == workspace)
-            .map(|t| t.label(L_WS_LABEL))
-            .unwrap_or_default();
-        let _ = existing;
         let tab = format!("{}-{}", workspace, suffix());
         let name = self.next_name(label)?;
         let term = self.start(
@@ -753,8 +764,11 @@ impl<'a> Core<'a> {
     }
 
     /// Creates a real git worktree under `~/.herdr/worktrees/<repo>/<branch>`,
-    /// the path Herdr 1 used, so a restored thread record still names it.
-    pub fn worktree_create(&self, repo: &str, branch: &str, base: &str, label: &str, tab_label: &str) -> Result<(Created, String, String), CoreError> {
+    /// the path Herdr 1 used, so a restored thread record still names it. Only
+    /// the folder and the branch: where its tab goes is the caller's decision
+    /// (`threads::place`), because every thread of a project shares one Space
+    /// (`docs/thread-space.md`).
+    pub fn worktree_add(&self, repo: &str, branch: &str, base: &str) -> Result<String, CoreError> {
         let path = worktree_path(repo, branch)?;
         if let Some(parent) = path.parent() {
             let _ = std::fs::create_dir_all(parent);
@@ -775,34 +789,28 @@ impl<'a> Core<'a> {
             // The branch may already exist: reuse it instead of failing.
             git(&["worktree", "add", &path_text, branch])?;
         }
-        let created = self.workspace_create(&path, label, tab_label)?;
-        let term = self.term(&created.pane_id)?;
-        self.label(&term.pane_id(), &[(L_WORKTREE, path_text.as_str())])?;
-        Ok((created, path_text.clone(), term.cwd()))
+        Ok(path_text)
     }
 
-    pub fn worktree_open(&self, path: &str, label: &str, tab_label: &str) -> Result<(Created, String, String), CoreError> {
-        let path = PathBuf::from(path);
-        if !path.is_dir() {
-            return Err(CoreError { code: "worktree_not_found".into(), message: format!("{path:?} is not a folder") });
-        }
-        let created = self.workspace_create(&path, label, tab_label)?;
-        let term = self.term(&created.pane_id)?;
-        self.label(&term.pane_id(), &[(L_WORKTREE, path.to_string_lossy().as_ref())])?;
-        Ok((created, path.to_string_lossy().into_owned(), term.cwd()))
+    /// Marks a pane as the one working in the worktree at `path`: the label the
+    /// cleanup reads to know which worktree that pane, and not another one in the
+    /// same Space, is standing in (`Core::worktree_remove`).
+    pub fn worktree_mark(&self, pane: &str, path: &str) -> Result<(), CoreError> {
+        self.label(pane, &[(L_WORKTREE, path)])
     }
 
-    /// Never passes `--force`: git refuses a dirty worktree and that refusal is
-    /// reported unchanged.
-    pub fn worktree_remove(&self, workspace: &str) -> Result<(), CoreError> {
-        let term = self
-            .terminals()?
-            .into_iter()
-            .find(|t| t.label(L_WS) == workspace)
-            .ok_or_else(|| CoreError { code: "pane_not_found".into(), message: format!("no terminal in {workspace}") })?;
-        let path = term.label(L_WORKTREE);
+    /// Removes the worktree **the pane at `pane` stands in**, by the
+    /// `hp_worktree` label on it. Never passes `--force`: git refuses a dirty
+    /// worktree and that refusal is reported unchanged.
+    ///
+    /// Keyed on the pane, not on a Space: a project's threads share one Space
+    /// (`docs/thread-space.md`), so a Space holds many worktrees at once and
+    /// picking "the Space's worktree" would remove one thread's folder while
+    /// cleaning up another's.
+    pub fn worktree_remove(&self, pane: &str) -> Result<(), CoreError> {
+        let path = self.term(pane).map_err(|_| CoreError { code: "pane_not_found".into(), message: format!("no terminal {pane}") })?.label(L_WORKTREE);
         if path.is_empty() {
-            return Err(CoreError { code: "worktree_not_found".into(), message: format!("{workspace} is not a worktree") });
+            return Err(CoreError { code: "worktree_not_found".into(), message: format!("pane {pane} is not in a worktree") });
         }
         let out = self
             .runner

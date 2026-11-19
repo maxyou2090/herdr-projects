@@ -80,6 +80,7 @@ agent started there that it is the coordinator), `PROJECT.md`, `TASKS.md` and
 - [`docs/getting-started.md`](docs/getting-started.md) — the first project, end to end
 - [`docs/operations.md`](docs/operations.md) — how it works, what it writes, settings, cleanup
 - [`docs/lanes.md`](docs/lanes.md) — several coordinators in one project
+- [`docs/thread-space.md`](docs/thread-space.md) — where a thread's tab goes: the project's one thread Space
 - [`docs/herdr-core-port.md`](docs/herdr-core-port.md) — the port itself: what was kept, rebuilt and deleted, the traps, and what is still open
 - [`docs/history/`](docs/history/README.md) — the Herdr 1 write-ups, kept as history: the acceptance list and what the builder verified about that host
 
