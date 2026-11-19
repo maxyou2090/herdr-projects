@@ -16,7 +16,7 @@ use serde::{Deserialize, Serialize};
 use crate::core::{Agent, Core, Pane};
 use crate::paths::{self, Ctx, SessionFlags};
 use crate::profiles::Role;
-use crate::project::{self, Coordinator, Project, Status};
+use crate::project::{self, Coordinator, Project};
 use crate::shell::quote;
 use crate::{inbox, names, ticker};
 
@@ -666,9 +666,6 @@ pub struct OpenOptions {
     /// Start the agent in the terminal this command runs in, when no agent
     /// occupies it and it belongs to this session (false: a new tab).
     pub here: bool,
-    /// Whether a person ran this `open` at a terminal rather than an agent's
-    /// shell or a script: a paused project is then resumed, not only noted.
-    pub person: bool,
     /// `--lane`: the lane to open or focus (§6.1). `None` is today's default
     /// lane, byte for byte.
     pub lane: Option<String>,
@@ -931,20 +928,6 @@ fn stray_signal(project: &Project, home: &Path, agent: &Agent, resolution: &crat
 
 pub fn open(ctx: &Ctx, slug: &str, options: &OpenOptions) -> Result<()> {
     let project = Project::load(&ctx.root, slug)?;
-    if project.status() == Status::Archived {
-        bail!("`{slug}` is archived; run `unarchive {slug}` first");
-    }
-    // Opening a paused project means to work on it: a person's `open` resumes
-    // it, or the coordinator would run with no ticker behind it. An agent's
-    // `open` never flips a lifecycle state the user set; it only notes it.
-    if project.status() == Status::Paused {
-        if options.person {
-            project.set_status(Status::Active)?;
-            println!("`{slug}` was paused; it is active again, and the ticker picks it up");
-        } else {
-            println!("`{slug}` is paused: the ticker skips it and `thread start` is refused; `resume {slug}` makes it active again");
-        }
-    }
     let (settings, body) = project.read_project_md()?;
     if body.chars().count() > crate::project::BODY_WARN_CHARS {
         eprintln!(
@@ -1523,7 +1506,7 @@ fn digest_for(ctx: &Ctx, project: &Project, prefix: &str) -> Result<(String, Vec
     let mut out = String::new();
     let slug = &project.slug;
     let _ = writeln!(out, "Commands: {prefix}");
-    let _ = writeln!(out, "Project: {slug} ({})", project.status());
+    let _ = writeln!(out, "Project: {slug}");
     let _ = writeln!(out, "Folder: {}", project.dir().display());
     // Read once: the identity line and the thread rows use the same view, so
     // a turn costs no more Herdr than it did before.
@@ -1668,7 +1651,7 @@ mod tests {
         let core = crate::fake_hc::FakeCore::new();
         let ctx = open_ctx(root.path(), &project.root, &core);
         let (text, _, _) = digest_for(&ctx, &project, "/bin/hp --root /r").unwrap();
-        assert!(text.contains("Project: demo (active)\n"), "{text}");
+        assert!(text.contains("Project: demo\n"), "{text}");
         assert!(!text.contains("Goal"), "{text}");
         assert!(!text.contains("monthly invoices"), "{text}");
     }

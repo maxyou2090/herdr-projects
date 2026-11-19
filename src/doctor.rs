@@ -426,7 +426,7 @@ fn report(
             (None, Ok(found)) => found.socket,
             (None, Err(_)) => {
                 notes.push(none);
-                check(&mut out, Some(true), &label, format!("{}; {}", project.status(), notes.join("; ")));
+                check(&mut out, Some(true), &label, notes.join("; "));
                 continue;
             }
         };
@@ -479,7 +479,7 @@ fn report(
                     &mut out,
                     if coordinators.is_empty() && record.is_some() { None } else { Some(true) },
                     &label,
-                    format!("{}; {}", project.status(), notes.join("; ")),
+                    notes.join("; "),
                 );
                 if let Some(view) = &app_view {
                     for note in coordinator_name_notes(&herdr, &project, view, record.as_ref()) {

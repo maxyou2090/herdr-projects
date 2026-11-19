@@ -29,7 +29,7 @@ const PHRASES: &[&str] = &[
     "Confirm folder trust",
 ];
 
-/// The trust-screen line on `screen` (`agent read --format ansi`), or `None`.
+/// The trust-screen line on `screen` (`hc read`), or `None`.
 /// A screen whose input box is visible and empty is the agent's prompt, and a
 /// phrase on it is only transcript text (an agent quoting a dialog); menus,
 /// dialogs and unknown layouts have no empty box.

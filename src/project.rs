@@ -1,5 +1,5 @@
-//! Project folders under the root: slugs, settings, status, the per-project
-//! lock and the coordinator record.
+//! Project folders under the root: slugs, settings, the per-project lock and
+//! the coordinator record.
 
 use std::fs::File;
 use std::io::Write as _;
@@ -175,29 +175,9 @@ pub fn parse_project_md(text: &str) -> Result<(Settings, String)> {
     Ok((settings, body.trim_start_matches('\n').to_string()))
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Default)]
-#[serde(rename_all = "lowercase")]
-pub enum Status {
-    #[default]
-    Active,
-    Paused,
-    Archived,
-}
-
-impl std::fmt::Display for Status {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(match self {
-            Status::Active => "active",
-            Status::Paused => "paused",
-            Status::Archived => "archived",
-        })
-    }
-}
-
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
 #[serde(default)]
 struct ProjectState {
-    status: Status,
     /// Slugs the project had before `rename`, oldest first: its threads'
     /// branches (`hp/<slug>/...`) keep the name they were made with.
     #[serde(skip_serializing_if = "Vec::is_empty")]
@@ -363,19 +343,6 @@ impl Project {
         let text = std::fs::read_to_string(self.project_md())
             .with_context(|| format!("could not read {}", self.project_md().display()))?;
         parse_project_md(&text)
-    }
-
-    pub fn status(&self) -> Status {
-        read_json::<ProjectState>(&self.state_dir().join("project.json"))
-            .unwrap_or_default()
-            .status
-    }
-
-    pub fn set_status(&self, status: Status) -> Result<()> {
-        let _lock = self.lock()?;
-        let path = self.state_dir().join("project.json");
-        let state = read_json::<ProjectState>(&path).unwrap_or_default();
-        write_json(&path, &ProjectState { status, ..state })
     }
 
     /// The slugs this project had before, oldest first.
@@ -743,6 +710,28 @@ pub fn create(root: &Path, name: &str, repos: Vec<Repo>) -> Result<Project> {
 mod tests {
     use super::*;
 
+    /// An older `hp` wrote the lifecycle state into `.state/project.json`. The
+    /// `status` key is gone from the struct, so the file must still parse:
+    /// `#[serde(default)]` ignores the stale key, and the former slugs it sits
+    /// beside are what a rename reads.
+    #[test]
+    fn an_old_status_key_does_not_take_the_former_slugs_with_it() {
+        let root = tempfile::tempdir().unwrap();
+        let project = create(root.path(), "Demo", vec![]).unwrap();
+        std::fs::write(project.state_dir().join("project.json"), "{\"status\":\"archived\",\"former_slugs\":[\"old-demo\"]}").unwrap();
+        assert_eq!(project.former_slugs(), ["old-demo"]);
+    }
+
+    /// A `PROJECT.md` from an older `hp` carries `status = "..."` in its front
+    /// matter. It must parse, and be nothing but an unknown line.
+    #[test]
+    fn an_old_status_line_in_project_md_parses() {
+        let text = "+++\nname = \"Demo\"\nstatus = \"paused\"\n+++\n\n# Instructions\n";
+        let (settings, body) = parse_project_md(text).unwrap();
+        assert_eq!(settings.name, "Demo");
+        assert_eq!(body, "# Instructions\n");
+    }
+
     #[test]
     fn only_folders_with_project_md_count() {
         let root = tempfile::tempdir().unwrap();
@@ -834,7 +823,6 @@ mod tests {
         assert!(crate::routine::load_all(&project).1.is_empty(), "the default routines parse");
         assert_eq!(settings.repos, vec![Repo { path: "/srv/app".into() }, Repo { path: "/no/such/repo".into() }]);
         assert!(body.starts_with("# Instructions"));
-        assert_eq!(project.status(), Status::Active);
         assert!(create(&root, "demo", vec![]).is_err());
     }
 

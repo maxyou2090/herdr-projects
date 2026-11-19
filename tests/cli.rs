@@ -36,7 +36,7 @@ fn context_prints_a_usable_prefix_in_a_scrubbed_environment() {
         .output()
         .unwrap();
     assert!(listed.status.success());
-    assert_eq!(String::from_utf8_lossy(&listed.stdout), "demo\tactive\tno threads\n");
+    assert_eq!(String::from_utf8_lossy(&listed.stdout), "demo\tno threads\n");
 }
 
 #[test]
@@ -193,7 +193,7 @@ fn goal_is_gone_from_the_output_and_refused_as_a_setting() {
     let out = hp(home.path(), &["--root", root_arg, "context", "demo", "--peek"]);
     assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
     let context = String::from_utf8(out.stdout).unwrap();
-    assert!(context.contains("Project: demo (active)\n"), "{context}");
+    assert!(context.contains("Project: demo\n"), "{context}");
     assert!(!context.contains("Goal"), "{context}");
     assert!(!context.contains("monthly invoices"), "{context}");
 
@@ -201,7 +201,7 @@ fn goal_is_gone_from_the_output_and_refused_as_a_setting() {
     let out = hp(home.path(), &["--root", root_arg, "overview", "demo"]);
     assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
     let overview = String::from_utf8(out.stdout).unwrap();
-    assert_eq!(overview.lines().next(), Some("demo (active)"), "{overview}");
+    assert_eq!(overview.lines().next(), Some("demo"), "{overview}");
     assert!(!overview.contains("monthly invoices"), "{overview}");
 
     // `hp set <slug> goal x` is an unknown setting.
@@ -215,6 +215,102 @@ fn goal_is_gone_from_the_output_and_refused_as_a_setting() {
     assert!(!out.status.success(), "`new --goal` must be refused");
     let err = String::from_utf8(out.stderr).unwrap();
     assert!(err.contains("--goal"), "{err}");
+}
+
+/// A project has two states: in use, or deleted. `pause`, `resume`, `archive`
+/// and `unarchive` are gone, so their names are not subcommands any more.
+#[test]
+fn pause_resume_archive_unarchive_are_unknown_commands() {
+    let home = tempfile::tempdir().unwrap();
+    let root = home.path().join("root");
+    let root_arg = root.to_str().unwrap();
+    assert!(hp(home.path(), &["--root", root_arg, "new", "Demo"]).status.success());
+    for command in ["pause", "resume", "archive", "unarchive"] {
+        let out = hp(home.path(), &["--root", root_arg, command, "demo"]);
+        assert!(!out.status.success(), "`{command}` must not be a subcommand any more");
+        let err = String::from_utf8(out.stderr).unwrap();
+        assert!(err.contains(&format!("unrecognized subcommand '{command}'")), "{command}: {err}");
+    }
+}
+
+/// Nothing prints a project's lifecycle state any more: `list` has two columns,
+/// `context`'s `Project:` line is the slug alone, and `overview`'s first line is
+/// the slug.
+#[test]
+fn no_output_marks_a_project_active_paused_or_archived() {
+    let home = tempfile::tempdir().unwrap();
+    let root = home.path().join("root");
+    let root_arg = root.to_str().unwrap();
+    assert!(hp(home.path(), &["--root", root_arg, "new", "Demo"]).status.success());
+
+    let out = hp(home.path(), &["--root", root_arg, "list"]);
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "demo\tno threads\n");
+
+    let out = hp(home.path(), &["--root", root_arg, "context", "demo", "--peek"]);
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    let context = String::from_utf8(out.stdout).unwrap();
+    assert!(context.contains("Project: demo\n"), "{context}");
+    for word in ["(active)", "paused", "archived"] {
+        assert!(!context.contains(word), "`{word}` is not part of a project's view: {context}");
+    }
+
+    let out = hp(home.path(), &["--root", root_arg, "overview", "demo"]);
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    let overview = String::from_utf8(out.stdout).unwrap();
+    assert_eq!(overview.lines().next(), Some("demo"), "{overview}");
+}
+
+/// With no project named and no terminal to ask, `overview` lists the projects
+/// in use — one with a live coordinator or with a thread that is open or
+/// starting — and `--all` lists every project there is.
+#[test]
+fn overview_lists_the_projects_in_use_and_all_lists_every_one() {
+    let home = tempfile::tempdir().unwrap();
+    let root = home.path().join("root");
+    let root_arg = root.to_str().unwrap();
+    assert!(hp(home.path(), &["--root", root_arg, "new", "Alpha"]).status.success());
+    assert!(hp(home.path(), &["--root", root_arg, "new", "Beta"]).status.success());
+    // Alpha has one open thread; beta has nothing running at all.
+    let record = "id = \"t-0001\"\ntitle = \"Do it\"\nstatus = \"open\"\nkind = \"home\"\n";
+    std::fs::write(root.join("alpha/threads/t-0001.toml"), record).unwrap();
+
+    let out = hp(home.path(), &["--root", root_arg, "overview"]);
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    let text = String::from_utf8(out.stdout).unwrap();
+    assert!(text.starts_with("alpha\n"), "{text}");
+    assert!(!text.contains("beta"), "a project with nothing running is not in the default view: {text}");
+
+    let out = hp(home.path(), &["--root", root_arg, "overview", "--all"]);
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    let text = String::from_utf8(out.stdout).unwrap();
+    assert!(text.contains("alpha\n"), "{text}");
+    assert!(text.contains("beta\n"), "--all lists every project: {text}");
+}
+
+/// `PROJECT.md` written by an older `hp` may carry a `status` line (and the old
+/// state file a `status` key). Both must read as an ordinary, in-use project.
+#[test]
+fn an_old_status_line_does_not_make_a_project_anything_but_a_project() {
+    let home = tempfile::tempdir().unwrap();
+    let root = home.path().join("root");
+    let root_arg = root.to_str().unwrap();
+    assert!(hp(home.path(), &["--root", root_arg, "new", "Demo"]).status.success());
+    let md = root.join("demo").join("PROJECT.md");
+    let text = std::fs::read_to_string(&md).unwrap();
+    std::fs::write(&md, text.replacen("+++\n", "+++\nstatus = \"archived\"\n", 1)).unwrap();
+    std::fs::write(root.join("demo/.state/project.json"), "{\"status\":\"archived\",\"former_slugs\":[\"old-demo\"]}").unwrap();
+
+    let out = hp(home.path(), &["--root", root_arg, "context", "demo", "--peek"]);
+    assert!(out.status.success(), "an old `status` line must not break the project: {}", String::from_utf8_lossy(&out.stderr));
+    let context = String::from_utf8(out.stdout).unwrap();
+    assert!(context.contains("Project: demo\n"), "{context}");
+    assert!(!context.contains("archived"), "{context}");
+
+    // It is listed and opened like any other project, not hidden or refused.
+    let out = hp(home.path(), &["--root", root_arg, "list"]);
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "demo\tno threads\n");
 }
 
 /// The commands the printed help and error messages name have to be the ones

@@ -185,10 +185,13 @@ again:
 5. **`hc send` refuses a `blocked` program.** That is a feature: it maps to
    `agent_blocked`, and it is safer than Herdr 1, which merged a prompt into
    half-typed text. `refused_before_typing` still matches on it.
-6. **`hc read` returns plain text, with no SGR.** `prompt_box` tells a
-   placeholder from typed text by dim/reverse styling, so on core it is weaker
-   than it was. The error is conservative ("do not type into a box I cannot
-   read"), which is why it was accepted for now — see §8.
+6. **`hc read` returns plain text, with no SGR.** `prompt_box` first told a
+   placeholder from typed text by dim/reverse styling, which on core it could
+   never see. It now reads the box by its glyphs, its borders and its known
+   placeholders only (t-0061), so a captured screen and a real read are judged
+   the same. The cost is one shape it cannot split: Claude Code's rotating
+   `Try "…"` suggestion is recognised by its shape, so a draft that is exactly
+   one quoted `Try "…"` would read as a placeholder. See §8.
 7. **The app needs time, and will not empty a Space.** `herdr-app ls` does not
    show a fresh space or tab for a moment; `tab.close` refuses the last tab of a
    space. So: create the Space, create our own terminal, close the placeholder
@@ -244,11 +247,12 @@ Ordered by what a user would notice first:
      binary cannot parse. A turn that prints nothing *and* redraws no
      elapsed-time line for six seconds reads as `idle`; a false `idle` can
      delay a brief by a tick but never types into a busy pane, because
-     `brief::deliver` re-reads the box before sending. `prompt_box`'s styling
-     loss (§6.6) stays: `hc read` gives plain text, so a dim placeholder counts
-     as a draft. And the ticker still reads screens itself for the
-     trust-screen check before a brief: redundant for watched kinds, the only
-     cover for the rest.
+     `brief::deliver` re-reads the box before sending. `prompt_box` reads the
+     box from plain text now (t-0061): placeholders, borders and prompt glyphs,
+     with every unknown layout left `Unknown` — which the ticker, the brief and
+     this watcher all treat as "not empty". And the ticker still reads screens
+     itself for the trust-screen check before a brief: redundant for watched
+     kinds, the only cover for the rest.
    - **Why not the PTY relay this port first planned.** A relay would have to
      own the terminal: `openpty`, raw mode, window-size and `SIGWINCH`
      forwarding, and a VT screen model to keep `prompt_box`'s geometry — all of

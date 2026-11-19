@@ -18,7 +18,7 @@ use serde::{Deserialize, Serialize};
 use crate::coordinator;
 use crate::core::{Agent, Core, Pane};
 use crate::paths::Ctx;
-use crate::project::{self, Project, Status};
+use crate::project::{self, Project};
 use crate::runner::{Cmd, Runner};
 use crate::steps::{self, Memory, Transition};
 use crate::{inbox, thread};
@@ -618,15 +618,6 @@ pub fn tick(ctx: &Ctx, log: &Log, memory: &mut Memory) -> bool {
         let Ok(project) = Project::load(&ctx.root, &slug) else {
             continue;
         };
-        if project.status() != Status::Active {
-            continue;
-        }
-        if project.status() == Status::Paused {
-            continue;
-        }
-        if project.status() != Status::Active {
-            continue;
-        }
         match tick_cheap(ctx, &project, &mut sessions) {
             Ok(Some(seen)) => {
                 let held = (!seen.nudge_held.is_empty()).then(|| held_text(&seen.nudge_held));
@@ -677,9 +668,6 @@ pub fn brief_pass(ctx: &Ctx, log: &Log) -> bool {
         let Ok(project) = Project::load(&ctx.root, &slug) else {
             continue;
         };
-        if project.status() != Status::Active {
-            continue;
-        }
         let pending: Vec<thread::Thread> = thread::list(&project)
             .into_iter()
             .filter(|t| t.status == thread::Status::Open && t.prompt_pending && !t.brief_stuck && t.launch_attempts > 0)
