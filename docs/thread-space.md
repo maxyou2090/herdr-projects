@@ -8,7 +8,7 @@ This page is the reference for that rule: where a thread's tab goes, what the
 Space is called, how it is found again, when it is closed, and what would break
 if any one of those were done the obvious way. It was implemented in t-0062
 (`src/threads.rs`, `src/core.rs`, `src/spaces.rs`, `src/labels.rs`); the second
-step — dissolving the `tab`/`home` kinds — is planned in §9 and not done.
+step — dissolving the `tab`/`home` kinds into one `local` — is in §9.
 
 ## 1. Why
 
@@ -48,12 +48,16 @@ Space names (§4).
 Every kind lands in the same Space; only the folder and what is cleaned up
 afterwards differ.
 
+`--kind` answers one question — **where does the thread work** — and the Space
+is the same for all of them. `tab` and `home` used to be two more names for
+what `local` is (one with a Space of its own, one a tab of the project's); they
+are gone, and both still parse from an old record and from the command line.
+
 | `--kind` | folder (the tab's `cwd`) | Space | tab | `hp_worktree` label |
 | --- | --- | --- | --- | --- |
 | `worktree` (default with `--repo`) | `~/.herdr/worktrees/<repo>/<branch>`, from `git worktree add` (`core::worktree_add`) | `<display name> Threads` | `t-00xx` | the worktree path |
 | `checkout` | the repository's main checkout (`record.repo`) | same | `t-00xx` | none |
-| `home` (default without a repo) | `<root>/<slug>/threads/<id>/` | same | `t-00xx` | none |
-| `tab` (legacy, kept parsing) | same as `home` | same | `t-00xx` | none |
+| `local` (default without a repo; `tab`/`home` are its old names) | `<root>/<slug>/threads/<id>/` | same | `t-00xx` | none |
 | `adopted` | whatever the pane already runs in | unchanged | unchanged | unchanged |
 
 Two things follow:
@@ -177,10 +181,9 @@ person opened there. It can never close a Space with a live thread in it, and it
 never looks at the label — a Space whose label stopped matching something is
 still somebody's.
 
-**Forget.** `spaces::forget` clears `repo_workspace`, `own_workspace` and — for an
-unresolved record — the `workspace_id` of every thread naming the closed Space,
-so the next placement creates a new one instead of writing into an id nothing
-lists.
+**Forget.** `spaces::forget` clears the `workspace_id` of every unresolved
+thread naming the closed Space, so the next placement creates a new one instead
+of writing into an id nothing lists.
 
 **A Space with no panes is invisible.** `Core::workspace_list` derives Spaces
 from terminals, so a Space whose last pane is gone is not listed at all: the
@@ -235,17 +238,16 @@ whose label is `Demo Threads`, `hpc`'s earlier name, still reuses.
 
 `Core::workspace_list` used to mark a Space as a worktree Space when **any**
 terminal in it carried `hp_worktree`. With threads sharing one Space, that made
-the thread Space a worktree Space — with a `checkout_path` picked from whichever
-pane was listed first — and `spaces::primary`, the orphan-home rule and the
-thread-Space rule each draw a different wrong conclusion from that. It now marks
-a Space only when **every** terminal names the same worktree. A Space of one
-worktree (the old shape) is unchanged.
+the thread Space a worktree Space — with the path picked from whichever pane was
+listed first — and the orphan-home rule and the thread-Space rule each draw a
+different wrong conclusion from that. It now marks a Space only when **every**
+terminal names the same worktree, and `Workspace::worktree` is simply that path
+(`Option<String>`). A Space of one worktree (the old shape) is unchanged.
 
-(Related, and already true before this change: `spaces::primary` looks for a
-Space whose `worktree.is_linked_worktree` is false, and nothing in the herdr-core
-port ever sets it — herdr-core has no worktree grouping. The repository-Space
-cleanup is therefore inert code, not a behaviour to preserve. It is left in place
-here; §9 lists it.)
+(Related, and gone with step 2: `spaces::primary` looked for herdr 1's
+"repository Space" grouping — a Space with `worktree.is_linked_worktree` false.
+Nothing in the herdr-core port ever set that flag, so the repository-Space rule
+never fired; it and `Thread::repo_workspace` are deleted, not ported. §9.)
 
 ### 6.5 `tab_create` on an app Space must write the Space's name too
 
@@ -264,13 +266,17 @@ the order of this page:
 
 | what | test |
 | --- | --- |
-| a new thread lands in the thread Space, its tab is `t-00xx`, never the project's Space (`home`, `tab`, `checkout`) | `threads::tests::a_new_thread_lands_in_the_project_s_thread_space` |
+| a new thread lands in the thread Space, its tab is `t-00xx`, never the project's Space (`local`, `checkout`) | `threads::tests::a_new_thread_lands_in_the_project_s_thread_space` |
 | a second thread joins it; two Spaces exist in total | `threads::tests::a_second_thread_joins_the_same_space_instead_of_opening_another` |
 | a restart reuses it (no Space per restart) | `threads::tests::a_restart_reuses_the_thread_space_rather_than_opening_a_new_one` |
 | a resolve closes one tab and leaves the Space, and `spaces::empty` agrees | `threads::tests::a_resolve_closes_the_tab_and_keeps_the_space_the_other_threads_are_in` |
 | the Space is closed with its last thread | `threads::tests::the_thread_space_is_closed_only_when_its_last_thread_leaves` |
 | `worktree_remove` takes the target worktree only (real git, two panes in one Space) | `threads::tests::a_worktree_removal_in_a_shared_space_takes_that_worktree_and_no_other` |
 | a `kind = "tab"` / `"home"` record still parses, starts, and lands in the thread Space | `threads::tests::a_record_from_before_the_change_still_starts_in_the_thread_space` |
+| `kind = "tab"` / `"home"` read as `local`, are written as `local`, and `--kind` still takes them | `threads::tests::the_old_kind_names_are_local`, `tests::the_old_kind_names_still_work_and_say_so` |
+| `thread show` on a `kind = "home"` / `"tab"` record says `local`, and `context` still sees the thread | `tests::a_record_from_before_the_merge_still_reads_and_says_local` |
+| `thread start --help` promises no Space of its own and names the three placements | `tests::thread_start_help_describes_where_a_thread_works_not_a_space_of_its_own` |
+| no repo means `local`, and `--repo` alone means `worktree` | `threads::tests::placement_follows_the_request_then_the_repo` |
 | a display-name change renames the Space instead of opening a second one | `threads::tests::the_thread_space_follows_the_display_name_instead_of_being_left_behind` |
 | the finder's order: record → other threads → label → panes, and never a home/one-worktree/old-own Space | `threads::tests::the_thread_space_is_named_by_the_record_the_label_or_the_panes` |
 | a Space holding two worktrees is not a worktree Space; one alone still is | `fake_hc::tests::a_space_holding_two_worktrees_is_not_a_worktree_space` |
@@ -301,58 +307,71 @@ the order of this page:
 
 ## 9. What is left
 
-**`Kind` convergence (step 2, after this lands).** `tab` ("a Space of its own")
-and `home` ("a tab of the project's Space") describe a difference that no longer
-exists; both now mean "its own folder on `threads/<id>/`, as a tab of the thread
-Space". `checkout` stays (the repo's main checkout, no branch of its own) and
-`worktree` stays.
+**Step 2 landed with this change: `tab` and `home` are one `local`.** They had
+described a difference that no longer existed ("a Space of its own" vs "a tab of
+the project's Space"), and `--kind` had stopped deciding anything about the
+sidebar at all. Now:
 
-Proposal, in the order that keeps old records working:
+- `Kind` is `Worktree`, `Local`, `Checkout`, `Adopted`. Records serialise the
+  kind as `local`.
+- `#[serde(alias = "home", alias = "tab")]` on `Local` keeps every record
+  written under an old name readable — the record is read on every tick, and a
+  value that failed to parse would make the thread unreadable: `thread list`,
+  the brief, the ticker and its own restart would all stop seeing it.
+- `Kind::parse` still takes `tab` and `home`, maps them to `Local` and says so
+  on stderr. Deprecating rather than rejecting is deliberate: a person's habit
+  is not worth a refusal, and nothing about the placement differs.
+- Every match that said `Kind::Tab | Kind::Home` says `Kind::Local`
+  (`place_and_brief`, `place_tab`, `restart_plan`, `threads::clean`, `sweep`,
+  `overview`'s place column). `spaces::empty`'s legacy own-Space rule and
+  `thread::own_space_id` are gone with the fields that fed them (below).
+- `hp thread start --help` says where each kind works and names no Space:
+  `worktree` is its own worktree and branch, `checkout` the repository's main
+  checkout, `local` a folder of its own under the project's `threads/<id>/`.
 
-1. Add `Kind::Local` with `#[serde(alias = "home", alias = "tab")]`, serialising
-   as `local`; keep `tab`/`home` parseable in `Kind::parse` for one release,
-   mapping both to `Local` and printing the deprecation on stderr.
-2. Move every match on `Kind::Tab | Kind::Home` to `Local` (there are four:
-   `place_and_brief`, `place_tab`, `restart_plan`, `threads::clean`,
-   `spaces::empty`'s legacy own-Space list, `overview`'s place column).
-3. After a release, drop the two `parse` arms and the serde aliases, and the
-   legacy own-Space rule in `spaces::empty` (it exists only for pre-t-0062
-   Spaces: the last one goes away when the last old thread is resolved).
+Deprecation, not removal, is what the two aliases and the two `parse` arms are
+for. They can go in a later release, when no record in any project says `tab` or
+`home`; nothing else depends on them.
 
-Deprecating rather than rejecting is deliberate: a record with `kind = "tab"` is
-read on every tick, and a value that fails to parse makes the thread unreadable —
-`thread list`, the brief, the ticker and its own restart all stop seeing it. The
-record parse is the one place where "be strict" is the wrong instinct.
+**Deleted as inert (not ported, not replaced):**
 
-**Other loose ends this change leaves:**
+- `spaces::primary` — herdr 1's "repository Space", the Space herdr grouped a
+  repository's worktree Spaces under. It looked for a Space whose
+  `worktree.is_linked_worktree` was false, and nothing in the herdr-core port
+  ever sets it (herdr-core has no worktree grouping), so it never found one.
+- `spaces::record`, `Thread::repo_workspace` and the repository-Space rule in
+  `spaces::empty` — they existed only to remember and later close that Space.
+- `thread::own_space_id`, `Thread::own_workspace` and the legacy own-Space rule
+  in `spaces::empty` — they closed a thread's *own* pre-t-0062 Space once its
+  panes were gone. Nothing has written `own_workspace` since t-0062, and a Space
+  that still holds a thread's panes is closed with its last tab at resolve
+  (`close_place`); the rule had nothing left to find.
+- `WorkspaceWorktree` — its only readers were the three above; what is left of
+  it is `Workspace::worktree: Option<String>`, "this Space *is* this worktree".
 
-- `spaces::primary`, `Thread::repo_workspace`, `spaces::record` and the
-  repository-Space rule in `spaces::empty` are inert (herdr-core has no worktree
-  grouping; `is_linked_worktree` is never false). They can go, with the tests
-  that encode the "grouped under a repository" shape.
-- `thread::own_workspace` is now written by nothing. It is read by the
-  legacy-Space rule in `spaces::empty` and can go with it.
-- `threads::clean` closes the Space when the resolved tab was the last pane. If
-  an app refuses that close (`space.close`), the note says so and the next
-  `spaces::empty` pass (idle shells only) retries it. Not observed; worth a look
-  on the first real resolve.
+**Still true, and not a loose end:** `threads::clean` closes the Space when the
+resolved tab was the last pane. If an app refuses that close (`space.close`), the
+note says so and the next `spaces::empty` pass (idle shells only) retries it. Not
+observed; worth a look on the first real resolve.
 
 ## 10. Migration
 
-Nothing is migrated. An open thread keeps its own Space until it is restarted or
-resolved:
+Nothing is migrated, and nothing needs to be:
 
 - **restart** places the tab in the thread Space (the old Space is not joined:
   §4);
-- **resolve** closes the tab, and `spaces::empty` closes the old Space once its
-  panes are gone (the legacy rule, keyed on the record's `own_workspace`/title);
+- **resolve** closes the tab, and `close_place` closes the Space when that tab
+  was its last pane;
 - **nothing** reopens a `threads/*.toml`: a record's `kind` is read, never
-  rewritten, so the `.toml` files stay as they are until step 2.
+  rewritten, so a `.toml` saying `kind = "tab"` or `"home"` keeps saying it and
+  keeps working (it reads as `local`; the record is written back as `local` the
+  next time anything updates it).
 
 Leaving them alone is cheaper and safer than moving tabs under a person: a
 restart is a thing the user asks for, a rewrite of every record in ten projects
-is not, and the two shapes coexist without any code path having to know which is
-which beyond the label check in §4.
+is not. A legacy Space — one Space per thread, named after its title — stays
+until that thread is resolved: its tab is not joined again (§4), and it goes with
+its last pane.
 
 ## 11. Where this differs from the first draft of the change
 

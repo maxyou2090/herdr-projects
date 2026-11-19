@@ -76,11 +76,11 @@ pub struct StartArgs {
     /// The profile (`--profile`), default `thread_profile` in PROJECT.md;
     /// it must be on the project's allow-list.
     pub profile: Option<String>,
-    /// Placement (`--kind worktree|tab|checkout|home`); default worktree
-    /// with a repo, home (its own folder on `threads/<id>/`) without one. All
-    /// four put the thread's tab in the project's thread Space
-    /// (`docs/thread-space.md`); `tab` and `home` only survive as the values
-    /// old records and commands carry.
+    /// Where the thread works (`--kind worktree|checkout|local`); default
+    /// worktree with a repo, `local` (its own folder on `threads/<id>/`)
+    /// without one. Every kind puts the thread's tab in the project's thread
+    /// Space (`docs/thread-space.md`); `tab` and `home` only survive as the
+    /// old names `Kind::parse` still takes and old records still carry.
     pub kind: Option<Kind>,
     pub base: Option<String>,
     pub task: String,
@@ -111,7 +111,7 @@ pub fn thread_profile(ctx: &Ctx, project: &Project, requested: Option<&str>) -> 
 pub fn placement(kind: Option<Kind>, has_repo: bool) -> Result<Kind> {
     match (kind, has_repo) {
         (None, true) => Ok(Kind::Worktree),
-        (None, false) => Ok(Kind::Home),
+        (None, false) => Ok(Kind::Local),
         (Some(Kind::Worktree), false) | (Some(Kind::Checkout), false) => bail!("a worktree or checkout thread needs --repo"),
         (Some(Kind::Adopted), _) => bail!("an adopted thread is made with `thread adopt`"),
         (Some(kind), _) => Ok(kind),
@@ -222,11 +222,9 @@ fn place_and_brief(ctx: &Ctx, project: &Project, view: &SessionView, id: &str, r
             if let Err(error) = view.herdr.worktree_mark(&created.pane_id, &path) {
                 eprintln!("warning: could not mark pane {} as worktree {path} ({error})", created.pane_id);
             }
-            let repo_workspace = repo_space(&view.herdr, &record.repo);
             // Recorded immediately, so a command killed midway still leaves a
             // record `thread restart` can act on.
             thread::update(project, id, |t| {
-                t.repo_workspace = repo_workspace;
                 t.origin = origin;
                 t.base = base;
                 t.branch = branch;
@@ -235,7 +233,7 @@ fn place_and_brief(ctx: &Ctx, project: &Project, view: &SessionView, id: &str, r
             finish_place(project, view, id, &created, &folder)?;
             thread::load(project, id)?
         }
-        Kind::Tab | Kind::Checkout | Kind::Home => place_tab(project, view, &record)?,
+        Kind::Local | Kind::Checkout => place_tab(project, view, &record)?,
         Kind::Adopted => bail!("an adopted thread is not placed by the binary"),
     };
     prepare_thread_agents(&placed)?;
@@ -249,12 +247,6 @@ fn prepare_thread_agents(thread: &Thread) -> Result<()> {
     }
     crate::skills::prepare(std::path::Path::new(&thread.repo), std::path::Path::new(&thread.worktree_path))
         .with_context(|| format!("could not prepare shared .agents directory for thread {}", thread.id))
-}
-
-/// The repository's primary Space herdr grouped a new worktree Space under,
-/// or "" when herdr does not list one (the ticker looks again).
-fn repo_space(herdr: &crate::core::Core, repo: &str) -> String {
-    herdr.workspace_list().ok().and_then(|all| crate::spaces::primary(&all, repo).map(|w| w.workspace_id.clone())).unwrap_or_default()
 }
 
 /// The Spaces this project's coordinators sit in, one per open lane: never a
@@ -397,7 +389,7 @@ fn write_brief(ctx: &Ctx, project: &Project, placed: &Thread, restart: bool) -> 
     let brief = thread::brief_for(project, &with_dir, &task, restart)?;
 
     std::fs::create_dir_all(Path::new(&dir).join("library")).with_context(|| format!("could not create {dir}"))?;
-    if !matches!(placed.kind, Kind::Tab | Kind::Home) {
+    if !matches!(placed.kind, Kind::Local) {
         exclude_from_git(ctx.runner, &placed.cwd)?;
     }
     project::write_atomic(&Path::new(&dir).join("brief.md"), brief.as_bytes())?;
@@ -450,7 +442,7 @@ pub enum RestartPlan {
 pub fn restart_plan(thread: &Thread, live: &Live, branch_exists: bool, now: jiff::Timestamp) -> Result<RestartPlan> {
     match thread.kind {
         Kind::Adopted => bail!("an adopted thread cannot be restarted; adopt a new pane instead"),
-        Kind::Worktree | Kind::Tab | Kind::Checkout | Kind::Home => {}
+        Kind::Worktree | Kind::Local | Kind::Checkout => {}
     }
     if thread.status == Status::Resolved {
         bail!("{} is resolved; `thread resolve --reopen` first", thread.id);
@@ -478,7 +470,7 @@ pub fn restart_plan(thread: &Thread, live: &Live, branch_exists: bool, now: jiff
         }
         return Ok(RestartPlan::Create);
     }
-    if matches!(thread.kind, Kind::Tab | Kind::Checkout | Kind::Home) && thread.pane_id.is_empty() {
+    if matches!(thread.kind, Kind::Local | Kind::Checkout) && thread.pane_id.is_empty() {
         return Ok(RestartPlan::Create);
     }
     if live.pane_exists {
@@ -1015,7 +1007,7 @@ pub fn clean(ctx: &Ctx, project: &Project, t: &Thread, options: &Clean) -> Clean
         }
         // A tab, checkout or home thread has nothing to remove but its tab
         // (below) and, for a checkout, no branch of its own either.
-        Kind::Tab | Kind::Checkout | Kind::Home => {}
+        Kind::Local | Kind::Checkout => {}
         Kind::Adopted => notes.push("its pane was left alone (an adopted pane is yours)".into()),
     }
     // Every thread's tab goes, after its worktree if it had one: the Space it
@@ -1031,9 +1023,9 @@ pub fn clean(ctx: &Ctx, project: &Project, t: &Thread, options: &Clean) -> Clean
     let mut stray = None;
     if let Some(view) = &view {
         clear_thread_tokens(&view.herdr, t);
-        // A thread's **own** Space from before the shared one (`own_workspace`),
-        // and the repository Spaces herdr 1 grouped worktrees under: both are
-        // closed once nothing uses them, and neither is ever the thread Space.
+        // A thread's own Space from before the shared one, and an orphan home
+        // Space: closed once nothing uses them. Neither is ever the thread
+        // Space, which `spaces::empty` judges by its panes.
         for error in crate::spaces::close_empty(ctx, project, &view.herdr) {
             notes.push(format!("{error:#}"));
         }
@@ -1441,8 +1433,8 @@ mod tests {
     #[test]
     fn restart_case_e_reopens_the_worktree() {
         assert_eq!(restart_plan(&worktree_thread(), &gone(), false, now()).unwrap(), RestartPlan::Reopen);
-        let tab = Thread { kind: Kind::Tab, worktree_path: String::new(), ..worktree_thread() };
-        assert_eq!(restart_plan(&tab, &gone(), false, now()).unwrap(), RestartPlan::Reopen);
+        let local = Thread { kind: Kind::Local, worktree_path: String::new(), ..worktree_thread() };
+        assert_eq!(restart_plan(&local, &gone(), false, now()).unwrap(), RestartPlan::Reopen);
     }
 
     #[test]
@@ -1474,7 +1466,7 @@ mod tests {
     #[test]
     fn the_thread_space_is_named_by_the_record_the_label_or_the_panes() {
         let project = crate::project::create(&tempfile::tempdir().unwrap().path().join("root"), "demo", vec![]).unwrap();
-        let t = Thread { id: "t-0001".into(), kind: Kind::Tab, title: "Research".into(), workspace_id: "w9".into(), ..Thread::default() };
+        let t = Thread { id: "t-0001".into(), kind: Kind::Local, title: "Research".into(), workspace_id: "w9".into(), ..Thread::default() };
         let mine = crate::core::Pane { pane_id: "p1".into(), workspace_id: "w4".into(), tokens: [("hp_project".to_string(), "demo".to_string())].into_iter().collect(), ..crate::core::Pane::default() };
         let elsewhere = crate::core::Pane { pane_id: "p2".into(), workspace_id: "w5".into(), tokens: [("hp_project".to_string(), "other".to_string())].into_iter().collect(), ..crate::core::Pane::default() };
         let panes = [mine, elsewhere];
@@ -1485,7 +1477,7 @@ mod tests {
         // Never the project's home Space, whatever the label.
         assert_eq!(threads_space(&project, &homes, &panes, &[], Some(&t)), None);
         // A Space that is one worktree is not a thread Space.
-        let worktree = crate::core::Workspace { worktree: Some(crate::core::WorkspaceWorktree::default()), ..space("w9", "Demo Threads") };
+        let worktree = crate::core::Workspace { worktree: Some("/wt/one".into()), ..space("w9", "Demo Threads") };
         assert_eq!(threads_space(&project, &[worktree], &[], &[], Some(&t)), None);
         // 3: today's label, for a Space nothing records yet.
         assert_eq!(threads_space(&project, &[space("w7", "Demo Threads")], &[], &[], None).as_deref(), Some("w7"));
@@ -1567,7 +1559,7 @@ mod tests {
     fn start_home(world: &FakeProject, title: &str) -> Thread {
         let record = thread::allocate(&world.project, |t| {
             t.title = title.to_string();
-            t.kind = Kind::Home;
+            t.kind = Kind::Local;
         })
         .unwrap();
         place_tab(&world.project, &world.view(), &record).unwrap()
@@ -1578,11 +1570,11 @@ mod tests {
     /// the Space its coordinator lives in.
     #[test]
     fn a_new_thread_lands_in_the_project_s_thread_space() {
-        for kind in [Kind::Home, Kind::Tab, Kind::Checkout] {
+        for kind in [Kind::Local, Kind::Checkout] {
             let world = FakeProject::new();
             let record = thread::allocate(&world.project, |t| {
                 t.title = "线程命名 tab 用 id".into();
-                t.kind = if kind == Kind::Checkout { Kind::Home } else { kind };
+                t.kind = kind;
             })
             .unwrap();
             let placed = place_tab(&world.project, &world.view(), &record).unwrap();
@@ -1658,18 +1650,20 @@ mod tests {
     #[test]
     fn a_record_from_before_the_change_still_starts_in_the_thread_space() {
         // `kind = "tab"` and `kind = "home"` records, with the Space of their own
-        // they were made in: the value still parses, and the placement puts the
-        // thread in the project's thread Space instead.
+        // they were made in and the fields the merge dropped (`own_workspace`,
+        // `repo_workspace`): the value still parses — as `local` —, the dropped
+        // fields are ignored, and the placement puts the thread in the project's
+        // thread Space instead.
         for raw in ["tab", "home"] {
             let world = FakeProject::new();
             let record = thread::allocate(&world.project, |t| {
                 t.title = "研究".into();
-                t.kind = Kind::Home;
+                t.kind = Kind::Local;
             })
             .unwrap();
             let path = thread::record_path(&world.project, &record.id);
             let mut toml = std::fs::read_to_string(&path).unwrap();
-            for (key, value) in [("kind", raw), ("own_workspace", "wold"), ("workspace_id", "wold")] {
+            for (key, value) in [("kind", raw), ("own_workspace", "wold"), ("workspace_id", "wold"), ("repo_workspace", "wrepo")] {
                 let line = format!("{key} = \"{value}\"");
                 match toml.lines().position(|l| l.starts_with(&format!("{key} = "))) {
                     Some(at) => {
@@ -1682,11 +1676,13 @@ mod tests {
             }
             std::fs::write(&path, toml).unwrap();
             let old = thread::load(&world.project, &record.id).unwrap();
-            assert_eq!(format!("{:?}", old.kind), if raw == "tab" { "Tab" } else { "Home" }, "the old value still parses");
+            assert_eq!(old.kind, Kind::Local, "kind = \"{raw}\" still parses, as `local`");
+            assert_eq!(toml::to_string(&old).unwrap().lines().find(|l| l.starts_with("kind = ")), Some("kind = \"local\""), "and is written back as `local`");
             let placed = place_tab(&world.project, &world.view(), &old).unwrap();
             assert_eq!(world.thread_spaces().len(), 1, "{raw}: {:?}", world.spaces());
             assert_eq!(placed.workspace_id, world.thread_spaces()[0].workspace_id);
             assert_ne!(placed.workspace_id, "wold");
+            assert_ne!(placed.workspace_id, "wrepo");
         }
     }
 
@@ -1718,7 +1714,7 @@ mod tests {
         let world = FakeProject::new();
         let dir = world.project.canonical_dir().to_string_lossy().into_owned();
         let stale = thread::allocate(&world.project, |t| {
-            t.kind = Kind::Tab;
+            t.kind = Kind::Local;
             t.status = Status::Resolved;
             t.title = "resolved and gone".into();
             t.resolved_reason = "manual".into();
@@ -1747,10 +1743,9 @@ mod tests {
     fn a_legacy_tab_thread_s_space_is_left_behind_and_its_tab_joins_the_thread_space() {
         let world = FakeProject::new();
         let record = thread::allocate(&world.project, |t| {
-            t.kind = Kind::Tab;
+            t.kind = Kind::Local;
             t.title = "线程命名 tab 用 id".into();
             t.status = Status::Open;
-            t.own_workspace = "wthread".into();
             t.workspace_id = "wthread".into();
         })
         .unwrap();
@@ -1778,7 +1773,6 @@ mod tests {
             t.title = "checkout thread".into();
             t.status = Status::Open;
             t.repo = repo_path.clone();
-            t.own_workspace = "wcheck".into();
             t.workspace_id = "wcheck".into();
         })
         .unwrap();
@@ -1797,8 +1791,8 @@ mod tests {
     fn a_home_thread_no_longer_lands_in_the_project_s_own_space() {
         let world = FakeProject::new();
         let record = thread::allocate(&world.project, |t| {
-            t.kind = Kind::Home;
-            t.title = "home thread".into();
+            t.kind = Kind::Local;
+            t.title = "local thread".into();
             t.status = Status::Open;
         })
         .unwrap();
@@ -1840,7 +1834,7 @@ mod tests {
             })
             .unwrap();
         let record = thread::allocate(&project, |t| {
-            t.kind = Kind::Home;
+            t.kind = Kind::Local;
             t.title = "Drain the held-document backlog".into();
             t.status = Status::Open;
             // What the incident's record was left saying.
@@ -1876,18 +1870,33 @@ mod tests {
     #[test]
     fn placement_follows_the_request_then_the_repo() {
         assert_eq!(placement(None, true).unwrap(), Kind::Worktree);
-        assert_eq!(placement(None, false).unwrap(), Kind::Home);
-        assert_eq!(placement(Some(Kind::Tab), true).unwrap(), Kind::Tab);
-        assert_eq!(placement(Some(Kind::Tab), false).unwrap(), Kind::Tab);
+        assert_eq!(placement(None, false).unwrap(), Kind::Local, "no repo: a folder of its own, no worktree");
+        assert_eq!(placement(Some(Kind::Local), true).unwrap(), Kind::Local);
+        assert_eq!(placement(Some(Kind::Local), false).unwrap(), Kind::Local);
         assert_eq!(placement(Some(Kind::Checkout), true).unwrap(), Kind::Checkout);
-        assert_eq!(placement(Some(Kind::Home), false).unwrap(), Kind::Home);
-        assert_eq!(placement(Some(Kind::Home), true).unwrap(), Kind::Home);
         assert!(placement(Some(Kind::Checkout), false).is_err());
         assert!(placement(Some(Kind::Worktree), false).is_err());
         assert!(placement(Some(Kind::Adopted), true).is_err());
         assert_eq!(Kind::parse("checkout").unwrap(), Kind::Checkout);
-        assert_eq!(Kind::parse("home").unwrap(), Kind::Home);
+        assert_eq!(Kind::parse("local").unwrap(), Kind::Local);
         assert!(Kind::parse("nowhere").is_err());
+    }
+
+    /// `tab` and `home` were two names for what `local` is; the command line
+    /// still takes them (a person's habit is not worth breaking), and the
+    /// record writes one value.
+    #[test]
+    fn the_old_kind_names_are_local() {
+        assert_eq!(Kind::parse("tab").unwrap(), Kind::Local);
+        assert_eq!(Kind::parse("home").unwrap(), Kind::Local);
+        assert_eq!(toml::to_string(&Thread { kind: Kind::Local, ..Thread::default() }).unwrap().lines().find(|l| l.starts_with("kind = ")), Some("kind = \"local\""), "one value is written, whatever it was called");
+        for raw in ["home", "tab"] {
+            let parsed: Thread = toml::from_str(&format!("kind = \"{raw}\"")).unwrap();
+            assert_eq!(parsed.kind, Kind::Local, "a record saying `{raw}` reads as `local`");
+        }
+        let parsed: Thread = toml::from_str("kind = \"local\"").unwrap();
+        assert_eq!(parsed.kind, Kind::Local);
+        assert!(toml::from_str::<Thread>("kind = \"nowhere\"").is_err(), "a value that is not a kind is still refused");
     }
 
     #[test]

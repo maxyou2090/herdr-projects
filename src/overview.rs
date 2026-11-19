@@ -208,8 +208,8 @@ pub fn render(project: &Project, rows: &[Row]) -> String {
             let t = &row.thread;
             let place = if !t.branch.is_empty() {
                 t.branch.clone()
-            } else if matches!(t.kind, thread::Kind::Tab | thread::Kind::Home) {
-                "tab".to_string()
+            } else if matches!(t.kind, thread::Kind::Local) {
+                "local".to_string()
             } else {
                 "-".to_string()
             };

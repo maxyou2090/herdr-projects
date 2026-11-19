@@ -146,18 +146,12 @@ pub struct Workspace {
     pub focused: bool,
     #[serde(default)]
     pub pane_count: usize,
+    /// The worktree this Space *is*, when every terminal in it names the same
+    /// one (`hp_worktree`); `None` for a plain Space. A Space holding several
+    /// worktrees — the project's thread Space holds one per thread — is plain
+    /// (`docs/thread-space.md` §6.4).
     #[serde(default)]
-    pub worktree: Option<WorkspaceWorktree>,
-}
-
-#[derive(Debug, Clone, Deserialize, PartialEq, Default)]
-pub struct WorkspaceWorktree {
-    #[serde(default)]
-    pub repo_key: String,
-    #[serde(default)]
-    pub checkout_path: String,
-    #[serde(default)]
-    pub is_linked_worktree: bool,
+    pub worktree: Option<String>,
 }
 
 /// The native session reference an agent reported (core: the `hp_session` label).
@@ -620,7 +614,7 @@ impl<'a> Core<'a> {
             let paths = worktrees.get(&space.workspace_id).cloned().unwrap_or_default();
             let first = paths.first().cloned().unwrap_or_default();
             if !first.is_empty() && paths.iter().all(|path| path == &first) {
-                space.worktree = Some(WorkspaceWorktree { repo_key: String::new(), checkout_path: first, is_linked_worktree: true });
+                space.worktree = Some(first);
             }
         }
         Ok(out)

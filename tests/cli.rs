@@ -355,3 +355,71 @@ fn dead_arguments_are_refused_and_nothing_names_the_old_binary() {
     assert!(!text.contains("herdr-projects safety"), "{text}");
     assert!(!text.contains("herdr-projects profile"), "{text}");
 }
+
+/// `--kind` says where a thread works, which is all that is left of it: every
+/// kind puts the tab in the project's thread Space, so a help text promising
+/// "a Space of its own" is a lie a user can check in the sidebar
+/// (`docs/thread-space.md` §2).
+#[test]
+fn thread_start_help_describes_where_a_thread_works_not_a_space_of_its_own() {
+    let home = tempfile::tempdir().unwrap();
+    let out = hp(home.path(), &["thread", "start", "--help"]);
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    let text = String::from_utf8(out.stdout).unwrap();
+    assert!(!text.contains("Space of its own"), "no kind has a Space of its own any more: {text}");
+    // The three placements, by the names `--kind` accepts, and where each works.
+    assert!(text.contains("--kind <worktree|checkout|local>") || text.contains("--kind <worktree|local|checkout>"), "{text}");
+    for want in ["its own worktree and branch", "the repository's main checkout", "threads/<id>/"] {
+        assert!(text.contains(want), "`{want}` is what a placement decides: {text}");
+    }
+    assert!(text.contains("default with --repo") && text.contains("default without a repo"), "the two defaults are stated: {text}");
+}
+
+/// A record written before `tab`/`home` became `local` reads as `local`:
+/// every tick, the brief and the restart read that value, and a value that
+/// failed to parse would make the thread vanish from all of them.
+#[test]
+fn a_record_from_before_the_merge_still_reads_and_says_local() {
+    let home = tempfile::tempdir().unwrap();
+    let root = home.path().join("root");
+    let root_arg = root.to_str().unwrap();
+    assert!(hp(home.path(), &["--root", root_arg, "new", "Demo"]).status.success());
+    for (id, raw) in [("t-0001", "home"), ("t-0002", "tab")] {
+        let dir = root.join("demo").join("threads").join(id);
+        std::fs::create_dir_all(&dir).unwrap();
+        let record = format!(
+            "id = \"{id}\"\ntitle = \"研究 {raw}\"\nstatus = \"open\"\nkind = \"{raw}\"\ncwd = \"{}\"\n",
+            dir.to_str().unwrap()
+        );
+        std::fs::write(root.join("demo").join("threads").join(format!("{id}.toml")), record).unwrap();
+
+        let out = hp(home.path(), &["--root", root_arg, "thread", "show", "demo", id]);
+        assert!(out.status.success(), "kind = \"{raw}\" must still parse: {}", String::from_utf8_lossy(&out.stderr));
+        let text = String::from_utf8(out.stdout).unwrap();
+        assert!(text.contains("kind = \"local\""), "the old value reads as `local` (and is written that way): {text}");
+        assert!(text.contains(&format!("title = \"研究 {raw}\"")), "{text}");
+    }
+    // And both are in the project's threads, with the placement it now means.
+    let out = hp(home.path(), &["--root", root_arg, "context", "demo", "--peek"]);
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    let text = String::from_utf8(out.stdout).unwrap();
+    assert!(text.contains("研究 home") && text.contains("研究 tab"), "both threads are still seen: {text}");
+}
+
+/// `--kind tab` and `--kind home` still work (people have the habit), and say
+/// once, on stderr, that `local` is the name now. They are not refused.
+#[test]
+fn the_old_kind_names_still_work_and_say_so() {
+    let home = tempfile::tempdir().unwrap();
+    let root = home.path().join("root");
+    let root_arg = root.to_str().unwrap();
+    assert!(hp(home.path(), &["--root", root_arg, "new", "Demo"]).status.success());
+    for old in ["tab", "home"] {
+        // No session in this environment, so the start stops after parsing the
+        // kind: the warning is what this test is about.
+        let out = hp(home.path(), &["--root", root_arg, "thread", "start", "demo", "--title", "x", "--kind", old, "--task-file", "-"]);
+        let err = String::from_utf8(out.stderr).unwrap();
+        assert!(err.contains(&format!("`{old}` is the old name")), "`--kind {old}` says what to use instead: {err}");
+        assert!(!err.contains(&format!("`{old}` is not a thread kind")), "`--kind {old}` is not refused: {err}");
+    }
+}
