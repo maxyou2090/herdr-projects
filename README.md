@@ -3,7 +3,7 @@
 Run a whole project across several coding agents without briefing each one by
 hand. You talk to a **coordinator** agent for each line of work; the
 coordinator starts a separate agent for each task in its own git worktree and
-branch, gives every one of them the same goal, instructions and memory, and
+branch, gives every one of them the same instructions and memory, and
 collects what needs you. A project can run several independent **lanes**, each
 with its own coordinator, its own `TASKS.md` sections and its own inbox over the
 same repositories, memory and settings.
@@ -49,7 +49,7 @@ Requirements: Rust 1.89 or later to build, `herdr-core` 0.1.21 or later (`hc` on
 Then create and open a project:
 
 ```bash
-hp new billing --goal "monthly invoices" --repo ~/dev/app
+hp new billing --repo ~/dev/app
 hp open billing
 ```
 

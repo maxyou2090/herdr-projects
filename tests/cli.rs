@@ -171,3 +171,48 @@ fn task_commands_write_tasks_md_and_work_without_a_lane_registry() {
     let context = String::from_utf8(out.stdout).unwrap();
     assert!(context.contains("## Later\n- [x] Write docs (me)\n  notes: A note"), "{context}");
 }
+
+/// A `PROJECT.md` written by an older `hp` still carries `goal = "..."`.
+/// `goal` is gone from every output and is not a setting any more, but such a
+/// file must still read as an ordinary project.
+#[test]
+fn goal_is_gone_from_the_output_and_refused_as_a_setting() {
+    let home = tempfile::tempdir().unwrap();
+    let root = home.path().join("root");
+    let root_arg = root.to_str().unwrap();
+    assert!(hp(home.path(), &["--root", root_arg, "new", "Demo"]).status.success());
+    let md = root.join("demo").join("PROJECT.md");
+    let text = std::fs::read_to_string(&md).unwrap();
+    let text = match text.contains("goal = \"\"\n") {
+        true => text.replacen("goal = \"\"\n", "goal = \"monthly invoices\"\n", 1),
+        false => text.replacen("+++\n", "+++\ngoal = \"monthly invoices\"\n", 1),
+    };
+    std::fs::write(&md, text).unwrap();
+
+    // The stale line is tolerated: `context` still works…
+    let out = hp(home.path(), &["--root", root_arg, "context", "demo", "--peek"]);
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    let context = String::from_utf8(out.stdout).unwrap();
+    assert!(context.contains("Project: demo (active)\n"), "{context}");
+    assert!(!context.contains("Goal"), "{context}");
+    assert!(!context.contains("monthly invoices"), "{context}");
+
+    // …and `overview` prints a project line with no goal tail.
+    let out = hp(home.path(), &["--root", root_arg, "overview", "demo"]);
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    let overview = String::from_utf8(out.stdout).unwrap();
+    assert_eq!(overview.lines().next(), Some("demo (active)"), "{overview}");
+    assert!(!overview.contains("monthly invoices"), "{overview}");
+
+    // `hp set <slug> goal x` is an unknown setting.
+    let out = hp(home.path(), &["--root", root_arg, "set", "demo", "goal", "x"]);
+    assert!(!out.status.success(), "setting a goal must be refused");
+    let err = String::from_utf8(out.stderr).unwrap();
+    assert!(err.contains("unknown setting `goal`"), "{err}");
+
+    // `hp new` no longer takes `--goal`.
+    let out = hp(home.path(), &["--root", root_arg, "new", "Other", "--goal", "x"]);
+    assert!(!out.status.success(), "`new --goal` must be refused");
+    let err = String::from_utf8(out.stderr).unwrap();
+    assert!(err.contains("--goal"), "{err}");
+}

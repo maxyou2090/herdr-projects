@@ -1558,7 +1558,6 @@ fn digest_for(ctx: &Ctx, project: &Project, prefix: &str) -> Result<(String, Vec
     match project.read_project_md() {
         Ok((settings, _)) => {
             let _ = writeln!(out, "Name: {}", project.display_name());
-            let _ = writeln!(out, "Goal: {}", if settings.goal.is_empty() { "(none set)" } else { &settings.goal });
             let _ = writeln!(
                 out,
                 "Settings: coordinator_profile={} thread_profile={} auto_resolve_days={} nudge={}",
@@ -1681,6 +1680,22 @@ fn inbox_heading(project: &Project, lane: &str, unhandled: usize) -> String {
 mod tests {
     use super::*;
 
+    /// A `PROJECT.md` written by an older `hp`: it still has a `goal`.
+    const OLD_PROJECT_MD: &str = "+++\nname = \"Demo\"\ngoal = \"monthly invoices\"\n+++\n\n# Instructions\n";
+
+    #[test]
+    fn the_digest_states_the_project_but_no_goal() {
+        let (root, project) = project();
+        // An older PROJECT.md still carries the line; nothing prints it.
+        std::fs::write(project.project_md(), OLD_PROJECT_MD).unwrap();
+        let core = crate::fake_hc::FakeCore::new();
+        let ctx = open_ctx(root.path(), &project.root, &core);
+        let (text, _, _) = digest_for(&ctx, &project, "/bin/hp --root /r").unwrap();
+        assert!(text.contains("Project: demo (active)\n"), "{text}");
+        assert!(!text.contains("Goal"), "{text}");
+        assert!(!text.contains("monthly invoices"), "{text}");
+    }
+
     #[test]
     fn prefix_has_the_fixed_shape_and_quotes_spaces() {
         assert_eq!(
@@ -1708,7 +1723,7 @@ mod tests {
 
     fn project() -> (tempfile::TempDir, Project) {
         let root = tempfile::tempdir().unwrap();
-        let project = crate::project::create(root.path(), "demo", "", vec![]).unwrap();
+        let project = crate::project::create(root.path(), "demo", vec![]).unwrap();
         (root, project)
     }
 
@@ -1781,7 +1796,7 @@ mod tests {
     #[test]
     fn a_coordinator_in_a_terminal_the_app_made_is_named_and_its_ids_returned() {
         let root = tempfile::tempdir().unwrap();
-        let project = crate::project::create(root.path(), "REXA", "", vec![]).unwrap();
+        let project = crate::project::create(root.path(), "REXA", vec![]).unwrap();
         let fake = crate::fake_hc::FakeCore::new();
         let app = crate::fake_hc::FakeApp::new(&fake);
         let herdr = Core::new("hc", "", &app);
@@ -1807,7 +1822,7 @@ mod tests {
     #[test]
     fn an_opened_coordinator_carries_every_label_its_space_and_tab_need() {
         let root = tempfile::tempdir().unwrap();
-        let project = crate::project::create(root.path(), "REXA", "", vec![]).unwrap();
+        let project = crate::project::create(root.path(), "REXA", vec![]).unwrap();
         let fake = crate::fake_hc::FakeCore::new();
         let app = crate::fake_hc::FakeApp::new(&fake);
         let herdr = Core::new("hc", "", &app);
@@ -1833,7 +1848,7 @@ mod tests {
     #[test]
     fn a_second_pass_finds_the_names_already_right() {
         let root = tempfile::tempdir().unwrap();
-        let project = crate::project::create(root.path(), "REXA", "", vec![]).unwrap();
+        let project = crate::project::create(root.path(), "REXA", vec![]).unwrap();
         let fake = crate::fake_hc::FakeCore::new();
         let app = crate::fake_hc::FakeApp::new(&fake);
         let herdr = Core::new("hc", "", &app);
@@ -2213,7 +2228,7 @@ mod tests {
     fn open_focuses_the_recorded_coordinator_whose_agent_labels_are_gone() {
         let home = tempfile::tempdir().unwrap();
         let root = home.path().join("root");
-        let project = crate::project::create(&root, "demo", "", vec![]).unwrap();
+        let project = crate::project::create(&root, "demo", vec![]).unwrap();
         let dir = project.canonical_dir().to_string_lossy().into_owned();
         let fake = crate::fake_hc::FakeCore::new();
         // Alive, reporting as an agent, claiming project and lane — and carrying
@@ -2269,7 +2284,7 @@ mod tests {
     fn new_still_starts_a_second_coordinator_beside_the_unlabeled_one() {
         let home = tempfile::tempdir().unwrap();
         let root = home.path().join("root");
-        let project = crate::project::create(&root, "demo", "", vec![]).unwrap();
+        let project = crate::project::create(&root, "demo", vec![]).unwrap();
         let fake = crate::fake_hc::FakeCore::new();
         let term = fake.terminal("", "/Users/someone", &[(crate::labels::PROJECT_TOKEN, "demo"), (crate::lanes::TOKEN, "c-1")]);
         fake.set_status("", "done");
@@ -2290,7 +2305,7 @@ mod tests {
     fn open_does_not_adopt_an_unlabeled_pane_the_record_does_not_name() {
         let home = tempfile::tempdir().unwrap();
         let root = home.path().join("root");
-        let project = crate::project::create(&root, "demo", "", vec![]).unwrap();
+        let project = crate::project::create(&root, "demo", vec![]).unwrap();
         let fake = crate::fake_hc::FakeCore::new();
         // The recorded terminal is finished: the record has nothing live to name.
         fake.terminal("hp-demo-old", "/Users/someone", &[("hp_agent", "hpc-demo"), ("hp_kind", "pi")]);
@@ -2318,7 +2333,7 @@ mod tests {
     fn open_does_not_take_a_recorded_pane_that_claims_another_project() {
         let home = tempfile::tempdir().unwrap();
         let root = home.path().join("root");
-        let project = crate::project::create(&root, "demo", "", vec![]).unwrap();
+        let project = crate::project::create(&root, "demo", vec![]).unwrap();
         let fake = crate::fake_hc::FakeCore::new();
         let term = fake.terminal("", "/Users/someone", &[(crate::labels::PROJECT_TOKEN, "other"), (crate::lanes::TOKEN, "c-1")]);
         fake.set_status("", "done");
@@ -2341,7 +2356,7 @@ mod tests {
     fn open_still_refuses_a_pane_that_carries_hp_agent_and_claims_no_lane() {
         let home = tempfile::tempdir().unwrap();
         let root = home.path().join("root");
-        let project = crate::project::create(&root, "demo", "", vec![]).unwrap();
+        let project = crate::project::create(&root, "demo", vec![]).unwrap();
         let fake = crate::fake_hc::FakeCore::new();
         fake.terminal("hp-demo-1", "/Users/someone", &[("hp_agent", "hpc-demo"), ("hp_kind", "pi")]);
         fake.set_status("hp-demo-1", "done");

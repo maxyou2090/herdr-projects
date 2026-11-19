@@ -1441,7 +1441,7 @@ mod tests {
     impl FakeProject {
         fn new() -> FakeProject {
             let home = tempfile::tempdir().unwrap();
-            let project = crate::project::create(&home.path().join("root"), "demo", "", vec![]).unwrap();
+            let project = crate::project::create(&home.path().join("root"), "demo", vec![]).unwrap();
             let dir = project.canonical_dir().to_string_lossy().into_owned();
             let core = crate::fake_hc::FakeCore::new();
             let coordinator = core.terminal("hpc-demo", &dir, &[("hp_ws", "whome"), ("hp_ws_label", "Demo")]);
@@ -1587,7 +1587,7 @@ mod tests {
     #[test]
     fn a_home_thread_restart_lands_in_the_projects_own_space_not_another_projects() {
         let home = tempfile::tempdir().unwrap();
-        let project = crate::project::create(&home.path().join("root"), "demo", "", vec![]).unwrap();
+        let project = crate::project::create(&home.path().join("root"), "demo", vec![]).unwrap();
         let dir = project.canonical_dir().to_string_lossy().into_owned();
         let core = crate::fake_hc::FakeCore::new();
         // The other project's coordinator, drifted into demo's folder. Terminals
@@ -1716,7 +1716,7 @@ mod tests {
         let (home, repo, worktree) = worktree_with_a_bare_agents_link();
         let env = crate::paths::Env::for_test(home.path(), &[]);
         let ctx = removal_ctx(home.path(), &env);
-        let project = crate::project::create(&ctx.root, "demo", "", vec![]).unwrap();
+        let project = crate::project::create(&ctx.root, "demo", vec![]).unwrap();
 
         let removal = remove_worktree(&ctx, &project, &record_of(&repo, &worktree), None).unwrap();
         assert!(matches!(removal, Removal::Removed));
@@ -1731,7 +1731,7 @@ mod tests {
         std::fs::write(worktree.join("unfinished.txt"), "not copied home").unwrap();
         let env = crate::paths::Env::for_test(home.path(), &[]);
         let ctx = removal_ctx(home.path(), &env);
-        let project = crate::project::create(&ctx.root, "demo", "", vec![]).unwrap();
+        let project = crate::project::create(&ctx.root, "demo", vec![]).unwrap();
 
         assert!(remove_worktree(&ctx, &project, &record_of(&repo, &worktree), None).is_err());
         assert!(worktree.exists(), "real work must keep the worktree");
@@ -1753,7 +1753,7 @@ mod coordinator_caller_tests {
     fn setup<'a>(home: &std::path::Path, runner: &'a crate::runner::fake::FakeRunner, terminal: &str) -> (Ctx<'a>, Project) {
         let root = &home.join("root");
         let project = crate::project::Project::load(root, "demo")
-            .or_else(|_| crate::project::create(root, "demo", "", vec![]))
+            .or_else(|_| crate::project::create(root, "demo", vec![]))
             .unwrap();
         project
             .update_coordinator(|c| {

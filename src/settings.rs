@@ -11,9 +11,8 @@ use crate::paths::Ctx;
 use crate::project::{self, Project, Settings};
 
 /// The keys `set` accepts, with what they hold.
-pub const KEYS: [(&str, &str); 8] = [
+pub const KEYS: [(&str, &str); 7] = [
     ("name", "text"),
-    ("goal", "text"),
     ("coordinator_profile", "profile name"),
     ("thread_profile", "profile name"),
     ("auto_resolve_days", "number (0 = never)"),
@@ -74,8 +73,8 @@ pub fn set_in(text: &str, key: &str, value: &str) -> Result<String> {
     let mut doc = front.parse::<DocumentMut>().context("PROJECT.md front matter does not parse")?;
     let value = value.trim();
     match key {
-        "name" | "goal" => {
-            if key == "name" && value.is_empty() {
+        "name" => {
+            if value.is_empty() {
                 bail!("the name may not be empty");
             }
             doc[key] = toml_edit::value(value);
@@ -243,13 +242,17 @@ mod tests {
         assert_eq!(project::parse_project_md(&named).unwrap().0.name, "REXA");
         assert_eq!(named.matches("name = ").count(), 1, "replaced, never duplicated: {named}");
         assert!(set_in(MD, "name", "  ").is_err(), "an empty name is refused, not written");
+        assert!(set_in(MD, "goal", "Ship it").is_err(), "`goal` is not a setting any more");
         // The old key is replaced by the new one, never duplicated.
         let old = set_in("+++\nthread_agent = \"claude\"\n+++\n", "thread_agent", "luna").unwrap();
         assert_eq!(old, "+++\nthread_profile = \"luna\"\n+++\n");
         assert_eq!(project::parse_project_md(&set_in(&old, "coordinator_profile", "sol").unwrap()).unwrap().0.coordinator_profile, "sol");
         assert!(set_in(MD, "whatever", "x").is_err());
-        let goal = set_in(MD, "goal", "Ship \"it\"").unwrap();
-        assert_eq!(project::parse_project_md(&goal).unwrap().0.goal, "Ship \"it\"");
+        // A `goal` line left by an older hp stays where it is and reads as
+        // nothing; another setting edits the file beside it.
+        let edited = set_in(MD, "auto_resolve_days", "9").unwrap();
+        assert!(edited.contains("goal = \"\""), "{edited}");
+        assert_eq!(project::parse_project_md(&edited).unwrap().0.auto_resolve_days, 9);
     }
 
     #[test]
@@ -259,10 +262,16 @@ mod tests {
         assert_eq!((settings.name.as_str(), settings.auto_resolve_days), ("Demo", 3));
         assert_eq!(body, "# Instructions\nBody with +++ inside\n");
         // …nor `hp set`, which leaves the dead line where it is.
-        let goal = set_in(MD, "goal", "Ship it").unwrap();
-        assert!(goal.contains("max_parallel_threads = 1000"));
-        let (settings, _) = project::parse_project_md(&goal).unwrap();
-        assert_eq!(settings.goal, "Ship it");
+        let edited = set_in(MD, "nudge", "true").unwrap();
+        assert!(edited.contains("max_parallel_threads = 1000"));
+        let (settings, _) = project::parse_project_md(&edited).unwrap();
+        assert!(settings.nudge);
+    }
+
+    #[test]
+    fn goal_is_not_a_setting_any_more() {
+        let err = set_in(MD, "goal", "Ship it").unwrap_err().to_string();
+        assert!(err.contains("unknown setting `goal`"), "{err}");
     }
 
     #[test]

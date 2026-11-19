@@ -612,7 +612,7 @@ mod tests {
     #[test]
     fn doctor_warns_about_a_coordinator_whose_app_tab_is_not_named() {
         let home = tempfile::tempdir().unwrap();
-        let project = project::create(home.path(), "REXA", "", vec![]).unwrap();
+        let project = project::create(home.path(), "REXA", vec![]).unwrap();
         let fake = crate::fake_hc::FakeCore::new();
         let app = crate::fake_hc::FakeApp::new(&fake);
         let herdr = Core::new("hc", "", &app);
@@ -656,8 +656,8 @@ mod tests {
     #[test]
     fn a_coordinator_is_named_by_its_own_claim_not_by_its_shells_folder() {
         let root = tempfile::tempdir().unwrap();
-        let rexa = project::create(root.path(), "rexa", "", vec![]).unwrap();
-        let law = project::create(root.path(), "law", "", vec![]).unwrap();
+        let rexa = project::create(root.path(), "rexa", vec![]).unwrap();
+        let law = project::create(root.path(), "law", vec![]).unwrap();
         let rexa_dir = rexa.canonical_dir().to_string_lossy().into_owned();
         let law_dir = law.canonical_dir().to_string_lossy().into_owned();
         let mut agent = crate::core::Agent {

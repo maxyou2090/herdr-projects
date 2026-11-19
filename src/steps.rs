@@ -1531,7 +1531,7 @@ mod tests {
     /// A project with one due, prompt-only `sweep` routine, and its setup for
     /// the `every 1m` schedule the tests drive.
     fn sweep_project(root: &std::path::Path) -> Project {
-        let project = project::create(root, "demo", "", vec![]).unwrap();
+        let project = project::create(root, "demo", vec![]).unwrap();
         std::fs::create_dir_all(project.dir().join("routines")).unwrap();
         std::fs::write(project.dir().join("routines").join("sweep.md"), "+++\nschedule = \"every 1m\"\n+++\nGo.\n").unwrap();
         project
@@ -1556,7 +1556,7 @@ mod tests {
     #[test]
     fn items_about_a_resolved_thread_are_archived_only_once_they_are_old() {
         let root = tempfile::tempdir().unwrap();
-        let project = project::create(root.path(), "demo", "", vec![]).unwrap();
+        let project = project::create(root.path(), "demo", vec![]).unwrap();
         let resolved = thread::allocate(&project, |t| t.status = Status::Resolved).unwrap();
         let open = thread::allocate(&project, |t| t.status = Status::Open).unwrap();
         let item = |id: &str, kind: &str, subject: &str, created: &str| {
@@ -1869,7 +1869,7 @@ mod tests {
     #[test]
     fn an_old_scalar_ticker_file_loads_into_the_default_lane_slots() {
         let root = tempfile::tempdir().unwrap();
-        let project = project::create(root.path(), "demo", "", vec![]).unwrap();
+        let project = project::create(root.path(), "demo", vec![]).unwrap();
         std::fs::write(
             project.state_dir().join("ticker.json"),
             r#"{
@@ -1916,7 +1916,7 @@ mod tests {
     #[test]
     fn fresh_seen_items_are_not_reminded_and_nothing_is_spent() {
         let root = tempfile::tempdir().unwrap();
-        let project = project::create(root.path(), "demo", "", vec![]).unwrap();
+        let project = project::create(root.path(), "demo", vec![]).unwrap();
         seen_item(&project, "20261008T140000Z-thread-state-t-0001-1", "2026-10-08T14:00:00Z");
         let runner = FakeRunner::new();
         let herdr = Core::new("herdr", "sock", &runner);
@@ -1950,7 +1950,7 @@ mod tests {
     #[test]
     fn a_coordinator_idle_for_the_window_with_a_quiet_box_is_nudged() {
         let root = tempfile::tempdir().unwrap();
-        let project = project::create(root.path(), "demo", "", vec![]).unwrap();
+        let project = project::create(root.path(), "demo", vec![]).unwrap();
         unseen_item(&project, "20261008T140000Z-thread-state-t-0001-1", "2026-10-08T14:00:00Z");
         let runner = FakeRunner::new();
         runner.on("read w1:p1", ok(&screen("")));
@@ -1982,7 +1982,7 @@ mod tests {
     #[test]
     fn a_coordinator_with_a_draft_in_its_box_is_never_nudged() {
         let root = tempfile::tempdir().unwrap();
-        let project = project::create(root.path(), "demo", "", vec![]).unwrap();
+        let project = project::create(root.path(), "demo", vec![]).unwrap();
         unseen_item(&project, "20261008T140000Z-thread-state-t-0001-1", "2026-10-08T14:00:00Z");
         let runner = FakeRunner::new();
         runner.on("read w1:p1", ok(&screen("half-typed thought")));
@@ -2006,7 +2006,7 @@ mod tests {
     #[test]
     fn aged_seen_items_ask_for_a_coordinator_but_are_not_spent() {
         let root = tempfile::tempdir().unwrap();
-        let project = project::create(root.path(), "demo", "", vec![]).unwrap();
+        let project = project::create(root.path(), "demo", vec![]).unwrap();
         seen_item(&project, "20261008T130000Z-thread-state-t-0001-1", "2026-10-08T13:00:00Z");
         let runner = FakeRunner::new();
         let herdr = Core::new("herdr", "sock", &runner);
@@ -2028,7 +2028,7 @@ mod tests {
 
     fn two_lane_project() -> (tempfile::TempDir, Project) {
         let root = tempfile::tempdir().unwrap();
-        let project = project::create(root.path(), "demo", "", vec![]).unwrap();
+        let project = project::create(root.path(), "demo", vec![]).unwrap();
         crate::lanes::Registry::ensure_written(&project).unwrap();
         let mut registry = crate::lanes::Registry::load(&project).unwrap();
         registry.create("books", "收藏");
@@ -2042,7 +2042,7 @@ mod tests {
     #[test]
     fn a_held_nudge_is_only_news_once_the_nudge_has_had_its_waiting_time() {
         let root = tempfile::tempdir().unwrap();
-        let project = project::create(root.path(), "demo", "", vec![]).unwrap();
+        let project = project::create(root.path(), "demo", vec![]).unwrap();
         let now = at("2026-10-08T14:10:00Z");
         // 15s idle + 10s quiet box + one 15s tick: the whole time a nudge may
         // legitimately still be waiting.
@@ -2104,7 +2104,7 @@ mod tests {
         assert_eq!(inbox::unhandled(&project).len(), 2);
         // A project without a registry never writes such an item (§7).
         let root = tempfile::tempdir().unwrap();
-        let plain = project::create(root.path(), "plain", "", vec![]).unwrap();
+        let plain = project::create(root.path(), "plain", vec![]).unwrap();
         let mut state = State::default();
         write_lane_items(&plain, &mut state, &[(crate::lanes::Lane { id: "c-9".into(), ..Default::default() }, 3)]).unwrap();
         assert!(inbox::unhandled(&plain).is_empty());
@@ -2114,7 +2114,7 @@ mod tests {
     #[test]
     fn an_idle_thread_without_a_report_change_is_noted_once() {
         let root = tempfile::tempdir().unwrap();
-        let project = project::create(root.path(), "demo", "", vec![]).unwrap();
+        let project = project::create(root.path(), "demo", vec![]).unwrap();
         // A verbal handoff: idle half an hour after its report stopped changing.
         let stale = thread::allocate(&project, |t| {
             t.title = "slow hands".into();
@@ -2153,7 +2153,7 @@ mod tests {
     #[test]
     fn a_watched_turn_without_a_report_change_is_noted_despite_a_small_gap() {
         let root = tempfile::tempdir().unwrap();
-        let project = project::create(root.path(), "demo", "", vec![]).unwrap();
+        let project = project::create(root.path(), "demo", vec![]).unwrap();
         // The blind spot the gap check could not see: a second turn ends
         // soon after the previous report, but the ticker watched it work.
         let quiet = thread::allocate(&project, |t| {

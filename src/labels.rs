@@ -222,7 +222,7 @@ mod tests {
         // The thread rework left the coordinator's names alone: its row is the
         // project's display name, joined to a lane label with ` · `.
         let root = tempfile::tempdir().unwrap();
-        let project = crate::project::create(&root.path().join("root"), "demo", "", vec![]).unwrap();
+        let project = crate::project::create(&root.path().join("root"), "demo", vec![]).unwrap();
         assert_eq!(coordinator_display(&project, None), "Demo", "a project with no lane registry reads as before");
     }
 }

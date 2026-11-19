@@ -15,9 +15,9 @@ autoproject owns one review ratchet per project, from setup to stop, run by the 
 
 ## Inputs
 
-- The user's request and the `hp context` digest: goal, repos, `thread_profile` and the allowed thread profiles, `nudge`, project status, TASKS.md, open threads, inbox.
+- The user's request and the `hp context` digest: repos, `thread_profile` and the allowed thread profiles, `nudge`, project status, TASKS.md, open threads, inbox.
 - Three inputs, each one free-text description, with these defaults:
-  - **Brief**: the goal, what makers build or improve. Default: the project goal. Reviewers never see it.
+  - **Brief**: the goal, what makers build or improve. Default: the user's request. Reviewers never see it.
   - **Rubric**: how the adversarial reviewer judges a candidate. Default: beats the base on the goal, with proof. Makers never see it.
   - **Limits**: max iterations, consecutive rejections, and an optional success criterion. Default: 5 iterations, 3 rejections in a row, no success criterion.
 - Not inputs: the repo is the project's only repo (ask which one when it has several), and maker and reviewer run on `thread_profile` unless the user names another allowed profile in words.
@@ -34,7 +34,7 @@ autoproject owns one review ratchet per project, from setup to stop, run by the 
 
 1. **Active run.** If TASKS.md already has an `autoproject` line, a bare or matching `/autoproject` takes the resume path (step 9). A request for a new run is refused, naming the active slug. One run per project.
 2. **Bare `/autoproject`.** With no request, print exactly three bullets, Brief, Rubric, and Limits, each with its one-line description and default, then "Or say run-now." Then wait.
-3. **Setup.** Draft the Brief (goal, scope, constraints, checks to run, repo context; no evaluation criteria), the Rubric (independent goal, what counts as BETTER, task-shaped evidence, complexity cost), and the Limits from the request, the goal, and a quick look at the repo. Ask only about the Brief, Rubric, or Limits, and only real gaps, one question at a time. Then show one block starting `**Ready to run autoproject?**` with exactly three items, Brief, Rubric, and Limits, then these warnings, and exactly `1. Go (Recommended)` / `2. No — changes needed`:
+3. **Setup.** Draft the Brief (goal, scope, constraints, checks to run, repo context; no evaluation criteria), the Rubric (independent goal, what counts as BETTER, task-shaped evidence, complexity cost), and the Limits from the request and a quick look at the repo. Ask only about the Brief, Rubric, or Limits, and only real gaps, one question at a time. Then show one block starting `**Ready to run autoproject?**` with exactly three items, Brief, Rubric, and Limits, then these warnings, and exactly `1. Go (Recommended)` / `2. No — changes needed`:
    - A hung thread stalls the run until you say "stop"; there is no timeout.
    - When "no limit" was chosen: cost is unbounded.
    - When `nudge=false` or the project is paused: the run moves only when you message the coordinator.

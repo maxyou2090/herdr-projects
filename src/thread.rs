@@ -408,7 +408,6 @@ pub fn launch_prompt(slug: &str, id: &str) -> String {
 pub struct BriefInput<'a> {
     pub project_name: &'a str,
     pub slug: &'a str,
-    pub goal: &'a str,
     pub repos: &'a [project::Repo],
     /// The project's `uploads/` folder.
     pub uploads_path: &'a str,
@@ -429,7 +428,6 @@ pub struct BriefInput<'a> {
 fn brief_header(input: &BriefInput) -> String {
     let mut out = String::from("# Project\n\n");
     out.push_str(&format!("- Project: {} (`{}`)\n", input.project_name, input.slug));
-    out.push_str(&format!("- Goal: {}\n", if input.goal.trim().is_empty() { "(none set)" } else { input.goal.trim() }));
     if input.repos.is_empty() {
         out.push_str("- Repos: (none)\n");
     } else {
@@ -523,7 +521,6 @@ pub fn brief_for(project: &Project, thread: &Thread, task: &str, restart: bool) 
     Ok(compose_brief(&BriefInput {
         project_name: &project_name,
         slug: &project.slug,
-        goal: &settings.goal,
         repos: &settings.repos,
         uploads_path: &uploads,
         instructions: &instructions,
@@ -1160,7 +1157,7 @@ mod tests {
     #[test]
     fn id_allocation_under_contention() {
         let root = tempfile::tempdir().unwrap();
-        let project = project::create(root.path(), "demo", "", vec![]).unwrap();
+        let project = project::create(root.path(), "demo", vec![]).unwrap();
         let handles: Vec<_> = (0..8)
             .map(|_| {
                 let project = project.clone();
@@ -1178,7 +1175,7 @@ mod tests {
     #[test]
     fn updates_are_atomic_and_keep_other_fields() {
         let root = tempfile::tempdir().unwrap();
-        let project = project::create(root.path(), "demo", "", vec![]).unwrap();
+        let project = project::create(root.path(), "demo", vec![]).unwrap();
         let t = allocate(&project, |t| t.title = "Hello".into()).unwrap();
         update(&project, &t.id, |t| t.pane_id = "w1:p2".into()).unwrap();
         update(&project, &t.id, |t| t.prompt_pending = true).unwrap();
@@ -1191,7 +1188,7 @@ mod tests {
     #[test]
     fn a_record_written_when_threads_could_live_on_another_machine_still_loads() {
         let root = tempfile::tempdir().unwrap();
-        let project = project::create(root.path(), "demo", "", vec![]).unwrap();
+        let project = project::create(root.path(), "demo", vec![]).unwrap();
         // One empty field (the usual leftover) and one naming a machine: both
         // are unknown to this version and must be ignored, not rejected.
         for machine in ["\"\"", "\"box\""] {
@@ -1217,7 +1214,7 @@ mod tests {
     #[test]
     fn an_index_only_memory_file_is_not_inlined_into_a_brief() {
         let root = tempfile::tempdir().unwrap();
-        let project = project::create(root.path(), "demo", "", vec![]).unwrap();
+        let project = project::create(root.path(), "demo", vec![]).unwrap();
         std::fs::write(project.dir().join("MEMORY.md"), "# Memory\n\n- [Decisions](memory/decisions.md): routed\n").unwrap();
         std::fs::create_dir_all(project.dir().join("memory")).unwrap();
         std::fs::write(project.dir().join("memory/decisions.md"), "DECISION BODY\n").unwrap();
@@ -1227,6 +1224,17 @@ mod tests {
         assert!(brief.contains("memory/decisions.md"), "{brief}");
         assert!(brief.contains("FACT BODY"), "{brief}");
         assert!(!brief.contains("DECISION BODY"), "{brief}");
+    }
+
+    #[test]
+    fn a_brief_does_not_carry_a_goal() {
+        let root = tempfile::tempdir().unwrap();
+        let project = project::create(root.path(), "demo", vec![]).unwrap();
+        // An older PROJECT.md still carries the line: nothing reads it.
+        std::fs::write(project.project_md(), "+++\nname = \"Demo\"\ngoal = \"Ship it\"\n+++\n\n# Instructions\n").unwrap();
+        let brief = brief_for(&project, &Thread::default(), "Do it.", false).unwrap();
+        assert!(!brief.contains("Goal"), "{brief}");
+        assert!(!brief.contains("Ship it"), "{brief}");
     }
 
     #[test]
@@ -1240,7 +1248,6 @@ mod tests {
         let input = BriefInput {
             project_name: "Demo",
             slug: "demo",
-            goal: "Ship it",
             repos: &repos,
             uploads_path: "/root/demo/uploads",
             instructions: "Always run the tests.",
@@ -1254,8 +1261,8 @@ mod tests {
         };
         let brief = compose_brief(&input);
         let pos = |needle: &str| brief.find(needle).unwrap_or_else(|| panic!("missing {needle}"));
-        // The header comes first: name, goal, repos, uploads, library, report.
-        assert!(brief.starts_with("# Project\n\n- Project: Demo (`demo`)\n- Goal: Ship it\n"));
+        // The header comes first: name, repos, uploads, library, report.
+        assert!(brief.starts_with("# Project\n\n- Project: Demo (`demo`)\n- Repos:\n  - /srv/app\n"));
         assert!(pos("- Repos:\n  - /srv/app\n  - /home/me/lib\n") < pos("- Uploads"));
         assert!(pos("Uploads, files from the user: `/root/demo/uploads`") < pos("# Thread brief"));
         assert!(pos("# Thread brief") < pos("previous attempt"));
@@ -1273,9 +1280,9 @@ mod tests {
             assert!(!brief.contains(word), "{word}");
         }
 
-        let fresh = compose_brief(&BriefInput { goal: "", repos: &[], instructions: "", memory_index: "", memory_files: &[], task: "t", restart: false, report_path: "r", library_path: "l", report_prefix: "", ..input });
+        let fresh = compose_brief(&BriefInput { repos: &[], instructions: "", memory_index: "", memory_files: &[], task: "t", restart: false, report_path: "r", library_path: "l", report_prefix: "", ..input });
         assert!(!fresh.contains("previous attempt"));
-        assert!(fresh.contains("- Goal: (none set)\n- Repos: (none)\n"));
+        assert!(fresh.contains("- Repos: (none)\n"));
         assert!(fresh.contains("if that command exists on this machine"), "no prefix: the note is the fallback");
     }
 
@@ -1290,7 +1297,7 @@ mod tests {
     #[test]
     fn follow_ups_are_appended_to_the_task_file_with_a_timestamp() {
         let root = tempfile::tempdir().unwrap();
-        let project = project::create(root.path(), "demo", "", vec![]).unwrap();
+        let project = project::create(root.path(), "demo", vec![]).unwrap();
         let t = allocate(&project, |_| {}).unwrap();
         std::fs::write(task_path(&project, &t.id), "The task.").unwrap();
         append_follow_up(&project, &t.id, "Also do Y.\n", Recorded::Coordinator).unwrap();
@@ -1328,7 +1335,7 @@ mod tests {
     fn copies_report_and_library_and_skips_symlinks() {
         let root = tempfile::tempdir().unwrap();
         let work = tempfile::tempdir().unwrap();
-        let project = project::create(root.path(), "demo", "", vec![]).unwrap();
+        let project = project::create(root.path(), "demo", vec![]).unwrap();
         let dir = work.path().join(".herdr-project/demo-t-0001");
         let t = local_thread(&project, &dir);
         std::fs::write(dir.join("report.md"), "## Report\nok\n").unwrap();
@@ -1350,7 +1357,7 @@ mod tests {
     fn symlinked_library_report_and_thread_dir_are_not_copied() {
         let root = tempfile::tempdir().unwrap();
         let work = tempfile::tempdir().unwrap();
-        let project = project::create(root.path(), "demo", "", vec![]).unwrap();
+        let project = project::create(root.path(), "demo", vec![]).unwrap();
         let dir = work.path().join(".herdr-project/demo-t-0001");
         let t = local_thread(&project, &dir);
         std::fs::remove_dir(dir.join("library")).unwrap();
@@ -1381,7 +1388,7 @@ mod tests {
         use crate::runner::fake::{FakeRunner, ok};
         let root = tempfile::tempdir().unwrap();
         let work = tempfile::tempdir().unwrap();
-        let project = project::create(root.path(), "demo", "", vec![]).unwrap();
+        let project = project::create(root.path(), "demo", vec![]).unwrap();
         let dir = work.path().join(".herdr-project/demo-t-0001");
         let t = local_thread(&project, &dir);
         std::fs::write(dir.join("report.md"), "r").unwrap();
@@ -1398,7 +1405,7 @@ mod tests {
         use crate::runner::fake::{FakeRunner, fail, ok};
         let root = tempfile::tempdir().unwrap();
         let work = tempfile::tempdir().unwrap();
-        let project = project::create(root.path(), "demo", "", vec![]).unwrap();
+        let project = project::create(root.path(), "demo", vec![]).unwrap();
         let dir = work.path().join(".herdr-project/demo-t-0001");
         let t = local_thread(&project, &dir);
         let runner = FakeRunner::new();

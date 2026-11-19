@@ -1437,7 +1437,7 @@ mod tests {
 
     fn temp_project(name: &str) -> (tempfile::TempDir, Project) {
         let home = tempfile::tempdir().unwrap();
-        let project = crate::project::create(&home.path().join("root"), name, "", vec![]).unwrap();
+        let project = crate::project::create(&home.path().join("root"), name, vec![]).unwrap();
         (home, project)
     }
 

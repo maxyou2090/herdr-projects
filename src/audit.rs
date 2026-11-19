@@ -358,7 +358,7 @@ mod tests {
         }
 
         fn project(&self, slug: &str) -> Project {
-            project::create(&self.home.path().join("root"), slug, "", vec![]).unwrap()
+            project::create(&self.home.path().join("root"), slug, vec![]).unwrap()
         }
 
         fn herdr(&self) -> Core<'_> {
