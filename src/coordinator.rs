@@ -115,21 +115,51 @@ fn session_matches(record: &Coordinator, agent: &Agent) -> bool {
         && agent.session_id() == record.agent_session
 }
 
-/// True when the pane sits in the project folder: its shell's directory, or
-/// its foreground process's while `open` runs a coordinator in it.
-fn pane_in_project(record: &Coordinator, pane: &Pane) -> bool {
-    !record.cwd.is_empty()
-        && (Path::new(&pane.cwd).starts_with(&record.cwd) || (!pane.foreground_cwd.is_empty() && Path::new(&pane.foreground_cwd).starts_with(&record.cwd)))
+/// The project a record names, as its slug: the record stores the canonical
+/// project folder, and a project folder is `<root>/<slug>` (`Project::dir`),
+/// so the last component is the slug every one of this project's pane labels
+/// carries ([`crate::labels::PROJECT_TOKEN`]). `None` only when the record has
+/// no folder at all.
+fn recorded_slug(record: &Coordinator) -> Option<&str> {
+    Path::new(&record.cwd).file_name().and_then(|name| name.to_str()).filter(|name| !name.is_empty())
 }
 
-/// The project's workspace is open when a listed pane of it works in the
-/// project folder (workspace ids repeat after a server restart).
+/// True when `pane` belongs to the project: it says so with its own label, or —
+/// with no label to read — it sits in the project folder.
+///
+/// The label decides first because the folder cannot: a coordinator runs
+/// commands wherever and drifts into another project's folder (2026-11-19: law's
+/// shell sat in rexa's home while rexa's own coordinator sat in `~`), so on the
+/// folder alone a pane labelled `law` became rexa's home and a rexa thread tab
+/// was placed in law's Space. Every pane hp starts carries `hp_project`, so it is
+/// the token that says whose pane this is, exactly as it does for lanes
+/// (`lanes::ours`).
+///
+/// The folder fallback stays for panes that carry no label: one started before
+/// the token existed, a shell the window made, a terminal another tool opened.
+/// Dropping it would hide the project's own Space from those panes.
+fn pane_in_project(record: &Coordinator, pane: &Pane) -> bool {
+    if record.cwd.is_empty() {
+        return false;
+    }
+    match pane.tokens.get(crate::labels::PROJECT_TOKEN).filter(|owner| !owner.is_empty()) {
+        Some(owner) => recorded_slug(record) == Some(owner.as_str()),
+        None => {
+            Path::new(&pane.cwd).starts_with(&record.cwd) || (!pane.foreground_cwd.is_empty() && Path::new(&pane.foreground_cwd).starts_with(&record.cwd))
+        }
+    }
+}
+
+/// The project's workspace is open when a listed pane of it belongs to the
+/// project (`pane_in_project`: its label, or its folder with no label).
+/// Workspace ids repeat after a server restart, so the pane is what proves the
+/// id still names this project's Space.
 pub fn workspace_open(record: &Coordinator, panes: &[Pane]) -> bool {
     !record.workspace_id.is_empty() && panes.iter().any(|p| p.workspace_id == record.workspace_id && pane_in_project(record, p))
 }
 
 /// The workspace thread tabs go to: the recorded one while open, else any
-/// workspace with a shell in the project folder (where earlier thread tabs
+/// workspace with a pane belonging to the project (where earlier thread tabs
 /// run, so the threads stay together). A coordinator `open` started in some
 /// other workspace's pane leaves the record pointing there. The recorded
 /// one also counts, last, while its pane still runs the recorded coordinator
@@ -1884,6 +1914,69 @@ mod tests {
         assert_eq!(project_workspace(&recorded, &[other, tabbed], std::slice::from_ref(&reused)).as_deref(), Some("w3"));
         // A recycled pane id running another session does not win.
         assert_eq!(project_workspace(&recorded, &[], &[reused]), None);
+    }
+
+    fn labelled_pane(pane: &str, space: &str, cwd: &str, owner: &str) -> Pane {
+        Pane {
+            pane_id: pane.into(),
+            workspace_id: space.into(),
+            cwd: cwd.into(),
+            foreground_cwd: cwd.into(),
+            tokens: [(crate::labels::PROJECT_TOKEN.to_string(), owner.to_string())].into_iter().collect(),
+            ..Pane::default()
+        }
+    }
+
+    /// The label decides, but a pane without one still says where it is by its
+    /// folder: the older pane, a shell the window made, a terminal another tool
+    /// started. Dropping this fallback would hide the project's own Space from
+    /// them and make a home thread refuse to be placed at all.
+    #[test]
+    fn a_pane_with_no_project_label_is_still_the_project_by_its_folder() {
+        let record = Coordinator { cwd: "/r/rexa".into(), workspace_id: "sp-rexa".into(), ..Coordinator::default() };
+        let old = Pane { pane_id: "p1".into(), workspace_id: "sp-rexa".into(), cwd: "/r/rexa/threads/t-0001".into(), ..Pane::default() };
+        assert!(workspace_open(&record, std::slice::from_ref(&old)), "a pane started before the token existed is found by its folder");
+        // `open --here` runs with the shell elsewhere and the agent in the folder.
+        let here = Pane {
+            pane_id: "p2".into(),
+            workspace_id: "sp-rexa".into(),
+            cwd: "/repo".into(),
+            foreground_cwd: "/r/rexa".into(),
+            ..Pane::default()
+        };
+        assert!(workspace_open(&record, std::slice::from_ref(&here)), "the foreground process's folder counts too");
+        // An empty label is no claim either.
+        let empty = Pane {
+            pane_id: "p3".into(),
+            workspace_id: "sp-rexa".into(),
+            cwd: "/r/rexa".into(),
+            tokens: [(crate::labels::PROJECT_TOKEN.to_string(), String::new())].into_iter().collect(),
+            ..Pane::default()
+        };
+        assert!(workspace_open(&record, std::slice::from_ref(&empty)), "an empty `hp_project` falls back to the folder");
+        // A pane in neither place and with no label is not the project's.
+        let elsewhere = Pane { pane_id: "p4".into(), workspace_id: "sp-other".into(), cwd: "/tmp".into(), ..Pane::default() };
+        assert!(!workspace_open(&record, std::slice::from_ref(&elsewhere)));
+        assert_eq!(project_workspace(&record, std::slice::from_ref(&elsewhere), &[]), None);
+    }
+
+    /// The 2026-11-19 incident, as the machine had it: rexa's record names
+    /// rexa's own Space, rexa's coordinator shell sits in `~` (so its folder
+    /// says nothing about the project), and law's coordinator has drifted into
+    /// rexa's folder while its own label still says law. Judging by the folder
+    /// alone makes law's pane rexa's home.
+    #[test]
+    fn a_pane_working_here_but_labelled_for_another_project_is_not_this_projects() {
+        let record = Coordinator { cwd: "/r/rexa".into(), workspace_id: "sp-rexa".into(), ..Coordinator::default() };
+        let mine = labelled_pane("t5b", "sp-rexa", "/home/me", "rexa");
+        let theirs = labelled_pane("t5h", "sp-law", "/r/rexa", "law");
+        assert_eq!(
+            project_workspace(&record, &[theirs.clone(), mine.clone()], &[]).as_deref(),
+            Some("sp-rexa"),
+            "a thread tab goes to rexa's Space, never to the Space law's drifted pane sits in"
+        );
+        assert!(workspace_open(&record, std::slice::from_ref(&mine)), "rexa's own Space is open: the pane in it is rexa's by label, whatever its shell's folder");
+        assert!(!workspace_open(&record, std::slice::from_ref(&theirs)), "law's pane is not rexa's home");
     }
 
     #[test]
