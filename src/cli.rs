@@ -97,9 +97,6 @@ enum Command {
     /// Who TASKS.md tasks may be assigned to: this project's thread profiles here, and `me`
     Assignable {
         slug: String,
-        /// Accepted and ignored: it used to look up other machines' profiles again
-        #[arg(long, hide = true)]
-        refresh: bool,
         /// Exit with an error unless OWNER (me or PROFILE) is valid
         #[arg(long, value_name = "OWNER")]
         check: Option<String>,
@@ -200,12 +197,7 @@ enum Command {
     /// Change one setting in PROJECT.md (name, coordinator_profile, thread_profile, auto_resolve_days, nudge, repos.add, repos.remove)
     Set { slug: String, key: String, value: String },
     /// Open a file: a text file in an editor in this terminal ($VISUAL, else $EDITOR), anything else with the system opener
-    OpenFile {
-        path: PathBuf,
-        /// Ignored: no tab is opened, so there is nothing to add one to
-        #[arg(long, value_name = "ID")]
-        workspace: Option<String>,
-    },
+    OpenFile { path: PathBuf },
     /// Open a URL (a pull request) in the browser
     OpenUrl { url: String },
     /// Report what the agent is doing (run by an agent in its own terminal)
@@ -746,7 +738,7 @@ pub fn run() -> Result<()> {
             }
         },
         Command::Context { slug, peek } => coordinator::context(&ctx, &slug, peek),
-        Command::Assignable { slug, refresh, check } => crate::assign::run(&ctx, &slug, refresh, check.as_deref()),
+        Command::Assignable { slug, check } => crate::assign::run(&ctx, &slug, check.as_deref()),
         Command::Overview { slug, wait } => overview::run(&ctx, slug.as_deref(), wait),
         Command::Inbox { command } => match command {
             InboxCommand::Done { slug, ids, all } => {
@@ -871,7 +863,7 @@ pub fn run() -> Result<()> {
         },
         Command::Sweep { slug, dry_run, yes } => crate::sweep::run(&ctx, &slug, dry_run, yes),
         Command::Set { slug, key, value } => crate::settings::set(&ctx, &slug, &key, &value),
-        Command::OpenFile { path, workspace } => crate::settings::open_file(&ctx, &path, workspace.as_deref()),
+        Command::OpenFile { path } => crate::settings::open_file(&ctx, &path),
         Command::OpenUrl { url } => {
             if !url.starts_with("https://") {
                 bail!("only https URLs are opened");
@@ -944,7 +936,7 @@ pub fn run() -> Result<()> {
         }
         Command::Report { done, activity } => crate::progress::report(&ctx, done, &activity),
         Command::Progress { pane } => crate::progress::print(&ctx, pane.as_deref()),
-        Command::Update { check } => crate::update::run(&ctx, check),
+        Command::Update { check } => crate::update::run(check),
         Command::Ticker { command } => match command {
             TickerCommand::Start => ticker::start(&ctx),
             TickerCommand::Run => ticker::run(&ctx),

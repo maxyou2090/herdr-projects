@@ -210,7 +210,7 @@ pub fn project_workspace(record: &Coordinator, panes: &[Pane], agents: &[Agent])
 /// same rule [`pane_in_project`] follows: another coordinator can drift into
 /// this folder (law's sat in rexa's), and this function's answer is written to
 /// `coordinator.json` by the ticker.
-pub fn found(project: &Project, socket: &str, session: &str, agents: &[Agent]) -> Option<Coordinator> {
+pub fn found(project: &Project, socket: &str, agents: &[Agent]) -> Option<Coordinator> {
     let cwd = project.canonical_dir().to_string_lossy().into_owned();
     let agent = agents
         .iter()
@@ -218,7 +218,6 @@ pub fn found(project: &Project, socket: &str, session: &str, agents: &[Agent]) -
         .max_by_key(|a| a.state_change_seq)?;
     Some(Coordinator {
         socket: socket.to_string(),
-        session: session.to_string(),
         workspace_id: agent.workspace_id.clone(),
         tab_id: agent.tab_id.clone(),
         pane_id: agent.pane_id.clone(),
@@ -236,9 +235,7 @@ pub fn found(project: &Project, socket: &str, session: &str, agents: &[Agent]) -
 #[serde(default)]
 pub struct LivePane {
     pub pane_id: String,
-    pub tab_id: String,
     pub workspace_id: String,
-    pub name: String,
     pub agent: String,
     pub agent_status: String,
     pub state_change_seq: u64,
@@ -286,9 +283,7 @@ pub fn discover(project: &Project, record: &Coordinator, previous: &[LivePane], 
                 let same = previous.iter().find(|p| p.pane_id == a.pane_id && p.agent_status == a.agent_status && p.state_change_seq == a.state_change_seq);
                 LivePane {
                     pane_id: a.pane_id.clone(),
-                    tab_id: a.tab_id.clone(),
                     workspace_id: a.workspace_id.clone(),
-                    name: a.name.clone(),
                     agent: a.agent.clone(),
                     agent_status: a.agent_status.clone(),
                     state_change_seq: a.state_change_seq,
@@ -964,7 +959,7 @@ pub fn open(ctx: &Ctx, slug: &str, options: &OpenOptions) -> Result<()> {
     // The session is read before the lane: a bare `--lane` reuses a lane whose
     // coordinator is gone, which needs the live panes. An unreachable session is
     // still reported below, after the session-ownership check.
-    let session = paths::resolve_session(&options.session, ctx.env, ctx.runner)?;
+    let session = paths::resolve_session(&options.session, ctx.env)?;
     let socket = session.socket.clone();
     let herdr = Core::new(ctx.env.hc_bin(), &session.socket, ctx.runner);
     let listed = herdr.agent_list();
@@ -1071,14 +1066,12 @@ pub fn open(ctx: &Ctx, slug: &str, options: &OpenOptions) -> Result<()> {
         // made has only those (t-0051).
         let (space, tab) = keep_names(&herdr, &project, &agent.pane_id);
         let _ = herdr.agent_focus(&agent.pane_id);
-        let session_name = session.name.clone().unwrap_or_default();
         let record = project.update_coordinator(|c| {
             // Another pane's profile is not known: the built-in of its kind.
             if c.pane_id != agent.pane_id {
                 c.profile = agent.agent.clone();
             }
             c.socket = socket.clone();
-            c.session = session_name;
             c.workspace_id = if space.is_empty() { agent.workspace_id.clone() } else { space };
             c.tab_id = if tab.is_empty() { agent.tab_id.clone() } else { tab };
             c.pane_id = agent.pane_id.clone();
@@ -1124,10 +1117,8 @@ pub fn open(ctx: &Ctx, slug: &str, options: &OpenOptions) -> Result<()> {
             .with_context(|| format!("could not write the agent labels of pane {}", record.pane_id))?;
         let (space, tab) = keep_names(&herdr, &project, &record.pane_id);
         let _ = herdr.agent_focus(&record.pane_id);
-        let session_name = session.name.clone().unwrap_or_default();
         let record = project.update_coordinator(|c| {
             c.socket = socket.clone();
-            c.session = session_name;
             c.workspace_id = if space.is_empty() { c.workspace_id.clone() } else { space };
             c.tab_id = if tab.is_empty() { c.tab_id.clone() } else { tab };
             c.pane_id = record.pane_id.clone();
@@ -1199,9 +1190,9 @@ pub fn open(ctx: &Ctx, slug: &str, options: &OpenOptions) -> Result<()> {
         let created = match home_space(&herdr, previous.as_ref(), &panes) {
             Some(id) => {
                 sync_label(&herdr, &id, &label);
-                herdr.tab_create(&id, &dir, crate::labels::coordinator_tab_label(), true)?
+                herdr.tab_create(&id, &dir, crate::labels::coordinator_tab_label())?
             }
-            None => herdr.workspace_create(&dir, &label, crate::labels::coordinator_tab_label(), true)?,
+            None => herdr.workspace_create(&dir, &label, crate::labels::coordinator_tab_label())?,
         };
         keep_names(&herdr, &project, &created.pane_id);
         (created.workspace_id, created.tab_id, created.pane_id)
@@ -1221,7 +1212,6 @@ pub fn open(ctx: &Ctx, slug: &str, options: &OpenOptions) -> Result<()> {
     let record = project.update_coordinator(|c| {
         *c = Coordinator {
             socket: socket.clone(),
-            session: session.name.clone().unwrap_or_default(),
             workspace_id,
             tab_id,
             pane_id,
@@ -1367,26 +1357,13 @@ fn start_when_shell_ready(herdr: &Core, name: &str, kind: &str, pane: &str, args
     }
 }
 
-/// A coordinator's sidebar group and line 3, from Herdr's state and its own report.
-pub fn row_state(pane: &LivePane, report: Option<&crate::progress::Record>) -> (crate::thread::Group, String) {
-    use crate::thread::Group;
-    let waiting = report.is_some_and(|r| r.waiting()) && pane.agent_status != "working";
-    if pane.agent_status == "blocked" || waiting {
-        (Group::WaitingOnYou, "needs you".into())
-    } else if pane.agent_status == "working" {
-        (Group::Working, "working".into())
-    } else {
-        (Group::Idle, "idle".into())
-    }
-}
-
 /// Reports a coordinator pane's row, claiming the lane the registry ties it to
 /// (`hp_lane`). A project with no lane registry claims nothing, so its rows
 /// read exactly as they did before lanes.
 pub fn report_tokens(herdr: &Core, project: &Project, pane_id: &str) {
     let lane = crate::lanes::token_for_pane(project, pane_id);
     let display = crate::labels::coordinator_display(project, lane.as_deref());
-    crate::labels::report_pane(herdr, pane_id, &display, &project.slug, crate::thread::Group::Idle, lane.as_deref());
+    crate::labels::report_pane(herdr, pane_id, &display, &project.slug, lane.as_deref());
 }
 
 /// Renames a Space whose label is not the project's name — the recorded one, or
@@ -2030,18 +2007,18 @@ mod tests {
             ..agent("w2:p1", &cwd, "idle", 9)
         };
         assert!(
-            found(&project, "sock", "s", std::slice::from_ref(&theirs)).is_none(),
+            found(&project, "sock", std::slice::from_ref(&theirs)).is_none(),
             "another project's pane is not this project's coordinator, whatever its folder"
         );
         // No label at all: still found by its folder, as for panes.
         let unlabelled = agent("w1:p1", &cwd, "idle", 1);
-        assert_eq!(found(&project, "sock", "s", std::slice::from_ref(&unlabelled)).map(|c| c.pane_id), Some("w1:p1".into()));
+        assert_eq!(found(&project, "sock", std::slice::from_ref(&unlabelled)).map(|c| c.pane_id), Some("w1:p1".into()));
         // One that names this project is found too, and still by activity.
         let mine = Agent {
             tokens: [(crate::labels::PROJECT_TOKEN.to_string(), "demo".to_string())].into_iter().collect(),
             ..agent("w3:p1", &cwd, "idle", 2)
         };
-        assert_eq!(found(&project, "sock", "s", &[theirs, mine]).map(|c| c.pane_id), Some("w3:p1".into()));
+        assert_eq!(found(&project, "sock", &[theirs, mine]).map(|c| c.pane_id), Some("w3:p1".into()));
     }
 
     /// The label decides, but a pane without one still says where it is by its
@@ -2213,6 +2190,37 @@ mod tests {
         let record = project.coordinator().unwrap();
         let found = discover(&project, &record, &[], &refreshed, "2026-11-18T02:41:00Z");
         assert_eq!(found.len(), 1, "the coordinator is found on the next tick");
+    }
+
+    /// `coordinators.json` is read by the nudge, the routing and the repair
+    /// paths: pane, Space, agent, status, pair, session and lane. `name` and
+    /// `tab_id` were copied out of core's agent on every tick and read by
+    /// nothing.
+    #[test]
+    fn a_coordinators_state_file_writes_only_the_fields_something_reads() {
+        let home = tempfile::tempdir().unwrap();
+        let project = crate::project::create(&home.path().join("root"), "demo", vec![]).unwrap();
+        let dir = project.canonical_dir().to_string_lossy().into_owned();
+        let agent = Agent {
+            pane_id: "w1:p1".into(),
+            tab_id: "w1:t1".into(),
+            workspace_id: "w1".into(),
+            name: "hpc-demo".into(),
+            agent: "pi".into(),
+            agent_status: "idle".into(),
+            cwd: dir.clone(),
+            ..Agent::default()
+        };
+        let record = Coordinator { cwd: dir, ..Coordinator::default() };
+        let live = discover(&project, &record, &[], std::slice::from_ref(&agent), "2026-11-19T00:00:00Z");
+        assert_eq!(live.len(), 1, "the agent in the project folder is the coordinator");
+        let text = serde_json::to_string(&live).unwrap();
+        for key in ["tab_id", "name"] {
+            assert!(!text.contains(&format!("\"{key}\"")), "`{key}` had no reader and is gone: {text}");
+        }
+        assert!(text.contains("\"pane_id\""), "{text}");
+        assert!(text.contains("\"workspace_id\""), "{text}");
+        assert!(text.contains("\"agent_status\""), "{text}");
     }
 
     /// The blind spot left by the label repair: `open`'s two guards — "focus the

@@ -155,7 +155,6 @@ fn close_workspaces(project: &Project, view: &SessionView) -> Vec<String> {
         if workspace.is_empty() || done.contains(&workspace) {
             continue;
         }
-        crate::labels::clear_workspace(&view.herdr, &workspace);
         close(&workspace, &what);
         done.push(workspace);
     }

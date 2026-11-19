@@ -9,8 +9,6 @@ use crate::core::Core;
 use crate::project::Project;
 use crate::thread::{Group, Live, Thread};
 
-/// Tokens this binary wrote in Herdr 1's layouts; cleared on every report.
-pub const OLD_TOKENS: [&str; 4] = ["project", "thread", "review", "rank"];
 /// Minutes without a self-report after which a working row says "Nm quiet".
 pub const QUIET_SECS: i64 = 300;
 /// The token every report writes naming the project a pane belongs to. It is
@@ -155,7 +153,7 @@ pub fn coordinator_display(project: &Project, lane: Option<&str>) -> String {
 /// whose lane the registry names — its lane claim (`docs/lanes.md` §5.1).
 /// `lane` is the id to write as `hp_lane`, or `None` for no claim: a thread
 /// pane never claims a lane, and a project with no lane registry reports none.
-pub fn report_pane(herdr: &Core, pane: &str, display: &str, slug: &str, _group: Group, lane: Option<&str>) {
+pub fn report_pane(herdr: &Core, pane: &str, display: &str, slug: &str, lane: Option<&str>) {
     if pane.is_empty() {
         return;
     }
@@ -167,7 +165,6 @@ pub fn report_pane(herdr: &Core, pane: &str, display: &str, slug: &str, _group: 
         pairs.push((crate::lanes::TOKEN.to_string(), lane.to_string()));
     }
     let _ = herdr.set_labels(pane, &pairs);
-    let _ = herdr.clear_labels(pane, &OLD_TOKENS);
 }
 
 /// Clears every label this binary set on a pane: its project, display name and
@@ -176,14 +173,8 @@ pub fn clear_pane(herdr: &Core, pane: &str) {
     if pane.is_empty() {
         return;
     }
-    let mut keys: Vec<&str> = vec![PROJECT_TOKEN, "hp_display", "hp_rank", crate::lanes::TOKEN];
-    keys.extend(OLD_TOKENS);
-    let _ = herdr.clear_labels(pane, &keys);
+    let _ = herdr.clear_labels(pane, &[PROJECT_TOKEN, "hp_display", crate::lanes::TOKEN]);
 }
-
-/// A Space is a group of terminals by label; closing its terminals is what
-/// removes it, so there is nothing left to clear.
-pub fn clear_workspace(_herdr: &Core, _workspace: &str) {}
 
 #[cfg(test)]
 mod tests {

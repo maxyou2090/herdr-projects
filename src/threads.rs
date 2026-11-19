@@ -32,11 +32,11 @@ pub fn session_view<'a>(ctx: &'a Ctx, project: &Project) -> Option<SessionView<'
     let record = match project.coordinator() {
         Some(record) => record,
         None => {
-            let session = crate::paths::resolve_session(&Default::default(), ctx.env, ctx.runner).ok()?;
+            let session = crate::paths::resolve_session(&Default::default(), ctx.env).ok()?;
             let socket = session.socket.clone();
             let agents = Core::new(ctx.env.hc_bin(), &socket, ctx.runner).agent_list().ok()?;
             // Read only: the ticker records it on its next tick.
-            crate::coordinator::found(project, &socket, &session.name.unwrap_or_default(), &agents)?
+            crate::coordinator::found(project, &socket, &agents)?
         }
     };
     let herdr = Core::new(ctx.env.hc_bin(), &record.socket, ctx.runner);
@@ -62,8 +62,8 @@ fn git(runner: &dyn Runner, repo: &str, args: &[&str], timeout: Duration) -> Res
     Ok(out.stdout.trim().to_string())
 }
 
-pub fn report_thread_tokens(herdr: &Core, thread: &Thread, slug: &str, group: Group) {
-    crate::labels::report_pane(herdr, &thread.pane_id, &crate::labels::thread_display(thread), slug, group, None);
+pub fn report_thread_tokens(herdr: &Core, thread: &Thread, slug: &str) {
+    crate::labels::report_pane(herdr, &thread.pane_id, &crate::labels::thread_display(thread), slug, None);
 }
 
 fn clear_thread_tokens(herdr: &Core, thread: &Thread) {
@@ -326,7 +326,7 @@ fn place_tab(project: &Project, view: &SessionView, record: &Thread) -> Result<T
             // rather than add a second tab for the same thread.
             match view.panes.iter().find(|p| p.workspace_id == home && !p.cwd.is_empty() && Path::new(&p.cwd).starts_with(&folder)) {
                 Some(pane) => crate::core::Created { workspace_id: pane.workspace_id.clone(), tab_id: pane.tab_id.clone(), pane_id: pane.pane_id.clone() },
-                None => view.herdr.tab_create(&home, &folder, &crate::labels::thread_tab_label(&record.id), false)?,
+                None => view.herdr.tab_create(&home, &folder, &crate::labels::thread_tab_label(&record.id))?,
             }
         }
         // Its own Space, never a tab of the project's home: a restart first
@@ -341,12 +341,12 @@ fn place_tab(project: &Project, view: &SessionView, record: &Thread) -> Result<T
                 for note in view.herdr.name_space(&id, &title) {
                     eprintln!("warning: {note}");
                 }
-                view.herdr.tab_create(&id, &folder, &crate::labels::thread_tab_label(&record.id), false)?
+                view.herdr.tab_create(&id, &folder, &crate::labels::thread_tab_label(&record.id))?
             }
             None => {
                 // Its own Space, its tab named after the thread's id, in the core
                 // label and in the app alike: `workspace_create` writes both.
-                view.herdr.workspace_create(&folder, &title, &crate::labels::thread_tab_label(&record.id), false)?
+                view.herdr.workspace_create(&folder, &title, &crate::labels::thread_tab_label(&record.id))?
             }
         },
         Kind::Worktree | Kind::Adopted => bail!("a {:?} thread is not placed in a tab", record.kind),
@@ -409,7 +409,7 @@ fn finish_placement(project: &Project, view: &SessionView, id: &str) -> Result<T
         t.last_state.clear();
         t.last_state_change = project::now();
     })?;
-    report_thread_tokens(&view.herdr, &thread, &project.slug, Group::Working);
+    report_thread_tokens(&view.herdr, &thread, &project.slug);
     Ok(thread)
 }
 
@@ -498,7 +498,7 @@ pub fn restart(ctx: &Ctx, slug: &str, id: &str, profile: Option<&str>) -> Result
             RestartPlan::Reopen => match record.kind {
                 Kind::Worktree => {
                     let (created, path, cwd) =
-                        view.herdr.worktree_open(&record.repo, &record.worktree_path, &crate::labels::thread_space_label(&record.title), &crate::labels::thread_tab_label(&record.id))?;
+                        view.herdr.worktree_open(&record.worktree_path, &crate::labels::thread_space_label(&record.title), &crate::labels::thread_tab_label(&record.id))?;
                     let repo_workspace = repo_space(&view.herdr, &record.repo);
                     thread::update(&project, id, |t| {
                         if !repo_workspace.is_empty() {

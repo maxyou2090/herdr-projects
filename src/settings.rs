@@ -184,10 +184,10 @@ pub fn is_text(path: &Path) -> bool {
     !buf[..n].contains(&0)
 }
 
-/// `open-file <path> [--workspace W]`: a text file opens in an editor in this
-/// terminal (`$VISUAL`, else `$EDITOR`); anything else with the system opener.
-/// No viewer, and no tab: `--workspace` is ignored.
-pub fn open_file(ctx: &Ctx, path: &Path, _workspace: Option<&str>) -> Result<()> {
+/// `open-file <path>`: a text file opens in an editor in this terminal
+/// (`$VISUAL`, else `$EDITOR`); anything else with the system opener. No
+/// viewer, and no tab.
+pub fn open_file(ctx: &Ctx, path: &Path) -> Result<()> {
     let path = std::fs::canonicalize(path).with_context(|| format!("{} does not exist", path.display()))?;
     if path.is_dir() || !is_text(&path) {
         return system_open(ctx, &path.to_string_lossy());

@@ -45,7 +45,7 @@ impl Assignable {
 }
 
 /// Everything a task in `project` may be assigned to.
-pub fn load(ctx: &Ctx, project: &Project, _refresh: bool) -> Result<Assignable> {
+pub fn load(ctx: &Ctx, project: &Project) -> Result<Assignable> {
     let config = crate::profiles::load(&ctx.config_dir)?;
     let safety = project.safety(&ctx.config_dir)?;
     let (settings, _) = project.read_project_md()?;
@@ -56,17 +56,16 @@ pub fn load(ctx: &Ctx, project: &Project, _refresh: bool) -> Result<Assignable> 
 
 /// The one `Assignable:` line of `context`.
 pub fn context_line(ctx: &Ctx, project: &Project) -> String {
-    match load(ctx, project, false) {
+    match load(ctx, project) {
         Ok(assignable) => format!("Assignable (agent owners): {}\n", assignable.line()),
         Err(error) => format!("config-error: assignable: {error:#}\n"),
     }
 }
 
-/// `assignable <slug> [--refresh] [--check OWNER]`. `--refresh` is accepted and
-/// does nothing: it used to re-look up other machines' profiles.
-pub fn run(ctx: &Ctx, slug: &str, refresh: bool, check: Option<&str>) -> Result<()> {
+/// `assignable <slug> [--check OWNER]`.
+pub fn run(ctx: &Ctx, slug: &str, check: Option<&str>) -> Result<()> {
     let project = Project::load(&ctx.root, slug)?;
-    let assignable = load(ctx, &project, refresh)?;
+    let assignable = load(ctx, &project)?;
     if let Some(owner) = check {
         let text = owner.trim().trim_start_matches('(').trim_end_matches(')');
         assignable.check(&Owner::parse(text))?;
