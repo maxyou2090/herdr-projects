@@ -124,6 +124,19 @@ fn coordinator_findings(project: &Project, agents: &[Agent], hc: &Core) -> Vec<F
     let Some(record) = project.coordinator() else {
         return Vec::new();
     };
+    // No pane recorded is not a lost terminal. A project whose `lanes.json` has
+    // a default lane and no `coordinator.json` answers with that lane's view,
+    // and a lane with no coordinator instance keeps `pane_id` empty on purpose
+    // (`docs/lanes.md` §10, `hp lane list` calls it "has no live coordinator").
+    // little-world, ovis and web-tpl printed `the record still names pane , but
+    // the session no longer knows its terminal` — an empty pane name and a
+    // "lost" verdict for a coordinator that was never started (2026-11-19,
+    // t-0055 §8c). `coordinator::repair` and `doctor` already skip exactly these
+    // records (`!record.pane_id.is_empty()`), so the audit asks the same
+    // question rather than phrasing the same answer differently.
+    if record.pane_id.is_empty() {
+        return Vec::new();
+    }
     let lane = crate::lanes::default_lane_id(project);
     match crate::coordinator::fate(hc, project, &record, agents, &lane) {
         crate::coordinator::Fate::Lost { detail } => vec![Finding {
@@ -328,6 +341,7 @@ mod tests {
     use super::*;
     use crate::core::Core;
     use crate::fake_hc::FakeCore;
+    use crate::lanes::{Lane, Registry};
     use crate::project::{self, Project};
     use crate::thread::{self, Thread};
 
@@ -441,6 +455,51 @@ mod tests {
         assert_eq!(hit.len(), 1, "a program that reports is still running, labels or not: \n{found:#?}");
         assert_eq!(hit[0].thread, t.id);
         assert!(hit[0].detail.contains("still open on its working directory"), "{}", hit[0].detail);
+    }
+
+    /// little-world, ovis and web-tpl on 2026-11-19: a `lanes.json` whose default
+    /// lane was never opened (empty `pane_id`) and **no** `coordinator.json` at
+    /// all. `Project::coordinator()` answers with that lane's view, so the audit
+    /// printed `the record still names pane , but the session no longer knows
+    /// its terminal` — an empty pane name and a "lost" verdict for a project
+    /// whose coordinator was never started. Nothing was lost: there is nothing
+    /// to lose.
+    #[test]
+    fn a_lane_with_no_pane_recorded_is_not_a_lost_coordinator() {
+        let world = World::new();
+        let project = world.project("little-world");
+        let lane = Lane {
+            id: "c-1".into(),
+            name: "default".into(),
+            label: "Little World".into(),
+            status: crate::lanes::Status::Open,
+            ..Lane::default()
+        };
+        Registry { lanes: vec![lane], default: "c-1".into(), next: 1 }.save(&project).unwrap();
+        assert!(!project.coordinator_path().exists(), "the real shape has no coordinator.json at all");
+        assert_eq!(project.coordinator().map(|r| r.pane_id).unwrap_or_default(), "");
+
+        let found = findings(&project, &world.herdr());
+        assert!(found.is_empty(), "no coordinator was ever opened in this project: \n{found:#?}");
+    }
+
+    /// The guard this keeps (2026-11-18, t-0053): the record names a pane and
+    /// core does not know that terminal any more.
+    #[test]
+    fn a_record_whose_terminal_is_gone_is_still_a_lost_coordinator() {
+        let world = World::new();
+        let project = world.project("law");
+        project
+            .update_coordinator(|c| {
+                c.pane_id = "hp-law-coordinator".into();
+                c.agent_name = "hpc-law".into();
+            })
+            .unwrap();
+
+        let found = findings(&project, &world.herdr());
+        assert_eq!(found.len(), 1, "a recorded terminal core cannot see is a finding: \n{found:#?}");
+        assert_eq!(found[0].kind, COORDINATOR_TERMINAL_FINISHED);
+        assert!(found[0].detail.contains("hp-law-coordinator"), "{}", found[0].detail);
     }
 
     #[test]
