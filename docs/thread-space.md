@@ -110,9 +110,11 @@ there a thread Space, and which". In this order, first match wins:
 1. **the Space `record` names** (its `workspace_id`), when that id is still
    listed and is a thread Space. This is what makes a restart land where the
    thread was, even after the display name changed and the label has not caught
-   up yet.
+   up yet. A Space wearing **no** name at all is accepted on the record alone
+   (see §4.1): nothing else is left to recognise it by, and
+   `spaces::sync_threads_label` names it on the next tick.
 2. **the Space another open thread of the project names.** A new thread joins
-   them instead of opening a Space beside them.
+   them instead of opening a Space beside them. Same empty-name exception.
 3. **the Space carrying today's label** (`<display name> Threads`).
 4. **any Space this project's thread panes are in** — a pane carries
    `hp_project=<slug>` (`labels::report_pane`). This is the fallback for a Space
@@ -128,16 +130,52 @@ A Space is usable (all of the above require it) only when it is
   (`lanes::open_spaces`). A coordinator pane also carries `hp_project`, so the
   pane rule in 4 would otherwise happily hand the project's own Space to a
   thread;
-- **not a worktree Space** (`workspace.worktree.is_none()`, see §7.4);
-- **not labelled with a thread's title** — that is a thread's *own* Space from
-  before this change (below).
+- **not a thread's own Space from before this change** — an old `tab`/`home`/
+  `checkout` thread's Space is labelled with the thread's title, an old `worktree`
+  thread's with `<title> Threads`, and both are recognised by those labels
+  (`labels::thread_space_matches`, `labels::threads_space_label`).
 
 **Never a thread's own Space from before.** Such a Space is labelled with the
-thread's title (`labels::thread_space_matches`), and a restart must abandon it,
-not join it: its tab is closed at resolve, and `spaces::empty` recycles the Space
-once its panes are gone (§6.4). The one residue: a thread whose *title* ends in
-` Threads` is indistinguishable by label from a thread Space, so its old Space may
-be joined once. That is cheap, one-off, and does not move any work.
+thread's title, and a restart must abandon it, not join it: its tab is closed at
+resolve, and `spaces::empty` recycles the Space once its panes are gone (§6.4).
+The one residue: a thread whose *title* ends in ` Threads` is indistinguishable by
+label from a thread Space, so its old Space may be joined once. That is cheap,
+one-off, and does not move any work.
+
+### 4.1 Why "a Space that is one worktree" is not one of the criteria
+
+It was, and that was the bug of 2026-11-19 (t-0072): three worktree threads of
+one project started within seconds, and each opened a Space of its own, all three
+named `Project Threads`. `Workspace::worktree` means "every pane in this Space
+names the same worktree" (§6.4), so a thread Space holding **exactly one**
+worktree thread — the state of every project until a second thread joins — reads
+as a worktree Space and was refused by all five sources at once:
+`w.worktree.is_none()` sat in the `usable` test, and rules 1, 2 and 4 all require
+`usable`. So the first worktree thread's Space could never be joined, and each
+thread after it opened its own, sequentially as well as at once — the lock's
+second look found nothing either, because what it re-read was refused for the
+same reason.
+
+The clause was written when a worktree Space *was* a thread's Space of its own
+(herdr 1's `worktree_create`: one Space per worktree thread, labelled
+`<title> Threads`). That shape is what the `own_old` label test above recognises
+now, and it is the only thing the worktree classification ever distinguished. A
+thread Space says whose it is by its name (`<display name> Threads`) and by the
+panes in it (`hp_project`), never by how many worktrees it happens to hold.
+`Workspace::worktree` keeps one reader: `spaces::empty`'s rule that a home Space
+is never a worktree Space.
+
+**Why the label looked like the suspect and is not.** `core::workspace_create`
+and `core::tab_create` start the terminal with `hp_ws_label` in the same
+`hc run --label` that makes it, so a Space `hp` made is listed under its name from
+the first listing: `workspace_list` adds a Space as it meets its first terminal,
+and that terminal already carries the label. Measured on the incident: t-0071 and
+t-0072 were started one second apart, **both** Spaces read `Project Threads`, and
+t-0071's record already carried its `workspace_id` before t-0072 started. So
+neither the label nor the record was late, and no amount of re-checking or
+serialising would have joined them. The Space that *can* be listed before any hp
+label lands on it is the one the **app** makes (§8, the window makes the Space
+and a placeholder tab); that is the case rule 4 is for.
 
 **Why not "just create it when it is missing".** Because the failure is silent
 and compounding: every judgement call that misses opens one more Space per
@@ -278,7 +316,10 @@ the order of this page:
 | `thread start --help` promises no Space of its own and names the three placements | `tests::thread_start_help_describes_where_a_thread_works_not_a_space_of_its_own` |
 | no repo means `local`, and `--repo` alone means `worktree` | `threads::tests::placement_follows_the_request_then_the_repo` |
 | a display-name change renames the Space instead of opening a second one | `threads::tests::the_thread_space_follows_the_display_name_instead_of_being_left_behind` |
-| the finder's order: record → other threads → label → panes, and never a home/one-worktree/old-own Space | `threads::tests::the_thread_space_is_named_by_the_record_the_label_or_the_panes` |
+| the finder's order: record → other threads → label → panes, and never a home Space or an old own Space | `threads::tests::the_thread_space_is_named_by_the_record_the_label_or_the_panes` |
+| a thread Space holding **one** worktree thread is the thread Space (the 2026-11-19 incident: three worktree threads started seconds apart) | `threads::tests::worktree_threads_started_one_after_another_share_one_space` |
+| two placements that took their snapshot before either Space existed still end in one Space (the lock's second look) | `threads::tests::two_threads_placed_from_one_snapshot_share_one_space` |
+| a thread Space with no name on it is found by its record, joined, and named on the next tick | `threads::tests::a_thread_space_with_no_name_yet_is_found_by_its_record_and_named` |
 | a Space holding two worktrees is not a worktree Space; one alone still is | `fake_hc::tests::a_space_holding_two_worktrees_is_not_a_worktree_space` |
 | a tab created in an app Space carries the Space's name | `fake_hc::tests::a_tab_created_in_an_app_space_carries_the_space_s_name` |
 | a record naming another project's Space is not trusted; a thread Space is made | `threads::tests::a_thread_record_naming_another_projects_space_is_not_trusted` |
@@ -402,3 +443,13 @@ corrections are what §6 is built on.
    refusing would block every project's first thread. The rule kept from that
    advice is the part that matters: find **before** creating, through five
    sources (§4), and never create because a label merely looked odd.
+7. **A fifth trap, and the worst one (t-0072, 2026-11-19): "not a one-worktree
+   Space" as a usability test.** §6.4 made the classification honest, but the
+   finder still refused a Space that *is* one worktree — which is what a thread
+   Space is whenever it holds a single worktree thread, that is, every project
+   until a second thread joins. So no thread after the first could join, and
+   each opened a Space of its own, all named `<display name> Threads`. It was
+   sequential as well as concurrent, so neither re-checking nor serialising
+   `thread start` would have helped: the finder's *criteria* were wrong, not its
+   timing (§4.1). The worktree classification now has one reader left,
+   `spaces::empty`'s home rule.

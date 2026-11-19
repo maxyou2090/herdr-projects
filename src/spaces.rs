@@ -151,16 +151,11 @@ pub fn sync_threads_label(project: &Project, herdr: &Core) {
         return;
     };
     let homes = crate::coordinator::coordinator_space_ids(project);
-    let named = |w: &crate::core::Workspace| crate::labels::is_threads_space_label(&w.label) || w.label.is_empty();
-    let found = crate::threads::threads_space(project, &workspaces, &[], &[], None)
-        .or_else(|| {
-            thread::list(project)
-                .into_iter()
-                .filter(|t| !t.workspace_id.is_empty() && !t.title.is_empty())
-                .find_map(|t| workspaces.iter().find(|w| w.workspace_id == t.workspace_id && named(w)).cloned())
-                .map(|w| w.workspace_id)
-        })
-        .filter(|id| !homes.contains(id));
+    // The one judgement of what the thread Space is, with the panes left out:
+    // this runs on a ticker tick and cannot afford a pane listing. A Space a
+    // thread record names with no name on it counts here too, which is how an
+    // app-made Space gets its name (`docs/thread-space.md` §4.1).
+    let found = crate::threads::threads_space(project, &workspaces, &[], &[], None).filter(|id| !homes.contains(id));
     let Some(id) = found else {
         return;
     };
