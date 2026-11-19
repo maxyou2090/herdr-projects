@@ -38,28 +38,36 @@ pub enum Status {
 pub enum Kind {
     #[default]
     Worktree,
-    /// A Space of the thread's own on `threads/<id>/`, asked for explicitly
-    /// with `thread start --kind tab`.
-    Tab,
-    /// A Space of the thread's own whose working directory is the repo's
-    /// main checkout, asked for explicitly with `thread start --kind checkout`.
+    /// A folder of the thread's own, `threads/<id>/`, with no repository: the
+    /// default for a thread started without `--repo`. It is a tab of the
+    /// project's thread Space like every other kind — no kind has a Space of
+    /// its own (`docs/thread-space.md`). `tab` and `home` are its old names:
+    /// `#[serde(alias)]` keeps every record written under them readable (a
+    /// record is read on every tick, so a value that failed to parse would
+    /// make the thread vanish), and [`Kind::parse`] still accepts them from
+    /// the command line.
+    #[serde(alias = "home", alias = "tab")]
+    Local,
+    /// The repository's main checkout, no branch of its own, asked for with
+    /// `thread start --kind checkout`.
     Checkout,
-    /// A tab of the project's own workspace (its home Space) whose working
-    /// directory is `threads/<id>/`: the default for a thread without a
-    /// repo, or asked for with `thread start --kind home`; never a Space of
-    /// its own.
-    Home,
     Adopted,
 }
 
 impl Kind {
+    /// `thread start --kind`. `tab` and `home` are the old names of `local`:
+    /// they are accepted, mapped to it, and say so on stderr — people have the
+    /// habit, and refusing them buys nothing.
     pub fn parse(text: &str) -> Result<Kind> {
         match text {
             "worktree" => Ok(Kind::Worktree),
-            "tab" => Ok(Kind::Tab),
+            "local" => Ok(Kind::Local),
             "checkout" => Ok(Kind::Checkout),
-            "home" => Ok(Kind::Home),
-            other => bail!("`{other}` is not a thread kind (worktree, tab, checkout or home)"),
+            "tab" | "home" => {
+                eprintln!("warning: `{text}` is the old name of `local`; use `--kind local` (same placement: a tab in the project's thread Space, on threads/<id>/)");
+                Ok(Kind::Local)
+            }
+            other => bail!("`{other}` is not a thread kind (worktree, local or checkout; `tab` and `home` are the old names of `local`)"),
         }
     }
 }
@@ -100,16 +108,6 @@ pub struct Thread {
     /// `<display name> Threads`, shared by every thread of the project since
     /// t-0062 (`docs/thread-space.md`).
     pub workspace_id: String,
-    /// The repository's primary Space herdr grouped this worktree under
-    /// (made or reused by `worktree create`); closed once nothing uses it.
-    /// Always empty in practice: herdr-core has no worktree grouping, so
-    /// `spaces::primary` finds no Space to record.
-    pub repo_workspace: String,
-    /// A thread's **own** Space, from before a project's threads shared one: a
-    /// plain Space labelled with the thread's title. Nothing writes it any
-    /// more; a record that still has it names a Space `spaces::empty` closes
-    /// once its panes are gone. Read through [`own_space_id`].
-    pub own_workspace: String,
     pub tab_id: String,
     pub pane_id: String,
     /// The Herdr agent kind: the profile's harness.
@@ -692,15 +690,6 @@ pub fn group(thread: &Thread, live: &Live, now: jiff::Timestamp) -> Group {
     }
     // 7
     Group::Idle
-}
-
-/// The Space id a thread recorded as its own under the old rule (`own_workspace`,
-/// or the record's `workspace_id` from before that field existed). Only the
-/// migration reads it: that Space is closed once its panes are gone, and a
-/// restart puts the thread in the project's shared thread Space instead
-/// (`threads::threads_space`, `docs/thread-space.md`).
-pub fn own_space_id(record: &Thread) -> &str {
-    if record.own_workspace.is_empty() { &record.workspace_id } else { &record.own_workspace }
 }
 
 /// A pane is the thread's pane only when workspace, tab and working directory

@@ -1307,8 +1307,7 @@ fn tick_slow(ctx: &Ctx, project: &Project, seen: &Seen, memory: &mut Memory, log
         Ok(_) => {}
         Err(error) => errors.push(error.context("archiving items of resolved threads")),
     }
-    // Repository Spaces: recorded when first seen, closed once empty.
-    crate::spaces::record(project, &herdr);
+    // Orphan home Spaces and the thread Space once empty.
     errors.extend(crate::spaces::close_empty(ctx, project, &herdr));
     // The home Space's label and the thread Space's follow the project's name
     // without an `open`.

@@ -352,7 +352,7 @@ enum CoordinatorCommand {
 
 #[derive(Subcommand)]
 enum ThreadCommand {
-    /// Start a thread: a worktree workspace for --repo, else a tab of the project's own workspace
+    /// Start a thread: its own worktree and branch for --repo, else a folder of its own on threads/<id>/
     Start {
         slug: String,
         #[arg(long)]
@@ -362,8 +362,8 @@ enum ThreadCommand {
         /// The agent's profile (harness, model, effort, flags), one the project allows (default: thread_profile in PROJECT.md); `context` lists them
         #[arg(long, alias = "agent", value_name = "NAME")]
         profile: Option<String>,
-        /// Placement, not the agent: worktree (default with --repo: its own worktree and branch), checkout (the repo's main checkout instead of a worktree), or tab/home (default without a repo: its own folder on threads/<id>/). Every kind puts the thread's tab in the project's thread Space, `<display name> Threads`; `tab` no longer makes a Space of its own (docs/thread-space.md)
-        #[arg(long, value_name = "worktree|tab|checkout|home")]
+        /// Where the thread works, not which agent runs in it: `worktree` (its own worktree and branch under ~/.herdr/worktrees/…; the default with --repo), `checkout` (the repository's main checkout, no branch of its own), `local` (a folder of its own under the project's threads/<id>/, no repository; the default without a repo). Every kind puts the thread's tab in the project's thread Space, `<display name> Threads`; `tab` and `home` are the old names of `local` and still work (docs/thread-space.md)
+        #[arg(long, value_name = "worktree|checkout|local")]
         kind: Option<String>,
         #[arg(long, value_name = "REF")]
         base: Option<String>,

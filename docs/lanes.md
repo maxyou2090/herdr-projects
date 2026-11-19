@@ -1025,7 +1025,7 @@ Explicitly out of scope for plan B:
   `hp context` is already its reader's lane and `hp overview` is the whole
   project. A user-side lane scope would need a flag of its own.
 - **Per-lane Spaces.** Decision 1 keeps every coordinator in the project home.
-  `--kind tab` style escape hatches for a coordinator would be a new placement
+  A `--kind`-style escape hatch for a coordinator would be a new placement
   mode, not part of this.
 - **Lane deletion.** `hp lane rm` is **not built**, deliberately: deleting needs
   an answer for "what happens to its open threads" and there isn't one. Closing
