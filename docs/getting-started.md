@@ -98,7 +98,7 @@ key bindings. The words Herdr 1's sidebar used are printed instead:
 | Instead of | Run |
 | --- | --- |
 | the sidebar | `hp overview <project>` |
-| the projects popup | `hp overview`, `hp thread list`, `hp task`, `hp routine list` |
+| the projects popup | `hp overview` (the projects in use) or `hp overview --all` (every project), `hp thread list`, `hp task`, `hp routine list` |
 | the popup's settings | `hp set`, `hp safety`, `hp profile`, `hp routine toggle` |
 | clicking a pane | `hc attach <terminal>` (printed by `hp open`) |
 

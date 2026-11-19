@@ -951,10 +951,11 @@ reaches a named lane's coordinator.
   yet, only the shared home is protected and that other Space could be offered
   for closing. Decision 1 keeps every lane in the home, so this only matters if
   a later placement mode moves one out.
-- **Lifecycle.** `lifecycle::close_workspaces()` (`src/lifecycle.rs`) iterates
-  the lanes (`alive_panes`, same file) instead of `coordinator().workspace_id`.
-  `archive` does not leave a lane's coordinator behind; `delete` is unchanged
-  (whole project).
+- **Lifecycle.** `delete` is unchanged (whole project; no lane is closed or
+  adopted on the way). The old `archive` — which closed the project's Space and
+  every lane's — is gone with `pause`/`resume`/`unarchive`: a project is in use
+  or deleted, and "not needed for now" is closing the Spaces and starting no
+  coordinator.
 - **Closed lanes leave the views.** A closed lane's threads are filtered out of
   `hp overview` (`overview::render`), so the lane disappears even when its
   coordinator process is still alive (§6.4 allows that). The pane stays on the
@@ -989,8 +990,8 @@ reaches a named lane's coordinator.
   from the existing `coordinator.json` (`pane_id`, `agent_session`, `profile`).
   Nothing to run, nothing to migrate, nothing that can half-finish.
 - **The old CLI is unchanged.** `open`, `context`, `thread`, `inbox`,
-  `needs-you`, `overview`, `archive`, `rename`, `doctor` all keep their
-  behaviour for single-lane projects.
+  `needs-you`, `overview`, `rename`, `doctor` all keep their behaviour for
+  single-lane projects.
 - **`rename <slug> <new-slug>`** keeps working: it rewrites `coordinator.json`
   paths (`src/rename.rs`) and moves the folder. It only has to iterate the
   lanes where it iterates one record: reopen each lane's coordinator in the new

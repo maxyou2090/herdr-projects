@@ -8,7 +8,7 @@ use anyhow::{Result, bail};
 
 use crate::core::{Core, Pane};
 use crate::paths::Ctx;
-use crate::project::{self, Project, Status};
+use crate::project::{self, Project};
 use crate::thread::{self, Group};
 use crate::threads::{self, Row};
 
@@ -51,10 +51,10 @@ pub fn resolve_slug_quiet(ctx: &Ctx) -> Option<String> {
 }
 
 /// The project a pane's `hp_project` label names, when that project is still
-/// there and not archived. A label naming a deleted project is no answer.
+/// there. A label naming a deleted project is no answer.
 fn labelled(ctx: &Ctx, pane: &Pane) -> Option<String> {
     let slug = pane.tokens.get(crate::labels::PROJECT_TOKEN)?.clone();
-    Project::load(&ctx.root, &slug).ok().filter(|p| p.status() != Status::Archived).map(|p| p.slug)
+    Project::load(&ctx.root, &slug).ok().map(|p| p.slug)
 }
 
 /// The project a Space belongs to, only among projects recorded in the same
@@ -72,7 +72,6 @@ fn project_for_space(ctx: &Ctx, panes: &[Pane], mine: &Pane) -> Option<String> {
     let projects: Vec<(Project, crate::project::Coordinator)> = project::list_slugs(&ctx.root)
         .into_iter()
         .filter_map(|slug| Project::load(&ctx.root, &slug).ok())
-        .filter(|p| p.status() != Status::Archived)
         .filter_map(|p| p.coordinator().filter(|r| crate::core::session_key(&r.socket) == session).map(|r| (p, r)))
         .collect();
     if projects.is_empty() {
@@ -132,12 +131,38 @@ pub fn resolve_slug(ctx: &Ctx, slug: Option<&str>) -> Result<Resolved> {
     Ok(Resolved::All)
 }
 
-/// The slug to act on, for commands that cannot act on "all projects".
+/// Every project in the root, in listing order.
 fn visible_slugs(ctx: &Ctx) -> Vec<String> {
     project::list_slugs(&ctx.root)
-        .into_iter()
-        .filter(|slug| Project::load(&ctx.root, slug).is_ok_and(|p| p.status() != Status::Archived))
-        .collect()
+}
+
+/// Is this project **in use**? A project has no state of its own: it is either
+/// in use or deleted, and "not needed for now" is a closed Space and no
+/// coordinator. So the question this view asks is the only one left: is
+/// somebody working in it, or is a thread of it still open or starting? Every
+/// other project is left out of `overview` and `hp overview --all` is how you
+/// see it, exactly as `ls -a` shows what a plain `ls` does not.
+fn in_use(ctx: &Ctx, project: &Project) -> bool {
+    let open = thread::list(project).iter().any(|t| matches!(t.status, thread::Status::Open | thread::Status::Starting));
+    open || coordinator_running(ctx, project)
+}
+
+/// A live coordinator: the ticker's own list of coordinator panes
+/// (`.state/coordinators.json`, one per lane, written every 15 s), else the
+/// pane the project's record names — asked about in the session that record
+/// names, so a coordinator in another core session still counts, and asked
+/// only when the ticker's file says nothing (a stopped ticker, a root the
+/// ticker never saw). A terminal that is alive but reports no status is a
+/// shell left behind, not a coordinator (t-0055), so it does not count.
+fn coordinator_running(ctx: &Ctx, project: &Project) -> bool {
+    if !crate::coordinator::live(project).is_empty() {
+        return true;
+    }
+    let Some(record) = project.coordinator().filter(|r| !r.pane_id.is_empty()) else {
+        return false;
+    };
+    let herdr = Core::new(ctx.env.hc_bin(), &record.socket, ctx.runner);
+    herdr.terminal_fate(&record.pane_id).is_ok_and(|terminal| terminal.live() && terminal.reported)
 }
 
 /// The numbered project picker.
@@ -169,7 +194,7 @@ pub fn render(project: &Project, rows: &[Row]) -> String {
     // a registry `thread_visible` is always true, so nothing changes there.
     let rows: Vec<&Row> = rows.iter().filter(|r| crate::lanes::thread_visible(project, &r.thread.lane)).collect();
     let mut out = String::new();
-    let _ = writeln!(out, "{} ({})", project.slug, project.status());
+    let _ = writeln!(out, "{}", project.slug);
     if rows.is_empty() {
         let _ = writeln!(out, "\n  no threads yet");
     }
@@ -197,13 +222,19 @@ pub fn render(project: &Project, rows: &[Row]) -> String {
     out
 }
 
-pub fn run(ctx: &Ctx, slug: Option<&str>, wait: bool) -> Result<()> {
+pub fn run(ctx: &Ctx, slug: Option<&str>, all: bool, wait: bool) -> Result<()> {
     let slugs = match resolve_slug(ctx, slug)? {
+        // A project named outright is printed whether or not anything runs in
+        // it: asking for it is the answer.
         Resolved::Slug(slug) => vec![slug],
-        Resolved::All => visible_slugs(ctx),
+        Resolved::All if all => visible_slugs(ctx),
+        Resolved::All => visible_slugs(ctx).into_iter().filter(|slug| Project::load(&ctx.root, slug).is_ok_and(|p| in_use(ctx, &p))).collect(),
     };
     if slugs.is_empty() {
-        println!("there are no projects in {}", ctx.root.display());
+        match all {
+            true => println!("there are no projects in {}", ctx.root.display()),
+            false => println!("no project is in use (nothing runs in any of them; --all lists every project)"),
+        }
     }
     for (index, slug) in slugs.iter().enumerate() {
         let project = Project::load(&ctx.root, slug)?;
@@ -272,10 +303,10 @@ mod tests {
         // An older PROJECT.md still carries the line; the line is not a view.
         std::fs::write(with_old_goal.project_md(), "+++\nname = \"alpha\"\ngoal = \"monthly invoices\"\n+++\n").unwrap();
         let text = render(&with_old_goal, &[]);
-        assert_eq!(text.lines().next(), Some("alpha (active)"), "{text}");
+        assert_eq!(text.lines().next(), Some("alpha"), "{text}");
         assert!(!text.contains("monthly invoices"), "{text}");
         let text = render(&plain, &[]);
-        assert_eq!(text.lines().next(), Some("beta (active)"), "{text}");
+        assert_eq!(text.lines().next(), Some("beta"), "{text}");
     }
 
     #[test]

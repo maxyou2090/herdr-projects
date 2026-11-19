@@ -181,10 +181,6 @@ pub fn clear_pane(herdr: &Core, pane: &str) {
     let _ = herdr.clear_labels(pane, &keys);
 }
 
-/// A Space is a group of terminals by label; closing its terminals is what
-/// removes it, so there is nothing left to clear.
-pub fn clear_workspace(_herdr: &Core, _workspace: &str) {}
-
 #[cfg(test)]
 mod tests {
     use super::*;

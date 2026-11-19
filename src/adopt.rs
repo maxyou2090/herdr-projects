@@ -55,9 +55,6 @@ pub fn adoptable_agent_except(ctx: &Ctx, herdr: &Core, socket: &str, pane: &str,
 
 pub fn adopt(ctx: &Ctx, slug: &str, pane: &str, title: &str, task: Option<String>) -> Result<Thread> {
     let project = Project::load(&ctx.root, slug)?;
-    if project.status() != project::Status::Active {
-        bail!("`{slug}` is {}; adopting is refused until it is active again", project.status());
-    }
     if title.trim().is_empty() {
         bail!("--title may not be empty");
     }

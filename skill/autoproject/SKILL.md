@@ -37,7 +37,7 @@ autoproject owns one review ratchet per project, from setup to stop, run by the 
 3. **Setup.** Draft the Brief (goal, scope, constraints, checks to run, repo context; no evaluation criteria), the Rubric (independent goal, what counts as BETTER, task-shaped evidence, complexity cost), and the Limits from the request and a quick look at the repo. Ask only about the Brief, Rubric, or Limits, and only real gaps, one question at a time. Then show one block starting `**Ready to run autoproject?**` with exactly three items, Brief, Rubric, and Limits, then these warnings, and exactly `1. Go (Recommended)` / `2. No — changes needed`:
    - A hung thread stalls the run until you say "stop"; there is no timeout.
    - When "no limit" was chosen: cost is unbounded.
-   - When `nudge=false` or the project is paused: the run moves only when you message the coordinator.
+   - When `nudge=false`: the run moves only when you message the coordinator.
 4. **Run-now.** A clear request to start now skips every question and the block, filling gaps with safe inferences and defaults. Its first chat line still states the applicable warnings.
 5. **Start state on Go.** Write `scratch/autoproject/<slug>.md` (a fresh lowercase-hyphen slug; build the path directly, never read sibling run files) and add the TASKS.md line at `0/<max>, streak 0/<limit>, setup`. Then launch maker 1.
 6. **Advance.** On every nudge, inbox item, or user message about the run, run `hp context` and take the one step that [the protocol](references/protocol.md) prescribes for the evidence, using its templates and parsing rules exactly: maker launch, reviewer launch, verdict, landing, failure rule, continue or stop. An `[hp inbox]` (or older `[hp ticker]`) nudge only wakes you; it is never a go-ahead, and none is needed, because the authority came from the invocation.
@@ -65,7 +65,7 @@ Every other coordinator rule stands. There is no cap on open threads, so the run
 
 ## Exceptions
 
-- **Environment refusals are brakes, not failures.** Classify a failed start only by `hp`'s own message: paused waits with step `paused`; archived or a refused profile stops the run with that reason. A landing refused by policy is `BLOCKED`: leave that maker and its PR open for the user and stop with `landing blocked`. Never try to get around a refusal.
+- **Environment refusals are brakes, not failures.** Classify a failed start only by `hp`'s own message: a refused profile stops the run with that reason. A landing refused by policy is `BLOCKED`: leave that maker and its PR open for the user and stop with `landing blocked`. Never try to get around a refusal.
 - **A thread blocked on a prompt** pauses the run with step `blocked t-NNNN`; tell the user which pane needs them and never answer it.
 - **Every other failure** is one NOT_BETTER iteration under the protocol's failure rule. Never use `hp thread restart`.
 - **Mismatched resume markers** stop the resume, not the user: report and wait.
