@@ -53,7 +53,12 @@ enum Command {
         coordinator_profile: Option<String>,
     },
     /// List projects with what their threads need
-    List,
+    List {
+        /// Machine-readable: one object per project, with each group's stable
+        /// `token` beside its label, so a script never parses prose
+        #[arg(long)]
+        json: bool,
+    },
     /// Open a project: start a coordinator agent in its folder — in this terminal when no agent runs there, else in a new terminal of the project's Space
     Open {
         slug: String,
@@ -478,6 +483,65 @@ enum ThreadCommand {
     },
 }
 
+/// One project's line in `list`, collected once so the text and the JSON answer
+/// the same numbers from the same reads.
+struct Listed {
+    slug: String,
+    name: String,
+    folder: String,
+    threads: usize,
+    /// `(token, label, count)`, in `Group::rank` order (needs-you first).
+    groups: Vec<(&'static str, &'static str, usize)>,
+}
+
+/// `list`: one line per project with what its threads need, or the same facts as
+/// JSON. Read only — it never marks items seen and writes no state.
+fn list(ctx: &Ctx, json: bool) -> Result<()> {
+    let mut listed: Vec<Listed> = Vec::new();
+    for slug in project::list_slugs(&ctx.root) {
+        let project = Project::load(&ctx.root, &slug)?;
+        let mut counts: std::collections::BTreeMap<u8, (&'static str, &'static str, usize)> = std::collections::BTreeMap::new();
+        let mut threads = 0;
+        for row in threads::rows(ctx, &project) {
+            let entry = counts.entry(row.group.rank()).or_insert((row.group.token(), row.group.label(), 0));
+            entry.2 += 1;
+            threads += 1;
+        }
+        listed.push(Listed {
+            slug: slug.clone(),
+            name: project.display_name(),
+            folder: project.dir().to_string_lossy().into_owned(),
+            threads,
+            groups: counts.into_values().collect(),
+        });
+    }
+    if json {
+        let values: Vec<serde_json::Value> = listed
+            .iter()
+            .map(|p| {
+                serde_json::json!({
+                    "slug": p.slug,
+                    "name": p.name,
+                    "folder": p.folder,
+                    "threads": p.threads,
+                    "groups": p
+                        .groups
+                        .iter()
+                        .map(|(token, label, count)| serde_json::json!({ "token": token, "label": label, "count": count }))
+                        .collect::<Vec<_>>(),
+                })
+            })
+            .collect();
+        println!("{}", serde_json::to_string_pretty(&values)?);
+        return Ok(());
+    }
+    for p in &listed {
+        let summary: Vec<String> = p.groups.iter().map(|(_, label, n)| format!("{label}: {n}")).collect();
+        println!("{}\t{}", p.slug, if summary.is_empty() { "no threads".to_string() } else { summary.join(", ") });
+    }
+    Ok(())
+}
+
 /// `-` is standard input; a relative path is relative to the caller's directory.
 fn read_text(file: &str) -> Result<String> {
     use std::io::Read;
@@ -691,18 +755,7 @@ pub fn run() -> Result<()> {
             println!("next: {prefix} open {}", project.slug);
             Ok(())
         }
-        Command::List => {
-            for slug in project::list_slugs(&ctx.root) {
-                let project = Project::load(&ctx.root, &slug)?;
-                let mut counts = std::collections::BTreeMap::new();
-                for row in threads::rows(&ctx, &project) {
-                    *counts.entry(row.group.rank()).or_insert((row.group.label(), 0)) = (row.group.label(), counts.get(&row.group.rank()).map_or(0, |c: &(&str, usize)| c.1) + 1);
-                }
-                let summary: Vec<String> = counts.values().map(|(label, n)| format!("{label}: {n}")).collect();
-                println!("{slug}\t{}", if summary.is_empty() { "no threads".to_string() } else { summary.join(", ") });
-            }
-            Ok(())
-        }
+        Command::List { json } => list(&ctx, json),
         Command::Open { slug, profile, new, tab, rebind, lane, lane_name, session } => {
             let person = std::io::stdin().is_terminal() && std::io::stdout().is_terminal();
             coordinator::open(
