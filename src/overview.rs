@@ -222,26 +222,126 @@ pub fn render(project: &Project, rows: &[Row]) -> String {
     out
 }
 
-pub fn run(ctx: &Ctx, slug: Option<&str>, all: bool, wait: bool) -> Result<()> {
-    let slugs = match resolve_slug(ctx, slug)? {
-        // A project named outright is printed whether or not anything runs in
-        // it: asking for it is the answer.
+/// Which projects this call reads. A project named outright is printed whether
+/// or not anything runs in it: asking for it is the answer. `--all` and
+/// `--needs-you` are about **every** project, so neither is narrowed by the
+/// pane a person happens to run the command in (t-0069: `--all` used to be
+/// dropped whenever the pane named a project, so `hp overview --all` inside a
+/// project printed that one project).
+fn chosen_slugs(ctx: &Ctx, slug: Option<&str>, all: bool, needs_you: bool) -> Result<Vec<String>> {
+    if slug.is_none() && (all || needs_you) {
+        return Ok(visible_slugs(ctx));
+    }
+    Ok(match resolve_slug(ctx, slug)? {
         Resolved::Slug(slug) => vec![slug],
-        Resolved::All if all => visible_slugs(ctx),
         Resolved::All => visible_slugs(ctx).into_iter().filter(|slug| Project::load(&ctx.root, slug).is_ok_and(|p| in_use(ctx, &p))).collect(),
-    };
+    })
+}
+
+const SUMMARY_CHARS: usize = 120;
+
+/// One line, at most [`SUMMARY_CHARS`] characters: an inbox writer may pour a
+/// paragraph into `summary` (a session loss does), and this screen is for
+/// scanning. The whole text stays in `hp context <slug> --peek`.
+fn cut(summary: &str) -> String {
+    let summary = summary.trim();
+    if summary.chars().count() <= SUMMARY_CHARS {
+        return summary.to_string();
+    }
+    format!("{}…", summary.chars().take(SUMMARY_CHARS).collect::<String>())
+}
+
+/// `hp overview --needs-you`: one line per thread that waits on a person — with
+/// the project it belongs to, its title and how long it has waited — and each
+/// project's unhandled inbox items underneath. **Read only**: nothing is marked
+/// seen (that is `context`, which writes), no record is touched, and no project
+/// is opened. `nothing needs you` when every project is quiet.
+///
+/// One session view serves every project that lives in the same core session,
+/// so ten projects cost two `hc` calls, not twenty. The view is taken from the
+/// first project of that session that can be listed — a project with a
+/// coordinator record, normally — and every project of the session borrows it:
+/// they are the same terminals, and asking per project would repeat the same
+/// two calls ten times over.
+pub fn needs_you_text(ctx: &Ctx, slugs: &[String]) -> Result<String> {
+    let now = jiff::Timestamp::now();
+    let projects: Vec<Project> = slugs.iter().map(|slug| Project::load(&ctx.root, slug)).collect::<Result<Vec<_>>>()?;
+    let socket_of = |project: &Project| project.coordinator().map(|record| record.socket).unwrap_or_default();
+    let mut views: std::collections::BTreeMap<String, Option<threads::SessionView>> = std::collections::BTreeMap::new();
+    // A project that has a coordinator record answers for its whole session in
+    // one try; one with no record has to look for an agent of its own first.
+    let mut ordered: Vec<&Project> = projects.iter().collect();
+    ordered.sort_by_key(|project| project.coordinator().is_none());
+    for project in ordered {
+        let socket = socket_of(project);
+        // Keep trying until this session answers: an early project may have no
+        // record at all, and its `None` says nothing about the session.
+        if views.get(&socket).is_some_and(Option::is_some) {
+            continue;
+        }
+        let view = threads::session_view(ctx, project);
+        views.insert(socket, view);
+    }
+    // (slug, the line without its slug column)
+    let mut lines: Vec<(String, String)> = Vec::new();
+    let mut details: Vec<(usize, String)> = Vec::new();
+    for project in &projects {
+        let slug = &project.slug;
+        let view = views.get(&socket_of(project)).and_then(Option::as_ref);
+        let rows = threads::rows_with_view(project, view);
+        let mut waiting: Vec<Row> = rows
+            .into_iter()
+            .filter(|row| crate::labels::needs_you(row.group))
+            .filter(|row| crate::lanes::thread_visible(project, &row.thread.lane))
+            .collect();
+        waiting.sort_by_key(|row| (row.group.rank(), row.thread.id.clone()));
+        for row in &waiting {
+            let t = &row.thread;
+            let waited = if !t.last_state_change.is_empty() { &t.last_state_change } else { &t.created };
+            let age = crate::audit::duration_text(crate::thread::seconds_since(waited, now));
+            lines.push((slug.clone(), format!("{}  [{} · {}]  {}  ({})", t.id, row.group.label(), age, t.title, row.note)));
+        }
+        let items = crate::inbox::unhandled(project);
+        if items.is_empty() {
+            continue;
+        }
+        let oldest = crate::thread::seconds_since(&items[0].created, now);
+        lines.push((slug.clone(), format!("inbox  {} unhandled · oldest {}", items.len(), crate::audit::duration_text(oldest))));
+        for item in &items {
+            details.push((lines.len() - 1, format!("- {}  [{}]  {}", item.id, item.kind, cut(&item.summary))));
+        }
+    }
+    if lines.is_empty() {
+        return Ok("nothing needs you\n".to_string());
+    }
+    let width = slugs.iter().map(|slug| slug.chars().count()).max().unwrap_or(0);
+    let mut out = String::new();
+    for (index, (slug, rest)) in lines.iter().enumerate() {
+        let _ = writeln!(out, "{slug:<width$}  {rest}");
+        for (_, detail) in details.iter().filter(|(after, _)| *after == index) {
+            let _ = writeln!(out, "{}  {detail}", " ".repeat(width));
+        }
+    }
+    Ok(out)
+}
+
+pub fn run(ctx: &Ctx, slug: Option<&str>, all: bool, wait: bool, needs_you: bool) -> Result<()> {
+    let slugs = chosen_slugs(ctx, slug, all, needs_you)?;
     if slugs.is_empty() {
-        match all {
+        match all || needs_you {
             true => println!("there are no projects in {}", ctx.root.display()),
             false => println!("no project is in use (nothing runs in any of them; --all lists every project)"),
         }
-    }
-    for (index, slug) in slugs.iter().enumerate() {
-        let project = Project::load(&ctx.root, slug)?;
-        if index > 0 {
-            println!();
+    } else if needs_you {
+        print!("{}", needs_you_text(ctx, &slugs)?);
+    } else {
+        for (index, slug) in slugs.iter().enumerate() {
+            let project = Project::load(&ctx.root, slug)?;
+            if index > 0 {
+                println!();
+            }
+            print!("{}", render(&project, &threads::rows(ctx, &project)));
         }
-        print!("{}", render(&project, &threads::rows(ctx, &project)));
     }
     // `--wait` is for a person reading it; an agent calling this never waits.
     if wait && std::io::stdout().is_terminal() && std::io::stdin().is_terminal() {
@@ -369,5 +469,142 @@ mod tests {
         let ghost = world.core.terminal("hp-ghost", "/tmp", &[(crate::labels::PROJECT_TOKEN, "ghost"), (L_WS, "ws-ghost")]);
         let ctx = world.ctx(&ghost.address);
         assert_eq!(resolve_slug_quiet(&ctx), None);
+    }
+
+    /// A thread record in the group a test wants, waiting since `secs` ago.
+    fn thread_record(project: &Project, title: &str, group: Group, secs: i64) -> String {
+        let waited = (jiff::Timestamp::now() - jiff::SignedDuration::from_secs(secs)).to_string();
+        let record = crate::thread::allocate(project, |t| {
+            t.title = title.to_string();
+            t.status = if group == Group::Resolved { crate::thread::Status::Resolved } else { crate::thread::Status::Open };
+            t.last_group = group.token().to_string();
+            t.last_state_change = waited.clone();
+            t.created = waited.clone();
+        })
+        .unwrap();
+        record.id
+    }
+
+    /// Every file under the project, with its size and modification time: what a
+    /// command that changes nothing leaves exactly as it was.
+    fn snapshot(project: &Project) -> Vec<(String, u64, std::time::SystemTime)> {
+        let mut found = Vec::new();
+        let mut stack = vec![project.dir().to_path_buf()];
+        while let Some(dir) = stack.pop() {
+            let Ok(entries) = std::fs::read_dir(&dir) else { continue };
+            for entry in entries.flatten() {
+                let path = entry.path();
+                match entry.metadata() {
+                    Ok(meta) if meta.is_dir() => stack.push(path),
+                    Ok(meta) => found.push((path.to_string_lossy().into_owned(), meta.len(), meta.modified().unwrap())),
+                    Err(_) => {}
+                }
+            }
+        }
+        found.sort();
+        found
+    }
+
+    #[test]
+    fn needs_you_lists_only_the_two_groups_that_wait_on_a_person() {
+        let world = World::new();
+        let project = world.project("alpha");
+        let ctx = world.ctx("");
+        let waiting = thread_record(&project, "api：操作日志分页", Group::WaitingOnYou, 3 * 86400);
+        let review = thread_record(&project, "案件操作日志 Tab 改版", Group::ReadyForReview, 3600);
+        let working = thread_record(&project, "后台搬砖", Group::Working, 60);
+        let resolved = thread_record(&project, "早就完事", Group::Resolved, 86400);
+        let text = needs_you_text(&ctx, &["alpha".to_string()]).unwrap();
+        assert!(text.contains(&waiting), "{text}");
+        assert!(text.contains("api：操作日志分页"), "{text}");
+        assert!(text.contains(&review), "{text}");
+        assert!(text.contains("案件操作日志 Tab 改版"), "{text}");
+        assert!(!text.contains(&working), "a thread that is working is not waiting on anybody: {text}");
+        assert!(!text.contains(&resolved), "neither is a resolved one: {text}");
+        assert!(text.contains("Waiting on you"), "{text}");
+        assert!(text.contains("Ready for review"), "{text}");
+        assert!(text.contains("3d"), "how long it has waited, in one word: {text}");
+        // Needs-you first, whatever the ids say: the display order of every
+        // other view, where a waiting thread outranks one waiting for a review.
+        let lines: Vec<&str> = text.lines().collect();
+        assert!(lines[0].contains(&waiting) && lines[1].contains(&review), "{text}");
+    }
+
+    #[test]
+    fn needs_you_reads_every_project_not_only_the_busy_ones() {
+        let world = World::new();
+        let rexa = world.project("rexa");
+        let law = world.project("law");
+        let quiet = world.project("ops");
+        let ctx = world.ctx("");
+        thread_record(&rexa, "RBI drafts", Group::WaitingOnYou, 120);
+        thread_record(&law, "操作日志分页", Group::WaitingOnYou, 60);
+        let text = needs_you_text(&ctx, &["law".to_string(), "ops".to_string(), "rexa".to_string()]).unwrap();
+        assert!(text.contains("rexa") && text.contains("law"), "{text}");
+        assert!(text.contains("RBI drafts") && text.contains("操作日志分页"), "{text}");
+        assert!(!text.contains("ops"), "a project with nothing waiting costs no line: {text}");
+        assert_eq!(quiet.slug, "ops");
+    }
+
+    #[test]
+    fn needs_you_counts_the_unhandled_inbox_of_each_project() {
+        let world = World::new();
+        let my_net = world.project("my-net");
+        let ctx = world.ctx("");
+        crate::inbox::write(&my_net, "pr", "t-0019", "merged", "t-0019: the pull request merged", "").unwrap();
+        crate::inbox::write(&my_net, "thread-error", "t-0020", "failed", "t-0020: the agent did not start", "").unwrap();
+        let text = needs_you_text(&ctx, &["my-net".to_string()]).unwrap();
+        assert!(text.contains("2 unhandled"), "{text}");
+        assert!(text.contains("t-0019: the pull request merged"), "what the items are about: {text}");
+        assert!(text.contains("t-0020: the agent did not start"), "{text}");
+        // The inbox line is the project's, not a thread's: there is no thread here.
+        assert!(!text.contains("Waiting on you"), "{text}");
+    }
+
+    #[test]
+    fn a_long_inbox_summary_is_one_short_line() {
+        let long = "x".repeat(400);
+        assert_eq!(cut("  short  "), "short");
+        let shortened = cut(&long);
+        assert_eq!(shortened.chars().count(), SUMMARY_CHARS + 1, "cut at the budget, with the ellipsis");
+        assert!(shortened.ends_with('…'));
+        // Chinese counts as characters, not bytes: no cut inside one.
+        let chinese = "等等".repeat(100);
+        assert!(cut(&chinese).starts_with("等等等等"));
+        assert_eq!(cut(&chinese).chars().count(), SUMMARY_CHARS + 1);
+    }
+
+    #[test]
+    fn a_quiet_root_reads_as_one_line() {
+        let world = World::new();
+        let project = world.project("alpha");
+        let ctx = world.ctx("");
+        thread_record(&project, "still working", Group::Working, 30);
+        assert_eq!(needs_you_text(&ctx, &["alpha".to_string()]).unwrap(), "nothing needs you\n");
+    }
+
+    #[test]
+    fn needs_you_writes_nothing() {
+        let world = World::new();
+        let project = world.project("alpha");
+        let ctx = world.ctx("");
+        thread_record(&project, "waiting", Group::WaitingOnYou, 600);
+        crate::inbox::write(&project, "pr", "t-0019", "merged", "t-0019: merged", "").unwrap();
+        let before = snapshot(&project);
+        let _ = needs_you_text(&ctx, &["alpha".to_string()]).unwrap();
+        assert_eq!(snapshot(&project), before, "no item is marked seen and no record changes: this is not `context`");
+    }
+
+    #[test]
+    fn all_reads_every_project_even_when_the_pane_names_one() {
+        let world = World::new();
+        let alpha = world.project("alpha");
+        let _beta = world.project("beta");
+        let pane = world.core.terminal("hp-alpha", &world.dir(&alpha), &[(crate::labels::PROJECT_TOKEN, "alpha"), (L_WS, "ws-alpha")]);
+        let ctx = world.ctx(&pane.address);
+        assert_eq!(resolve_slug(&ctx, None).unwrap(), Resolved::Slug("alpha".into()), "the pane does name a project");
+        assert_eq!(chosen_slugs(&ctx, None, true, false).unwrap(), vec!["alpha".to_string(), "beta".to_string()], "--all lists every project anyway");
+        assert_eq!(chosen_slugs(&ctx, None, false, true).unwrap(), vec!["alpha".to_string(), "beta".to_string()], "so does --needs-you, from anywhere");
+        assert_eq!(chosen_slugs(&ctx, Some("beta"), false, false).unwrap(), vec!["beta".to_string()], "a project named outright is still printed alone");
     }
 }

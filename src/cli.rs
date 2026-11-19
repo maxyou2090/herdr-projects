@@ -107,6 +107,9 @@ enum Command {
         /// List every project, not only the ones in use (a live coordinator, or a thread that is open or starting)
         #[arg(long)]
         all: bool,
+        /// Print only what waits on a person, across every project: the `Waiting on you` and `Ready for review` threads with how long they have waited, and each project's unhandled inbox items. Read only: nothing is marked seen
+        #[arg(long)]
+        needs_you: bool,
         /// Wait for Enter before exiting (only when on a terminal; for a person running it by hand)
         #[arg(long)]
         wait: bool,
@@ -732,7 +735,7 @@ pub fn run() -> Result<()> {
         },
         Command::Context { slug, peek } => coordinator::context(&ctx, &slug, peek),
         Command::Assignable { slug, check } => crate::assign::run(&ctx, &slug, check.as_deref()),
-        Command::Overview { slug, all, wait } => overview::run(&ctx, slug.as_deref(), all, wait),
+        Command::Overview { slug, all, needs_you, wait } => overview::run(&ctx, slug.as_deref(), all, wait, needs_you),
         Command::Inbox { command } => match command {
             InboxCommand::Done { slug, ids, all } => {
                 let project = Project::load(&ctx.root, &slug)?;
