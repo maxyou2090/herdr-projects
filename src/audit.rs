@@ -282,10 +282,17 @@ fn newest_activity(t: &Thread) -> Option<jiff::Timestamp> {
     written.or_else(|| stamp(&t.created))
 }
 
-/// `22h 30m`, `45m`, `30s`: long enough to read, short enough for one line.
-fn duration_text(secs: i64) -> String {
-    let (hours, minutes) = (secs / 3600, secs % 3600 / 60);
-    if hours > 0 {
+/// `3d`, `22h 30m`, `45m`, `30s`: long enough to read, short enough for one
+/// line. Days are there for `hp overview --needs-you`, where a thread can wait
+/// on a person for days.
+pub(crate) fn duration_text(secs: i64) -> String {
+    let (days, hours, minutes) = (secs / 86400, secs % 86400 / 3600, secs % 3600 / 60);
+    if days > 0 {
+        match hours {
+            0 => format!("{days}d"),
+            _ => format!("{days}d {hours}h"),
+        }
+    } else if hours > 0 {
         format!("{hours}h {minutes}m")
     } else if minutes > 0 {
         format!("{minutes}m")
@@ -508,5 +515,7 @@ mod tests {
         assert_eq!(duration_text(45 * 60), "45m");
         assert_eq!(duration_text(22 * 3600 + 30 * 60), "22h 30m");
         assert_eq!(duration_text(WORKING_STALE_SECS), "1h 30m");
+        assert_eq!(duration_text(3 * 86400), "3d");
+        assert_eq!(duration_text(3 * 86400 + 4 * 3600 + 59 * 60), "3d 4h");
     }
 }
