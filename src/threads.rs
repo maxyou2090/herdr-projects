@@ -1579,6 +1579,66 @@ mod tests {
         assert_eq!(world.spaces().len(), 1, "the project Space is the only one");
     }
 
+    /// The 2026-11-19 incident at the placement level, the way `thread restart`
+    /// would meet it: demo's home thread record still names the Space another
+    /// project's drifted coordinator sat in, and demo's own Space is proven only
+    /// by its coordinator's label (its shell sits in `~`). The restart must put
+    /// the tab back in demo's Space.
+    #[test]
+    fn a_home_thread_restart_lands_in_the_projects_own_space_not_another_projects() {
+        let home = tempfile::tempdir().unwrap();
+        let project = crate::project::create(&home.path().join("root"), "demo", "", vec![]).unwrap();
+        let dir = project.canonical_dir().to_string_lossy().into_owned();
+        let core = crate::fake_hc::FakeCore::new();
+        // The other project's coordinator, drifted into demo's folder. Terminals
+        // keep creation order, so a folder search finds this one first; only its
+        // label says it is not demo's.
+        core.terminal("t5h", &dir, &[("hp_ws", "sp-law"), ("hp_ws_label", "Law"), ("hp_project", "law")]);
+        // Demo's own coordinator in demo's own Space, its shell at `~`.
+        core.terminal("t5b", "/home/me", &[("hp_ws", "sp-demo"), ("hp_ws_label", "Demo"), ("hp_project", "demo")]);
+        project
+            .update_coordinator(|c| {
+                c.socket = String::new();
+                c.workspace_id = "sp-demo".into();
+                c.tab_id = "sp-demo-tab".into();
+                c.pane_id = "t5b".into();
+                c.cwd = dir.clone();
+            })
+            .unwrap();
+        let record = thread::allocate(&project, |t| {
+            t.kind = Kind::Home;
+            t.title = "Drain the held-document backlog".into();
+            t.status = Status::Open;
+            // What the incident's record was left saying.
+            t.workspace_id = "sp-law".into();
+        })
+        .unwrap();
+        let folder = project.dir().join("threads").join(&record.id);
+        std::fs::create_dir_all(&folder).unwrap();
+        let folder = std::fs::canonicalize(&folder).unwrap().to_string_lossy().into_owned();
+
+        let herdr = Core::new("hc", "", &core);
+        let agents = herdr.agent_list().unwrap();
+        let panes = herdr.pane_list().unwrap();
+        let view = SessionView { herdr, socket: String::new(), agents, panes };
+        let placed = place_tab(&project, &view, &record).unwrap();
+
+        assert_eq!(placed.workspace_id, "sp-demo", "the tab goes to the project's own Space, never to the drifted pane's");
+        assert!(placed.tab_id.starts_with("sp-demo-"), "the tab is made in that Space: {}", placed.tab_id);
+        let labels = core
+            .terminals
+            .borrow()
+            .iter()
+            .find(|t| t.name == placed.pane_id)
+            .map(|t| t.labels.clone())
+            .unwrap();
+        assert_eq!(labels.get("hp_ws").map(String::as_str), Some("sp-demo"));
+        assert!(
+            !core.terminals.borrow().iter().any(|t| t.labels.get("hp_ws").map(String::as_str) == Some("sp-law") && t.cwd.starts_with(&folder)),
+            "no tab was added to the other project's Space"
+        );
+    }
+
     #[test]
     fn placement_follows_the_request_then_the_repo() {
         assert_eq!(placement(None, true).unwrap(), Kind::Worktree);
