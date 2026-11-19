@@ -163,7 +163,7 @@ pub struct Session {
 /// core sets `HC_SESSION` for every command it starts and never sets either of
 /// those, so reading them could only ever name a session the command is not in
 /// (a recorded socket path still reads as the default session, see [`Session`]).
-pub fn resolve_session(flags: &SessionFlags, env: &Env, _runner: &dyn Runner) -> Result<Session> {
+pub fn resolve_session(flags: &SessionFlags, env: &Env) -> Result<Session> {
     if let Some(name) = &flags.session {
         return Ok(Session {
             socket: name.clone(),
@@ -185,7 +185,6 @@ pub fn resolve_session(flags: &SessionFlags, env: &Env, _runner: &dyn Runner) ->
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::runner::fake::FakeRunner;
 
     #[test]
     fn root_order_flag_env_config_default() {
@@ -240,22 +239,21 @@ mod tests {
 
     #[test]
     fn session_order_flag_then_hc_session_then_default() {
-        let runner = FakeRunner::new();
         let by_flag = SessionFlags { session: Some("explicit".into()) };
         let env = Env::for_test(Path::new("/h"), &[("HC_SESSION", "hp-dev")]);
-        let got = resolve_session(&by_flag, &env, &runner).unwrap();
+        let got = resolve_session(&by_flag, &env).unwrap();
         assert_eq!(got, Session { socket: "explicit".into(), name: Some("explicit".into()) });
 
-        let got = resolve_session(&SessionFlags::default(), &env, &runner).unwrap();
+        let got = resolve_session(&SessionFlags::default(), &env).unwrap();
         assert_eq!(got, Session { socket: "hp-dev".into(), name: Some("hp-dev".into()) });
 
         // Nothing set: the default core, which has no name to pass on.
         let env = Env::for_test(Path::new("/h"), &[]);
-        assert_eq!(resolve_session(&SessionFlags::default(), &env, &runner).unwrap(), Session { socket: String::new(), name: None });
+        assert_eq!(resolve_session(&SessionFlags::default(), &env).unwrap(), Session { socket: String::new(), name: None });
 
         // Herdr 1's variable no longer selects a session: core never sets it.
         let env = Env::for_test(Path::new("/h"), &[("HERDR_SESSION", "hp-dev")]);
-        assert_eq!(resolve_session(&SessionFlags::default(), &env, &runner).unwrap(), Session { socket: String::new(), name: None });
+        assert_eq!(resolve_session(&SessionFlags::default(), &env).unwrap(), Session { socket: String::new(), name: None });
     }
 
     #[test]

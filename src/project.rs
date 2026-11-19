@@ -191,8 +191,6 @@ struct ProjectState {
 #[serde(default)]
 pub struct Coordinator {
     pub socket: String,
-    /// Empty when the session was chosen by socket path alone.
-    pub session: String,
     pub workspace_id: String,
     pub tab_id: String,
     pub pane_id: String,
@@ -1034,6 +1032,23 @@ mod tests {
         std::fs::remove_dir_all(project.dir()).unwrap();
         assert!(project.lock().is_err());
         assert!(!project.dir().exists());
+    }
+
+    /// A coordinator record is read by `socket`, the Space, tab, pane, folder
+    /// and agent fields. `session` was written on every `open` and read by
+    /// nothing: the socket already names the core session.
+    #[test]
+    fn a_coordinator_record_writes_only_the_fields_something_reads() {
+        let root = tempfile::tempdir().unwrap();
+        let project = create(root.path(), "demo", vec![]).unwrap();
+        project.update_coordinator(|c| c.socket = "/s".into()).unwrap();
+        let text = std::fs::read_to_string(project.state_dir().join("coordinator.json")).unwrap();
+        assert!(!text.contains("\"session\""), "`session` had no reader and is gone: {text}");
+        assert!(text.contains("\"socket\""), "{text}");
+        // A file an older `hp` wrote still reads: the key is ignored.
+        std::fs::write(project.state_dir().join("coordinator.json"), "{\"socket\":\"/s\",\"session\":\"main\"}").unwrap();
+        let record = project.coordinator().unwrap();
+        assert_eq!(record.socket, "/s");
     }
 
     #[test]

@@ -552,7 +552,7 @@ fn run_logged(ctx: &Ctx, log: &Log) -> Result<()> {
         pid: std::process::id(),
         root: root.display().to_string(),
         started: project::now(),
-        tools: ["herdr", "git", "gh", "ssh", "scp", "rsync"]
+        tools: ["herdr", "git", "gh", "rsync"]
             .iter()
             .map(|tool| {
                 let name = if *tool == "herdr" { ctx.env.hc_bin() } else { tool.to_string() };
@@ -703,7 +703,7 @@ pub struct Sessions {
     lists: std::collections::BTreeMap<String, Option<Lists>>,
     /// The sockets a project without a live record is looked for in: the
     /// default session first, then every other project's recorded socket.
-    candidates: Option<Vec<(String, String)>>,
+    candidates: Option<Vec<String>>,
     known: Vec<String>,
 }
 
@@ -733,18 +733,18 @@ impl Sessions {
             .as_ref()
     }
 
-    /// `(socket, session name)` pairs, the default session first.
-    fn candidates(&mut self, ctx: &Ctx) -> Vec<(String, String)> {
+    /// The sockets to look in, the default session first.
+    fn candidates(&mut self, ctx: &Ctx) -> Vec<String> {
         if let Some(found) = &self.candidates {
             return found.clone();
         }
         let mut found = Vec::new();
-        if let Ok(session) = crate::paths::resolve_session(&Default::default(), ctx.env, ctx.runner) {
-            found.push((session.socket.clone(), session.name.unwrap_or_default()));
+        if let Ok(session) = crate::paths::resolve_session(&Default::default(), ctx.env) {
+            found.push(session.socket);
         }
         for socket in &self.known {
-            if !found.iter().any(|(s, _)| s == socket) {
-                found.push((socket.clone(), String::new()));
+            if !found.contains(socket) {
+                found.push(socket.clone());
             }
         }
         self.candidates = Some(found.clone());
@@ -761,11 +761,11 @@ impl Sessions {
 /// another project uses, becomes its coordinator and is recorded just as
 /// `open` records one. Agents in `threads/` or a worktree are threads.
 fn discover_record(ctx: &Ctx, project: &Project, sessions: &mut Sessions) -> Result<Option<project::Coordinator>> {
-    for (socket, name) in sessions.candidates(ctx) {
+    for socket in sessions.candidates(ctx) {
         let Some((agents, _)) = sessions.get(ctx, &socket) else {
             continue;
         };
-        if let Some(found) = coordinator::found(project, &socket, &name, agents) {
+        if let Some(found) = coordinator::found(project, &socket, agents) {
             return project.update_coordinator(|c| *c = found).map(Some);
         }
     }
@@ -957,7 +957,7 @@ fn thread_pass(project: &Project, herdr: &Core, socket: &str, threads: &[thread:
             })?;
         }
         if live.pane_exists {
-            crate::labels::report_pane(herdr, &t.pane_id, &crate::labels::thread_display(t), slug, group, None);
+            crate::labels::report_pane(herdr, &t.pane_id, &crate::labels::thread_display(t), slug, None);
         }
         // A thread sitting idle with a failed retry on its pane has lost its
         // turn: no report is coming, so it is reported for the coordinator
@@ -1012,7 +1012,7 @@ fn launch_pass(ctx: &Ctx, project: &Project, seen: &Seen, threads: &[thread::Thr
                 if !refused.is_empty() {
                     thread::update(project, &t.id, |t| t.agent_args = model.clone())?;
                     let summary = format!(
-                        "{}: launched without agent arguments that are not a model flag: {}. Launch flags belong in a profile, which only the user sets (`herdr-projects profile list`)",
+                        "{}: launched without agent arguments that are not a model flag: {}. Launch flags belong in a profile, which only the user sets (`hp profile list`)",
                         t.id,
                         refused.join(" "),
                     );
@@ -1134,15 +1134,12 @@ fn tick_cheap_body(ctx: &Ctx, project: &Project, sessions: &mut Sessions, state:
         })?;
     }
     for c in &coordinators {
-        let terminal = agents.iter().find(|a| a.pane_id == c.pane_id).map(|a| a.terminal_id.clone()).unwrap_or_default();
-        let report = crate::progress::self_report(&ctx.root, &record.socket, &c.pane_id, &terminal);
-        let (group, _) = coordinator::row_state(c, report.as_ref());
         // The lane claim, refreshed every tick from the registry, so a pane
         // whose shell drifted keeps saying which lane it is (§5.1, risk (b)).
         // A pane the resolver could not place keeps no claim at all: rule 4
         // never assigns an `Ambiguous` pane a lane.
         let lane = (!c.lane.is_empty()).then(|| c.lane.clone());
-        crate::labels::report_pane(&herdr, &c.pane_id, &crate::labels::coordinator_display(project, lane.as_deref()), slug, group, lane.as_deref());
+        crate::labels::report_pane(&herdr, &c.pane_id, &crate::labels::coordinator_display(project, lane.as_deref()), slug, lane.as_deref());
         // The names that pane's Space and tab must show, repaired here rather
         // than on demand: the ticker already visits every coordinator, so one
         // that was never named — a coordinator started in a terminal the app

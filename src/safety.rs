@@ -203,7 +203,7 @@ pub fn apply(ctx: &Ctx, target: &Target, key: &str, words: &[String]) -> Result<
 pub fn set_cli(ctx: &Ctx, target: &str, key: &str, words: &[String]) -> Result<()> {
     let target = Target::parse(ctx, target)?;
     value_item(key, words)?;
-    let command = format!("herdr-projects safety set {} {key} {}", target.word(), words.join(" "));
+    let command = format!("hp safety set {} {key} {}", target.word(), words.join(" "));
     if !(std::io::stdin().is_terminal() && std::io::stdout().is_terminal()) {
         bail!(
             "safety settings are changed only by a person at a terminal: run `{}`. Standard input is not a terminal",
@@ -333,11 +333,11 @@ pub fn show_text(ctx: &Ctx, target: &Target) -> Result<String> {
             let list = config.allowed(&safety, role).map(|l| if l.is_empty() { "none".to_string() } else { l.join(", ") }).unwrap_or_else(|| "every profile".into());
             out.push_str(&format!("  {:<24} {list}\n", role.list_key()));
         }
-        out.push_str(&format!("Profiles and these lists: `herdr-projects profile list --project {}`; you change them with `profile add|edit|remove|allow`.\n", project.slug));
+        out.push_str(&format!("Profiles and these lists: `hp profile list --project {}`; you change them with `profile add|edit|remove|allow`.\n", project.slug));
     }
     let word = target.word();
     out.push_str(&format!(
-        "\nChange them at a terminal:\n  herdr-projects safety yolo {word} on|off|default\n  herdr-projects safety set {word} <key> <value>|default\n"
+        "\nChange them at a terminal:\n  hp safety yolo {word} on|off|default\n  hp safety set {word} <key> <value>|default\n"
     ));
     out.push_str("A change reaches agents launched after it; running agents keep their flags until restarted.\n");
     Ok(out)

@@ -296,7 +296,7 @@ Ordered by what a user would notice first:
    remote-machine deletion and dead code (#27), the three always-false checks
    (#28), the ticker that cannot die silently (#30) and the routine/sidebar/
    `hp-agent` rename (#29). It is still not published anywhere as a product: no
-   release feed, no crate, no install other than `scripts/link-command.sh`.
+   release feed, no crate, no install other than `scripts/install.sh`.
 
 ## 9. Where the code is
 

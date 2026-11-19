@@ -10,11 +10,8 @@ use std::path::{Path, PathBuf};
 
 use anyhow::Result;
 
-use crate::paths::Ctx;
-use crate::runner::Runner;
-
 /// `hp update`: nothing to fetch; say which build this is and how it moves.
-pub fn run(_ctx: &Ctx, check_only: bool) -> Result<()> {
+pub fn run(check_only: bool) -> Result<()> {
     let checkout = own_root().map(|path| path.display().to_string()).unwrap_or_else(|| "an unknown checkout".to_string());
     if check_only {
         println!("version:  {} (built from a checkout, not a release)", crate::VERSION);
@@ -26,12 +23,6 @@ pub fn run(_ctx: &Ctx, check_only: bool) -> Result<()> {
     println!("hp {} comes from a checkout ({checkout}); there is nothing to fetch", crate::VERSION);
     println!("to update it: `git pull`, `cargo build --release --locked`, then `ticker stop && ticker start`");
     Ok(())
-}
-
-/// A newer release than this binary, when one is known. Nothing is published
-/// for this build, so there is never one to report.
-pub fn newer_release(_runner: &dyn Runner, _root: Option<&Path>) -> Option<String> {
-    None
 }
 
 /// The checkout this binary was built in, when it still exists.

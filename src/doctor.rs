@@ -183,10 +183,6 @@ fn report(
     let _ = writeln!(out, "config dir: {}", config_dir.display());
     let _ = writeln!(out);
 
-    if let Some(latest) = crate::update::newer_release(runner, crate::update::own_root().as_deref()) {
-        check(&mut out, None, "update", format!("a newer version is available ({latest}): run `hp update`"));
-    }
-
     let app = env.herdr_app_bin();
     if crate::app::running(runner) {
         check(&mut out, Some(true), "app", format!("{app}: this project's terminals are shown in its spaces and tabs"));
@@ -215,7 +211,7 @@ fn report(
         check(&mut out, ok, "command", detail);
     }
 
-    match paths::resolve_session(session, env, runner) {
+    match paths::resolve_session(session, env) {
         Ok(found) => {
             let reachable = Core::new(&bin, &found.socket, runner).reachable();
             // Never print an empty name: the default core is a real session, it
@@ -239,7 +235,6 @@ fn report(
 
     for (tool, args, required) in [
         ("git", vec!["--version"], true),
-        ("ssh", vec!["-V"], true),
         ("rsync", vec!["--version"], false),
         ("gh", vec!["--version"], false),
     ] {
@@ -426,7 +421,7 @@ fn report(
             Some(record) => (None, vec![format!("recorded session `{}` no longer runs", record.socket)]),
             None => (None, Vec::new()),
         };
-        let socket = match (&record, paths::resolve_session(session, env, runner)) {
+        let socket = match (&record, paths::resolve_session(session, env)) {
             (Some(record), _) => record.socket.clone(),
             (None, Ok(found)) => found.socket,
             (None, Err(_)) => {

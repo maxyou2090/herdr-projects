@@ -136,6 +136,6 @@ pub fn adopt(ctx: &Ctx, slug: &str, pane: &str, title: &str, task: Option<String
         crate::brief::deliver(&project, &herdr, &open, &agent, crate::brief::Sender::Manual)?;
     }
     let adopted = thread::load(&project, &id)?;
-    threads::report_thread_tokens(&herdr, &adopted, slug, thread::Group::Working);
+    threads::report_thread_tokens(&herdr, &adopted, slug);
     Ok(adopted)
 }

@@ -437,8 +437,8 @@ mod tests {
         let (home, fake) = core();
         let herdr = Core::new("hc", "", &fake);
         let dir = home.path();
-        let first = herdr.workspace_create(dir, "Demo", "Demo", false).unwrap();
-        let second = herdr.tab_create(&first.workspace_id, dir, "thread", false).unwrap();
+        let first = herdr.workspace_create(dir, "Demo", "Demo").unwrap();
+        let second = herdr.tab_create(&first.workspace_id, dir, "thread").unwrap();
         assert_ne!(first.pane_id, second.pane_id, "each terminal is its own pane");
         assert_ne!(first.tab_id, second.tab_id, "a tab is its own terminal");
         assert_eq!(herdr.pane_list().unwrap().len(), 2);
@@ -498,7 +498,7 @@ mod tests {
         let herdr = Core::new("hc", "", &fake);
         let title = "线程命名 tab 用 id";
         let tab = crate::labels::thread_tab_label("t-0047");
-        let created = herdr.workspace_create(home.path(), &crate::labels::thread_space_label(title), &tab, false).unwrap();
+        let created = herdr.workspace_create(home.path(), &crate::labels::thread_space_label(title), &tab).unwrap();
         assert_eq!(fake.spaces.borrow()[0].1, "线程命名tab用id", "the Space carries the thread's title, tightened, not its id");
         let address = &child.terminals.borrow()[0].address;
         assert_eq!(fake.renamed.borrow().last(), Some(&(FakeApp::tab_for(address), tab.clone())), "the app's tab carries the id too");
@@ -512,7 +512,7 @@ mod tests {
         let (home, child) = core();
         let fake = FakeApp::new(&child);
         let herdr = Core::new("hc", "", &fake);
-        herdr.workspace_create(home.path(), "Herdr Projects", "coordinator", true).unwrap();
+        herdr.workspace_create(home.path(), "Herdr Projects", "coordinator").unwrap();
         assert_eq!(fake.spaces.borrow()[0].1, "Herdr Projects", "the Space is the project, not the tab");
         let address = &child.terminals.borrow()[0].address;
         assert_eq!(fake.renamed.borrow().last(), Some(&(FakeApp::tab_for(address), "coordinator".to_string())));

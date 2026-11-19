@@ -210,7 +210,6 @@ pub struct Lane {
     /// the ticker — never the identity itself.
     pub pane_id: String,
     pub agent_session: String,
-    pub created: String,
     /// When `hp lane close` ran.
     pub closed: String,
     /// When the lane last did anything: the default-lane election of §6.4
@@ -285,7 +284,6 @@ impl Registry {
                 status: Status::Open,
                 pane_id: record.pane_id.clone(),
                 agent_session: record.agent_session.clone(),
-                created: record.updated.clone(),
                 closed: String::new(),
                 last_active: record.updated.clone(),
             }],
@@ -349,7 +347,6 @@ impl Registry {
             name: DEFAULT_NAME.to_string(),
             label: project_label(project),
             status: Status::Open,
-            created: project::now(),
             ..Lane::default()
         };
         self.default = lane.id.clone();
@@ -423,7 +420,6 @@ impl Registry {
             id,
             name: name.to_string(),
             label: label.to_string(),
-            created: project::now(),
             ..Lane::default()
         });
         self.lanes.last_mut().expect("just pushed")
@@ -458,7 +454,6 @@ impl Registry {
         let shared = read_coordinator(project).unwrap_or_default();
         Coordinator {
             socket: shared.socket,
-            session: shared.session,
             workspace_id: shared.workspace_id,
             tab_id: shared.tab_id,
             pane_id: lane.pane_id.clone(),
@@ -1527,7 +1522,6 @@ pub fn lane_adopt(ctx: &Ctx, project: Option<&str>, handle: &str) -> Result<()> 
     project.update_coordinator(|record| {
         *record = Coordinator {
             socket: socket.clone(),
-            session: ctx.env.this_session().to_string(),
             workspace_id: agent.workspace_id.clone(),
             tab_id: agent.tab_id.clone(),
             pane_id: pane.clone(),
@@ -1539,7 +1533,7 @@ pub fn lane_adopt(ctx: &Ctx, project: Option<&str>, handle: &str) -> Result<()> 
             updated: String::new(),
         }
     })?;
-    crate::labels::report_pane(&herdr, &pane, &crate::labels::coordinator_display(&project, Some(&lane.id)), &project.slug, crate::thread::Group::Idle, Some(&lane.id));
+    crate::labels::report_pane(&herdr, &pane, &crate::labels::coordinator_display(&project, Some(&lane.id)), &project.slug, Some(&lane.id));
     let prefix = crate::coordinator::current_prefix(&ctx.root)?;
     println!("lane `{}` ({}) is coordinated by pane {pane}", lane.label, lane.id);
     println!("Commands: {prefix}");
@@ -1605,7 +1599,7 @@ pub fn lane_assign(ctx: &Ctx, project: &Project, handle: &str, pane: &str) -> Re
             record.last_active = now.clone();
         }
     })?;
-    crate::labels::report_pane(&session.herdr, pane, &crate::labels::coordinator_display(project, Some(&lane.id)), &project.slug, crate::thread::Group::Idle, Some(&lane.id));
+    crate::labels::report_pane(&session.herdr, pane, &crate::labels::coordinator_display(project, Some(&lane.id)), &project.slug, Some(&lane.id));
     if !old_pane.is_empty() && old_pane != pane {
         // Clear only the lane claim: the old pane may still be a shell or an
         // agent the user is using for something else. It must not keep saying
@@ -2176,7 +2170,7 @@ mod tests {
         let mut live = lane_at("c-1", "default", "t5h", "");
         live.last_active = "2026-11-18T03:12:43Z".into();
         reg(
-            vec![live, Lane { created: "2026-11-17T09:45:32Z".into(), ..lane("c-1", "coordinator2") }],
+            vec![live, Lane { last_active: "2026-11-17T09:45:32Z".into(), ..lane("c-1", "coordinator2") }],
             "",
             2,
         )
@@ -2395,7 +2389,6 @@ mod tests {
         let record = project
             .update_coordinator(|c| {
                 c.socket = "/s/a.sock".into();
-                c.session = "main".into();
                 c.workspace_id = "w1".into();
                 c.tab_id = "w1:t1".into();
                 c.pane_id = "w1:p1".into();
@@ -2858,13 +2851,31 @@ mod tests {
         assert_eq!(registry.lane_of(&named.lane), None, "a lane the project does not have names nothing");
     }
 
+    /// `lanes.json` is read by `lane list`, `lane close` and the resolver, and
+    /// none of them looks at `created`: `lane close` works on the record's
+    /// position, and the election of §6.4 keys on `last_active`.
+    #[test]
+    fn a_lane_record_writes_only_the_fields_something_reads() {
+        let (_world, project) = temp_project("demo");
+        assert!(Registry::ensure_written(&project).unwrap());
+        let text = std::fs::read_to_string(project.state_dir().join("lanes.json")).unwrap();
+        assert!(!text.contains("created"), "`created` had no reader and is gone: {text}");
+        assert!(text.contains("last_active"), "{text}");
+        // A file an older `hp` wrote still reads: the key is ignored.
+        std::fs::write(
+            project.state_dir().join("lanes.json"),
+            r#"{"lanes":[{"id":"c-1","name":"default","created":"2026-10-26T10:08:21Z"}],"default":"c-1","next":2}"#,
+        )
+        .unwrap();
+        let registry = Registry::load(&project).unwrap();
+        assert_eq!(registry.lanes[0].id, "c-1");
+    }
+
     #[test]
     fn the_lane_token_is_reported_never_cleared_and_cleared_on_release() {
         assert_eq!(TOKEN, "hp_lane");
-        // `OLD_TOKENS` is the `--clear-token` list of *every* report: a token
-        // that joins it is erased as fast as it is written (§5.1).
-        assert!(!crate::labels::OLD_TOKENS.contains(&TOKEN), "{TOKEN} would be cleared on every report");
-        // Releasing a pane clears the claim, through labels now.
+        // One report is one label write, and it writes the claim: a token on a
+        // clear list would be erased as fast as it is written (§5.1).
         let (_world, project) = temp_project("demo");
         Registry::ensure_written(&project).unwrap();
         let runner = crate::runner::fake::FakeRunner::new();
@@ -2872,7 +2883,9 @@ mod tests {
         let herdr = crate::core::Core::new("hc", "", &runner);
         crate::coordinator::report_tokens(&herdr, &project, "w1:p1");
         let calls: Vec<String> = runner.calls.borrow().iter().map(|c| c.display()).collect();
-        assert!(calls.iter().any(|t| t.contains(&format!("{TOKEN}=c-1"))), "{calls:?}");
+        assert_eq!(calls.len(), 1, "one label write per report: {calls:?}");
+        assert!(calls[0].contains(&format!("{TOKEN}=c-1")), "{calls:?}");
+        assert!(!calls[0].contains(" thread=") && !calls[0].contains(" rank="), "Herdr 1's tokens are neither written nor cleared: {calls:?}");
         runner.calls.borrow_mut().clear();
         crate::labels::clear_pane(&herdr, "w1:p1");
         let cleared: Vec<String> = runner.calls.borrow().iter().map(|c| c.display()).collect();

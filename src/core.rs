@@ -520,7 +520,7 @@ impl<'a> Core<'a> {
     }
 
     /// Writes labels onto a terminal. Herdr 1's token reports are labels here:
-    /// the same names (`hp_project`, `hp_lane`, `hp_rank`), no TTL.
+    /// the same names (`hp_project`, `hp_lane`), no TTL.
     pub fn set_labels(&self, pane: &str, pairs: &[(String, String)]) -> Result<(), CoreError> {
         if pairs.is_empty() || pane.is_empty() {
             return Ok(());
@@ -666,7 +666,7 @@ impl<'a> Core<'a> {
     /// project's Space holds the `coordinator` tab, a thread's Space the
     /// thread's id (`labels::thread_tab_label`) — so the core label and the
     /// app's tab agree.
-    pub fn workspace_create(&self, cwd: &Path, label: &str, tab_label: &str, _focus: bool) -> Result<Created, CoreError> {
+    pub fn workspace_create(&self, cwd: &Path, label: &str, tab_label: &str) -> Result<Created, CoreError> {
         let dir = cwd.to_string_lossy().into_owned();
         // A person who works in the Herdr app has to see the project: the app
         // makes the Space, and the terminal inside it is ours — named by us, so
@@ -712,7 +712,7 @@ impl<'a> Core<'a> {
         Ok(self.created(&term))
     }
 
-    pub fn tab_create(&self, workspace: &str, cwd: &Path, label: &str, _focus: bool) -> Result<Created, CoreError> {
+    pub fn tab_create(&self, workspace: &str, cwd: &Path, label: &str) -> Result<Created, CoreError> {
         if workspace.starts_with("sp") && crate::app::running(self.runner) {
             let tab = format!("{}-{}", workspace, suffix());
             let name = self.next_name(label)?;
@@ -775,18 +775,18 @@ impl<'a> Core<'a> {
             // The branch may already exist: reuse it instead of failing.
             git(&["worktree", "add", &path_text, branch])?;
         }
-        let created = self.workspace_create(&path, label, tab_label, false)?;
+        let created = self.workspace_create(&path, label, tab_label)?;
         let term = self.term(&created.pane_id)?;
         self.label(&term.pane_id(), &[(L_WORKTREE, path_text.as_str())])?;
         Ok((created, path_text.clone(), term.cwd()))
     }
 
-    pub fn worktree_open(&self, _repo: &str, path: &str, label: &str, tab_label: &str) -> Result<(Created, String, String), CoreError> {
+    pub fn worktree_open(&self, path: &str, label: &str, tab_label: &str) -> Result<(Created, String, String), CoreError> {
         let path = PathBuf::from(path);
         if !path.is_dir() {
             return Err(CoreError { code: "worktree_not_found".into(), message: format!("{path:?} is not a folder") });
         }
-        let created = self.workspace_create(&path, label, tab_label, false)?;
+        let created = self.workspace_create(&path, label, tab_label)?;
         let term = self.term(&created.pane_id)?;
         self.label(&term.pane_id(), &[(L_WORKTREE, path.to_string_lossy().as_ref())])?;
         Ok((created, path.to_string_lossy().into_owned(), term.cwd()))
@@ -1119,13 +1119,9 @@ impl<'a> Core<'a> {
         }
     }
 
-    /// The agent's screen and history as core keeps it.
+    /// The agent's screen and history as core keeps it: plain text, which is
+    /// all `hc read` prints.
     pub fn agent_read(&self, target: &str, lines: Option<usize>) -> Result<String, CoreError> {
-        self.agent_read_as(target, lines, "text")
-    }
-
-    /// `format` is kept for the call sites; core only prints plain text.
-    pub fn agent_read_as(&self, target: &str, lines: Option<usize>, _format: &str) -> Result<String, CoreError> {
         let lines = lines.map(|n| n.to_string()).unwrap_or_else(|| "0".into());
         let result = self.json(&["read", target, "--lines", &lines], CALL_TIMEOUT)?;
         Ok(result["text"].as_str().unwrap_or_default().to_string())

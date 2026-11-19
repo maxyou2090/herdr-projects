@@ -77,7 +77,7 @@ fn extend_path() {
 fn main() {
     extend_path();
     if let Err(error) = cli::run() {
-        eprintln!("herdr-projects: {error:#}");
+        eprintln!("hp: {error:#}");
         std::process::exit(1);
     }
 }

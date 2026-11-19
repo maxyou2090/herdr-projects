@@ -23,7 +23,7 @@ hp doctor
 ```
 
 It reports the core it found (`hc 0.1.21` or later), the tools the features need
-(`git`, `gh`, `rsync`, `ssh`), the projects root and every project's priming
+(`git`, `gh`, `rsync`), the projects root and every project's priming
 files. `hp doctor --fix` repairs what it can: the `~/.local/bin/hp` link and the
 `AGENTS.md` priming of each project.
 
