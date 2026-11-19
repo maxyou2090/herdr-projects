@@ -216,3 +216,46 @@ fn goal_is_gone_from_the_output_and_refused_as_a_setting() {
     let err = String::from_utf8(out.stderr).unwrap();
     assert!(err.contains("--goal"), "{err}");
 }
+
+/// The commands the printed help and error messages name have to be the ones
+/// that exist, and the flags a user could still type have to be the ones that
+/// do something.
+#[test]
+fn dead_arguments_are_refused_and_nothing_names_the_old_binary() {
+    let home = tempfile::tempdir().unwrap();
+    let root = home.path().join("root");
+    let root_arg = root.to_str().unwrap();
+    assert!(hp(home.path(), &["--root", root_arg, "new", "Demo"]).status.success());
+
+    // `assignable --refresh` re-looked-up other machines' profiles, and the
+    // other machines are gone: the flag is not accepted any more.
+    let out = hp(home.path(), &["--root", root_arg, "assignable", "demo", "--refresh"]);
+    assert!(!out.status.success(), "`assignable --refresh` must be refused");
+    let err = String::from_utf8(out.stderr).unwrap();
+    assert!(err.contains("--refresh"), "{err}");
+
+    // `open-file --workspace` promised a tab this binary never opens.
+    let file = root.join("demo/notes.txt");
+    std::fs::write(&file, "x").unwrap();
+    let out = hp(home.path(), &["--root", root_arg, "open-file", file.to_str().unwrap(), "--workspace", "w1"]);
+    assert!(!out.status.success(), "`open-file --workspace` must be refused");
+    let err = String::from_utf8(out.stderr).unwrap();
+    assert!(err.contains("--workspace"), "{err}");
+
+    // `doctor` checked for `ssh`, which only the deleted remote machines
+    // needed, and its failure line is the `hp` command, not the old binary.
+    let out = hp(home.path(), &["--root", root_arg, "doctor"]);
+    let text = String::from_utf8_lossy(&out.stdout).to_string() + &String::from_utf8_lossy(&out.stderr);
+    assert!(!text.contains(" ssh:"), "the ssh check is gone: {text}");
+    assert!(!text.contains("herdr-projects: "), "the failure line names `hp`: {text}");
+    assert!(text.contains("hp: "), "{text}");
+
+    // `safety show` prints commands to copy: they have to be `hp`.
+    let out = hp(home.path(), &["--root", root_arg, "safety", "show", "demo"]);
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    let text = String::from_utf8(out.stdout).unwrap();
+    assert!(text.contains("hp safety yolo demo on|off|default"), "{text}");
+    assert!(text.contains("hp profile list --project demo"), "{text}");
+    assert!(!text.contains("herdr-projects safety"), "{text}");
+    assert!(!text.contains("herdr-projects profile"), "{text}");
+}

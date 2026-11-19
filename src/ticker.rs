@@ -1024,7 +1024,7 @@ fn launch_pass(ctx: &Ctx, project: &Project, seen: &Seen, threads: &[thread::Thr
                 if !refused.is_empty() {
                     thread::update(project, &t.id, |t| t.agent_args = model.clone())?;
                     let summary = format!(
-                        "{}: launched without agent arguments that are not a model flag: {}. Launch flags belong in a profile, which only the user sets (`herdr-projects profile list`)",
+                        "{}: launched without agent arguments that are not a model flag: {}. Launch flags belong in a profile, which only the user sets (`hp profile list`)",
                         t.id,
                         refused.join(" "),
                     );
