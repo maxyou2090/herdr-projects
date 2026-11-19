@@ -109,7 +109,7 @@ impl Finding {
 pub fn findings_with(project: &Project, socket: &str, now: jiff::Timestamp, agents: &[Agent], panes: &[Pane], hc: &Core) -> Findings {
     let mut found = Vec::new();
     for t in thread::list(project) {
-        found.extend(thread_findings(&t, agents, panes, now, &project.root, socket));
+        found.extend(thread_findings(&t, agents, panes, now, &project.root, socket, hc));
     }
     found.extend(coordinator_findings(project, agents, hc));
     Findings { found }
@@ -124,6 +124,19 @@ fn coordinator_findings(project: &Project, agents: &[Agent], hc: &Core) -> Vec<F
     let Some(record) = project.coordinator() else {
         return Vec::new();
     };
+    // No pane recorded is not a lost terminal. A project whose `lanes.json` has
+    // a default lane and no `coordinator.json` answers with that lane's view,
+    // and a lane with no coordinator instance keeps `pane_id` empty on purpose
+    // (`docs/lanes.md` §10, `hp lane list` calls it "has no live coordinator").
+    // little-world, ovis and web-tpl printed `the record still names pane , but
+    // the session no longer knows its terminal` — an empty pane name and a
+    // "lost" verdict for a coordinator that was never started (2026-11-19,
+    // t-0055 §8c). `coordinator::repair` and `doctor` already skip exactly these
+    // records (`!record.pane_id.is_empty()`), so the audit asks the same
+    // question rather than phrasing the same answer differently.
+    if record.pane_id.is_empty() {
+        return Vec::new();
+    }
     let lane = crate::lanes::default_lane_id(project);
     match crate::coordinator::fate(hc, project, &record, agents, &lane) {
         crate::coordinator::Fate::Lost { detail } => vec![Finding {
@@ -151,26 +164,50 @@ fn coordinator_findings(project: &Project, agents: &[Agent], hc: &Core) -> Vec<F
     }
 }
 
-/// The three checks for one thread, against this session's lists.
-fn thread_findings(t: &Thread, agents: &[Agent], panes: &[Pane], now: jiff::Timestamp, root: &std::path::Path, socket: &str) -> Vec<Finding> {
+/// The three checks for one thread, against this session's lists. `hc` answers
+/// the one question the lists cannot — whether a terminal still runs a program
+/// at all — and is asked only for a resolved thread whose pane is open while no
+/// agent of it reports a state.
+fn thread_findings(t: &Thread, agents: &[Agent], panes: &[Pane], now: jiff::Timestamp, root: &std::path::Path, socket: &str, hc: &Core) -> Vec<Finding> {
     let mut found = Vec::new();
     let live = thread::live_with_report(t, agents, panes, now, root, socket);
     match t.status {
         Status::Resolved => {
-            // The 2026-11-13 report: resolved for a day, still looping.
-            if let Some(state) = &live.agent_state {
+            // "Still running" means a program that *reports* a state, never the
+            // `hp_agent` label: that label is written at launch and nothing
+            // clears it when the program exits, so a terminal core keeps as a
+            // shell still carries it while `hc get` answers `status: null`.
+            // Reading the label alone printed `still listed in pane X ()` — the
+            // empty brackets were the whole tell — for three my-net threads
+            // whose processes and worktrees were long gone (2026-11-19, t-0055).
+            // `coordinator::fate` asks the same question through
+            // `TerminalFate::reported`, and so does `Agent::reporting` here.
+            let running = agents.iter().find(|a| thread::agent_matches(t, a) && a.reporting());
+            if let Some(agent) = running {
                 found.push(Finding {
                     kind: RESOLVED_BUT_RUNNING,
                     thread: t.id.clone(),
                     lane: String::new(),
-                    detail: format!("resolved, but its agent is still listed in pane {} ({state}): nothing stopped it", t.pane_id),
+                    detail: format!(
+                        "resolved, but its agent is still listed in pane {} ({}): nothing stopped it",
+                        t.pane_id, agent.agent_status
+                    ),
                 });
-            } else if live.pane_exists {
+            } else if live.pane_exists && !hc.pane_idle_shell(&t.pane_id) {
+                // No agent of this thread in the list, but a program in the pane
+                // still reports: its labels were lost, or it is not ours. The
+                // list cannot say which, so this is reported and not acted on.
+                // A pane holding a bare shell answers the same question with
+                // "idle shell" and is not reported: that is the ordinary
+                // leftover of a resolved thread.
                 found.push(Finding {
                     kind: RESOLVED_BUT_RUNNING,
                     thread: t.id.clone(),
                     lane: String::new(),
-                    detail: format!("resolved, but pane {} is still open on its working directory", t.pane_id),
+                    detail: format!(
+                        "resolved, but pane {} is still open on its working directory and a program still reports a status there: nothing stopped it",
+                        t.pane_id
+                    ),
                 });
             }
         }
@@ -302,6 +339,168 @@ pub fn run(ctx: &Ctx, slug: Option<&str>, json: bool) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::core::Core;
+    use crate::fake_hc::FakeCore;
+    use crate::lanes::{Lane, Registry};
+    use crate::project::{self, Project};
+    use crate::thread::{self, Thread};
+
+    /// A record and the core session that answers `hc`: what [`findings_with`]
+    /// reads. `HC_SESSION` stays unset, which is the default core.
+    struct World {
+        home: tempfile::TempDir,
+        fake: FakeCore,
+    }
+
+    impl World {
+        fn new() -> World {
+            World { home: tempfile::tempdir().unwrap(), fake: FakeCore::new() }
+        }
+
+        fn project(&self, slug: &str) -> Project {
+            project::create(&self.home.path().join("root"), slug, "", vec![]).unwrap()
+        }
+
+        fn herdr(&self) -> Core<'_> {
+            Core::new("hc", "", &self.fake)
+        }
+    }
+
+    const PANE: &str = "hp-google-ai-pro-gemini-7e46d1";
+
+    /// One resolved thread whose recorded pane core still lists. `labelled`
+    /// writes the `hp_agent`/`hp_kind` labels `agent start` leaves behind, and
+    /// `status` is what a program in that pane reports over OSC 7501 — `None`
+    /// for a terminal kept as a shell after its program exited (2026-11-19,
+    /// my-net t-0017/t-0018/t-0019).
+    fn resolved_in_a_recorded_pane(world: &World, slug: &str, status: Option<&str>, labelled: bool) -> (Project, Thread) {
+        let project = world.project(slug);
+        let dir = project.canonical_dir().to_string_lossy().into_owned();
+        let thread = thread::allocate(&project, |t| {
+            t.title = "resolved and gone".into();
+            t.status = Status::Resolved;
+            t.resolved_reason = "merged".into();
+            t.pane_id = PANE.into();
+            t.cwd = dir.clone();
+            t.agent = "pi".into();
+            t.agent_name = format!("hp-{slug}-t-0017");
+        })
+        .unwrap();
+        let labels: &[(&str, &str)] = if labelled { &[("hp_agent", thread.agent_name.as_str()), ("hp_kind", "pi")] } else { &[] };
+        world.fake.terminal(PANE, &dir, labels);
+        if let Some(status) = status {
+            world.fake.set_status(PANE, status);
+        }
+        (project, thread)
+    }
+
+    fn findings(project: &Project, herdr: &Core) -> Vec<Finding> {
+        let agents = herdr.agent_list().unwrap();
+        let panes = herdr.pane_list().unwrap();
+        findings_with(project, "", jiff::Timestamp::now(), &agents, &panes, herdr).found
+    }
+
+    /// The accident: `hc get` answers `state: live`, `status: null`, and the
+    /// labels `hp_agent`/`hp_kind` are still on it, because nothing clears them
+    /// when the program exits. Nothing runs there, so nothing is "still
+    /// running" — the old check printed `still listed in pane X ()`, and the
+    /// empty brackets were the whole tell.
+    #[test]
+    fn a_terminal_kept_after_its_program_exited_is_not_an_agent_still_running() {
+        let world = World::new();
+        let (project, t) = resolved_in_a_recorded_pane(&world, "my-net", None, true);
+        let herdr = world.herdr();
+        // The shape itself: core's agent list has the terminal (the label) and
+        // says nothing about any state.
+        let agents = herdr.agent_list().unwrap();
+        assert_eq!(agents.len(), 1, "the label alone lists it as an agent: {agents:#?}");
+        assert_eq!(agents[0].pane_id, t.pane_id);
+        assert!(!agents[0].reporting(), "no program reported a status");
+        assert!(agents[0].agent_status.is_empty());
+
+        let found = findings(&project, &herdr);
+        assert!(
+            found.iter().all(|f| f.kind != RESOLVED_BUT_RUNNING),
+            "{} is resolved and no program runs in its pane: \n{:#?}",
+            t.id,
+            found
+        );
+    }
+
+    /// The guard this change must not remove (2026-11-18, t-0053/t-0054): the
+    /// program is really there, reports `done`, and outlived the thread.
+    #[test]
+    fn a_resolved_thread_whose_program_still_reports_is_still_a_finding() {
+        let world = World::new();
+        let (project, t) = resolved_in_a_recorded_pane(&world, "my-net", Some("done"), true);
+        let herdr = world.herdr();
+        let found = findings(&project, &herdr);
+        let hit: Vec<&Finding> = found.iter().filter(|f| f.kind == RESOLVED_BUT_RUNNING).collect();
+        assert_eq!(hit.len(), 1, "a program that reports `done` is still running: \n{found:#?}");
+        assert_eq!(hit[0].thread, t.id);
+        assert!(hit[0].detail.contains("(done)"), "{}", hit[0].detail);
+    }
+
+    /// The pane branch is not dead code: a program can report a status while the
+    /// `hp_agent` label is gone (the 2026-11-18 rexa/law shape, on a resolved
+    /// thread). The agent list cannot see it; `hc get` can.
+    #[test]
+    fn a_resolved_pane_whose_program_still_reports_without_labels_is_a_finding() {
+        let world = World::new();
+        let (project, t) = resolved_in_a_recorded_pane(&world, "my-net", Some("done"), false);
+        let herdr = world.herdr();
+        assert!(herdr.agent_list().unwrap().is_empty(), "without `hp_agent` core lists no agent");
+        let found = findings(&project, &herdr);
+        let hit: Vec<&Finding> = found.iter().filter(|f| f.kind == RESOLVED_BUT_RUNNING).collect();
+        assert_eq!(hit.len(), 1, "a program that reports is still running, labels or not: \n{found:#?}");
+        assert_eq!(hit[0].thread, t.id);
+        assert!(hit[0].detail.contains("still open on its working directory"), "{}", hit[0].detail);
+    }
+
+    /// little-world, ovis and web-tpl on 2026-11-19: a `lanes.json` whose default
+    /// lane was never opened (empty `pane_id`) and **no** `coordinator.json` at
+    /// all. `Project::coordinator()` answers with that lane's view, so the audit
+    /// printed `the record still names pane , but the session no longer knows
+    /// its terminal` — an empty pane name and a "lost" verdict for a project
+    /// whose coordinator was never started. Nothing was lost: there is nothing
+    /// to lose.
+    #[test]
+    fn a_lane_with_no_pane_recorded_is_not_a_lost_coordinator() {
+        let world = World::new();
+        let project = world.project("little-world");
+        let lane = Lane {
+            id: "c-1".into(),
+            name: "default".into(),
+            label: "Little World".into(),
+            status: crate::lanes::Status::Open,
+            ..Lane::default()
+        };
+        Registry { lanes: vec![lane], default: "c-1".into(), next: 1 }.save(&project).unwrap();
+        assert!(!project.coordinator_path().exists(), "the real shape has no coordinator.json at all");
+        assert_eq!(project.coordinator().map(|r| r.pane_id).unwrap_or_default(), "");
+
+        let found = findings(&project, &world.herdr());
+        assert!(found.is_empty(), "no coordinator was ever opened in this project: \n{found:#?}");
+    }
+
+    /// The guard this keeps (2026-11-18, t-0053): the record names a pane and
+    /// core does not know that terminal any more.
+    #[test]
+    fn a_record_whose_terminal_is_gone_is_still_a_lost_coordinator() {
+        let world = World::new();
+        let project = world.project("law");
+        project
+            .update_coordinator(|c| {
+                c.pane_id = "hp-law-coordinator".into();
+                c.agent_name = "hpc-law".into();
+            })
+            .unwrap();
+
+        let found = findings(&project, &world.herdr());
+        assert_eq!(found.len(), 1, "a recorded terminal core cannot see is a finding: \n{found:#?}");
+        assert_eq!(found[0].kind, COORDINATOR_TERMINAL_FINISHED);
+        assert!(found[0].detail.contains("hp-law-coordinator"), "{}", found[0].detail);
+    }
 
     #[test]
     fn durations_stay_readable() {

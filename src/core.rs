@@ -199,6 +199,19 @@ impl Agent {
         ready_state(&self.agent_status)
     }
 
+    /// True when a program in the pane reports its state over OSC 7501 — the
+    /// only evidence core has that an agent is there at all.
+    ///
+    /// Not the same as carrying `hp_agent`: that label is written when the agent
+    /// starts and nothing clears it when the program exits, so a terminal core
+    /// keeps as a shell still has it while `hc get` answers `status: null`.
+    /// [`crate::core::TerminalFate::reported`] is this same bit on one terminal,
+    /// and it is what `coordinator::fate` asks; every "is an agent still there"
+    /// check has to ask it too (2026-11-19, t-0055).
+    pub fn reporting(&self) -> bool {
+        self.interactive_ready && !self.agent_status.is_empty()
+    }
+
     pub fn ready_for_brief(&self, kind: &str) -> bool {
         self.ready() || (self.agent_status == "unknown" && self.interactive_ready && crate::prompt_box::knows(kind))
     }
