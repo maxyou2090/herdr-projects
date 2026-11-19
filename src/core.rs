@@ -26,6 +26,15 @@ use serde::Deserialize;
 
 use crate::runner::{Cmd, Runner};
 
+/// How long `end` waits for a killed program to be gone before it tries the
+/// `rm` anyway. Tens of milliseconds is the real figure for a program that
+/// exits; two seconds covers a shell still waiting on a child, and bounds what
+/// a program that ignores the hangup can cost a resolve (t-0068 §6.1).
+pub const END_WAIT: Duration = Duration::from_secs(2);
+/// How often `end` looks while it waits: short enough that a program which is
+/// gone in 30ms is not waited on for the rest of the second.
+pub const END_POLL: Duration = Duration::from_millis(100);
+
 /// herdr-core 0.1.21 is the first release this binary was written against.
 pub const MIN_VERSION: Version = Version(0, 1, 21);
 pub const CALL_TIMEOUT: Duration = Duration::from_secs(10);
@@ -859,23 +868,34 @@ impl<'a> Core<'a> {
         (!kind.is_empty()).then_some(kind)
     }
 
-    /// Ends every terminal of a Space.
+    /// Ends every terminal of a Space. One that will not go does not keep the
+    /// others: the first refusal is returned once the rest are tried.
     pub fn workspace_close(&self, workspace: &str) -> Result<(), CoreError> {
         if workspace.starts_with("sp") && crate::app::running(self.runner) && crate::app::space_close(self.runner, workspace) {
             return Ok(());
         }
+        let mut refused = None;
         for term in self.terminals()?.into_iter().filter(|t| t.label(L_WS) == workspace) {
-            self.end(&term.pane_id())?;
+            if let Err(error) = self.end(&term.pane_id())
+                && refused.is_none()
+            {
+                refused = Some(error);
+            }
         }
-        Ok(())
+        refused.map_or(Ok(()), Err)
     }
 
     /// Ends a tab: its terminal, and any other terminal carrying the label.
     pub fn tab_close(&self, tab: &str) -> Result<(), CoreError> {
+        let mut refused = None;
         for term in self.terminals()?.into_iter().filter(|t| t.label(L_TAB) == tab) {
-            self.end(&term.pane_id())?;
+            if let Err(error) = self.end(&term.pane_id())
+                && refused.is_none()
+            {
+                refused = Some(error);
+            }
         }
-        Ok(())
+        refused.map_or(Ok(()), Err)
     }
 
     /// Ends one pane.
@@ -884,10 +904,47 @@ impl<'a> Core<'a> {
     }
 
     /// Kills a terminal and removes its record, tolerating one that is gone.
+    ///
+    /// The `rm` waits for the program to exit. Killing is asynchronous — core
+    /// hangs up, then the process takes tens of milliseconds to go (more for a
+    /// shell waiting on a child) — and `hc rm` refuses a terminal whose program
+    /// is still running (`live`). Sending it in the same breath as the kill had
+    /// it refused every time, which is where the `finished, rm=false` records in
+    /// `hc ls --all` came from, and it left the resolve looking for a stray
+    /// agent in a pane that was still exiting: 72 false `agent outlived its
+    /// pane` items in a few days (t-0068 §6.1).
+    ///
+    /// Bounded by [`END_WAIT`]: a program that ignores the hangup must not make
+    /// a resolve hang. When the wait runs out the `rm` is tried anyway, and its
+    /// refusal is **returned**, not swallowed — the caller says so in a note
+    /// (`its tab could not be closed (…)`) or fails. A pane core has already
+    /// forgotten is a success: there is nothing left to end.
     fn end(&self, pane: &str) -> Result<(), CoreError> {
-        let _ = self.json(&["kill", pane], CALL_TIMEOUT);
-        let _ = self.json(&["rm", pane], CALL_TIMEOUT);
-        Ok(())
+        match self.json(&["kill", pane], CALL_TIMEOUT) {
+            Ok(_) => {}
+            // Already gone is the job; anything else is not something `rm`
+            // can fix, so there is no point polling for it.
+            Err(error) if error.code == "pane_not_found" => return Ok(()),
+            Err(error) => return Err(error),
+        }
+        let deadline = std::time::Instant::now() + END_WAIT;
+        loop {
+            match self.terminal_fate(pane) {
+                Ok(fate) if !fate.live() => break,
+                // Gone from core's own view: nothing to remove.
+                Err(error) if error.code == "pane_not_found" => return Ok(()),
+                // A terminal that will not go, or a core that will not answer:
+                // stop waiting and let `rm` say what it found.
+                Ok(_) if std::time::Instant::now() >= deadline => break,
+                Err(_) => break,
+                Ok(_) => std::thread::sleep(END_POLL),
+            }
+        }
+        match self.json(&["rm", pane], CALL_TIMEOUT) {
+            Ok(_) => Ok(()),
+            Err(error) if error.code == "pane_not_found" => Ok(()),
+            Err(error) => Err(error),
+        }
     }
 
     /// A Space's label, as the overview shows it.
@@ -1361,6 +1418,32 @@ mod tests {
         assert_eq!(labels.get(L_WS_LABEL).map(String::as_str), Some("REXA"));
         assert_eq!(labels.get(L_TAB_LABEL).map(String::as_str), Some("coordinator"));
         assert!(!fake.calls.borrow().iter().any(|call| call.contains("space.rename")), "core owns this Space: no app call");
+    }
+
+    /// t-0071: killing is asynchronous — core hangs up, the program takes tens
+    /// of milliseconds to go — and `hc rm` refuses a terminal whose program is
+    /// still running (`live`). `end` sent the `rm` in the same breath as the
+    /// kill, so it was refused every time and the refusal was swallowed: that
+    /// is where the `finished, rm=false` records in `hc ls --all` came from
+    /// (t-0068 §6.1). It must wait for the terminal to say `finished` first.
+    #[test]
+    fn ending_a_pane_waits_for_the_program_to_go_before_removing_it() {
+        let fake = crate::fake_hc::FakeCore::new();
+        let herdr = Core::new("hc", "", &fake);
+        fake.terminal("hp-law-9", "/w", &[]);
+        fake.dies_in("hp-law-9", Duration::from_millis(300));
+
+        herdr.pane_close("hp-law-9").expect("the pane ends");
+
+        let calls = fake.calls.borrow().clone();
+        let kill = calls.iter().position(|call| call.contains("kill")).unwrap_or_else(|| panic!("no kill: {calls:?}"));
+        let rm = calls.iter().position(|call| call.contains(" rm")).unwrap_or_else(|| panic!("the record is not removed: {calls:?}"));
+        assert!(kill < rm, "the kill comes first: {calls:?}");
+        assert!(
+            calls[kill..rm].iter().any(|call| call.contains(" get")),
+            "the rm waits for the program to exit instead of racing it: {calls:?}"
+        );
+        assert!(!fake.terminals.borrow().iter().any(|t| t.name == "hp-law-9"), "the record is gone, not left `finished, rm=false`: {:?}", fake.terminals.borrow());
     }
 
     #[test]

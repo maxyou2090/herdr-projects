@@ -1072,9 +1072,15 @@ impl std::fmt::Display for StrayAgent {
 /// Listed twice on purpose: the close and the listing go through the same
 /// server, and one more pair of calls turns an entry cached from the moment
 /// before the close into nothing to report, instead of a false alarm on every
-/// resolve. An unreachable session reports nothing: guessing here would block
-/// every resolve. `Kind::Adopted` panes are the user's and
-/// outlive their thread by design.
+/// resolve. [`Core::end`] now waits for the program to be gone before it
+/// removes the record, so the race that made this look twice — a kill sent and
+/// a look taken in the same breath (t-0068 §6.1) — is closed; the second look
+/// stays because the wait is bounded (a program that outlives [`crate::core::END_WAIT`]
+/// is still listed on this look, and core's registry is its own to change), and
+/// because a stray is written into the record and an inbox item: a false one
+/// costs a coordinator a real errand. An unreachable session reports nothing:
+/// guessing here would block every resolve. `Kind::Adopted` panes are the
+/// user's and outlive their thread by design.
 fn stray_agent(view: &SessionView, t: &Thread) -> Option<StrayAgent> {
     if t.kind == Kind::Adopted || t.pane_id.is_empty() {
         return None;
@@ -1633,6 +1639,36 @@ mod tests {
         let herdr = Core::new("hc", "", &world.core);
         let empty = crate::spaces::empty(&ctx, &world.project, &herdr, false);
         assert!(!empty.iter().any(|s| s.id == first.workspace_id), "{empty:?}");
+    }
+
+    /// t-0071: a resolve used to look for a stray agent the instant it hung the
+    /// program up. A real program takes tens of milliseconds to exit, so the
+    /// look found it alive, wrote `agent outlived its pane` into the record and
+    /// an inbox `thread-error` (`is resolved but its agent is still running`) —
+    /// 72 of those in a few days, 7 of them measurably dead 0–19 seconds later
+    /// (t-0068 §6.1). The close waits now, so a thread whose agent does exit is
+    /// not reported as a stray.
+    #[test]
+    fn a_resolve_does_not_call_an_agent_a_stray_while_it_is_still_exiting() {
+        let world = FakeProject::new();
+        let placed = start_home(&world, "Research");
+        // The pane is a running agent, as one is after the ticker's launch
+        // step: the record names it and the terminal carries the label.
+        let record = thread::update(&world.project, &placed.id, |t| t.agent_name = "hp-demo-t-0001".into()).unwrap();
+        let herdr = Core::new("hc", "", &world.core);
+        herdr.set_labels(&record.pane_id, &[(crate::core::L_AGENT.to_string(), record.agent_name.clone())]).unwrap();
+        world.core.dies_in(&record.pane_id, std::time::Duration::from_millis(300));
+        let env = crate::paths::Env::for_test(world._home.path(), &[]);
+        let ctx = world.ctx(&env);
+        let resolved = thread::update(&world.project, &record.id, |t| t.status = Status::Resolved).unwrap();
+
+        let cleaned = clean(&ctx, &world.project, &resolved, &Clean { keep_worktree: false, copy_complete: true, merged_head: String::new() });
+
+        assert!(cleaned.stray.is_none(), "the agent was exiting, not a stray: {:?}", cleaned.stray);
+        assert!(report_stray(&world.project, &resolved.id, &resolved, cleaned.stray).is_ok(), "a clean close is not an error");
+        let items = crate::inbox::unhandled(&world.project);
+        assert!(!items.iter().any(|i| i.summary.contains("still running")), "no `thread-error` about an agent that went away: {items:?}");
+        assert!(thread::load(&world.project, &record.id).unwrap().stray_agent.is_empty(), "nor in the record");
     }
 
     #[test]
