@@ -42,8 +42,6 @@ enum Command {
         /// The project's name: it makes the slug (its folder) and, humanized
         /// when it is slug-like, the name every Space, row and brief shows
         name: String,
-        #[arg(long, default_value = "")]
-        goal: String,
         /// A repository, as PATH or PATH@MACHINE; repeatable
         #[arg(long = "repo", value_name = "PATH[@MACHINE]")]
         repos: Vec<String>,
@@ -199,7 +197,7 @@ enum Command {
         #[arg(long)]
         yes: bool,
     },
-    /// Change one setting in PROJECT.md (name, goal, coordinator_profile, thread_profile, auto_resolve_days, nudge, repos.add, repos.remove)
+    /// Change one setting in PROJECT.md (name, coordinator_profile, thread_profile, auto_resolve_days, nudge, repos.add, repos.remove)
     Set { slug: String, key: String, value: String },
     /// Open a file: a text file in an editor in this terminal ($VISUAL, else $EDITOR), anything else with the system opener
     OpenFile {
@@ -688,7 +686,7 @@ pub fn run() -> Result<()> {
     };
 
     match cli.command {
-        Command::New { name, goal, repos, thread_profile, coordinator_profile } => {
+        Command::New { name, repos, thread_profile, coordinator_profile } => {
             let repos = repos.into_iter().map(|path| project::Repo { path }).collect();
             let config = crate::profiles::load(&ctx.config_dir)?;
             let thread = thread_profile.unwrap_or_else(|| config.new_project_default(crate::profiles::Role::Thread));
@@ -698,7 +696,7 @@ pub fn run() -> Result<()> {
                     bail!("there is no profile `{name}`; `profile list` shows them");
                 }
             }
-            let project = project::create(&ctx.root, &name, &goal, repos)?;
+            let project = project::create(&ctx.root, &name, repos)?;
             crate::profiles::write_project_defaults(&project, &thread, &coordinator)?;
             let prefix = coordinator::current_prefix(&ctx.root)?;
             project::write_priming(&project, &prefix, "new")?;
@@ -953,5 +951,18 @@ pub fn run() -> Result<()> {
             TickerCommand::Stop => ticker::stop(&ctx),
             TickerCommand::Status => ticker::status(&ctx.root),
         },
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn new_takes_no_goal_option() {
+        let Err(err) = Cli::try_parse_from(["hp", "new", "Demo", "--goal", "x"]) else {
+            panic!("`new --goal` must be refused");
+        };
+        assert!(err.to_string().contains("--goal"), "{err}");
     }
 }

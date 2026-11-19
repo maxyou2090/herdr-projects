@@ -202,7 +202,6 @@ pub struct Lane {
     pub name: String,
     /// The display name: sidebar, tab, Space label.
     pub label: String,
-    pub goal: String,
     /// The lane's default coordinator profile. Empty falls back to the
     /// project's own `coordinator_profile`.
     pub profile: String,
@@ -282,7 +281,6 @@ impl Registry {
                 id: FALLBACK_ID.to_string(),
                 name: DEFAULT_NAME.to_string(),
                 label: project_label(project),
-                goal: String::new(),
                 profile: record.profile.clone(),
                 status: Status::Open,
                 pane_id: record.pane_id.clone(),
@@ -1263,7 +1261,7 @@ pub fn views(registry: &Registry, sightings: &[Sighting]) -> Vec<LaneView> {
 }
 
 /// The JSON of `hp lane list --json`: the same lanes, the same panes and the
-/// same rules, plus what only a machine reads (goal, profile, recorded pane).
+/// same rules, plus what only a machine reads (profile, recorded pane).
 pub fn list_json(view: &View) -> serde_json::Value {
     serde_json::Value::Array(
         views(&view.registry, &view.sightings())
@@ -1277,7 +1275,6 @@ pub fn list_json(view: &View) -> serde_json::Value {
                     "default": row.is_default,
                     "last_active": row.lane.last_active,
                     "profile": row.lane.profile,
-                    "goal": row.lane.goal,
                     "pane_id": row.lane.pane_id,
                     "threads": view.counts.get(&row.lane.id).map(|counts| counts.threads).unwrap_or(0),
                     "inbox": view.counts.get(&row.lane.id).map(|counts| counts.inbox).unwrap_or(0),
@@ -1911,7 +1908,7 @@ mod tests {
 
     fn temp_project(name: &str) -> (tempfile::TempDir, Project) {
         let world = tempfile::tempdir().unwrap();
-        let project = project::create(&world.path().join("root"), name, "", vec![]).unwrap();
+        let project = project::create(&world.path().join("root"), name, vec![]).unwrap();
         (world, project)
     }
 
@@ -2172,7 +2169,7 @@ mod tests {
     #[test]
     fn closing_one_of_two_lanes_that_share_an_id_counts_only_its_own_threads() {
         let world = tempfile::tempdir().unwrap();
-        let project = project::create(&world.path().join("root"), "law", "", vec![]).unwrap();
+        let project = project::create(&world.path().join("root"), "law", vec![]).unwrap();
         // The real record, whose `default` is empty: the default lane is then
         // the newest `last_active`, which is law's live lane and not the empty
         // one created later.
@@ -2210,7 +2207,7 @@ mod tests {
     #[test]
     fn a_lane_with_an_open_thread_is_still_refused() {
         let world = tempfile::tempdir().unwrap();
-        let project = project::create(&world.path().join("root"), "demo", "", vec![]).unwrap();
+        let project = project::create(&world.path().join("root"), "demo", vec![]).unwrap();
         reg(vec![lane("c-1", "default")], "c-1", 2).save(&project).unwrap();
         let open = crate::thread::allocate(&project, |t| {
             t.title = "still going".into();
@@ -2313,21 +2310,27 @@ mod tests {
     }
 
     #[test]
+    fn a_lane_serializes_no_goal() {
+        let json = serde_json::to_value(Lane::default()).unwrap();
+        assert!(json.get("goal").is_none(), "{json}");
+    }
+
+    #[test]
     fn round_trip_keeps_every_field_and_loads_a_file_without_them() {
         let (_world, project) = temp_project("demo");
         let mut registry = reg(vec![lane("c-1", "default")], "c-1", 2);
         let lane = registry.create("books", "收藏");
-        lane.goal = "bookmark features".into();
         lane.profile = "pi-deepseek-flash-high".into();
         lane.pane_id = "w1:p3".into();
         lane.agent_session = "sess-3".into();
         lane.last_active = "2026-10-25T10:42:11Z".into();
         registry.save(&project).unwrap();
         assert_eq!(Registry::load(&project).unwrap(), registry);
-        // An old-style file with only some fields still loads.
+        // An old-style file with only some fields still loads, and a `goal` a
+        // lane carried before that field was removed is ignored.
         std::fs::write(
             registry_path(&project),
-            r#"{"lanes":[{"id":"c-1","name":"default"}],"default":"c-1","next":2}"#,
+            r#"{"lanes":[{"id":"c-1","name":"default","goal":"old goal"}],"default":"c-1","next":2}"#,
         )
         .unwrap();
         let loaded = Registry::load(&project).unwrap();

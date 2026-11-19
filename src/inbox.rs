@@ -278,7 +278,7 @@ mod tests {
     #[test]
     fn lists_marks_seen_and_moves_to_done() {
         let root = tempfile::tempdir().unwrap();
-        let project = project::create(root.path(), "demo", "", vec![]).unwrap();
+        let project = project::create(root.path(), "demo", vec![]).unwrap();
         write_item(&project, "20260917T000002Z-routine-r-2", "\nbody text\n");
         write_item(&project, "20260917T000001Z-routine-r-1", "");
         let items = unhandled(&project);
@@ -299,7 +299,7 @@ mod tests {
     #[test]
     fn two_events_in_one_tick_get_two_items() {
         let root = tempfile::tempdir().unwrap();
-        let project = project::create(root.path(), "demo", "", vec![]).unwrap();
+        let project = project::create(root.path(), "demo", vec![]).unwrap();
         let a = write(&project, "thread-state", "t-0001", "idle", "first", "").unwrap();
         let b = write(&project, "thread-state", "t-0001", "idle", "second\nline", "").unwrap();
         assert_ne!(a, b);
@@ -316,7 +316,7 @@ mod tests {
     #[test]
     fn routine_items_carry_a_body_and_subjects_are_made_file_safe() {
         let root = tempfile::tempdir().unwrap();
-        let project = project::create(root.path(), "demo", "", vec![]).unwrap();
+        let project = project::create(root.path(), "demo", vec![]).unwrap();
         let id = write(&project, "outage", "Elias MacBook/../x", "unreachable", "down", "").unwrap();
         assert!(id.contains("-outage-elias-macbook----x-"), "{id}");
         write(&project, "routine", "nightly", "due", "due", "Check the build.\n\n```\nout\n```").unwrap();
@@ -327,7 +327,7 @@ mod tests {
 
     fn two_lane_project() -> (tempfile::TempDir, Project) {
         let root = tempfile::tempdir().unwrap();
-        let project = project::create(root.path(), "demo", "", vec![]).unwrap();
+        let project = project::create(root.path(), "demo", vec![]).unwrap();
         crate::lanes::Registry::ensure_written(&project).unwrap();
         let mut registry = crate::lanes::Registry::load(&project).unwrap();
         registry.create("books", "收藏");
@@ -356,7 +356,7 @@ mod tests {
     #[test]
     fn seen_state_is_one_file_without_a_registry_and_one_file_per_lane_with_one() {
         let root = tempfile::tempdir().unwrap();
-        let project = project::create(root.path(), "demo", "", vec![]).unwrap();
+        let project = project::create(root.path(), "demo", vec![]).unwrap();
         write_item(&project, "20260917T000001Z-routine-r-1", "");
         mark_seen(&project, &["20260917T000001Z-routine-r-1".to_string()]).unwrap();
         assert!(project.state_dir().join("inbox-seen.json").is_file());
@@ -403,7 +403,7 @@ mod tests {
     #[test]
     fn hostile_ids_are_refused() {
         let root = tempfile::tempdir().unwrap();
-        let project = project::create(root.path(), "demo", "", vec![]).unwrap();
+        let project = project::create(root.path(), "demo", vec![]).unwrap();
         for bad in ["../PROJECT", "a/b", "", ".hidden", "x..y"] {
             assert!(done(&project, &[bad.to_string()], false).is_err(), "{bad}");
         }

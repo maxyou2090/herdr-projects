@@ -169,12 +169,7 @@ pub fn render(project: &Project, rows: &[Row]) -> String {
     // a registry `thread_visible` is always true, so nothing changes there.
     let rows: Vec<&Row> = rows.iter().filter(|r| crate::lanes::thread_visible(project, &r.thread.lane)).collect();
     let mut out = String::new();
-    let goal = project.read_project_md().map(|(s, _)| s.goal).unwrap_or_default();
-    let _ = write!(out, "{} ({})", project.slug, project.status());
-    if !goal.is_empty() {
-        let _ = write!(out, " — {goal}");
-    }
-    let _ = writeln!(out);
+    let _ = writeln!(out, "{} ({})", project.slug, project.status());
     if rows.is_empty() {
         let _ = writeln!(out, "\n  no threads yet");
     }
@@ -248,7 +243,7 @@ mod tests {
         }
 
         fn project(&self, name: &str) -> Project {
-            project::create(&self.home.path().join("root"), name, "", vec![]).unwrap()
+            project::create(&self.home.path().join("root"), name, vec![]).unwrap()
         }
 
         fn dir(&self, project: &Project) -> String {
@@ -267,6 +262,20 @@ mod tests {
                 detached_ticker: false,
             }
         }
+    }
+
+    #[test]
+    fn a_project_line_has_no_goal_tail() {
+        let world = World::new();
+        let with_old_goal = world.project("alpha");
+        let plain = world.project("beta");
+        // An older PROJECT.md still carries the line; the line is not a view.
+        std::fs::write(with_old_goal.project_md(), "+++\nname = \"alpha\"\ngoal = \"monthly invoices\"\n+++\n").unwrap();
+        let text = render(&with_old_goal, &[]);
+        assert_eq!(text.lines().next(), Some("alpha (active)"), "{text}");
+        assert!(!text.contains("monthly invoices"), "{text}");
+        let text = render(&plain, &[]);
+        assert_eq!(text.lines().next(), Some("beta (active)"), "{text}");
     }
 
     #[test]

@@ -409,7 +409,7 @@ mod tests {
     #[test]
     fn apply_writes_the_table_and_rows_show_where_values_come_from() {
         let root = tempfile::tempdir().unwrap();
-        let project = project::create(root.path(), "demo", "", vec![]).unwrap();
+        let project = project::create(root.path(), "demo", vec![]).unwrap();
         let env = crate::paths::Env::for_test(root.path(), &[]);
         let runner = crate::runner::fake::FakeRunner::new();
         let ctx = Ctx { env: &env, root: root.path().to_path_buf(), config_dir: root.path().join("cfg"), runner: &runner, detached_ticker: false };

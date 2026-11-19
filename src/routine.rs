@@ -398,7 +398,7 @@ mod tests {
     #[test]
     fn broken_files_are_reported_with_their_hash() {
         let root = tempfile::tempdir().unwrap();
-        let project = project::create(root.path(), "demo", "", vec![]).unwrap();
+        let project = project::create(root.path(), "demo", vec![]).unwrap();
         std::fs::write(project.dir().join("routines/good.md"), "+++\nschedule = \"every 1h\"\n+++\nP").unwrap();
         std::fs::write(project.dir().join("routines/Bad Name.md"), "+++\nschedule = \"every 1h\"\n+++\nP").unwrap();
         std::fs::write(project.dir().join("routines/broken.md"), "+++\nschedule = \n+++\n").unwrap();

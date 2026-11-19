@@ -130,7 +130,6 @@ pub struct Repo {
 #[serde(default)]
 pub struct Settings {
     pub name: String,
-    pub goal: String,
     /// The profile `open` starts a coordinator with (`coordinator_agent`
     /// before profiles; a Herdr kind is a built-in profile).
     #[serde(alias = "coordinator_agent")]
@@ -147,7 +146,6 @@ impl Default for Settings {
     fn default() -> Self {
         Settings {
             name: String::new(),
-            goal: String::new(),
             coordinator_profile: "claude".into(),
             thread_profile: "claude".into(),
             auto_resolve_days: 7,
@@ -696,7 +694,7 @@ pub fn priming_problems(project: &Project, prefix: &str) -> Vec<String> {
 
 /// Creates the folder and skeleton files. The only code path that creates a
 /// project's directories. Fails if the slug exists.
-pub fn create(root: &Path, name: &str, goal: &str, repos: Vec<Repo>) -> Result<Project> {
+pub fn create(root: &Path, name: &str, repos: Vec<Repo>) -> Result<Project> {
     let slug = slug_from_name(name)?;
     let project = Project {
         root: root.to_path_buf(),
@@ -717,7 +715,6 @@ pub fn create(root: &Path, name: &str, goal: &str, repos: Vec<Repo>) -> Result<P
         .collect();
     let settings = Settings {
         name: display_name(name, &slug),
-        goal: goal.to_string(),
         repos,
         ..Settings::default()
     };
@@ -787,10 +784,10 @@ mod tests {
     #[test]
     fn create_stores_a_display_name_and_keeps_the_slug() {
         let root = tempfile::tempdir().unwrap();
-        let project = create(root.path(), "herdr-projects", "", vec![]).unwrap();
+        let project = create(root.path(), "herdr-projects", vec![]).unwrap();
         assert_eq!(project.slug, "herdr-projects");
         assert_eq!(project.read_project_md().unwrap().0.name, "Herdr Projects");
-        let project = create(root.path(), "GTM AI", "", vec![]).unwrap();
+        let project = create(root.path(), "GTM AI", vec![]).unwrap();
         assert_eq!(project.slug, "gtm-ai");
         assert_eq!(project.read_project_md().unwrap().0.name, "GTM AI");
     }
@@ -798,10 +795,11 @@ mod tests {
     #[test]
     fn a_project_shows_the_name_it_has_and_else_the_humanized_slug() {
         let root = tempfile::tempdir().unwrap();
-        let project = create(root.path(), "herdr-projects", "", vec![]).unwrap();
+        let project = create(root.path(), "herdr-projects", vec![]).unwrap();
         assert_eq!(project.display_name(), "Herdr Projects", "the name `new` wrote into PROJECT.md");
-        // A PROJECT.md with no `name`: an older hp's, or one a person trimmed.
-        write_atomic(&project.project_md(), b"+++\ngoal = \"\"\n+++\n# Instructions\n").unwrap();
+        // A PROJECT.md with no `name`: an older hp's (it has a `goal` instead,
+        // which no version reads any more), or one a person trimmed.
+        write_atomic(&project.project_md(), b"+++\ngoal = \"Old goal\"\n+++\n# Instructions\n").unwrap();
         assert_eq!(project.display_name(), "Herdr Projects", "no name line: the slug, humanized");
         write_atomic(&project.project_md(), b"+++\nname = \"REXA\"\n+++\n").unwrap();
         assert_eq!(project.display_name(), "REXA", "a typed name is used as it is");
@@ -821,7 +819,7 @@ mod tests {
     fn create_writes_the_skeleton_and_refuses_a_second_time() {
         let root = tempfile::tempdir().unwrap();
         let root = root.path().join("root");
-        let project = create(&root, "Demo", "Ship \"it\"", vec![Repo { path: "/srv/app".into() }, Repo { path: "/no/such/repo".into() }]).unwrap();
+        let project = create(&root, "Demo", vec![Repo { path: "/srv/app".into() }, Repo { path: "/no/such/repo".into() }]).unwrap();
         assert_eq!(project.slug, "demo");
         for sub in ["memory", "scratch", "routines", "threads", "inbox/done", "library", "uploads", ".state"] {
             assert!(project.dir().join(sub).is_dir(), "{sub}");
@@ -830,7 +828,6 @@ mod tests {
         assert!(project.dir().join("TASKS.md").is_file());
         let (settings, body) = project.read_project_md().unwrap();
         assert_eq!(settings.name, "Demo");
-        assert_eq!(settings.goal, "Ship \"it\"");
         assert_eq!(settings.coordinator_profile, "claude");
         assert_eq!(settings.auto_resolve_days, 7);
         assert!(settings.nudge);
@@ -840,13 +837,13 @@ mod tests {
         assert_eq!(settings.repos, vec![Repo { path: "/srv/app".into() }, Repo { path: "/no/such/repo".into() }]);
         assert!(body.starts_with("# Instructions"));
         assert_eq!(project.status(), Status::Active);
-        assert!(create(&root, "demo", "", vec![]).is_err());
+        assert!(create(&root, "demo", vec![]).is_err());
     }
 
     #[test]
     fn new_writes_both_default_routines_and_an_edited_one_is_never_rewritten() {
         let root = tempfile::tempdir().unwrap();
-        let project = create(root.path(), "Demo", "", vec![]).unwrap();
+        let project = create(root.path(), "Demo", vec![]).unwrap();
         let prefix = format!("{} --root {}", std::env::current_exe().unwrap().display(), root.path().display());
 
         // `new` writes both defaults, and the sweep is the file law already has.
@@ -881,7 +878,7 @@ mod tests {
     #[test]
     fn new_records_both_default_routines_as_create_events() {
         let root = tempfile::tempdir().unwrap();
-        let project = create(root.path(), "Demo", "", vec![]).unwrap();
+        let project = create(root.path(), "Demo", vec![]).unwrap();
         let journal = std::fs::read_to_string(crate::routine::journal_path(&project)).unwrap();
         let lines: Vec<&str> = journal.lines().collect();
         assert_eq!(lines.len(), 2, "{journal}");
@@ -901,7 +898,7 @@ mod tests {
     #[test]
     fn priming_files_are_written_linked_and_checked() {
         let root = tempfile::tempdir().unwrap();
-        let project = create(root.path(), "Demo Project", "", vec![]).unwrap();
+        let project = create(root.path(), "Demo Project", vec![]).unwrap();
         let prefix = format!("{} --root {}", std::env::current_exe().unwrap().display(), root.path().display());
         write_priming(&project, &prefix, "open").unwrap();
         let text = std::fs::read_to_string(project.dir().join("AGENTS.md")).unwrap();
@@ -938,6 +935,16 @@ mod tests {
     }
 
     #[test]
+    fn a_project_file_that_still_has_a_goal_reads_and_the_goal_is_dropped() {
+        // Every project made before `goal` was removed carries the line. It must
+        // read as an ordinary project, and the value must not reach anything.
+        let text = "+++\nname = \"Old\"\ngoal = \"Ship it\"\nnudge = true\n+++\n\n# Instructions\nBody\n";
+        let (settings, body) = parse_project_md(text).unwrap();
+        assert_eq!((settings.name.as_str(), settings.nudge), ("Old", true));
+        assert_eq!(body, "# Instructions\nBody\n");
+    }
+
+    #[test]
     fn front_matter_parsing() {
         let (settings, body) =
             parse_project_md("+++\nname = \"X\"\nnudge = true\n+++\n\nBody\n+++\nmore\n").unwrap();
@@ -961,9 +968,9 @@ mod tests {
         assert_eq!((settings.name.as_str(), settings.nudge, body.as_str()), ("Old", true, "Body\n"));
         // And a `set` on such a file leaves the stale line alone rather than
         // failing on it.
-        let edited = crate::settings::set_in(text, "goal", "Later").unwrap();
+        let edited = crate::settings::set_in(text, "name", "Later").unwrap();
         let (settings, _) = parse_project_md(&edited).unwrap();
-        assert_eq!((settings.name.as_str(), settings.goal.as_str()), ("Old", "Later"));
+        assert_eq!((settings.name.as_str(), settings.nudge), ("Later", true));
     }
 
     #[test]
@@ -1030,7 +1037,7 @@ mod tests {
     #[test]
     fn writers_drop_their_write_when_project_md_is_gone() {
         let root = tempfile::tempdir().unwrap();
-        let project = create(root.path(), "demo", "", vec![]).unwrap();
+        let project = create(root.path(), "demo", vec![]).unwrap();
         std::fs::remove_file(project.project_md()).unwrap();
         assert!(project.update_coordinator(|c| c.pane_id = "w1:p1".into()).is_err());
         assert!(project.coordinator().is_none());
@@ -1044,7 +1051,7 @@ mod tests {
     #[test]
     fn coordinator_updates_keep_other_fields() {
         let root = tempfile::tempdir().unwrap();
-        let project = create(root.path(), "demo", "", vec![]).unwrap();
+        let project = create(root.path(), "demo", vec![]).unwrap();
         project.update_coordinator(|c| c.socket = "/s".into()).unwrap();
         project.update_coordinator(|c| c.agent_session = "sess".into()).unwrap();
         let record = project.coordinator().unwrap();

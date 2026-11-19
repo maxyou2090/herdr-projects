@@ -266,7 +266,7 @@ mod tests {
     #[test]
     fn a_drifted_home_space_is_renamed_to_the_display_name_on_the_app_that_draws_it() {
         let root = tempfile::tempdir().unwrap();
-        let project = crate::project::create(root.path(), "REXA", "", vec![]).unwrap();
+        let project = crate::project::create(root.path(), "REXA", vec![]).unwrap();
         let dir = project.canonical_dir().to_string_lossy().into_owned();
         let core = FakeCore::new();
         let app = FakeApp::new(&core);
@@ -294,7 +294,7 @@ mod tests {
     #[test]
     fn a_home_space_already_named_right_is_not_renamed() {
         let root = tempfile::tempdir().unwrap();
-        let project = crate::project::create(root.path(), "herdr-projects", "", vec![]).unwrap();
+        let project = crate::project::create(root.path(), "herdr-projects", vec![]).unwrap();
         let dir = project.canonical_dir().to_string_lossy().into_owned();
         let core = FakeCore::new();
         let app = FakeApp::new(&core);

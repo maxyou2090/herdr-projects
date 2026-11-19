@@ -562,7 +562,7 @@ mod tests {
     fn a_rename_relabels_the_home_space_with_the_display_name() {
         let home = tempfile::tempdir().unwrap();
         let root = home.path().join("root");
-        let project = crate::project::create(&root, "Rexa", "", vec![]).unwrap();
+        let project = crate::project::create(&root, "Rexa", vec![]).unwrap();
         let dir = project.canonical_dir().to_string_lossy().into_owned();
         // The home Space, as `open` left it: the old display name as the label.
         let core = crate::fake_hc::FakeCore::new();

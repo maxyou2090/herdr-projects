@@ -104,7 +104,7 @@ answer is acceptable at all.
 Three things, deliberately kept apart:
 
 - **Project** — the folder `~/.herdr-projects/<slug>/`, its `PROJECT.md`
-  (`name`, `goal`, `repos`, profiles, safety), `MEMORY.md`, `TASKS.md`,
+  (`name`, `repos`, profiles, safety), `MEMORY.md`, `TASKS.md`,
   `inbox/`, `threads/`, `routines/`. One project, one root, one lock.
 - **Lane** — a named line of work inside the project: `c-1` fix, `c-2`
   features. A lane owns a coordinator record, a slice of `TASKS.md`, and the
@@ -115,12 +115,12 @@ Three things, deliberately kept apart:
 
 ```text
 project: law  (~/.herdr-projects/law)
-├── lane: c-1  "抢修"      goal: production incidents
+├── lane: c-1  "抢修"
 │     coordinator: pane w1AR:p3, agent hp-c-law-1, profile pi-deepseek-flash-high
 │     TASKS.md:  ## 抢修/Backlog   ## 抢修/Doing
 │     inbox:     items with lane = c-1
 │     threads:   t-0171, t-0172 …
-├── lane: c-2  "收藏"      goal: bookmark features
+├── lane: c-2  "收藏"
 │     coordinator: pane w1AR:p5, agent hp-c-law-2, profile pi-deepseek-flash-high
 │     TASKS.md:  ## 收藏/Backlog   ## 收藏/Doing
 │     inbox:     items with lane = c-2
@@ -213,7 +213,6 @@ default lane (§10).
       "id": "c-1",                 // stable, never reused, never renumbered
       "name": "fix",               // CLI handle: `--lane fix`; unique per project
       "label": "抢修",              // display name: Space and tab labels, hp_display
-      "goal": "production incidents only",
       "profile": "pi-deepseek-flash-high",   // default profile for this lane
       "status": "open",            // "open" or "closed" (§6.4); closed is reversible
       "pane_id": "w1AR:p3",        // last known instance (see §5, rule 2)
@@ -226,7 +225,6 @@ default lane (§10).
       "id": "c-2",
       "name": "books",
       "label": "收藏",
-      "goal": "",
       "profile": "",
       "status": "open",
       "pane_id": "",
@@ -457,7 +455,7 @@ was standing still.
 So visibility is a standing output, not an event:
 
 - **`hp context` prints one `Coordinators:` line at the top, every turn, no
-  exceptions**, before the goal and the settings — because it is the fact that
+  exceptions**, before the settings — because it is the fact that
   decides whether the rest of the digest can exist at all. It names, for every
   live pane in the project folder:
 
@@ -510,7 +508,7 @@ So visibility is a standing output, not an event:
   and closed lanes as `closed`. Its first line **is** the `Coordinators:` line —
   both are rendered from one `View`, so the two cannot drift apart — and its
   rows name each lane's panes as `pane(rule)` (`-` when a lane has none).
-  `--json` adds `goal`, `profile`, `pane_id` and an `orphan` flag per lane, set
+  `--json` adds `profile`, `pane_id` and an `orphan` flag per lane, set
   from the same `degraded`/`orphan` decision the text uses. Per-lane thread and
   inbox counts belong to the same command and are printed for each lane
   (`lane_counts`, same file).
@@ -967,7 +965,7 @@ reaches a named lane's coordinator.
   from §5.4 on **every** run. It prints the whole digest (`digest()`,
   `src/coordinator.rs`), but the first lines are `Commands:`, `Project:`,
   `Folder:`, then the `Coordinators:` line (which rule each live pane matched,
-  and the fix for an ambiguous one), before the goal and settings. After that
+  and the fix for an ambiguous one), before the settings. After that
   come the lane's tasks, the lane's inbox and the threads of the lane. **Closed
   lanes get no section of any of it** — no tasks, no inbox, no threads — but a
   still-running pane of a closed lane stays on the `Coordinators:` line (marked

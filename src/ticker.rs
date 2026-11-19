@@ -1428,7 +1428,7 @@ mod tests {
         }
         let home = tempfile::tempdir().unwrap();
         let root = home.path().join("root");
-        project::create(&root, "demo", "", vec![]).unwrap();
+        project::create(&root, "demo", vec![]).unwrap();
         let env = Env::for_test(home.path(), &[]);
         let runner = FakeRunner::new();
         runner.on("launchctl print", fail(113, "Could not find service"));
@@ -1486,7 +1486,7 @@ mod tests {
         }
         let home = tempfile::tempdir().unwrap();
         let root = home.path().join("root");
-        project::create(&root, "demo", "", vec![]).unwrap();
+        project::create(&root, "demo", vec![]).unwrap();
         let env = Env::for_test(home.path(), &[]);
         let runner = FakeRunner::new();
         runner.on("launchctl print", ok(""));
@@ -1512,7 +1512,7 @@ mod tests {
         }
         let home = tempfile::tempdir().unwrap();
         let root = home.path().join("root");
-        project::create(&root, "demo", "", vec![]).unwrap();
+        project::create(&root, "demo", vec![]).unwrap();
         let env = Env::for_test(home.path(), &[]);
         let runner = FakeRunner::new();
         runner.on("launchctl print", ok(""));
@@ -1534,7 +1534,7 @@ mod tests {
     fn the_stop_file_path_is_logged() {
         let home = tempfile::tempdir().unwrap();
         let root = home.path().join("root");
-        project::create(&root, "demo", "", vec![]).unwrap();
+        project::create(&root, "demo", vec![]).unwrap();
         let env = Env::for_test(home.path(), &[]);
         let runner = FakeRunner::new();
         let ctx = Ctx { env: &env, root: root.clone(), config_dir: home.path().join("cfg"), runner: &runner, detached_ticker: false };
@@ -1562,7 +1562,7 @@ mod tests {
     fn a_second_ticker_says_why_it_steps_aside() {
         let home = tempfile::tempdir().unwrap();
         let root = home.path().join("root");
-        project::create(&root, "demo", "", vec![]).unwrap();
+        project::create(&root, "demo", vec![]).unwrap();
         let env = Env::for_test(home.path(), &[]);
         let runner = FakeRunner::new();
         let ctx = Ctx { env: &env, root: root.clone(), config_dir: home.path().join("cfg"), runner: &runner, detached_ticker: false };
@@ -1622,7 +1622,7 @@ mod tests {
     fn fixture() -> Fixture {
         let home = tempfile::tempdir().unwrap();
         let root = home.path().join("root");
-        let project = project::create(&root, "demo", "", vec![]).unwrap();
+        let project = project::create(&root, "demo", vec![]).unwrap();
         let socket = home.path().join("herdr.sock");
         std::fs::write(&socket, b"").unwrap();
         let cwd = project.dir().to_string_lossy().into_owned();
@@ -1700,7 +1700,7 @@ mod tests {
     fn a_coordinator_whose_terminal_was_reaped_is_found_again_and_nudged() {
         let home = tempfile::tempdir().unwrap();
         let root = home.path().join("root");
-        let project = project::create(&root, "demo", "", vec![]).unwrap();
+        let project = project::create(&root, "demo", vec![]).unwrap();
         let core = crate::fake_hc::FakeCore::new();
         let dir = project.canonical_dir().to_string_lossy().into_owned();
         let labels = [("hp_agent", "hpc-demo"), ("hp_kind", "pi")];
@@ -1754,7 +1754,7 @@ mod tests {
     fn a_coordinator_that_is_gone_outright_leaves_one_item_and_a_named_hold() {
         let home = tempfile::tempdir().unwrap();
         let root = home.path().join("root");
-        let project = project::create(&root, "demo", "", vec![]).unwrap();
+        let project = project::create(&root, "demo", vec![]).unwrap();
         let core = crate::fake_hc::FakeCore::new();
         let dir = project.canonical_dir().to_string_lossy().into_owned();
         core.terminal("hp-demo-1", &dir, &[("hp_agent", "hpc-demo")]);
