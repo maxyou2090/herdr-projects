@@ -120,10 +120,6 @@ pub fn placement(kind: Option<Kind>, has_repo: bool) -> Result<Kind> {
 /// returns. The agent is launched by the ticker, so there is one delivery path.
 pub fn start(ctx: &Ctx, slug: &str, args: StartArgs) -> Result<Thread> {
     let project = Project::load(&ctx.root, slug)?;
-    let status = project.status();
-    if status != project::Status::Active {
-        bail!("`{slug}` is {status}; `thread start` is refused until it is active again");
-    }
     if let Some(rename) = crate::rename::pending(&ctx.root, slug) {
         bail!("`{slug}` is being renamed to `{}`; `thread start` is refused until its coordinator reopens there", rename.to);
     }

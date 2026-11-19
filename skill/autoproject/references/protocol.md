@@ -24,7 +24,7 @@ One line under `## Backlog` (create `TASKS.md` with `# Tasks`, a blank line, and
 ```
 
 - `<n>` is the current iteration (0 at setup). `<max>` and `<limit>` are numbers or `none` for an explicit "no limit".
-- `<step>` is one of: `setup`, `maker t-NNNN`, `reviewer t-NNNN`, `landing t-NNNN`, `paused`, `blocked t-NNNN`.
+- `<step>` is one of: `setup`, `maker t-NNNN`, `reviewer t-NNNN`, `landing t-NNNN`, `blocked t-NNNN`.
 - Only the ratchet changes this line. It is created on the go-ahead and deleted at stop.
 
 ### Scratch file
@@ -75,7 +75,6 @@ Run `hp context <project>` at the start of every turn. Find this run's threads b
 
 | Evidence | Step |
 | --- | --- |
-| `Project: <project> (paused)` | Set step `paused`. Start nothing until it is active again. The streak does not change. |
 | No open run thread and the run continues | Launch maker `<n+1>` (section 3). |
 | A run thread is `Waiting on you` with note `blocked`, or its agent is waiting on the user | Set step `blocked t-NNNN` and tell the user which pane needs them. Do not prompt it or count it as a failure. When it moves again, restore the step. |
 | Maker report has the three fixed lines and `CHECKS: PASS`, and `HEAD` differs from `BASE` | Launch the reviewer (section 3). |
@@ -111,8 +110,6 @@ A failed start is classified only by what `hp` printed:
 
 | `hp` printed | Meaning |
 | --- | --- |
-| `` `<project>` is paused; `thread start` is refused until it is active again `` | Environment: set step `paused` and wait. |
-| `` `<project>` is archived; `thread start` is refused … `` | Environment: stop with reason `project archived`. |
 | `` profile `<name>` is not allowed … `` or `` there is no profile `<name>` … `` | Environment: stop with reason `profile refused`. |
 | Anything else, including `thread t-NNNN failed to start` | Failure rule: one NOT_BETTER iteration. Never `hp thread restart`. |
 

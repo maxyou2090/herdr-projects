@@ -62,7 +62,13 @@ agent started there that it is the coordinator), `PROJECT.md`, `TASKS.md` and
 - **Talk to the coordinator** in its terminal. Ask for a task and it starts a
   thread; you answer questions and review reports instead of managing agents.
 - **`hp overview <project>`** is the window that would have been: needs you,
-  ready for review, working, landing, idle, resolved.
+  ready for review, working, landing, idle, resolved. `hp overview` without a
+  project lists only the ones in use — a live coordinator, or a thread that is
+  open or starting — and `hp overview --all` lists every project in the root.
+- **A project is in use or deleted**, and nothing else. Not needing one for a
+  while is closing its Space and running no coordinator there; working on it
+  again is `hp open <slug>`, and a project that is really finished is
+  `hp delete <slug>` (its folder goes to `.trash/`).
 - **`hc attach <terminal>`** takes you to any pane; `hp open` prints it when a
   coordinator is already running.
 - **The skill** (`hp skill`) is what the coordinator follows; it ships in

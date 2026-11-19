@@ -6,7 +6,7 @@ use clap::{Args, Parser, Subcommand};
 
 use crate::coordinator::{self, OpenOptions};
 use crate::paths::{self, Ctx, Env, SessionFlags};
-use crate::project::{self, Project, Status};
+use crate::project::{self, Project};
 use crate::runner::RealRunner;
 use crate::threads::{self, ResolveArgs, StartArgs};
 use crate::{adopt, doctor, inbox, lanes, lifecycle, overview, routine, ticker};
@@ -52,7 +52,7 @@ enum Command {
         #[arg(long, value_name = "NAME")]
         coordinator_profile: Option<String>,
     },
-    /// List projects, archived ones marked `archived`
+    /// List projects with what their threads need
     List,
     /// Open a project: start a coordinator agent in its folder — in this terminal when no agent runs there, else in a new terminal of the project's Space
     Open {
@@ -107,6 +107,9 @@ enum Command {
     /// Print threads grouped by what needs you
     Overview {
         slug: Option<String>,
+        /// List every project, not only the ones in use (a live coordinator, or a thread that is open or starting)
+        #[arg(long)]
+        all: bool,
         /// Wait for Enter before exiting (only when on a terminal; for a person running it by hand)
         #[arg(long)]
         wait: bool,
@@ -136,14 +139,6 @@ enum Command {
         #[command(subcommand)]
         command: RoutineCommand,
     },
-    /// Pause a project: the ticker skips it and `thread start` is refused
-    Pause { slug: String },
-    /// Make a paused project active again
-    Resume { slug: String },
-    /// Archive a project: paused, hidden, labels cleared, `open` refused
-    Archive { slug: String },
-    /// Make an archived project active again
-    Unarchive { slug: String },
     /// Move a project folder to the trash (no worktree, branch or PR is touched)
     Delete {
         slug: String,
@@ -707,13 +702,12 @@ pub fn run() -> Result<()> {
         Command::List => {
             for slug in project::list_slugs(&ctx.root) {
                 let project = Project::load(&ctx.root, &slug)?;
-                let status = project.status();
                 let mut counts = std::collections::BTreeMap::new();
                 for row in threads::rows(&ctx, &project) {
                     *counts.entry(row.group.rank()).or_insert((row.group.label(), 0)) = (row.group.label(), counts.get(&row.group.rank()).map_or(0, |c: &(&str, usize)| c.1) + 1);
                 }
                 let summary: Vec<String> = counts.values().map(|(label, n)| format!("{label}: {n}")).collect();
-                println!("{slug}\t{status}\t{}", if summary.is_empty() { "no threads".to_string() } else { summary.join(", ") });
+                println!("{slug}\t{}", if summary.is_empty() { "no threads".to_string() } else { summary.join(", ") });
             }
             Ok(())
         }
@@ -730,7 +724,6 @@ pub fn run() -> Result<()> {
                     // Only a person at a terminal gets the agent in place; an
                     // agent's shell tool or a script runs `open` without one.
                     here: !tab && person,
-                    person,
                     lane,
                     lane_name,
                 },
@@ -747,7 +740,7 @@ pub fn run() -> Result<()> {
         },
         Command::Context { slug, peek } => coordinator::context(&ctx, &slug, peek),
         Command::Assignable { slug, refresh, check } => crate::assign::run(&ctx, &slug, refresh, check.as_deref()),
-        Command::Overview { slug, wait } => overview::run(&ctx, slug.as_deref(), wait),
+        Command::Overview { slug, all, wait } => overview::run(&ctx, slug.as_deref(), all, wait),
         Command::Inbox { command } => match command {
             InboxCommand::Done { slug, ids, all } => {
                 let project = Project::load(&ctx.root, &slug)?;
@@ -886,15 +879,6 @@ pub fn run() -> Result<()> {
                 Ok(())
             }
         },
-        Command::Pause { slug } => lifecycle::set_status(&ctx, &slug, Status::Paused),
-        Command::Resume { slug } => {
-            if Project::load(&ctx.root, &slug)?.status() == Status::Archived {
-                bail!("`{slug}` is archived; use `unarchive`");
-            }
-            lifecycle::set_status(&ctx, &slug, Status::Active)
-        }
-        Command::Archive { slug } => lifecycle::set_status(&ctx, &slug, Status::Archived),
-        Command::Unarchive { slug } => lifecycle::set_status(&ctx, &slug, Status::Active),
         Command::Delete { slug, force } => lifecycle::delete(&ctx, &slug, force),
         Command::Rename { slug, new_slug, name, dry_run, session } => {
             crate::rename::cli(&ctx, &crate::rename::Args { from: &slug, to: &new_slug, name: name.as_deref(), dry_run, by_ticker: false }, &session.into())
