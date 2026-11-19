@@ -16,9 +16,10 @@ are history.
       Herdr 1 list is history (`docs/history/manual-test-herdr1.md`) and its
       client-witnessed checks describe a sidebar and popups that no longer exist.
 - [ ] Tag `v<version>` on `port/herdr-core`, push the tag, and create the GitHub release with notes in user terms.
-- [ ] The `Release binaries` workflow would have to be rewritten first: it still
-      builds the Herdr 1 plugin binary (`herdr-plugin.toml`, `herdr-projects`)
-      for four targets. Nothing runs it while nothing is published.
+- [ ] The `Release binaries` workflow is gone: it built the Herdr 1 plugin
+      binary (`herdr-plugin.toml`, `herdr-projects`) for four targets and could
+      not run any more. Publishing means writing a new one for `hp` and
+      `hp-agent`.
 - [ ] On every machine that runs `hp` from a checkout: `git pull`, `cargo build --release --locked`, `hp doctor --fix`, then `hp ticker stop && hp ticker start`.
 
 ## Done

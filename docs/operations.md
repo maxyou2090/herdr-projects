@@ -297,9 +297,7 @@ Install herdr-core and hp on an always-on machine, keep the projects root there 
 
 ```bash
 cargo test                       # unit tests and scenarios against a scripted fake runner
-scripts/dev-server               # a throwaway `hp-dev` Herdr session with a scratch root
 scripts/dev-hp <subcommand>      # the binary against <repo>/.dev-root; pass --session hp-dev to open/doctor
-scripts/dev-herdr <args>         # herdr against that session
 HOME=<scratch> XDG_CONFIG_HOME=<scratch> ...  # a whole scratch config dir
 ```
 
