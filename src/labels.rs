@@ -65,25 +65,39 @@ pub fn state_line(group: Group, thread: &Thread, live: &Live, now: jiff::Timesta
 }
 
 /// A thread's tab name: the id alone. The app shows a row as `<tab> <Space>`,
-/// so the title belongs to the Space ([`thread_space_label`]) and lives there
-/// once; the tab says which thread it is, without repeating the title.
+/// so the title belongs to the record (and to `hp_display`), and the tab says
+/// which thread it is, without repeating the title.
 pub fn thread_tab_label(id: &str) -> String {
     id.to_string()
 }
 
-/// A thread's Space name: its title, tightened for a Chinese title
-/// ([`tight_cjk`]) and otherwise unchanged by the tab/display rework. A restart
-/// recognises a thread's own Space by this label (`thread::recorded_own_space`,
-/// `threads::place_tab`, `spaces::empty`), so it is the title on purpose.
-pub fn thread_space_label(title: &str) -> String {
-    tight_cjk(title)
+/// What every thread Space of a project is called after: ` Threads`.
+pub const THREADS_SUFFIX: &str = " Threads";
+
+/// A project's thread Space: `<display name> Threads`, the one Space every
+/// thread of the project runs in (`docs/thread-space.md`). The display name is
+/// the project's (`project::display_name`), the same string its home Space
+/// carries, so the two Spaces of a project read as a pair.
+///
+/// Not tightened by [`tight_cjk`]: the suffix is a Latin word, and dropping the
+/// space beside a Chinese name would glue them (`法律事务所Threads`). A thread's
+/// **title** is still tightened, in `hp_display` and in the record.
+pub fn threads_space_label(display_name: &str) -> String {
+    format!("{}{THREADS_SUFFIX}", display_name.trim())
 }
 
-/// Whether `label` names a thread's Space: the tightened title, or the title as
-/// written — a Space made before the tightening rule keeps the old label, so a
-/// restart must still recognise it (and renames it through `Core::name_space`).
+/// Whether `label` is a project's thread Space label, whatever display name it
+/// was made with: a display name that changed (or has not reached the Space
+/// yet) must not make `hp` open a second one.
+pub fn is_threads_space_label(label: &str) -> bool {
+    label.ends_with(THREADS_SUFFIX)
+}
+
+/// Whether `label` names a thread's own Space under the old rule — a Space per
+/// thread, labelled with the thread's title. Only the migration reads this: such
+/// a Space is left for `spaces::empty` to close, never reused for new placement.
 pub fn thread_space_matches(label: &str, title: &str) -> bool {
-    label == tight_cjk(title) || label == title
+    !title.is_empty() && (label == tight_cjk(title) || label == title)
 }
 
 /// The Han ideographs: what [`tight_cjk`] reads as Chinese. Kana, Hangul and CJK
@@ -184,15 +198,19 @@ mod tests {
     fn a_threads_three_names_say_the_id_once_and_the_title_once() {
         let thread = Thread { id: "t-0047".into(), title: "线程命名 tab 用 id".into(), ..Thread::default() };
         assert_eq!(thread_tab_label(&thread.id), "t-0047", "the tab is the id alone");
-        assert_eq!(thread_space_label(&thread.title), "线程命名tab用id", "the Space keeps the title, with no space beside Chinese");
+        assert_eq!(threads_space_label("Herdr Projects"), "Herdr Projects Threads", "the Space is the project's, not the thread's");
         assert_eq!(thread_display(&thread), "t-0047 线程命名tab用id", "the display is id, one space, the tightened title");
         assert!(!thread_display(&thread).contains('·'), "the separator is a space, never `·`");
+        assert_eq!(threads_space_label("法律事务所"), "法律事务所 Threads", "the Latin suffix keeps its space: it is not Chinese text");
+        assert!(is_threads_space_label("Law Office Threads"), "a Space made under another display name is still one");
+        assert!(is_threads_space_label("法律事务所 Threads"));
+        assert!(!is_threads_space_label("线程命名tab用id"), "a thread's own Space under the old rule is not one");
+        assert!(!is_threads_space_label("Herdr Projects"), "nor is the project's home Space");
     }
 
     #[test]
     fn a_space_beside_a_chinese_character_goes_and_other_spaces_stay() {
         assert_eq!(tight_cjk("今天 1 月 abc 课程"), "今天1月abc课程");
-        assert_eq!(thread_space_label("今天 1 月 abc 课程"), "今天1月abc课程", "a thread's Space label is the tightened title");
         let thread = Thread { id: "t-0052".into(), title: "今天 1 月 abc 课程".into(), ..Thread::default() };
         assert_eq!(thread_display(&thread), "t-0052 今天1月abc课程", "and so is hp_display");
         assert_eq!(tight_cjk("hello world"), "hello world", "two Latin words keep their space");

@@ -106,3 +106,4 @@ key bindings. The words Herdr 1's sidebar used are printed instead:
 
 - [`operations.md`](operations.md) — settings, safety, cleanup, other machines
 - [`lanes.md`](lanes.md) — several coordinators in one project
+- [`thread-space.md`](thread-space.md) — the Space every thread of a project lives in

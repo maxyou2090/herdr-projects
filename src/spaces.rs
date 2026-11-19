@@ -73,6 +73,10 @@ pub fn empty(ctx: &Ctx, project: &Project, herdr: &Core, include_focused: bool) 
         })
         .collect();
     let mut in_use = Vec::new();
+    // The panes of open threads, across every project: the project's thread
+    // Space is shared by all of them, so a Space is "in use" when one of **their
+    // panes** is in it, not when a record merely names it (`docs/thread-space.md`).
+    let mut open_panes: Vec<String> = Vec::new();
     let mut coordinators = Vec::new();
     for slug in project::list_slugs(&ctx.root) {
         let Ok(other) = Project::load(&ctx.root, &slug) else {
@@ -84,6 +88,9 @@ pub fn empty(ctx: &Ctx, project: &Project, herdr: &Core, include_focused: bool) 
             }
             if !t.workspace_id.is_empty() {
                 in_use.push(t.workspace_id);
+            }
+            if !t.pane_id.is_empty() {
+                open_panes.push(t.pane_id);
             }
         }
         // Every open lane's Space, not just the default lane's (§9): a lane
@@ -97,11 +104,11 @@ pub fn empty(ctx: &Ctx, project: &Project, herdr: &Core, include_focused: bool) 
     recorded.dedup_by(|a, b| a.0 == b.0);
     own.sort();
     own.dedup_by(|a, b| a.0 == b.0);
-    // A twin can only exist where a thread was placed outside the home:
-    // without one, the cheap early return spares every project's tick three
-    // lists it cannot need.
+    // A twin, or a thread Space, can only exist where a thread was placed
+    // outside the home: without one, the cheap early return spares every
+    // project's tick three lists it cannot need.
     let home_id = project.coordinator().map(|c| c.workspace_id).unwrap_or_default();
-    let twins = threads.iter().any(|t| t.kind != Kind::Worktree && !t.workspace_id.is_empty() && t.workspace_id != home_id);
+    let twins = threads.iter().any(|t| !t.workspace_id.is_empty() && t.workspace_id != home_id);
     if recorded.is_empty() && own.is_empty() && !twins {
         return Vec::new();
     }
@@ -171,6 +178,24 @@ pub fn empty(ctx: &Ctx, project: &Project, herdr: &Core, include_focused: bool) 
         }
         found.push(Space { id, label: space.label.clone() });
     }
+    // The project's thread Space (`docs/thread-space.md`): shared by every
+    // thread, so it is never "in use" for one of them and is closed only when
+    // nothing is left in it. A Space that still holds a pane of an **open**
+    // thread is that thread's: it stays, whatever the Space is called.
+    if let Some(id) = crate::threads::threads_space(project, &workspaces, &panes, &agents, None)
+        && let Some(space) = workspaces.iter().find(|w| w.workspace_id == id)
+    {
+        let own_panes: Vec<_> = panes.iter().filter(|p| p.workspace_id == id).collect();
+        if !coordinators.contains(&id)
+            && own_panes.len() == space.pane_count
+            && !own_panes.iter().any(|p| open_panes.contains(&p.pane_id))
+            && !agents.iter().any(|a| a.workspace_id == id)
+            && (include_focused || (!space.focused && !own_panes.iter().any(|p| p.focused)))
+            && own_panes.iter().all(|p| herdr.pane_idle_shell(&p.pane_id))
+        {
+            found.push(Space { id: id.clone(), label: space.label.clone() });
+        }
+    }
     found
 }
 
@@ -187,10 +212,13 @@ pub fn close(herdr: &Core, space: &Space) -> Result<(), crate::core::CoreError> 
 /// the project's home instead, which is never closed here while the thread is
 /// open: `empty` keeps every Space an open thread still uses.)
 fn forget(project: &Project, id: &str) {
-    for t in thread::list(project).into_iter().filter(|t| t.repo_workspace == id || t.own_workspace == id || (t.kind == Kind::Tab && t.workspace_id == id)) {
+    for t in thread::list(project).into_iter().filter(|t| t.repo_workspace == id || t.own_workspace == id || t.workspace_id == id) {
         let repo = t.repo_workspace == id;
         let own = t.own_workspace == id;
-        let tab = t.kind == Kind::Tab;
+        // The Space is gone, so a record that says its tab is there is stale —
+        // for every kind now that one Space holds them all: the next placement
+        // makes a new one instead of writing into an id nobody lists.
+        let tab = t.workspace_id == id && t.status != Status::Resolved;
         let _ = thread::update(project, &t.id, |t| {
             if repo {
                 t.repo_workspace.clear();
@@ -198,10 +226,7 @@ fn forget(project: &Project, id: &str) {
             if own {
                 t.own_workspace.clear();
             }
-            // A legacy tab record has no `own_workspace`; its `workspace_id`
-            // names the same Space. Only the closed one is cleared: the tab
-            // may have moved elsewhere since.
-            if (own || tab) && t.workspace_id == id {
+            if tab && t.workspace_id == id {
                 t.workspace_id.clear();
             }
         });
@@ -232,6 +257,40 @@ pub fn close_empty(ctx: &Ctx, project: &Project, herdr: &Core) -> Vec<anyhow::Er
         }
     }
     errors
+}
+
+/// Renames the project's thread Space to `<display name> Threads` when the
+/// display name changed (`hp set <project> name …`, or a `rename`). Silent, like
+/// [`sync_home_label`]: the ticker runs it every tick, so it reads one Space
+/// list and does nothing else unless the label is wrong.
+///
+/// It finds the Space the way placement does (`threads::threads_space`), with the
+/// panes left out: a Space renaming is owed to is named by a thread's record,
+/// which is cheaper and truer than a pane (`docs/thread-space.md` §4). A Space a
+/// record names that carries no label at all is the one case that needs the
+/// second look — hp's label never landed on it (§6.5).
+pub fn sync_threads_label(project: &Project, herdr: &Core) {
+    let label = crate::labels::threads_space_label(&project.display_name());
+    let Ok(workspaces) = herdr.workspace_list() else {
+        return;
+    };
+    let homes = crate::coordinator::coordinator_space_ids(project);
+    let named = |w: &crate::core::Workspace| crate::labels::is_threads_space_label(&w.label) || w.label.is_empty();
+    let found = crate::threads::threads_space(project, &workspaces, &[], &[], None)
+        .or_else(|| {
+            thread::list(project)
+                .into_iter()
+                .filter(|t| !t.workspace_id.is_empty() && !t.title.is_empty())
+                .find_map(|t| workspaces.iter().find(|w| w.workspace_id == t.workspace_id && named(w)).cloned())
+                .map(|w| w.workspace_id)
+        })
+        .filter(|id| !homes.contains(id));
+    let Some(id) = found else {
+        return;
+    };
+    if herdr.workspace_label(&id).unwrap_or_default() != label {
+        let _ = herdr.name_space(&id, &label);
+    }
 }
 
 /// Renames the project's home Space to the label its `PROJECT.md` name spells:
