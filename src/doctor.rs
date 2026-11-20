@@ -100,15 +100,24 @@ const AGENT_WAIT: Duration = Duration::from_secs(10);
 /// may be running right now, but nothing will start it again — or launchd has
 /// the plist and never loaded it, which is the state the second disappearance
 /// left behind (`launchctl print` empty while the file sat on disk). `fix`
-/// rewrites and reloads the plist, and checks that a process really took the
-/// lock rather than trusting `launchctl bootstrap` alone.
+/// rewrites and loads the plist, and checks that a process really took the
+/// lock rather than trusting `launchctl bootstrap` alone. It never unloads a
+/// job a running ticker holds (2026-11-19: that SIGTERM cost seven hours), so
+/// where the job is not loaded it says so instead of killing the loop.
 fn ticker_agent_line(env: &Env, root: &Path, runner: &dyn Runner, fix: bool, running: bool) -> Option<(Option<bool>, String)> {
     let binary = paths::binary().ok()?;
     let state = crate::ticker::agent_state(&env.home, &binary, root, runner)?;
     let path = state.path.display();
     if fix && !(state.installed && state.current && state.loaded && running) {
         return Some(match crate::ticker::reload_agent(&env.home, &binary, root, runner) {
-            Ok(()) => {
+            Ok(report) if report.kept_running => {
+                let what = if report.wrote_plist { format!("wrote {path}") } else { format!("{path} is written") };
+                (
+                    Some(true),
+                    format!("{what}; the ticker that is running was left alone, so launchd has no job for it until it next starts one — `hp ticker start` after it stops"),
+                )
+            }
+            Ok(_) => {
                 let loaded = crate::ticker::agent_state(&env.home, &binary, root, runner).is_some_and(|after| after.installed && after.current && after.loaded);
                 let started = running || crate::ticker::wait_for_ticker(root, AGENT_WAIT);
                 match (loaded, started) {

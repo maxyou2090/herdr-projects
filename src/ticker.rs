@@ -145,6 +145,17 @@ fn agent_plist(binary: &Path, root: &Path, log: &Path) -> String {
     )
 }
 
+/// The program a plist runs — the first `<string>` after `ProgramArguments`.
+/// Only for saying *what* an out-of-date plist points at: the 2026-11-19 accident
+/// had a plist rewritten to a build in a worktree, and a name in the report is
+/// what makes that visible.
+fn plist_program(text: &str) -> Option<String> {
+    let rest = text.split("<key>ProgramArguments</key>").nth(1)?;
+    let start = rest.find("<string>")? + "<string>".len();
+    let end = rest[start..].find("</string>")? + start;
+    Some(rest[start..end].to_string())
+}
+
 /// The LaunchAgent as `doctor` sees it: whether the plist is there, whether it
 /// is the text [`install_agent`] would write now (an old `KeepAlive` is what
 /// the 2026-11-17 accident left on disk), and whether launchd has the job
@@ -154,6 +165,8 @@ pub struct AgentState {
     pub installed: bool,
     pub current: bool,
     pub loaded: bool,
+    /// The program the plist on disk runs, when it could be read.
+    pub program: Option<String>,
 }
 
 /// `None` where this machine has no LaunchAgents (not macOS), so `doctor`
@@ -166,8 +179,9 @@ pub fn agent_state(home: &Path, binary: &Path, root: &Path, runner: &dyn Runner)
     let text = std::fs::read_to_string(&path).ok();
     Some(AgentState {
         installed: text.is_some(),
-        current: text.is_some_and(|text| text == agent_plist(binary, root, &log_path(root))),
+        current: text.as_deref().is_some_and(|text| text == agent_plist(binary, root, &log_path(root))),
         loaded: agent_loaded(runner),
+        program: text.as_deref().and_then(plist_program),
         path,
     })
 }
@@ -184,44 +198,151 @@ fn launchctl(runner: &dyn Runner, args: &[&str]) {
     let _ = runner.run(&Cmd::new("launchctl", LAUNCHCTL_TIMEOUT).args(args.iter().copied()));
 }
 
-/// Writes the plist and loads it, so a stopped or rebooted machine brings the
-/// ticker back without anybody running a command. Idempotent: a plist that is
-/// already this text and already loaded is left alone (nothing is bounced), an
-/// outdated one — an old `KeepAlive`, a moved binary or root — is rewritten and
-/// reloaded.
-pub fn install_agent(home: &Path, binary: &Path, root: &Path, runner: &dyn Runner) -> Result<()> {
+/// Writes the plist and makes sure launchd has the job loaded, so a stopped or
+/// rebooted machine brings the ticker back without anybody running a command.
+///
+/// Idempotent, and **it never bounces a ticker that is running**: a plist that is
+/// out of date is rewritten and takes effect at the ticker's next start, because
+/// `bootout` is SIGTERM and the 2026-11-19 accident lost seven hours to a
+/// command that unloaded a healthy job to make a strictly better plist
+/// effective. `bootout` is run only when nothing holds the root's lock.
+pub fn install_agent(home: &Path, binary: &Path, root: &Path, runner: &dyn Runner) -> Result<LoadReport> {
     load_agent(home, binary, root, runner, false)
 }
 
-/// Writes and loads the plist even when it is already right and loaded: that is
-/// what starts a ticker whose plist says it should be running and is not
-/// (`doctor --fix` uses it; `ticker start` reuses [`install_agent`] and then
-/// checks the process rather than bouncing a healthy one).
-pub fn reload_agent(home: &Path, binary: &Path, root: &Path, runner: &dyn Runner) -> Result<()> {
+/// [`install_agent`], plus the reload a job that launchd has loaded and nothing
+/// is running under (`doctor --fix`; `hp ticker status` when it heals one).
+/// Even this one leaves a running ticker alone: a loop that is up is not
+/// something a repair has to kill.
+pub fn reload_agent(home: &Path, binary: &Path, root: &Path, runner: &dyn Runner) -> Result<LoadReport> {
     load_agent(home, binary, root, runner, true)
 }
 
-fn load_agent(home: &Path, binary: &Path, root: &Path, runner: &dyn Runner, force: bool) -> Result<()> {
+/// What loading the LaunchAgent did or refused to do, so a caller can say it.
+#[derive(Debug, Default, PartialEq)]
+pub struct LoadReport {
+    /// The plist on disk was not the text this binary and root would write.
+    pub wrote_plist: bool,
+    /// `launchctl bootstrap` ran and launchd accepted the job.
+    pub bootstrapped: bool,
+    /// The job was unloaded first.
+    pub bounced: bool,
+    /// A ticker held the root's lock, so it was left running.
+    pub kept_running: bool,
+}
+
+fn agent_lock_path(root: &Path) -> PathBuf {
+    root.join(".ticker.agent.lock")
+}
+
+/// Serializes the unload-and-load pair across `hp` processes: two commands run
+/// at once used to interleave them, and the one whose `bootstrap` landed on a
+/// label the other had already loaded failed.
+pub(crate) struct AgentLock(Option<File>);
+
+impl Drop for AgentLock {
+    fn drop(&mut self) {
+        if let Some(file) = &self.0 {
+            let _ = file.unlock();
+        }
+    }
+}
+
+fn agent_lock(root: &Path) -> AgentLock {
+    let file = File::options().create(true).truncate(false).read(true).write(true).open(agent_lock_path(root)).ok();
+    if let Some(file) = &file {
+        let _ = file.lock();
+    }
+    AgentLock(file)
+}
+
+fn load_agent(home: &Path, binary: &Path, root: &Path, runner: &dyn Runner, force: bool) -> Result<LoadReport> {
     let path = agent_path_in(home);
     let text = agent_plist(binary, root, &log_path(root));
+    let log = Log { path: log_path(root) };
     let uid = unsafe { libc_getuid() };
-    let current = std::fs::read_to_string(&path).map(|old| old == text).unwrap_or(false);
-    if current && !force && agent_loaded(runner) {
-        return Ok(());
+    // One `hp` command at a time writes and loads: the pair below is what a
+    // second process used to split (both unloaded, one loaded).
+    let _serial = agent_lock(root);
+    let previous = std::fs::read_to_string(&path).ok();
+    let current = previous.as_deref() == Some(text.as_str());
+    // Asked of launchd, not guessed from the plist: a written plist nobody
+    // loaded starts nothing. It can also fail on a launchd hiccup while the job
+    // is loaded, which is why a failure here never leads to a `bootout` of a
+    // ticker that holds the lock.
+    let loaded = agent_loaded(runner);
+    let running = lock_state(root) != LockState::Free;
+    let mut report = LoadReport::default();
+    if current && loaded && !force {
+        return Ok(report);
     }
     if !current {
         if let Some(dir) = path.parent() {
             std::fs::create_dir_all(dir).with_context(|| format!("could not create {}", dir.display()))?;
         }
-        std::fs::write(&path, text).with_context(|| format!("could not write {}", path.display()))?;
+        std::fs::write(&path, &text).with_context(|| format!("could not write {}", path.display()))?;
+        report.wrote_plist = true;
     }
-    // `bootout` first: loading a label that is already loaded fails.
-    launchctl(runner, &["bootout", &format!("gui/{uid}/{AGENT_LABEL}")]);
-    let bootstrap = Cmd::new("launchctl", LAUNCHCTL_TIMEOUT).args(["bootstrap", &format!("gui/{uid}"), &path.to_string_lossy()]);
-    match runner.run(&bootstrap) {
-        Ok(out) if out.success() => Ok(()),
-        Ok(out) => bail!("launchctl bootstrap failed: {}", out.error_text()),
-        Err(error) => Err(error).context("could not run launchctl"),
+    // A ticker holds the lock: it is the loop this LaunchAgent exists to keep
+    // alive, so it is left running. A new plist is used the next time launchd
+    // starts the job, and a job launchd has not loaded is loaded after it exits
+    // (`hp ticker start`, `hp ticker status`).
+    if running {
+        report.kept_running = true;
+        if report.wrote_plist {
+            log.line(&format!(
+                "wrote {} (the text was out of date: it now runs {}); a ticker holds {}, so it left it running — the new text takes effect at its next start",
+                path.display(),
+                binary.display(),
+                lock_path(root).display()
+            ));
+        }
+        return Ok(report);
+    }
+    if loaded {
+        launchctl(runner, &["bootout", &format!("gui/{uid}/{AGENT_LABEL}")]);
+        report.bounced = true;
+    }
+    let bootstrap = || Cmd::new("launchctl", LAUNCHCTL_TIMEOUT).args(["bootstrap", &format!("gui/{uid}"), &path.to_string_lossy()]);
+    match runner.run(&bootstrap()) {
+        Ok(out) if out.success() => {
+            report.bootstrapped = true;
+            if report.bounced {
+                log.line(&format!("loaded {} again (nothing was running under it)", path.display()));
+            }
+            Ok(report)
+        }
+        Ok(out) => {
+            // Nothing is loaded now, and a failed load that leaves no trace is
+            // the other half of the 2026-11-19 accident: the reason used to
+            // reach only the stdout of whichever command happened to run.
+            let refused = format!("launchctl bootstrap failed: {}", out.error_text());
+            log.line(&refused);
+            revert_plist(&path, previous.as_deref(), &log, runner, &bootstrap);
+            bail!("{refused} (the LaunchAgent is not loaded, so nothing starts the ticker; `hp ticker start` repairs it, see {})", log_path(root).display())
+        }
+        Err(error) => {
+            log.line(&format!("could not run launchctl bootstrap ({error:#})"));
+            Err(error).context("could not run launchctl")
+        }
+    }
+}
+
+/// Puts the plist launchd refused back to what it was, and tries that one: a
+/// newer text that will not load must not be the one left on disk.
+fn revert_plist(path: &Path, previous: Option<&str>, log: &Log, runner: &dyn Runner, bootstrap: &dyn Fn() -> Cmd) {
+    match previous {
+        Some(old) => {
+            let _ = std::fs::write(path, old);
+            match runner.run(&bootstrap()).map(|out| out.success()) {
+                Ok(true) => log.line("the previous text was put back and launchd loaded it"),
+                _ => log.line("the previous text was put back, but launchd would not load that one either: nothing of this agent is loaded"),
+            }
+        }
+        None => {
+            let _ = std::fs::remove_file(path);
+            log.line("the plist this run wrote was removed again: launchd has the job it had before");
+        }
     }
 }
 
@@ -284,16 +405,30 @@ fn start_with(ctx: &Ctx, wait: Duration, spawn_directly: &dyn Fn(&Path) -> Resul
 /// starting a process.
 fn launch_with(ctx: &Ctx, wait: Duration, spawn_directly: &dyn Fn(&Path) -> Result<()>) -> Result<()> {
     if cfg!(target_os = "macos") {
+        // Both ways out are logged as well as printed: a failure that reaches
+        // only the stdout of one command is invisible to everybody else, which
+        // is how the 2026-11-19 disappearance left nothing in the log to read.
+        let log = Log { path: log_path(&ctx.root) };
         let installed = crate::paths::binary().and_then(|binary| install_agent(&ctx.env.home, &binary, &ctx.root, ctx.runner));
         match installed {
-            Ok(()) if wait_for_ticker(&ctx.root, wait) => return Ok(()),
-            Ok(()) => println!(
-                "ticker start: the LaunchAgent is loaded but no ticker took {} within {}s; starting one directly (see {})",
-                lock_path(&ctx.root).display(),
-                wait.as_secs(),
-                log_path(&ctx.root).display()
-            ),
-            Err(error) => println!("ticker start: could not install the LaunchAgent ({error:#}); starting the loop directly"),
+            Ok(_) if wait_for_ticker(&ctx.root, wait) => return Ok(()),
+            Ok(_) => {
+                log.line(&format!(
+                    "the LaunchAgent is loaded but no ticker took {} within {}s; started the loop directly",
+                    lock_path(&ctx.root).display(),
+                    wait.as_secs()
+                ));
+                println!(
+                    "ticker start: the LaunchAgent is loaded but no ticker took {} within {}s; starting one directly (see {})",
+                    lock_path(&ctx.root).display(),
+                    wait.as_secs(),
+                    log_path(&ctx.root).display()
+                );
+            }
+            Err(error) => {
+                log.line(&format!("could not install the LaunchAgent ({error:#}); started the loop directly"));
+                println!("ticker start: could not install the LaunchAgent ({error:#}); starting the loop directly");
+            }
         }
     }
     spawn_directly(&ctx.root)
@@ -386,9 +521,21 @@ fn wait_until_free(root: &Path, limit: Duration) -> bool {
     }
 }
 
-pub fn status(root: &Path) -> Result<()> {
-    match lock_state(root) {
-        LockState::Free => println!("ticker: not running (root {})", root.display()),
+/// How long `ticker status` waits for a ticker it just loaded to take the lock.
+const STATUS_WAIT: Duration = Duration::from_secs(5);
+
+/// `ticker status`, and the one place a person looks when nothing is being
+/// announced — so it also repairs a LaunchAgent that is written but not doing
+/// its job: the plist missing, out of date, or not loaded (the state the
+/// 2026-11-19 accident left behind: a plist on disk, no job in launchd, no
+/// process).
+pub fn status(ctx: &Ctx) -> Result<()> {
+    status_with(ctx, STATUS_WAIT)
+}
+
+fn status_with(ctx: &Ctx, wait: Duration) -> Result<()> {
+    match lock_state(&ctx.root) {
+        LockState::Free => println!("ticker: not running (root {})", ctx.root.display()),
         LockState::Held(info) => {
             println!("ticker: running");
             println!("  version: {}", info.version);
@@ -403,7 +550,63 @@ pub fn status(root: &Path) -> Result<()> {
             }
         }
     }
+    let agent = status_agent(ctx, wait);
+    if !agent.is_empty() {
+        println!("{agent}");
+    }
     Ok(())
+}
+
+/// The LaunchAgent half of `ticker status`: what launchd has, and the repair
+/// when it is not "written, loaded, and a ticker running under it". Empty where
+/// this machine has no LaunchAgents (not macOS).
+///
+/// The repair is safe to run on a healthy machine because a ticker that holds
+/// the root's lock is never bounced: this command is what a person types when a
+/// project has been silent for hours, and it must not be the thing that kills a
+/// working loop.
+fn status_agent(ctx: &Ctx, wait: Duration) -> String {
+    let Ok(binary) = crate::paths::binary() else { return String::new() };
+    let Some(state) = agent_state(&ctx.env.home, &binary, &ctx.root, ctx.runner) else { return String::new() };
+    let path = state.path.display().to_string();
+    let running = lock_state(&ctx.root) != LockState::Free;
+    if state.installed && state.current && state.loaded && running {
+        return format!("agent:  {path} is loaded, and launchd restarts the ticker after any exit");
+    }
+    let why = if !state.installed {
+        "there is no plist".to_string()
+    } else if !state.current {
+        // Naming the program is what made the 2026-11-19 accident legible: a
+        // build in a worktree had rewritten the plist to point at itself.
+        match &state.program {
+            Some(program) => format!("its text is out of date (it runs {program})"),
+            None => "its text is out of date".to_string(),
+        }
+    } else if !state.loaded {
+        "launchd has not loaded it, so nothing starts the ticker".to_string()
+    } else {
+        "launchd has it loaded but nothing is running under it".to_string()
+    };
+    // `reload_agent` may bounce a job launchd has and nothing runs under; with a
+    // ticker holding the lock only the plist text is brought up to date.
+    let repair = if running { install_agent(&ctx.env.home, &binary, &ctx.root, ctx.runner) } else { reload_agent(&ctx.env.home, &binary, &ctx.root, ctx.runner) };
+    let log = log_path(&ctx.root).display().to_string();
+    match repair {
+        Ok(report) if report.kept_running && report.wrote_plist => format!(
+            "agent:  {path}: {why}; wrote the current text and left the running ticker alone (it takes effect at the ticker's next start)"
+        ),
+        Ok(report) if report.kept_running => format!(
+            "agent:  {path}: {why}; the ticker runs but launchd has no job for it, so nothing restarts it if it exits — `hp ticker start` loads the job once it has stopped"
+        ),
+        Ok(_) => {
+            let alive = wait_for_ticker(&ctx.root, wait);
+            match alive {
+                true => format!("agent:  {path}: {why}; repaired, and a ticker is running under it"),
+                false => format!("agent:  {path}: {why}; loaded the job, but no ticker took the lock within {}s — run `hp ticker start` (see {log})", wait.as_secs()),
+            }
+        }
+        Err(error) => format!("agent:  {path}: {why}; repairing it failed ({error:#}) — see {log}"),
+    }
 }
 
 /// Where a tool resolves from this process's own `PATH`.
@@ -1407,6 +1610,201 @@ mod tests {
         assert_eq!(runner.count("launchctl bootstrap"), 2);
     }
 
+    /// A ticker process: it holds the root's lock, which is the only thing that
+    /// says a loop is running. Held in the test's own thread, so the probe in
+    /// [`load_agent`] cannot miss it.
+    fn hold_lock(root: &Path) -> File {
+        let file = File::options().create(true).truncate(false).read(true).write(true).open(lock_path(root)).unwrap();
+        file.lock().unwrap();
+        file
+    }
+
+    fn plist_in(home: &Path) -> PathBuf {
+        home.join(format!("Library/LaunchAgents/{AGENT_LABEL}.plist"))
+    }
+
+    fn write_plist(home: &Path, text: &str) {
+        let path = plist_in(home);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, text).unwrap();
+    }
+
+    /// The 2026-11-19 accident, part one: the plist was rewritten at 18:21 and
+    /// the ticker it was keeping alive died of SIGTERM in the same second. A
+    /// rewrite is not a reason to bounce a loop that is running.
+    #[test]
+    fn a_running_ticker_is_not_bounced_to_refresh_the_plist() {
+        let home = tempfile::tempdir().unwrap();
+        let root = home.path().join("root");
+        std::fs::create_dir(&root).unwrap();
+        write_plist(home.path(), "<plist><dict><key>KeepAlive</key><dict><key>SuccessfulExit</key><false/></dict></dict></plist>");
+        let runner = FakeRunner::new();
+        runner.on("launchctl print", ok(""));
+        runner.on("launchctl bootout", ok(""));
+        runner.on("launchctl bootstrap", ok(""));
+        let lock = hold_lock(&root);
+
+        let report = install_agent(home.path(), Path::new("/opt/hp/hp"), &root, &runner).unwrap();
+        assert!(report.wrote_plist, "the out of date plist is still rewritten");
+        assert!(report.kept_running, "{report:?}");
+        assert_eq!(runner.count("launchctl bootout"), 0, "a running ticker must not be unloaded to refresh a plist");
+        assert_eq!(runner.count("launchctl bootstrap"), 0);
+        assert!(std::fs::read_to_string(plist_in(home.path())).unwrap().contains("<key>KeepAlive</key><true/>"));
+        let log = std::fs::read_to_string(root.join(".ticker.log")).unwrap_or_default();
+        assert!(log.contains("left it running"), "{log}");
+        drop(lock);
+    }
+
+    /// `launchctl print` failing is not proof that no job is loaded (launchd
+    /// answers an I/O error too), so a job nobody has loaded is loaded with
+    /// `bootstrap` alone: `bootout` first is what killed the ticker.
+    #[test]
+    fn loading_a_job_launchd_does_not_have_unloads_nothing_first() {
+        let home = tempfile::tempdir().unwrap();
+        let root = home.path().join("root");
+        std::fs::create_dir(&root).unwrap();
+        let runner = FakeRunner::new();
+        runner.on("launchctl print", fail(113, "Could not find service"));
+        runner.on("launchctl bootout", ok(""));
+        runner.on("launchctl bootstrap", ok(""));
+
+        let report = install_agent(home.path(), Path::new("/opt/hp/hp"), &root, &runner).unwrap();
+        assert!(report.bootstrapped, "{report:?}");
+        assert!(!report.bounced, "{report:?}");
+        assert_eq!(runner.count("launchctl bootout"), 0, "nothing was loaded, so there is nothing to unload");
+        assert_eq!(runner.count("launchctl bootstrap"), 1);
+    }
+
+    /// Part two: a `bootstrap` that fails leaves no job and no process. The
+    /// reason used to reach only the stdout of the command that happened to be
+    /// running; the plist launchd refused is put back so the previous state is
+    /// the one on disk.
+    #[test]
+    fn a_refused_bootstrap_is_logged_and_the_old_plist_put_back() {
+        let home = tempfile::tempdir().unwrap();
+        let root = home.path().join("root");
+        std::fs::create_dir(&root).unwrap();
+        let old = "<plist><dict><key>KeepAlive</key><dict><key>SuccessfulExit</key><false/></dict></dict></plist>";
+        write_plist(home.path(), old);
+        let runner = FakeRunner::new();
+        runner.on("launchctl print", ok(""));
+        runner.on("launchctl bootout", ok(""));
+        runner.on("launchctl bootstrap", fail(5, "Bootstrap failed: 5: Input/output error"));
+
+        let error = install_agent(home.path(), Path::new("/opt/hp/hp"), &root, &runner).unwrap_err();
+        assert!(format!("{error:#}").contains("Input/output error"), "{error:#}");
+        let log = std::fs::read_to_string(root.join(".ticker.log")).unwrap_or_default();
+        assert!(log.contains("launchctl bootstrap failed: Bootstrap failed: 5: Input/output error"), "{log}");
+        assert_eq!(std::fs::read_to_string(plist_in(home.path())).unwrap(), old, "the plist launchd refused is not left behind");
+    }
+
+    /// The repair the accident asks for: `hp ticker status` is the command a
+    /// person runs when nothing is announced, so it is also the one that puts a
+    /// written-but-unloaded plist back to work.
+    #[test]
+    fn ticker_status_loads_a_written_plist_launchd_does_not_have() {
+        if !cfg!(target_os = "macos") {
+            return;
+        }
+        let home = tempfile::tempdir().unwrap();
+        let root = home.path().join("root");
+        std::fs::create_dir(&root).unwrap();
+        let binary = crate::paths::binary().unwrap();
+        write_plist(home.path(), &agent_plist(&binary, &root, &log_path(&root)));
+        let env = Env::for_test(home.path(), &[]);
+        let runner = FakeRunner::new();
+        runner.on("launchctl print", fail(113, "Could not find service"));
+        runner.on("launchctl bootout", ok(""));
+        runner.on("launchctl bootstrap", ok(""));
+        let ctx = Ctx { env: &env, root: root.clone(), config_dir: home.path().join("cfg"), runner: &runner, detached_ticker: true };
+
+        let line = status_agent(&ctx, Duration::from_millis(100));
+        assert_eq!(runner.count("launchctl bootstrap"), 1, "the job nobody loaded is loaded: {line:?}");
+        assert_eq!(runner.count("launchctl bootout"), 0, "nothing held the lock, so nothing needed unloading");
+        assert!(line.contains("hp ticker start"), "and it says what is still missing: {line:?}");
+    }
+
+    /// The same command on a healthy machine says so and touches no job.
+    #[test]
+    fn ticker_status_leaves_a_healthy_agent_alone() {
+        if !cfg!(target_os = "macos") {
+            return;
+        }
+        let home = tempfile::tempdir().unwrap();
+        let root = home.path().join("root");
+        std::fs::create_dir(&root).unwrap();
+        let binary = crate::paths::binary().unwrap();
+        write_plist(home.path(), &agent_plist(&binary, &root, &log_path(&root)));
+        let env = Env::for_test(home.path(), &[]);
+        let runner = FakeRunner::new();
+        runner.on("launchctl print", ok(""));
+        runner.on("launchctl bootout", ok(""));
+        runner.on("launchctl bootstrap", ok(""));
+        let ctx = Ctx { env: &env, root: root.clone(), config_dir: home.path().join("cfg"), runner: &runner, detached_ticker: true };
+        let lock = hold_lock(&root);
+
+        let line = status_agent(&ctx, Duration::from_millis(100));
+        assert!(line.contains("is loaded"), "{line:?}");
+        assert_eq!(runner.count("launchctl bootout"), 0);
+        assert_eq!(runner.count("launchctl bootstrap"), 0);
+        drop(lock);
+    }
+
+    /// The plist an accident leaves behind names the binary it points at: a
+    /// build in a worktree rewriting the global plist is what a person needs to
+    /// see, not just "out of date".
+    #[test]
+    fn an_out_of_date_plist_says_which_program_it_runs() {
+        if !cfg!(target_os = "macos") {
+            return;
+        }
+        let home = tempfile::tempdir().unwrap();
+        let root = home.path().join("root");
+        std::fs::create_dir(&root).unwrap();
+        let elsewhere = Path::new("/Users/me/.herdr/worktrees/x/target/release/hp");
+        write_plist(home.path(), &agent_plist(elsewhere, &root, &log_path(&root)));
+        let env = Env::for_test(home.path(), &[]);
+        let runner = FakeRunner::new();
+        runner.on("launchctl print", ok(""));
+        let ctx = Ctx { env: &env, root: root.clone(), config_dir: home.path().join("cfg"), runner: &runner, detached_ticker: true };
+        let lock = hold_lock(&root);
+
+        let line = status_agent(&ctx, Duration::from_millis(100));
+        assert!(line.contains("it runs /Users/me/.herdr/worktrees/x/target/release/hp"), "{line}");
+        assert_eq!(runner.count("launchctl bootout"), 0);
+        drop(lock);
+    }
+
+    /// Two `hp` commands at once used to interleave their unload and load, and
+    /// the loser's `bootstrap` was the one that failed. The pair is serialized
+    /// on a lock under the root, so the second call sees the first one's result.
+    #[test]
+    fn the_unload_and_load_pair_is_serialized_across_processes() {
+        let home = tempfile::tempdir().unwrap();
+        let root = home.path().join("root");
+        std::fs::create_dir(&root).unwrap();
+        let guard = File::options().create(true).truncate(false).read(true).write(true).open(agent_lock_path(&root)).unwrap();
+        guard.lock().unwrap();
+        let home_path = home.path().to_path_buf();
+        let root_path = root.clone();
+        let (done, wait) = std::sync::mpsc::channel();
+        let spawned = std::thread::spawn(move || {
+            let runner = FakeRunner::new();
+            runner.on("launchctl print", fail(113, "Could not find service"));
+            runner.on("launchctl bootstrap", ok(""));
+            let result = install_agent(&home_path, Path::new("/opt/hp/hp"), &root_path, &runner).map(|report| report.bootstrapped);
+            done.send(result).unwrap();
+        });
+        // While the other holder is inside, nothing is written and no launchctl
+        // runs: the pair cannot be split by a second process.
+        assert!(wait.recv_timeout(Duration::from_millis(300)).is_err(), "install did not wait for the other process");
+        assert!(!plist_in(home.path()).exists());
+        drop(guard);
+        assert!(wait.recv_timeout(Duration::from_secs(10)).unwrap().unwrap());
+        assert!(plist_in(home.path()).exists());
+        spawned.join().unwrap();
+    }
+
     #[test]
     fn a_version_change_leaves_a_launch_agent_behind() {
         if !cfg!(target_os = "macos") {
@@ -1489,6 +1887,35 @@ mod tests {
         .unwrap();
         assert_eq!(runner.count("launchctl bootstrap"), 1, "the LaunchAgent was written and loaded");
         assert_eq!(started.get(), 1, "nothing took the lock, so a process is started directly");
+    }
+
+    /// The acceptance check for the 2026-11-19 accident, in one test: a command
+    /// that ensures the ticker runs (`hp thread start` goes through here) does
+    /// nothing at all to a ticker that is running — no unload, no load, no spawn,
+    /// and nothing new in `.ticker.log`.
+    #[test]
+    fn a_healthy_ticker_is_not_touched_by_a_command_that_ensures_it() {
+        if !cfg!(target_os = "macos") {
+            return;
+        }
+        let home = tempfile::tempdir().unwrap();
+        let root = home.path().join("root");
+        project::create(&root, "demo", vec![]).unwrap();
+        let binary = crate::paths::binary().unwrap();
+        write_plist(home.path(), &agent_plist(&binary, &root, &log_path(&root)));
+        let env = Env::for_test(home.path(), &[]);
+        let runner = FakeRunner::new();
+        runner.on("launchctl print", ok(""));
+        runner.on("launchctl bootout", ok(""));
+        runner.on("launchctl bootstrap", ok(""));
+        let ctx = Ctx { env: &env, root: root.clone(), config_dir: home.path().join("cfg"), runner: &runner, detached_ticker: true };
+        let lock = hold_lock(&root);
+
+        launch_with(&ctx, Duration::from_secs(5), &|_| panic!("a healthy ticker was replaced by a plain process")).unwrap();
+        assert_eq!(runner.count("launchctl bootout"), 0, "the healthy job was unloaded");
+        assert_eq!(runner.count("launchctl bootstrap"), 0);
+        assert!(!root.join(".ticker.log").exists(), "a command that found everything right logged something");
+        drop(lock);
     }
 
     #[test]

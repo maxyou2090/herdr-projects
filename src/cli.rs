@@ -981,7 +981,7 @@ pub fn run() -> Result<()> {
             TickerCommand::Start => ticker::start(&ctx),
             TickerCommand::Run => ticker::run(&ctx),
             TickerCommand::Stop => ticker::stop(&ctx),
-            TickerCommand::Status => ticker::status(&ctx.root),
+            TickerCommand::Status => ticker::status(&ctx),
         },
     }
 }
