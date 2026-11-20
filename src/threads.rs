@@ -282,21 +282,47 @@ fn coordinator_spaces(project: &Project, panes: &[Pane], agents: &[Agent]) -> Ve
 ///    app made can be stale or missing, and the panes are what say whose it is;
 /// 5. `None`: there is none, and the caller creates the first one.
 ///
-/// Never the project's own Space, a lane's, or a Space that is one worktree, and
-/// never a Space labelled with a thread's title — that is a thread's **own**
-/// Space from before this change, which a restart abandons (its tabs close, and
-/// `spaces::empty` recycles it) rather than joins.
+/// Never the project's own Space, a lane's, or a Space labelled with a thread's
+/// own name — that is a thread's **own** Space from before this change, which a
+/// restart abandons (its tabs close, and `spaces::empty` recycles it) rather than
+/// joins.
 pub fn threads_space(project: &Project, workspaces: &[Workspace], panes: &[Pane], agents: &[Agent], record: Option<&Thread>) -> Option<String> {
     let homes = coordinator_spaces(project, panes, agents);
     let threads = thread::list(project);
-    // A thread's own Space under the old rule: labelled with the thread's title.
-    let own_old = |w: &Workspace| threads.iter().any(|t| crate::labels::thread_space_matches(&w.label, &t.title));
-    let usable = |w: &Workspace| !homes.contains(&w.workspace_id) && w.worktree.is_none() && !own_old(w);
+    // A thread's own Space under the old rule, when a thread had one to itself:
+    // labelled with the thread's title, or `<title> Threads` for the worktree
+    // kind. Both are abandoned, never joined — resolving them closes them.
+    let own_old = |w: &Workspace| {
+        threads.iter().any(|t| {
+            crate::labels::thread_space_matches(&w.label, &t.title)
+                || (!t.title.is_empty() && w.label == crate::labels::threads_space_label(&t.title))
+        })
+    };
+    // **Not** "a Space that is one worktree". That reading means "every pane in
+    // it names the same worktree", which a thread Space is the moment it holds
+    // exactly one worktree thread — and every thread of a repository is one, so
+    // with that clause the first worktree thread's Space was refused and each
+    // thread after it opened a Space of its own (2026-11-19, t-0072). What a
+    // Space is called and whose panes are in it say whose it is; the worktree
+    // classification only ever described a Space of the old one-worktree-each
+    // shape, which is now `own_old` above.
+    let usable = |w: &Workspace| !homes.contains(&w.workspace_id) && !own_old(w);
     // The panes of this project, in that Space: the strongest statement a Space
     // makes about whose it is, and the one a label change cannot touch.
     let mine = |id: &str| panes.iter().any(|p| p.workspace_id == id && p.tokens.get(crate::labels::PROJECT_TOKEN).is_some_and(|slug| slug == &project.slug));
     let shared = |w: &Workspace| usable(w) && (crate::labels::is_threads_space_label(&w.label) || mine(&w.workspace_id));
-    let recorded = |id: &str| !id.is_empty() && workspaces.iter().any(|w| w.workspace_id == id && shared(w));
+    // A Space a record of this project names, when it is still a Space a thread
+    // could be in. A Space wearing no name yet is accepted on the record alone:
+    // the app can list a Space it made before any hp label is on a terminal of
+    // it (§4.1), and `spaces::sync_threads_label` names it on the next tick. A
+    // Space **with** a name has to match, or a drifted record would trust
+    // another project's Space (`a_thread_record_naming_another_projects_space_is_not_trusted`).
+    let recorded = |id: &str| {
+        !id.is_empty()
+            && workspaces
+                .iter()
+                .any(|w| w.workspace_id == id && usable(w) && (w.label.is_empty() || shared(w)))
+    };
     if let Some(id) = record.map(|t| t.workspace_id.clone()).filter(|id| recorded(id)) {
         return Some(id);
     }
@@ -1471,8 +1497,16 @@ mod tests {
 
     #[test]
     fn the_thread_space_is_named_by_the_record_the_label_or_the_panes() {
-        let project = crate::project::create(&tempfile::tempdir().unwrap().path().join("root"), "demo", vec![]).unwrap();
-        let t = Thread { id: "t-0001".into(), kind: Kind::Local, title: "Research".into(), workspace_id: "w9".into(), ..Thread::default() };
+        let home = tempfile::tempdir().unwrap();
+        let project = crate::project::create(&home.path().join("root"), "demo", vec![]).unwrap();
+        // A real record: the finder reads the project's threads, and a thread's
+        // own Space is recognised by that thread's label.
+        let t = thread::allocate(&project, |t| {
+            t.title = "Research".into();
+            t.kind = Kind::Local;
+        })
+        .unwrap();
+        let t = Thread { workspace_id: "w9".into(), ..t };
         let mine = crate::core::Pane { pane_id: "p1".into(), workspace_id: "w4".into(), tokens: [("hp_project".to_string(), "demo".to_string())].into_iter().collect(), ..crate::core::Pane::default() };
         let elsewhere = crate::core::Pane { pane_id: "p2".into(), workspace_id: "w5".into(), tokens: [("hp_project".to_string(), "other".to_string())].into_iter().collect(), ..crate::core::Pane::default() };
         let panes = [mine, elsewhere];
@@ -1482,9 +1516,16 @@ mod tests {
         assert_eq!(threads_space(&project, &[space("w9", "Demo Threads"), space("whome", "Demo")], &panes, &[], Some(&t)).as_deref(), Some("w9"));
         // Never the project's home Space, whatever the label.
         assert_eq!(threads_space(&project, &homes, &panes, &[], Some(&t)), None);
-        // A Space that is one worktree is not a thread Space.
+        // A Space that is one worktree is still the thread Space when a record
+        // names it: a thread Space holding a single worktree thread is exactly
+        // that, and reading it as "somebody's worktree Space" is what made every
+        // worktree thread open a Space of its own (2026-11-19, t-0072).
         let worktree = crate::core::Workspace { worktree: Some("/wt/one".into()), ..space("w9", "Demo Threads") };
-        assert_eq!(threads_space(&project, &[worktree], &[], &[], Some(&t)), None);
+        assert_eq!(threads_space(&project, &[worktree], &[], &[], Some(&t)).as_deref(), Some("w9"));
+        // A thread's own Space from **before** the change is still not one, and
+        // the worktree kind's own Space was labelled `<title> Threads`.
+        let legacy = crate::core::Workspace { worktree: Some("/wt/one".into()), ..space("w9", "Research Threads") };
+        assert_eq!(threads_space(&project, &[legacy], &[], &[], None), None);
         // 3: today's label, for a Space nothing records yet.
         assert_eq!(threads_space(&project, &[space("w7", "Demo Threads")], &[], &[], None).as_deref(), Some("w7"));
         // 4: this project's panes, when the label drifted (the app's own name).
@@ -1603,6 +1644,117 @@ mod tests {
         assert_ne!(second.tab_id, first.tab_id, "a tab each");
         assert_eq!(world.thread_spaces().len(), 1, "{:?}", world.spaces());
         assert_eq!(world.spaces().len(), 2, "the coordinator's Space and the threads' one, and no third");
+    }
+
+    /// The same incident at its worst: two placements that took their snapshot
+    /// of panes and agents before either Space existed, so neither can see the
+    /// other's pane or the other's record. The Space the first one made is
+    /// re-read under the project lock (`threads::place`), which is what has to
+    /// make the second one join it instead of making a second one.
+    #[test]
+    fn two_threads_placed_from_one_snapshot_share_one_space() {
+        let world = FakeProject::new();
+        let view = world.view();
+        let folders = tempfile::tempdir().unwrap();
+        let folder = |name: &str| {
+            let path = folders.path().join(name);
+            std::fs::create_dir_all(&path).unwrap();
+            std::fs::canonicalize(&path).unwrap()
+        };
+        let (a, b) = (folder("one"), folder("two"));
+        let record = |title: &str, path: &Path| {
+            thread::allocate(&world.project, |t| {
+                t.title = title.to_string();
+                t.kind = Kind::Worktree;
+                t.worktree_path = path.to_string_lossy().into_owned();
+            })
+            .unwrap()
+        };
+        let (first, second) = (record("first", &a), record("second", &b));
+        // The first one lands, worktree label and all, before the second asks.
+        let made = place(&world.project, &view, &first, &a).unwrap();
+        view.herdr.worktree_mark(&made.pane_id, &a.to_string_lossy()).unwrap();
+        let also = place(&world.project, &view, &second, &b).unwrap();
+        assert_eq!(also.workspace_id, made.workspace_id, "one Space, not one each");
+        assert_eq!(world.thread_spaces().len(), 1, "{:?}", world.spaces());
+        assert_eq!(world.spaces().len(), 2, "the coordinator's Space and the threads' one: {:?}", world.spaces());
+    }
+
+    /// One worktree thread of the project, placed the way `thread start`
+    /// places it: the worktree folder first (already made here, so no git), its
+    /// tab second, `hp_worktree` on the pane, and the record written between.
+    fn start_worktree(world: &FakeProject, title: &str, path: &Path) -> Thread {
+        let text = path.to_string_lossy().into_owned();
+        let record = thread::allocate(&world.project, |t| {
+            t.title = title.to_string();
+            t.kind = Kind::Worktree;
+            t.repo = path.to_string_lossy().into_owned();
+            t.worktree_path = text.clone();
+        })
+        .unwrap();
+        let created = place(&world.project, &world.view(), &record, path).unwrap();
+        world.view().herdr.worktree_mark(&created.pane_id, &text).unwrap();
+        finish_place(&world.project, &world.view(), &record.id, &created, path).unwrap();
+        thread::load(&world.project, &record.id).unwrap()
+    }
+
+    /// The app can list a Space it made before any hp label is on a terminal of
+    /// it. Nothing is written on such a Space, so the record naming it is the
+    /// only thing that says whose it is — and it is renamed on the next tick,
+    /// by the same judgement (`spaces::sync_threads_label`).
+    #[test]
+    fn a_thread_space_with_no_name_yet_is_found_by_its_record_and_named() {
+        let world = FakeProject::new();
+        let first = start_home(&world, "Research");
+        let herdr = world.view().herdr;
+        herdr.clear_labels(&first.pane_id, &["hp_ws_label", "hp_project"]).unwrap();
+        let label_of = |world: &FakeProject, id: &str| world.spaces().into_iter().find(|w| w.workspace_id == id).map(|w| w.label);
+        assert_eq!(label_of(&world, &first.workspace_id), Some(String::new()), "precondition: a Space with no name");
+        assert_eq!(
+            threads_space(&world.project, &world.spaces(), &[], &[], None).as_deref(),
+            Some(first.workspace_id.as_str()),
+            "the record is enough when nothing is written on the Space"
+        );
+        let second = start_home(&world, "Write the notes");
+        assert_eq!(second.workspace_id, first.workspace_id, "a thread started now joins it, not a Space beside it");
+        crate::spaces::sync_threads_label(&world.project, &herdr);
+        assert_eq!(label_of(&world, &first.workspace_id), Some("Demo Threads".into()), "and it gets its name");
+        assert_eq!(world.thread_spaces().len(), 1, "{:?}", world.spaces());
+    }
+
+    /// The 2026-11-19 incident: three worktree threads started seconds apart in
+    /// one project, and each one opened a Space of its own, all named `Project
+    /// Threads`. A thread Space holding one worktree thread — every thread here
+    /// is one — was being judged "this Space is one worktree" and refused.
+    #[test]
+    fn worktree_threads_started_one_after_another_share_one_space() {
+        let world = FakeProject::new();
+        let folders = tempfile::tempdir().unwrap();
+        let paths: Vec<std::path::PathBuf> = ["one", "two", "three"]
+            .iter()
+            .map(|name| {
+                let path = folders.path().join(name);
+                std::fs::create_dir_all(&path).unwrap();
+                std::fs::canonicalize(&path).unwrap()
+            })
+            .collect();
+        let mut placed = Vec::new();
+        for (n, path) in paths.iter().enumerate() {
+            placed.push(start_worktree(&world, &format!("thread {n}"), path));
+        }
+        let ids: Vec<&str> = placed.iter().map(|t| t.workspace_id.as_str()).collect();
+        assert_eq!(ids[0], ids[1], "the second thread joins the first one's Space, so the same Space: {ids:?}");
+        assert_eq!(ids[1], ids[2], "and the third the same: {ids:?}");
+        assert_eq!(world.thread_spaces().len(), 1, "one `<display name> Threads`, not one per thread: {:?}", world.spaces());
+        assert_eq!(world.spaces().len(), 2, "the coordinator's Space and the threads' one, and no third: {:?}", world.spaces());
+        assert_eq!(world.thread_spaces()[0].pane_count, 3, "three tabs in it");
+        // And a restart lands in it with one worktree thread left in the Space,
+        // which is the shape that reads as "this Space is one worktree".
+        world.core.finish(&placed[1].pane_id, "exited");
+        let record = thread::load(&world.project, &placed[1].id).unwrap();
+        let again = place(&world.project, &world.view(), &record, &paths[1]).unwrap();
+        assert_eq!(again.workspace_id, ids[0], "a restart lands in the same Space: {:?}", world.spaces());
+        assert_eq!(world.thread_spaces().len(), 1, "{:?}", world.spaces());
     }
 
     #[test]
