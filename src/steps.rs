@@ -180,12 +180,119 @@ pub struct State {
     /// the reason stays the same, so the digest can say how long.
     #[serde(default, deserialize_with = "string_or_map")]
     pub held_since: BTreeMap<String, String>,
+    /// coordinator pane id -> the clock of the turn that pane's agent is in,
+    /// written by the ticker because it is the only process that watches pane
+    /// state between the coordinator's own turns. `hp context` prints it (the
+    /// `This pane:` line) and the audit measures it
+    /// ([`crate::audit::COORDINATOR_LONG_TURN_SECS`]).
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub coordinator_turns: BTreeMap<String, Turn>,
     /// The default lane in force for this load. Not part of the file: the
     /// per-lane maps are keyed by lane id, and an empty lane argument reads as
     /// this one. `State::default()` (a test or a fresh ticker) falls back to
     /// [`crate::lanes::FALLBACK_ID`].
     #[serde(skip)]
     pub default_lane: String,
+}
+
+/// What the ticker knows about one coordinator pane's current turn: when the
+/// agent started saying `working`, and the longest turn it finished today.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Turn {
+    /// UTC start of the turn the pane is in. Empty when it is not working.
+    pub since: String,
+    /// Seconds of the longest turn that ended today.
+    pub longest: i64,
+    /// The day `longest` belongs to, so the figure resets when the date
+    /// changes instead of growing for a week (UTC, like every stamp hp writes).
+    pub day: String,
+}
+
+impl Turn {
+    /// The day's longest, or 0 when the record was written on another day.
+    fn longest_today(&self, today: &str) -> i64 {
+        if self.day == today { self.longest } else { 0 }
+    }
+}
+
+/// One coordinator pane's turn as a reader sees it: how long the turn has run
+/// (`None` when the pane is not working) and the longest turn finished today.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TurnClock {
+    pub working_secs: Option<i64>,
+    pub longest_today_secs: i64,
+}
+
+/// The one function that turns the ticker's record into the two numbers `hp
+/// context` prints and `hp thread audit` compares against its threshold, so
+/// the two can never disagree about how long a turn is. `None` when the ticker
+/// has never recorded this pane: a thread's pane, a stopped ticker and a fresh
+/// project have no turn, and printing zeros would read as a measurement.
+pub fn turn_clock(state: &State, pane: &str, now: jiff::Timestamp) -> Option<TurnClock> {
+    let turn = state.coordinator_turns.get(pane)?;
+    let working_secs = (!turn.since.is_empty()).then(|| elapsed(&turn.since, now)).flatten();
+    Some(TurnClock {
+        // A turn still running is today's longest until it ends, so a
+        // coordinator cannot read a smaller "longest" than the turn it is in.
+        longest_today_secs: turn.longest_today(&today(now)).max(working_secs.unwrap_or(0)),
+        working_secs,
+    })
+}
+
+/// One tick's look at the project's coordinator panes: `working` is `(pane id,
+/// whether its agent says working)`, `live_panes` every pane the session lists.
+/// A turn starts when the status becomes `working` and ends when it stops
+/// being, and its length joins the day's longest. A record whose pane is gone
+/// is dropped rather than kept for ever.
+///
+/// The ticker is the only caller: a coordinator cannot measure its own turn (a
+/// turn it is in never ends from its side), and no other process watches the
+/// pane between turns.
+pub fn track_coordinator_turns(state: &mut State, working: &[(String, bool)], live_panes: &[String], now: jiff::Timestamp) {
+    state.coordinator_turns.retain(|pane, _| live_panes.iter().any(|live| live == pane));
+    let day = today(now);
+    for (pane, is_working) in working {
+        let turn = state.coordinator_turns.entry(pane.clone()).or_default();
+        // Midnight while a turn runs: the day's longest starts again, the
+        // running turn keeps its own start.
+        if turn.day != day {
+            turn.day = day.clone();
+            turn.longest = 0;
+        }
+        match (is_working, turn.since.is_empty()) {
+            (true, true) => turn.since = now.to_string(),
+            (false, false) => {
+                turn.longest = turn.longest.max(elapsed(&turn.since, now).unwrap_or(0));
+                turn.since.clear();
+            }
+            _ => {}
+        }
+    }
+}
+
+/// The UTC day a stamp belongs to, for [`Turn::day`].
+fn today(now: jiff::Timestamp) -> String {
+    now.strftime("%Y-%m-%d").to_string()
+}
+
+fn elapsed(since: &str, now: jiff::Timestamp) -> Option<i64> {
+    since.parse::<jiff::Timestamp>().ok().map(|then| (now.as_second() - then.as_second()).max(0))
+}
+
+/// `12m41s`, `1h05m`, `2d 3h`: a turn's length, seconds only below the hour, so
+/// the number a coordinator reads is the number the audit measured.
+pub fn turn_text(secs: i64) -> String {
+    let (days, hours, minutes, seconds) = (secs / 86400, secs % 86400 / 3600, secs % 3600 / 60, secs % 60);
+    if days > 0 {
+        format!("{days}d {hours}h")
+    } else if hours > 0 {
+        format!("{hours}h{minutes:02}m")
+    } else if minutes > 0 {
+        format!("{minutes}m{seconds:02}s")
+    } else {
+        format!("{seconds}s")
+    }
 }
 
 /// Accepts both the pre-lanes scalar shape and the per-lane map of §4.4. A
@@ -269,6 +376,7 @@ pub fn save_state(project: &Project, state: &State) -> Result<()> {
         audited: &'a BTreeMap<String, String>,
         last_audit: &'a str,
         coordinator_lost: &'a BTreeMap<String, String>,
+        coordinator_turns: &'a BTreeMap<String, Turn>,
     }
     project::write_json(
         &path,
@@ -294,6 +402,7 @@ pub fn save_state(project: &Project, state: &State) -> Result<()> {
             audited: &state.audited,
             last_audit: &state.last_audit,
             coordinator_lost: &state.coordinator_lost,
+            coordinator_turns: &state.coordinator_turns,
         },
     )
 }
@@ -1535,6 +1644,85 @@ mod tests {
         std::fs::create_dir_all(project.dir().join("routines")).unwrap();
         std::fs::write(project.dir().join("routines").join("sweep.md"), "+++\nschedule = \"every 1m\"\n+++\nGo.\n").unwrap();
         project
+    }
+
+    /// A coordinator's turn is the time between the pane saying `working` and
+    /// the tick that no longer sees it working; the day's longest is kept and
+    /// starts again when the date changes. Every number here is one the ticker
+    /// would write, and `now` is passed in, so the test owes nothing to the
+    /// wall clock.
+    #[test]
+    fn a_coordinators_turn_is_timed_and_todays_longest_restarts_at_midnight() {
+        let pane = "w1:p1".to_string();
+        let mut state = State::default();
+        let tick = |state: &mut State, working: bool, now: &str| {
+            let panes: &[String] = std::slice::from_ref(&pane);
+            track_coordinator_turns(state, &[(pane.clone(), working)], panes, at(now));
+        };
+
+        // Nothing recorded yet: no numbers to print.
+        assert_eq!(turn_clock(&state, &pane, at("2026-11-20T09:00:00Z")), None);
+
+        // Working from 09:10; two ticks later a turn of 10m is on the books.
+        tick(&mut state, true, "2026-11-20T09:10:00Z");
+        tick(&mut state, true, "2026-11-20T09:15:00Z");
+        assert_eq!(turn_clock(&state, &pane, at("2026-11-20T09:20:00Z")).unwrap().working_secs, Some(600));
+        tick(&mut state, false, "2026-11-20T09:20:00Z");
+        let clock = turn_clock(&state, &pane, at("2026-11-20T09:30:00Z")).unwrap();
+        assert_eq!(clock, TurnClock { working_secs: None, longest_today_secs: 600 });
+
+        // A later, shorter turn never lowers the day's longest while it runs.
+        tick(&mut state, true, "2026-11-20T10:00:00Z");
+        assert_eq!(turn_clock(&state, &pane, at("2026-11-20T10:03:00Z")).unwrap().longest_today_secs, 600);
+        assert_eq!(turn_clock(&state, &pane, at("2026-11-20T10:03:00Z")).unwrap().working_secs, Some(180));
+
+        // The date changes: the day's longest starts again, the turn in hand
+        // keeps its own start.
+        tick(&mut state, false, "2026-11-20T10:05:00Z");
+        tick(&mut state, true, "2026-11-21T00:00:30Z");
+        let clock = turn_clock(&state, &pane, at("2026-11-21T00:12:30Z")).unwrap();
+        assert_eq!(clock.longest_today_secs, 720, "a turn that runs over midnight is today's longest");
+        assert_eq!(clock.working_secs, Some(720));
+        tick(&mut state, false, "2026-11-21T00:12:30Z");
+        assert_eq!(turn_clock(&state, &pane, at("2026-11-21T00:13:00Z")).unwrap().longest_today_secs, 720);
+
+        // The pane closes: its record goes rather than ageing for ever.
+        assert_eq!(turn_clock(&state, "w9:p9", at("2026-11-21T00:13:00Z")), None);
+        track_coordinator_turns(&mut state, &[], &[], at("2026-11-21T00:14:00Z"));
+        assert_eq!(turn_clock(&state, &pane, at("2026-11-21T00:14:00Z")), None);
+    }
+
+    /// The field is new, so the one write path that is easy to miss is the
+    /// pre-lanes `LegacyState` hand-written in [`save_state`]: a project
+    /// without `lanes.json` is most of the real ones, and a field missing there
+    /// is silently dropped every tick.
+    #[test]
+    fn the_turn_clock_survives_the_pre_lanes_ticker_file() {
+        let root = tempfile::tempdir().unwrap();
+        let project = project::create(root.path(), "demo", vec![]).unwrap();
+        assert!(!crate::lanes::split_in_use(&project));
+        let pane = "w1:p1".to_string();
+        let mut state = State::default();
+        let panes: &[String] = std::slice::from_ref(&pane);
+        track_coordinator_turns(&mut state, &[(pane.clone(), true)], panes, at("2026-11-20T09:00:00Z"));
+        save_state(&project, &state).unwrap();
+        let text = std::fs::read_to_string(project.state_dir().join("ticker.json")).unwrap();
+        assert!(text.contains("coordinator_turns"), "{text}");
+        let back = load_state(&project);
+        assert_eq!(
+            turn_clock(&back, &pane, at("2026-11-20T09:12:41Z")).unwrap().working_secs,
+            Some(12 * 60 + 41),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn turn_lengths_read_as_seconds_below_the_hour() {
+        assert_eq!(turn_text(9), "9s");
+        assert_eq!(turn_text(12 * 60 + 41), "12m41s");
+        assert_eq!(turn_text(60 * 60 + 5 * 60), "1h05m");
+        assert_eq!(turn_text(2 * 86400 + 3 * 3600), "2d 3h");
+        assert_eq!(turn_text(crate::audit::COORDINATOR_LONG_TURN_SECS), "10m00s");
     }
 
     /// A UTC zoned time on the sweep's minute grid.

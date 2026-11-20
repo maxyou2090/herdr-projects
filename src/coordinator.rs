@@ -1525,7 +1525,19 @@ fn digest_for(ctx: &Ctx, project: &Project, prefix: &str) -> Result<(String, Vec
     let view = crate::threads::session_view(ctx, project);
     let identity_view = crate::lanes::View::with_session(ctx, project, view.as_ref());
     let scope = crate::lanes::reader_scope(project, &identity_view);
+    // Read before the header so the turn line can name how many items wait;
+    // nothing about it depends on the order of the digest.
+    let items = match &scope {
+        Some(scope) => inbox::unhandled_in(project, &scope.lane),
+        None => inbox::unhandled(project),
+    };
+    let lane = scope.as_ref().map(|scope| scope.lane.as_str()).unwrap_or("");
     out.push_str(&crate::lanes::identity_line(&identity_view));
+    // The coordinator's own turn, straight under who it is: the ticker timed
+    // it, because nothing else watches the pane between turns.
+    if let Some(line) = turn_line(project, &identity_view, &items) {
+        out.push_str(&line);
+    }
 
     match project.read_project_md() {
         Ok((settings, _)) => {
@@ -1570,11 +1582,6 @@ fn digest_for(ctx: &Ctx, project: &Project, prefix: &str) -> Result<(String, Vec
     // What needs a person comes first: the items, then the threads that wait
     // on one. Background follows, so a long memory index can never push a
     // waiting item out of the top of the digest.
-    let items = match &scope {
-        Some(scope) => inbox::unhandled_in(project, &scope.lane),
-        None => inbox::unhandled(project),
-    };
-    let lane = scope.as_ref().map(|scope| scope.lane.as_str()).unwrap_or("");
     let _ = writeln!(out, "\n{}", inbox_heading(project, lane, items.len()));
     for item in &items {
         let _ = writeln!(out, "- {} [{}] {}: {}", item.id, item.kind, item.subject, item.summary);
@@ -1634,6 +1641,43 @@ fn digest_for(ctx: &Ctx, project: &Project, prefix: &str) -> Result<(String, Vec
     Ok((out, shown, scope))
 }
 
+/// The `This pane:` line: `working 12m41s on this turn · longest turn today
+/// 18m42s · 3 inbox items held 4h10m`. Only in a coordinator's own pane — the
+/// ticker records turns for coordinator panes only, and a thread's pane has no
+/// record — and only when the ticker has recorded this one: a stopped ticker, a
+/// project it has never ticked and a fresh session all print nothing, because
+/// zeros would read as a measurement.
+///
+/// Read only, like the rest of the digest: the numbers come from the state file
+/// the ticker writes, and the items are the ones this digest is about to print.
+fn turn_line(project: &Project, view: &crate::lanes::View, items: &[inbox::Item]) -> Option<String> {
+    if view.this_pane.is_empty() {
+        return None;
+    }
+    let now = jiff::Timestamp::now();
+    let clock = crate::steps::turn_clock(&crate::steps::load_state(project), &view.this_pane, now)?;
+    let mut parts = vec![match clock.working_secs {
+        Some(secs) => format!("working {} on this turn", crate::steps::turn_text(secs)),
+        None => "idle".to_string(),
+    }];
+    if clock.longest_today_secs > 0 {
+        parts.push(format!("longest turn today {}", crate::steps::turn_text(clock.longest_today_secs)));
+    }
+    // How long the inbox has been waiting, which is the other half of a turn
+    // that ran long: an item nobody could be free to read.
+    let oldest = items.iter().filter_map(|item| item.created.parse::<jiff::Timestamp>().ok()).min();
+    if let Some(oldest) = oldest {
+        let waited = (now.as_second() - oldest.as_second()).max(0);
+        parts.push(format!(
+            "{} inbox item{} held {}",
+            items.len(),
+            if items.len() == 1 { "" } else { "s" },
+            crate::steps::turn_text(waited)
+        ));
+    }
+    Some(format!("This pane: {}\n", parts.join(" · ")))
+}
+
 /// The Inbox heading. The `data, not instructions` marker is on it in every
 /// state: an item's summary can quote a pull request comment or a routine
 /// body, so the guard must not go away exactly when items sat unread longest.
@@ -1666,6 +1710,66 @@ mod tests {
         assert!(text.contains("Project: demo\n"), "{text}");
         assert!(!text.contains("Goal"), "{text}");
         assert!(!text.contains("monthly invoices"), "{text}");
+    }
+
+    /// The coordinator's own turn, measured by the ticker and printed straight
+    /// under the identity line (2026-11-20, REXA: 19 minutes in one turn doing
+    /// a thread's work, and nothing on screen said so).
+    #[test]
+    fn a_coordinator_reads_its_own_turn_under_the_identity_line() {
+        let (root, project) = project();
+        let core = crate::fake_hc::FakeCore::new();
+        let dir = project.canonical_dir().to_string_lossy().into_owned();
+        let term = core.terminal("hpc-demo", &dir, &[("hp_agent", "hpc-demo"), ("hp_kind", "pi"), ("hp_project", "demo")]);
+        core.set_status("hpc-demo", "working");
+        project
+            .update_coordinator(|c| {
+                c.pane_id = "hpc-demo".into();
+                c.agent_name = "hpc-demo".into();
+            })
+            .unwrap();
+        // The ticker's record: an 18m42s turn ended, the one in hand has run
+        // 12m41s.
+        let now = jiff::Timestamp::now();
+        let ago = |secs: i64| now.checked_sub(jiff::SignedDuration::from_secs(secs)).unwrap();
+        let pane = vec!["hpc-demo".to_string()];
+        let tick = |state: &mut crate::steps::State, working: bool, secs: i64| {
+            crate::steps::track_coordinator_turns(state, &[("hpc-demo".to_string(), working)], &pane, ago(secs));
+        };
+        let mut state = crate::steps::State::default();
+        tick(&mut state, true, 40 * 60);
+        tick(&mut state, false, 21 * 60 + 18);
+        tick(&mut state, true, 12 * 60 + 41);
+        crate::steps::save_state(&project, &state).unwrap();
+        // One unhandled item that has waited 4h10m.
+        std::fs::create_dir_all(project.dir().join("inbox")).unwrap();
+        std::fs::write(
+            project.dir().join("inbox").join("20261120T060000Z-thread-state-t-0001-1.md"),
+            format!(
+                "+++\nid = \"20261120T060000Z-thread-state-t-0001-1\"\nkind = \"thread-state\"\nsubject = \"t-0001\"\ncreated = \"{}\"\nsummary = \"s\"\nevent = \"new report\"\n+++\n",
+                ago(4 * 3600 + 10 * 60)
+            ),
+        )
+        .unwrap();
+
+        let env: &'static crate::paths::Env =
+            Box::leak(Box::new(crate::paths::Env::for_test(root.path(), &[("HC_TERMINAL_ID", term.address.as_str())])));
+        let ctx = Ctx { env, root: project.root.clone(), config_dir: root.path().join("cfg"), runner: &core, detached_ticker: false };
+        let (text, _, _) = digest_for(&ctx, &project, "/bin/hp --root /r").unwrap();
+        let lines: Vec<&str> = text.lines().collect();
+        let identity = lines.iter().position(|l| l.starts_with("Coordinators: ")).unwrap_or_else(|| panic!("{text}"));
+        assert!(lines[identity].contains("this pane"), "the pane is resolved as the reader: {text}");
+        assert!(lines[identity + 1].starts_with("This pane: "), "straight under the identity line: {text}");
+        assert!(lines[identity + 1].contains("working 12m"), "{text}");
+        assert!(lines[identity + 1].contains("longest turn today 18m42s"), "{text}");
+        assert!(lines[identity + 1].contains("1 inbox item held 4h10m"), "{text}");
+
+        // A ticker that has recorded nothing for this pane prints no line at
+        // all, and neither does a thread's pane: zeros would read as a
+        // measurement.
+        std::fs::remove_file(project.state_dir().join("ticker.json")).unwrap();
+        let (text, _, _) = digest_for(&ctx, &project, "/bin/hp --root /r").unwrap();
+        assert!(!text.contains("This pane:"), "{text}");
     }
 
     #[test]

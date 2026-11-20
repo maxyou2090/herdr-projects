@@ -503,6 +503,22 @@ So visibility is a standing output, not an event:
   same silence this section exists to end, only seen from the near side. A pane
   outside a core terminal (`HC_TERMINAL_ID` unset), or one that is only a shell
   and no agent, is said nothing about.
+
+  **The pane's own turn is on the next line, when the ticker has timed one:**
+
+  ```text
+  This pane: working 12m41s on this turn · longest turn today 18m42s · 3 inbox items held 4h10m
+  ```
+
+  A coordinator cannot see its own turn end, and nothing else looks at the pane
+  between turns, so the ticker records the start of the turn (from `working`
+  to anything else) and the longest turn of the day in `.state/ticker.json`
+  (`State::coordinator_turns`); `steps::turn_clock` is the one function that
+  reads it, `hp context` prints it and `hp thread audit` measures it
+  (`coordinator-long-turn`, ten minutes). The count and the wait are the
+  unhandled items this digest already lists, so the line costs no extra read.
+  A pane the ticker has never recorded — a thread's pane, a stopped ticker, a
+  fresh project — prints no line at all rather than zeros.
 - **`hp lane list`** prints the same fact per lane and per live pane (the
   matched rule included), plus open lanes whose coordinator is missing entirely
   and closed lanes as `closed`. Its first line **is** the `Coordinators:` line —
@@ -966,7 +982,8 @@ reaches a named lane's coordinator.
   from §5.4 on **every** run. It prints the whole digest (`digest()`,
   `src/coordinator.rs`), but the first lines are `Commands:`, `Project:`,
   `Folder:`, then the `Coordinators:` line (which rule each live pane matched,
-  and the fix for an ambiguous one), before the settings. After that
+  and the fix for an ambiguous one), then `This pane:` in a coordinator's own
+  pane (its turn, as the ticker timed it), before the settings. After that
   come the lane's tasks, the lane's inbox and the threads of the lane. **Closed
   lanes get no section of any of it** — no tasks, no inbox, no threads — but a
   still-running pane of a closed lane stays on the `Coordinators:` line (marked

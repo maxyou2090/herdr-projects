@@ -1351,6 +1351,15 @@ fn tick_cheap_body(ctx: &Ctx, project: &Project, sessions: &mut Sessions, state:
         crate::coordinator::keep_names(&herdr, project, &c.pane_id);
     }
 
+    // The coordinator's own turn, timed here and nowhere else: a coordinator
+    // cannot see its own turn end, and this is the only process that looks at
+    // the pane between turns. `hp context` prints it and the audit measures it
+    // ([`crate::audit::COORDINATOR_LONG_TURN_SECS`]); one tick's resolution is
+    // better than the turn's 19-minute blindness (2026-11-20).
+    let working: Vec<(String, bool)> = coordinators.iter().map(|c| (c.pane_id.clone(), c.agent_status == "working")).collect();
+    let live_panes: Vec<String> = panes.iter().map(|p| p.pane_id.clone()).collect();
+    steps::track_coordinator_turns(state, &working, &live_panes, jiff::Timestamp::now());
+
     let pass = thread_pass(project, &herdr, &record.socket, &open_threads(project), &agents, &panes, None)?;
     // Progress records of panes that are gone are dropped; a new agent in a
     // reused pane id is told apart by its terminal id.
