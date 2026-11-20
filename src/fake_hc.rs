@@ -30,6 +30,9 @@ pub struct Terminal {
     pub reason: String,
     pub pid: Option<u32>,
     pub exit_code: Option<i32>,
+    /// When a killed program will be gone, for a terminal that takes its time
+    /// to die (see [`FakeCore::dies_in`]). `None` means the kill lands at once.
+    pub exits_at: Option<std::time::Instant>,
 }
 
 #[derive(Default)]
@@ -105,6 +108,7 @@ impl FakeCore {
             reason: String::new(),
             pid: None,
             exit_code: None,
+            exits_at: None,
         };
         self.terminals.borrow_mut().push(term.clone());
         term
@@ -119,6 +123,37 @@ impl FakeCore {
             term.reason = reason.to_string();
             term.pid = Some(2515);
             term.exit_code = Some(1);
+        }
+    }
+
+    /// Makes a killed terminal take `after` to be gone, the way a real program
+    /// does: core hangs up, the process takes tens of milliseconds to exit, and
+    /// until then `get`/`ls` still say `live` and `rm` is refused (`live`, "…
+    /// is still running"). Without this a kill lands in the same instant, which
+    /// is the shape no real program has — and the fake asserted nothing about
+    /// waiting for the exit (t-0071).
+    pub fn dies_in(&self, name: &str, after: std::time::Duration) {
+        if let Some(mut term) = self.find_mut(name) {
+            term.exits_at = Some(std::time::Instant::now() + after);
+        }
+    }
+
+    /// Terminals whose program is now gone: a killed one whose grace has passed
+    /// is `finished`, with the reason core reports for a hangup.
+    fn expire(&self) {
+        let now = std::time::Instant::now();
+        for term in self.terminals.borrow_mut().iter_mut() {
+            if let Some(at) = term.exits_at
+                && term.state == "live"
+                && now >= at
+            {
+                term.state = "finished".into();
+                term.status = None;
+                term.reason = "killed".into();
+                term.pid = Some(2515);
+                term.exit_code = Some(1);
+                term.exits_at = None;
+            }
         }
     }
 
@@ -149,6 +184,7 @@ impl FakeCore {
 
     /// The one call path: `hc --json <command> <args...>`.
     fn dispatch(&self, args: &[String]) -> Result<Output> {
+        self.expire();
         let mut args: Vec<&str> = args.iter().map(String::as_str).collect();
         let json = !args.is_empty() && args[0] == "--json";
         if json {
@@ -251,11 +287,25 @@ impl FakeCore {
                     None => fail("not_found", &format!("no terminal {id}")),
                 }
             }
-            ("kill", [id]) | ("rm", [id]) => match self.find_mut(id) {
+            // The hangup lands at once, the program it hit need not: a
+            // terminal with a grace still says `live` until it is gone.
+            ("kill", [id]) => match self.find_mut(id) {
                 Some(mut term) => {
-                    term.state = "finished".into();
-                    term.status = None;
-                    term.reason = "killed".into();
+                    if term.exits_at.is_none() {
+                        term.state = "finished".into();
+                        term.status = None;
+                        term.reason = "killed".into();
+                    }
+                    ok(short(&term).to_string())
+                }
+                None => fail("not_found", &format!("no terminal {id}")),
+            },
+            ("rm", [id]) => match self.find(id) {
+                // Core refuses a terminal whose program still runs, with
+                // `kind: live`.
+                Some(term) if term.state == "live" => fail("live", &format!("{} is still running", term.address)),
+                Some(_) => {
+                    self.terminals.borrow_mut().retain(|t| t.name != *id && t.address != *id);
                     ok("{\"removed\":\"\"}".to_string())
                 }
                 None => fail("not_found", &format!("no terminal {id}")),
