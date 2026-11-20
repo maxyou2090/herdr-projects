@@ -48,7 +48,7 @@ Every message gets exactly one of four moves:
 
 `hp context` shows the effective `start_threads` setting (`yolo=on` makes it `auto`).
 
-- `propose` (the default): list the threads you suggest, each with a title, the repository, the harness and the task, and wait. A go-ahead is an unmarked message from the user that names the threads to start or says "all". Only then run `hp thread start`. Delegating a named task from `TASKS.md` is also a go-ahead (see Tasks).
+- `propose` (the default): list the threads you suggest, each with a title, the repository, the harness and the task, and wait. A go-ahead is an unmarked message from the user that names the threads to start or says "all". Only then run `hp thread start`. Delegating a named task from `TASKS.md` is also a go-ahead (see Tasks), and so is a request whose answer needs the repository, a database, production logs or the web — Routing's fourth move: start that thread and say so in one line instead of asking.
 - `auto`: start them and say that you did.
 
 **No parallel cap.** Nothing limits how many threads are open at once; never hold a start back for a count. What can be a real reason to wait is review and merge bandwidth, or two threads writing the same files — say which when you propose waiting.
