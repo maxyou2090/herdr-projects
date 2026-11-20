@@ -38,6 +38,25 @@ pub const COORDINATOR_TERMINAL_FINISHED: &str = "coordinator-terminal-finished";
 /// The recorded coordinator terminal is alive and its program reports a status,
 /// but it carries no `hp_agent`/`hp_kind`, so core's agent list cannot see it.
 pub const COORDINATOR_LABELS_MISSING: &str = "coordinator-labels-missing";
+/// The project's own coordinator has said `working` on one turn for longer than
+/// [`COORDINATOR_LONG_TURN_SECS`].
+pub const COORDINATOR_LONG_TURN: &str = "coordinator-long-turn";
+
+/// How long one turn of the project's **own coordinator** may run before the
+/// audit calls it long.
+///
+/// Ten minutes, not the [90](WORKING_STALE_SECS) a thread gets, because they
+/// measure opposite things. A thread's long turn is work somebody asked for,
+/// and only its *silence* is a finding; the coordinator's long turn is the
+/// incident this exists for — a coordinator that writes ad-hoc SQL, or reads
+/// production logs, in its own pane instead of starting a thread (REXA,
+/// 2026-11-20, 19 minutes and no thread). `skill/COORDINATOR.md` allows it "at
+/// most two tool calls and about a minute", so ten is already generous: a
+/// coordinator still working at ten minutes is doing the thread's work itself,
+/// and waiting for 90 would only let it finish. Nothing a coordinator is
+/// supposed to do takes ten minutes (answer, `hp task`, `hp thread start`,
+/// read a report), so a false alarm is rare, and it costs one inbox item.
+pub const COORDINATOR_LONG_TURN_SECS: i64 = 10 * 60;
 
 /// How long an agent may sit in `working` with nothing written before the
 /// audit calls it stale. Three aged-reminder windows
@@ -63,7 +82,8 @@ pub struct Findings {
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct Finding {
     /// One of [`RESOLVED_BUT_RUNNING`], [`REGISTERED_PANE_MISSING`],
-    /// [`WORKING_BUT_STALE`], [`COORDINATOR_TERMINAL_FINISHED`]: stable, so a
+    /// [`WORKING_BUT_STALE`], [`COORDINATOR_TERMINAL_FINISHED`],
+    /// [`COORDINATOR_LABELS_MISSING`], [`COORDINATOR_LONG_TURN`]: stable, so a
     /// sweep can grep for it.
     pub kind: &'static str,
     /// The thread this is about, empty for a finding about the project's
@@ -96,6 +116,7 @@ impl Finding {
             REGISTERED_PANE_MISSING => "pane gone and it cannot restart itself",
             COORDINATOR_TERMINAL_FINISHED => "its coordinator's terminal is gone",
             COORDINATOR_LABELS_MISSING => "its coordinator's pane carries no `hp_agent` label",
+            COORDINATOR_LONG_TURN => "its coordinator's turn has run long",
             _ => "working but nothing written",
         }
     }
@@ -111,7 +132,7 @@ pub fn findings_with(project: &Project, socket: &str, now: jiff::Timestamp, agen
     for t in thread::list(project) {
         found.extend(thread_findings(&t, agents, panes, now, &project.root, socket, hc));
     }
-    found.extend(coordinator_findings(project, agents, hc));
+    found.extend(coordinator_findings(project, agents, hc, now));
     Findings { found }
 }
 
@@ -119,8 +140,9 @@ pub fn findings_with(project: &Project, socket: &str, now: jiff::Timestamp, agen
 /// and nothing took its place: the 2026-11-18 incident, where every
 /// notification was held as "no coordinator is idle long enough" while the
 /// coordinator was in fact unreachable, and this audit said `nothing unusual`
-/// because it only looked at threads.
-fn coordinator_findings(project: &Project, agents: &[Agent], hc: &Core) -> Vec<Finding> {
+/// because it only looked at threads. It is also the one place a long turn is
+/// a finding, which is about the coordinator and never about a thread.
+fn coordinator_findings(project: &Project, agents: &[Agent], hc: &Core, now: jiff::Timestamp) -> Vec<Finding> {
     let Some(record) = project.coordinator() else {
         return Vec::new();
     };
@@ -160,8 +182,35 @@ fn coordinator_findings(project: &Project, agents: &[Agent], hc: &Core) -> Vec<F
                 record.pane_id, project.slug
             ),
         }],
-        _ => Vec::new(),
+        // Only a coordinator that is still there can be in a turn that runs
+        // long: the two shapes above have no live turn to time.
+        _ => long_turn_finding(project, &record.pane_id, lane, now),
     }
+}
+
+/// [`COORDINATOR_LONG_TURN`] for the coordinator's recorded pane: the start of
+/// the turn the ticker recorded is the only measurement of it that exists, and
+/// `steps::turn_clock` is the one function that reads it (the `This pane:` line
+/// of `hp context` reads the same). Nothing is reported when the ticker has
+/// never recorded this pane — a stopped ticker, a fresh project, or a
+/// coordinator it has not yet seen working — rather than calling an unmeasured
+/// turn short.
+fn long_turn_finding(project: &Project, pane: &str, lane: String, now: jiff::Timestamp) -> Vec<Finding> {
+    let Some(clock) = crate::steps::turn_clock(&crate::steps::load_state(project), pane, now) else {
+        return Vec::new();
+    };
+    let Some(secs) = clock.working_secs.filter(|secs| *secs >= COORDINATOR_LONG_TURN_SECS) else {
+        return Vec::new();
+    };
+    vec![Finding {
+        kind: COORDINATOR_LONG_TURN,
+        thread: String::new(),
+        lane,
+        detail: format!(
+            "working {} on one turn: the skill puts anything past a quick look in a thread",
+            crate::steps::turn_text(secs)
+        ),
+    }]
 }
 
 /// The three checks for one thread, against this session's lists. `hc` answers
@@ -507,6 +556,61 @@ mod tests {
         assert_eq!(found.len(), 1, "a recorded terminal core cannot see is a finding: \n{found:#?}");
         assert_eq!(found[0].kind, COORDINATOR_TERMINAL_FINISHED);
         assert!(found[0].detail.contains("hp-law-coordinator"), "{}", found[0].detail);
+    }
+
+    /// 2026-11-20, REXA: a coordinator spent 19 minutes on one turn writing SQL
+    /// and reading production logs, and started no thread. Nothing watched a
+    /// coordinator's turn, so nothing could say so; the ticker's turn clock is
+    /// what makes it visible, and ten minutes is where the audit calls it long.
+    #[test]
+    fn a_coordinator_working_one_turn_too_long_is_a_finding() {
+        let world = World::new();
+        let project = world.project("rexa");
+        let pane = "hp-rexa-coordinator";
+        project
+            .update_coordinator(|c| {
+                c.pane_id = pane.into();
+                c.agent_name = "hpc-rexa".into();
+            })
+            .unwrap();
+        let dir = project.canonical_dir().to_string_lossy().into_owned();
+        world.fake.terminal(pane, &dir, &[("hp_agent", "hpc-rexa"), ("hp_kind", "pi"), ("hp_project", "rexa")]);
+        world.fake.set_status(pane, "working");
+        let herdr = world.herdr();
+        let now = jiff::Timestamp::now();
+        let start = |secs: i64| now.checked_sub(jiff::SignedDuration::from_secs(secs)).unwrap();
+        let record_turn = |secs: i64| {
+            let mut state = crate::steps::State::default();
+            crate::steps::track_coordinator_turns(&mut state, &[(pane.to_string(), true)], &[pane.to_string()], start(secs));
+            crate::steps::save_state(&project, &state).unwrap();
+        };
+
+        // A turn that is still running 12m41s after it started.
+        record_turn(12 * 60 + 41);
+        let found = findings(&project, &herdr);
+        let hit: Vec<&Finding> = found.iter().filter(|f| f.kind == COORDINATOR_LONG_TURN).collect();
+        assert_eq!(hit.len(), 1, "{found:#?}");
+        assert_eq!(hit[0].subject(), "coordinator-c-1", "it is about the coordinator, not a thread: {:#?}", hit[0]);
+        assert!(hit[0].thread.is_empty());
+        assert!(hit[0].detail.starts_with("working 12m"), "{}", hit[0].detail);
+        assert!(hit[0].detail.contains("past a quick look in a thread"), "{}", hit[0].detail);
+
+        // Three minutes is a quick look: the skill allows it, so it is no news.
+        record_turn(3 * 60);
+        let found = findings(&project, &herdr);
+        assert!(
+            found.iter().all(|f| f.kind != COORDINATOR_LONG_TURN),
+            "3 minutes is not a long turn: {found:#?}"
+        );
+
+        // A ticker that has never recorded the pane says nothing at all rather
+        // than calling an unmeasured turn short.
+        std::fs::remove_file(project.state_dir().join("ticker.json")).unwrap();
+        let found = findings(&project, &herdr);
+        assert!(
+            found.iter().all(|f| f.kind != COORDINATOR_LONG_TURN),
+            "no turn was ever recorded: {found:#?}"
+        );
     }
 
     #[test]
