@@ -190,7 +190,14 @@ fn remove(ctx: &Ctx, project: &Project, orphan: &Orphan) -> Result<()> {
         Orphan::Folder { path, .. } => Ok(std::fs::remove_dir_all(path)?),
         Orphan::Space(space) => {
             let view = threads::session_view(ctx, project).ok_or_else(|| anyhow::anyhow!("the session is not reachable"))?;
-            crate::spaces::close(&view.herdr, space).map_err(|e| anyhow::anyhow!("{e}"))
+            // Judged again under the project lock: the listing this came from can
+            // be minutes old, and a `thread start` may have placed a tab there
+            // since.
+            if crate::spaces::close_one(ctx, project, &view.herdr, &space.id, true)? {
+                Ok(())
+            } else {
+                bail!("no longer empty; something is in it now")
+            }
         }
         Orphan::DoneItems { .. } => {
             crate::inbox::prune_done(project, crate::steps::DONE_RETENTION_DAYS);

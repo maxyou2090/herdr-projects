@@ -250,14 +250,16 @@ deliberately no "renamed project → new Space" path.
 
 ## 5. Lifecycle
 
-**Create.** `threads::place` looks for the Space; when there is none it takes
-the project lock, looks again, and only then calls `core::workspace_create` with
-the thread's own folder and its `t-00xx` tab. The second look under the lock is
-what stops two threads started at the same moment from opening two Spaces: the
-first one's Space is listed by core (and labelled) before the second gets the
-lock. The Space's own folder is the first thread's folder; every later tab
-carries its own `cwd`, so the Space's folder means nothing after the first
-thread (it is not used by any code).
+**Create.** `threads::place_thread` takes the project lock, and under it looks
+for the Space (`threads::place`) and only then calls `core::workspace_create`
+with the thread's own folder and its `t-00xx` tab — or `core::tab_create` into
+the Space it found — and writes the record that names the pane. The lock covers
+all three, and it is the same one `spaces::close_empty` takes, which is what
+makes a placement and a recycle mutually exclusive (§6.2). It is also what stops
+two threads started at the same moment from opening two Spaces: the first one's
+record is written before the second looks. The Space's own folder is the first
+thread's folder; every later tab carries its own `cwd`, so the Space's folder
+means nothing after the first thread (it is not used by any code).
 
 **Reuse (restart).** `thread restart` with a dead pane goes through
 `place_tab`/`place` again, which finds the Space by rule 1 above — the record's
@@ -266,22 +268,43 @@ the tab only (`core::worktree_add` is not called; the folder is already there)
 and re-marks `hp_worktree` on the new pane.
 
 **Close (one thread).** `threads::clean` closes the thread's tab
-(`threads::close_place`), and the Space only when that tab was **its last pane**:
-`others == 0` is counted over the pane list taken before the close. Resolving one
-of three threads in a Space therefore closes one tab and nothing else.
+(`threads::close_place`) under the project lock, and the Space only when that
+tab was **its last pane**: `others == 0` is counted over the pane list taken
+before the close. Resolving one of three threads in a Space therefore closes one
+tab and nothing else.
 
 **Recycle (backstop).** `spaces::empty` reports the thread Space only when
 
 - it still has at least one pane, every one of them is in it (`own_panes.len() ==
   space.pane_count`, so a hidden pane is never missed),
-- no pane of any **open** thread of any project is in it (`open_panes`),
+- no pane of a **live** thread of any project is in it — and a pane is a live
+  thread's when a record names it (`pane_id`, `tab_id`) **or** the pane says so
+  itself (`hp_tab_label` is that thread's tab, `labels::thread_tab_label`),
 - no agent is in it, it is not focused (unless `include_focused`, which only
   `sweep` passes), and every pane is an idle shell.
 
 That covers what the close path cannot: an app placeholder shell, or a shell a
-person opened there. It can never close a Space with a live thread in it, and it
-never looks at the label — a Space whose label stopped matching something is
-still somebody's.
+person opened there. It never looks at the label — a Space whose label stopped
+matching something is still somebody's.
+
+**What it can and cannot promise.** "It never closes a Space with a live thread
+in it" is a claim about two things working together, and it is worth stating as
+the two it is:
+
+- **the lock** — `spaces::close_empty` holds `project.lock()` from the first
+  listing to the last close, and every placement holds it from its Space lookup
+  to its record (`threads::place_thread`, `threads::close_place` for the resolve
+  side). A tick therefore never acts on a snapshot that a placement has since
+  invalidated, and a placement never lands in a Space a tick is about to close.
+- **the pane's own claim** — with the lock, the remaining window is a placement
+  that dies between `tab_create` and the record write, or a placement from
+  another machine sharing one core session. Such a pane carries
+  `hp_tab_label = t-00xx`, which is what makes its Space in use; before
+  2026-11-20 it was indistinguishable from a leftover shell and was collected.
+
+A record is one of the three pieces of evidence then, not the condition: the
+listing order in `spaces::empty` (records **after** the three core lists) comes
+from the same rule.
 
 **Forget.** `spaces::forget` clears the `workspace_id` of every unresolved
 thread naming the closed Space, so the next placement creates a new one instead
@@ -325,7 +348,33 @@ See §5. The old rule was "a plain Space labelled with a thread's title, with no
 agent and only idle shells" — the thread-Space rule above never consults a
 title, and the "in use" test had to change with it: a shared Space is named by
 *every* open thread's `workspace_id`, so "is a record naming it" is always true
-and must not be the test. It is the **panes** (`open_panes`) that decide.
+and must not be the test. It is the **panes** that decide.
+
+**The 2026-11-20 incident is why the panes have to answer twice.** In law,
+`thread start` created the thread Space and its tab at 23:31:42.8 and, 1.3
+seconds later, a tick's `spaces::empty` closed that Space and killed the pane:
+the tick had read the thread records at ~41s, before the placement, judged the
+Space on that listing, and closed it after the placement had filled it. Two
+things were wrong, and both are fixed:
+
+- the listing and the close were not one step (no lock), so a placement could
+  land in between — now `spaces::close_empty` holds `project.lock()`, and the
+  placement that fills the Space holds it too;
+- the judgement only knew about panes a **record** named, so a pane placed a
+  moment ago and not yet recorded looked exactly like a leftover idle shell —
+  now the pane's own `hp_tab_label` is evidence as well, which is the only
+  evidence left when `hp` dies mid-placement.
+
+The cost is held time: three core listings (`workspace_list`, `pane_list`,
+`agent_list`, ~0.2s each on this machine) plus any close, all under the lock, so
+a `thread start` in the same project can wait that long for its turn, and the
+sweep waits for places that are running. No timeout was added: a shorter lock is
+only possible by reading less, not by giving up the mutual exclusion.
+
+`hp sweep` is the third caller. It lists its orphans once and removes them after
+a person confirms, which can be minutes later, so its Space removal goes through
+`spaces::close_one` — the same judgement again, under the same lock — rather
+than closing the id it listed.
 
 ### 6.3 Reuse cannot be "the Space's label is the thread's title"
 
@@ -373,6 +422,8 @@ the order of this page:
 | a restart reuses it (no Space per restart) | `threads::tests::a_restart_reuses_the_thread_space_rather_than_opening_a_new_one` |
 | a resolve closes one tab and leaves the Space, and `spaces::empty` agrees | `threads::tests::a_resolve_closes_the_tab_and_keeps_the_space_the_other_threads_are_in` |
 | the Space is closed with its last thread | `threads::tests::the_thread_space_is_closed_only_when_its_last_thread_leaves` |
+| a Space holding a tab no record names yet (the 2026-11-20 incident) is not empty, and is once the pane's own `hp_tab_label` is gone | `threads::tests::a_space_holding_a_tab_no_record_names_yet_is_not_empty` |
+| the recycle waits for the project lock a placement holds | `threads::tests::closing_empty_spaces_waits_for_a_placement_that_holds_the_lock` |
 | `worktree_remove` takes the target worktree only (real git, two panes in one Space) | `threads::tests::a_worktree_removal_in_a_shared_space_takes_that_worktree_and_no_other` |
 | a `kind = "tab"` / `"home"` record still parses, starts, and lands in the thread Space | `threads::tests::a_record_from_before_the_change_still_starts_in_the_thread_space` |
 | `kind = "tab"` / `"home"` read as `local`, are written as `local`, and `--kind` still takes them | `threads::tests::the_old_kind_names_are_local`, `tests::the_old_kind_names_still_work_and_say_so` |

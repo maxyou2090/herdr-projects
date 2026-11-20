@@ -7,7 +7,7 @@
 //! itself once its last thread and shell are gone. Both are closed here, once
 //! nothing runs in them and nobody looks at them.
 
-use crate::core::Core;
+use crate::core::{Core, L_TAB_LABEL, Pane};
 use crate::paths::Ctx;
 use crate::project::{self, Project};
 use crate::thread::{self, Status};
@@ -24,13 +24,40 @@ pub struct Space {
 /// project's thread Space once nothing is left in it. None of them may hold an
 /// agent, and every pane must be an idle shell. A focused Space or pane is kept
 /// unless `include_focused`.
+///
+/// A Space is "in use" when a live thread's **pane** is in it, and a pane says
+/// that two ways: a record names it (`pane_id`, `tab_id`), or the pane names
+/// itself (`hp_tab_label` is that thread's tab). Both are needed — the record is
+/// written after `tab_create`, and until it is, the pane is all there is
+/// (`docs/thread-space.md` §5).
+///
+/// Takes no lock: [`close_empty`] takes it around this call and the close, and
+/// `hp sweep` reads without one.
 pub fn empty(ctx: &Ctx, project: &Project, herdr: &Core, include_focused: bool) -> Vec<Space> {
-    let threads = thread::list(project);
+    // A twin, or a thread Space, can only exist where a thread was placed
+    // outside the home: without one, the cheap early return spares every
+    // project's tick three lists it cannot need.
+    let home_id = project.coordinator().map(|c| c.workspace_id).unwrap_or_default();
+    let recorded = thread::list(project);
+    let twins = recorded.iter().any(|t| !t.workspace_id.is_empty() && t.workspace_id != home_id);
+    if !twins {
+        return Vec::new();
+    }
+    let (Ok(workspaces), Ok(panes), Ok(agents)) = (herdr.workspace_list(), herdr.pane_list(), herdr.agent_list()) else {
+        return Vec::new();
+    };
+    // The records are read **after** the three listings, so a placement that
+    // finished while they ran is seen rather than missed. The lock is what makes
+    // the whole step one snapshot; this ordering keeps a caller that has none
+    // (`hp sweep`, which only lists) from judging with records older than its
+    // panes.
     let mut in_use = Vec::new();
     // The panes of open threads, across every project: the project's thread
     // Space is shared by all of them, so a Space is "in use" when one of **their
     // panes** is in it, not when a record merely names it (`docs/thread-space.md`).
     let mut open_panes: Vec<String> = Vec::new();
+    let mut open_tabs: Vec<String> = Vec::new();
+    let mut open_tab_labels: Vec<String> = Vec::new();
     let mut coordinators = Vec::new();
     for slug in project::list_slugs(&ctx.root) {
         let Ok(other) = Project::load(&ctx.root, &slug) else {
@@ -43,22 +70,24 @@ pub fn empty(ctx: &Ctx, project: &Project, herdr: &Core, include_focused: bool) 
             if !t.pane_id.is_empty() {
                 open_panes.push(t.pane_id);
             }
+            if !t.tab_id.is_empty() {
+                open_tabs.push(t.tab_id);
+            }
+            open_tab_labels.push(crate::labels::thread_tab_label(&t.id));
         }
         // Every open lane's Space, not just the default lane's (§9): a lane
         // whose coordinator still lives in a home Space keeps it from the
         // orphan sweep. A closed lane protects nothing (§6.4).
         coordinators.extend(crate::lanes::open_spaces(&other));
     }
-    // A twin, or a thread Space, can only exist where a thread was placed
-    // outside the home: without one, the cheap early return spares every
-    // project's tick three lists it cannot need.
-    let home_id = project.coordinator().map(|c| c.workspace_id).unwrap_or_default();
-    let twins = threads.iter().any(|t| !t.workspace_id.is_empty() && t.workspace_id != home_id);
-    if !twins {
-        return Vec::new();
-    }
-    let (Ok(workspaces), Ok(panes), Ok(agents)) = (herdr.workspace_list(), herdr.pane_list(), herdr.agent_list()) else {
-        return Vec::new();
+    // A pane a live thread runs in, however that is known. The second half is
+    // what covers the window between `tab_create` and the record write: such a
+    // pane used to look exactly like a shell somebody left behind, which is how
+    // a Space was closed under a thread that had just been placed (2026-11-20).
+    let live_thread_pane = |p: &Pane| {
+        open_panes.contains(&p.pane_id)
+            || (!p.tab_id.is_empty() && open_tabs.contains(&p.tab_id))
+            || p.tokens.get(L_TAB_LABEL).is_some_and(|label| open_tab_labels.contains(label))
     };
     let mut found = Vec::new();
     // Orphan home Spaces: plain Spaces still carrying the project's home
@@ -72,6 +101,7 @@ pub fn empty(ctx: &Ctx, project: &Project, herdr: &Core, include_focused: bool) 
             let own: Vec<_> = panes.iter().filter(|p| p.workspace_id == w.workspace_id).collect();
             if own.is_empty()
                 || own.len() != w.pane_count
+                || own.iter().any(|p| live_thread_pane(p))
                 || agents.iter().any(|a| a.workspace_id == w.workspace_id)
                 || (!include_focused && (w.focused || own.iter().any(|p| p.focused)))
                 || !own.iter().all(|p| herdr.pane_idle_shell(&p.pane_id))
@@ -91,7 +121,7 @@ pub fn empty(ctx: &Ctx, project: &Project, herdr: &Core, include_focused: bool) 
         let own_panes: Vec<_> = panes.iter().filter(|p| p.workspace_id == id).collect();
         if !coordinators.contains(&id)
             && own_panes.len() == space.pane_count
-            && !own_panes.iter().any(|p| open_panes.contains(&p.pane_id))
+            && !own_panes.iter().any(|p| live_thread_pane(p))
             && !agents.iter().any(|a| a.workspace_id == id)
             && (include_focused || (!space.focused && !own_panes.iter().any(|p| p.focused)))
             && own_panes.iter().all(|p| herdr.pane_idle_shell(&p.pane_id))
@@ -111,28 +141,64 @@ pub fn close(herdr: &Core, space: &Space) -> Result<(), crate::core::CoreError> 
 /// Forgets a Space on every thread of `project` that names it. The Space is
 /// gone, so a record that says its tab is there is stale — every kind now
 /// shares one Space, so the next placement makes a new one instead of writing
-/// into an id nobody lists.
+/// into an id nobody lists. The caller holds the project lock.
 fn forget(project: &Project, id: &str) {
     for t in thread::list(project).into_iter().filter(|t| t.workspace_id == id && t.status != Status::Resolved) {
-        let _ = thread::update(project, &t.id, |t| t.workspace_id.clear());
+        let _ = thread::update_locked(project, &t.id, |t| t.workspace_id.clear());
     }
 }
 
 /// Closes `project`'s empty Spaces, one inbox item each. A Space kept because
 /// something is busy or focused is retried on a later tick, silently.
+///
+/// The listings, the judgement and the closes are one step, under the project
+/// lock: a `thread start` holds the same lock from its Space lookup to the
+/// record that names its pane, so a tick cannot judge a Space on a snapshot
+/// older than a placement and then close it under the new tab (2026-11-20,
+/// `docs/thread-space.md` §5). The lock is the cost of that: three `hc` listings
+/// (about 0.6s here) are held while a placement waits.
 pub fn close_empty(ctx: &Ctx, project: &Project, herdr: &Core) -> Vec<anyhow::Error> {
     let mut errors = Vec::new();
-    for space in empty(ctx, project, herdr, false) {
-        match close(herdr, &space) {
-            Ok(()) => {
-                forget(project, &space.id);
-                errors.extend(crate::inbox::write(project, "space", &space.id, "closed empty Space", &format!("closed empty Space {} ({})", space.label, space.id), "").err());
+    let mut closed: Vec<Space> = Vec::new();
+    {
+        let _lock = match project.lock() {
+            Ok(lock) => lock,
+            Err(error) => {
+                errors.push(error);
+                return errors;
             }
-            Err(error) if error.code == "workspace_group_close_required" => {}
-            Err(error) => errors.push(anyhow::anyhow!("could not close empty Space {}: {error}", space.id)),
+        };
+        for space in empty(ctx, project, herdr, false) {
+            match close(herdr, &space) {
+                Ok(()) => {
+                    forget(project, &space.id);
+                    closed.push(space);
+                }
+                Err(error) if error.code == "workspace_group_close_required" => {}
+                Err(error) => errors.push(anyhow::anyhow!("could not close empty Space {}: {error}", space.id)),
+            }
         }
     }
+    // The items go out after the lock is released: `inbox::write` takes it too.
+    for space in closed {
+        errors.extend(crate::inbox::write(project, "space", &space.id, "closed empty Space", &format!("closed empty Space {} ({})", space.label, space.id), "").err());
+    }
     errors
+}
+
+/// Closes the Space at `id` when it is still empty **now**, under the project
+/// lock. `hp sweep` lists its orphans once and removes them after a
+/// confirmation, so its listing can be minutes old by the time one is removed;
+/// this is the same judgement the tick makes, made again at the close. Says
+/// whether it closed it. No inbox item: `sweep` prints its own line.
+pub fn close_one(ctx: &Ctx, project: &Project, herdr: &Core, id: &str, include_focused: bool) -> anyhow::Result<bool> {
+    let _lock = project.lock()?;
+    let Some(space) = empty(ctx, project, herdr, include_focused).into_iter().find(|space| space.id == id) else {
+        return Ok(false);
+    };
+    close(herdr, &space).map_err(|error| anyhow::anyhow!("{error}"))?;
+    forget(project, &space.id);
+    Ok(true)
 }
 
 /// Renames the project's thread Space to `<display name> Threads` when the

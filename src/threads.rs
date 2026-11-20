@@ -216,22 +216,22 @@ fn place_and_brief(ctx: &Ctx, project: &Project, view: &SessionView, id: &str, r
             // worktree and its tab is placed like any other thread's.
             let path = view.herdr.worktree_add(&record.repo, &branch, &base)?;
             let folder = std::path::PathBuf::from(&path);
-            let created = place(project, view, &record, &folder)?;
-            // Which worktree this pane stands in: what the cleanup reads to
-            // remove this one and no other in the same Space.
-            if let Err(error) = view.herdr.worktree_mark(&created.pane_id, &path) {
-                eprintln!("warning: could not mark pane {} as worktree {path} ({error})", created.pane_id);
-            }
-            // Recorded immediately, so a command killed midway still leaves a
-            // record `thread restart` can act on.
-            thread::update(project, id, |t| {
+            // The worktree's own fields recorded with the placement, so a command
+            // killed midway still leaves a record `thread restart` can act on.
+            let placed = place_thread(project, view, &record, &folder, |t| {
                 t.origin = origin;
                 t.base = base;
                 t.branch = branch;
-                t.worktree_path = path;
+                t.worktree_path = path.clone();
             })?;
-            finish_place(project, view, id, &created, &folder)?;
-            thread::load(project, id)?
+            // Which worktree this pane stands in: what the cleanup reads to
+            // remove this one and no other in the same Space. Marked outside the
+            // placement's lock, which is safe: the record already names the pane,
+            // so nothing judges that Space empty in between.
+            if let Err(error) = view.herdr.worktree_mark(&placed.pane_id, &path) {
+                eprintln!("warning: could not mark pane {} as worktree {path} ({error})", placed.pane_id);
+            }
+            placed
         }
         Kind::Local | Kind::Checkout => place_tab(project, view, &record)?,
         Kind::Adopted => bail!("an adopted thread is not placed by the binary"),
@@ -366,9 +366,10 @@ fn thread_folder(project: &Project, record: &Thread) -> Result<std::path::PathBu
 /// when this is the project's first thread: named after its display name, its
 /// tab named after the thread's id, in hp's labels and in the app alike.
 ///
-/// A new Space is made only when nothing names one (see [`threads_space`]). It
-/// is made under the project lock, and looked for once more there, so two
-/// threads started at the same moment cannot each open one.
+/// A new Space is made only when nothing names one (see [`threads_space`]). The
+/// caller holds `project.lock()` ([`place_thread`]), which is what keeps two
+/// threads started at the same moment from opening one each: the first one's
+/// record is written before the second looks.
 fn place(project: &Project, view: &SessionView, record: &Thread, folder: &Path) -> Result<crate::core::Created> {
     let tab = crate::labels::thread_tab_label(&record.id);
     let label = crate::labels::threads_space_label(&project.display_name());
@@ -376,26 +377,35 @@ fn place(project: &Project, view: &SessionView, record: &Thread, folder: &Path) 
     if let Some(space) = threads_space(project, &listed, &view.panes, &view.agents, Some(record)) {
         return Ok(view.herdr.tab_create(&space, folder, &tab)?);
     }
-    let _lock = project.lock()?;
-    let listed = view.herdr.workspace_list().unwrap_or_default();
-    if let Some(space) = threads_space(project, &listed, &view.panes, &view.agents, Some(record)) {
-        return Ok(view.herdr.tab_create(&space, folder, &tab)?);
-    }
     Ok(view.herdr.workspace_create(folder, &label, &tab)?)
 }
 
+/// Places a thread's tab and writes where it landed, all under the project
+/// lock: finding the Space, `tab_create`, and the record that names the pane are
+/// one step. `spaces::close_empty` holds the same lock, so a tick can never
+/// judge a Space on a listing taken before this placement finished and then
+/// close it under the new tab (2026-11-20, `docs/thread-space.md` §5).
+///
+/// `before_finish` writes the fields a kind records ahead of the tab's ids — a
+/// worktree's branch and path — and is empty for the rest.
+fn place_thread(project: &Project, view: &SessionView, record: &Thread, folder: &Path, before_finish: impl FnOnce(&mut Thread)) -> Result<Thread> {
+    let _lock = project.lock()?;
+    let created = place(project, view, record, folder)?;
+    thread::update_locked(project, &record.id, before_finish)?;
+    finish_place(project, view, &record.id, &created, folder)
+}
+
 /// Records where a placement ended, so the ticker, a restart and a resolve all
-/// read the same ids.
-fn finish_place(project: &Project, view: &SessionView, id: &str, created: &crate::core::Created, folder: &Path) -> Result<()> {
+/// read the same ids. The caller holds the project lock ([`place_thread`]).
+fn finish_place(project: &Project, view: &SessionView, id: &str, created: &crate::core::Created, folder: &Path) -> Result<Thread> {
     let cwd = view.herdr.pane_cwd(&created.pane_id).unwrap_or_default();
     let cwd = if cwd.is_empty() { folder.to_string_lossy().into_owned() } else { cwd };
-    thread::update(project, id, |t| {
+    thread::update_locked(project, id, |t| {
         t.cwd = cwd;
         t.workspace_id = created.workspace_id.clone();
         t.tab_id = created.tab_id.clone();
         t.pane_id = created.pane_id.clone();
-    })?;
-    Ok(())
+    })
 }
 
 /// A thread's tab in the project's shared thread Space, on its own folder for a
@@ -404,9 +414,7 @@ fn finish_place(project: &Project, view: &SessionView, id: &str, created: &crate
 /// thread.
 fn place_tab(project: &Project, view: &SessionView, record: &Thread) -> Result<Thread> {
     let folder = thread_folder(project, record)?;
-    let created = place(project, view, record, &folder)?;
-    finish_place(project, view, &record.id, &created, &folder)?;
-    thread::load(project, &record.id)
+    place_thread(project, view, record, &folder, |_| {})
 }
 
 /// Creates the thread directory, keeps it out of git, writes `brief.md`.
@@ -1044,7 +1052,7 @@ pub fn clean(ctx: &Ctx, project: &Project, t: &Thread, options: &Clean) -> Clean
     // pane).
     if t.kind != Kind::Adopted {
         match &view {
-            Some(view) => notes.extend(close_place(view, t)),
+            Some(view) => notes.extend(close_place(project, view, t)),
             None => notes.push("its tab was already closed".into()),
         }
     }
@@ -1264,7 +1272,11 @@ pub fn remove_worktree(ctx: &Ctx, project: &Project, record: &Thread, view: Opti
 /// there: a project's threads share one Space, so it is closed only when nothing
 /// is left in it, never because this thread left (`docs/thread-space.md`).
 /// Returns one note per thing.
-fn close_place(view: &SessionView, t: &Thread) -> Vec<String> {
+///
+/// The pane count and the closes are one step, under the project lock: a
+/// `thread start` placing a tab into this Space holds the same lock, so its new
+/// pane is never counted as absent and then closed underneath it.
+fn close_place(project: &Project, view: &SessionView, t: &Thread) -> Vec<String> {
     let mut notes = Vec::new();
     if t.pane_id.is_empty() {
         return vec!["its tab was already closed".into()];
@@ -1273,6 +1285,10 @@ fn close_place(view: &SessionView, t: &Thread) -> Vec<String> {
     if !thread::live_state(t, &view.agents, &view.panes, now).pane_exists {
         return vec!["its tab was already closed".into()];
     }
+    let _lock = match project.lock() {
+        Ok(lock) => lock,
+        Err(error) => return vec![format!("its tab was left open: {error}")],
+    };
     // The live pane's tab, not the recorded one: ids move after a restart.
     let pane = view.panes.iter().find(|p| thread::pane_matches(t, p));
     let tab = pane.map(|p| p.tab_id.clone()).unwrap_or_else(|| t.tab_id.clone());
@@ -1626,10 +1642,9 @@ mod tests {
             t.worktree_path = text.clone();
         })
         .unwrap();
-        let created = place(&world.project, &world.view(), &record, path).unwrap();
+        let created = place_thread(&world.project, &world.view(), &record, path, |_| {}).unwrap();
         world.view().herdr.worktree_mark(&created.pane_id, &text).unwrap();
-        finish_place(&world.project, &world.view(), &record.id, &created, path).unwrap();
-        thread::load(&world.project, &record.id).unwrap()
+        created
     }
 
     /// t-0062: every thread of a project runs in one Space of its own,
@@ -1742,6 +1757,78 @@ mod tests {
         let cleaned = clean(&ctx, &world.project, &record, &Clean { keep_worktree: false, copy_complete: true, merged_head: String::new() });
         assert!(cleaned.notes.iter().any(|n| n == "the Space it was the last thread in was closed"), "{:?}", cleaned.notes);
         assert!(!world.spaces().iter().any(|w| w.workspace_id == first.workspace_id), "nothing is left in it: {:?}", world.spaces());
+    }
+
+    /// 2026-11-20, law: `thread start` made the Space and its tab at 23:31:42.8,
+    /// and at 23:31:44.2 a tick's `spaces::empty` called that Space empty and
+    /// closed it, killing the pane and the thread 1.3s after it was placed. The
+    /// record is written after `tab_create`, so at that instant the only thing
+    /// saying the pane was a thread's was the pane's own `hp_tab_label`.
+    #[test]
+    fn a_space_holding_a_tab_no_record_names_yet_is_not_empty() {
+        let world = FakeProject::new();
+        // A thread resolved a moment before, its record still naming the Space:
+        // that is what gets the sweep past its cheap early return, as it did
+        // then.
+        let earlier = start_home(&world, "Earlier");
+        world.core.finish(&earlier.pane_id, "exited");
+        thread::update(&world.project, &earlier.id, |t| t.status = Status::Resolved).unwrap();
+        // The tab placed, the record not written yet: exactly the window.
+        let fresh = start_home(&world, "Research");
+        thread::update(&world.project, &fresh.id, |t| {
+            t.workspace_id.clear();
+            t.tab_id.clear();
+            t.pane_id.clear();
+        })
+        .unwrap();
+        let env = crate::paths::Env::for_test(world._home.path(), &[]);
+        let ctx = world.ctx(&env);
+        let herdr = Core::new("hc", "", &world.core);
+
+        let empty = crate::spaces::empty(&ctx, &world.project, &herdr, false);
+        assert!(!empty.iter().any(|s| s.id == fresh.workspace_id), "the pane says which thread it is: {empty:?}");
+
+        // Take that self-claim away and the Space is what it looked like before
+        // the fix: nothing left in it. This half is what makes the one above a
+        // test of the rule rather than of "never close anything".
+        herdr.set_labels(&fresh.pane_id, &[(crate::core::L_TAB_LABEL.to_string(), String::new())]).unwrap();
+        let empty = crate::spaces::empty(&ctx, &world.project, &herdr, false);
+        assert!(empty.iter().any(|s| s.id == fresh.workspace_id), "nothing names it any more: {empty:?}");
+    }
+
+    /// The tick's recycle holds the project lock across "list, judge, close",
+    /// and a placement holds that same lock from its Space lookup to the record
+    /// naming its pane (`threads::place_thread`). That is what makes them one
+    /// step: a tick that listed before a placement cannot close after it. Here
+    /// the lock is held by the test, and the close has to wait for it.
+    #[test]
+    fn closing_empty_spaces_waits_for_a_placement_that_holds_the_lock() {
+        struct NoCommands;
+        impl Runner for NoCommands {
+            fn run(&self, _: &Cmd) -> Result<crate::runner::Output> {
+                Ok(crate::runner::Output { code: Some(1), stdout: String::new(), stderr: "the session is not reachable".into(), timed_out: false })
+            }
+            fn run_foreground(&self, _: &Cmd, _: &mut dyn FnMut() -> bool) -> Result<Option<i32>> {
+                Ok(Some(1))
+            }
+        }
+        let home = tempfile::tempdir().unwrap();
+        let root = home.path().join("root");
+        let project = crate::project::create(&root, "demo", vec![]).unwrap();
+        let held = project.lock().unwrap();
+        let (done, waiting) = std::sync::mpsc::channel();
+        let worker_root = root.clone();
+        let worker = std::thread::spawn(move || {
+            let env = crate::paths::Env::for_test(&worker_root, &[]);
+            let ctx = Ctx { env: &env, root: worker_root.clone(), config_dir: worker_root.join("cfg"), runner: &NoCommands, detached_ticker: false };
+            let project = Project::load(&worker_root, "demo").unwrap();
+            let herdr = Core::new("hc", "", &NoCommands);
+            let _ = done.send(crate::spaces::close_empty(&ctx, &project, &herdr).len());
+        });
+        assert!(waiting.recv_timeout(std::time::Duration::from_millis(300)).is_err(), "the close waits while the lock is held");
+        drop(held);
+        assert_eq!(waiting.recv_timeout(std::time::Duration::from_secs(10)).ok(), Some(0), "and finishes once it is free");
+        worker.join().unwrap();
     }
 
     #[test]
@@ -1985,16 +2072,16 @@ mod tests {
         // which is the shape that reads as "this Space is one worktree".
         world.core.finish(&placed[1].pane_id, "exited");
         let record = thread::load(&world.project, &placed[1].id).unwrap();
-        let again = place(&world.project, &world.view(), &record, &paths[1]).unwrap();
+        let again = place_thread(&world.project, &world.view(), &record, &paths[1], |_| {}).unwrap();
         assert_eq!(again.workspace_id, ids[0], "a restart lands in the same Space: {:?}", world.spaces());
         assert_eq!(world.thread_spaces().len(), 1, "{:?}", world.spaces());
     }
 
     /// The same incident at its worst: two placements that took their snapshot
     /// of panes and agents before either Space existed, so neither can see the
-    /// other's pane or the other's record. The Space the first one made is
-    /// re-read under the project lock (`threads::place`), which is what has to
-    /// make the second one join it instead of making a second one.
+    /// other's pane. Each placement holds the project lock from the lookup to its
+    /// own record (`threads::place_thread`), so the second one reads the first
+    /// one's record and joins its Space instead of making a second one.
     #[test]
     fn two_threads_placed_from_one_snapshot_share_one_space() {
         let world = FakeProject::new();
@@ -2016,9 +2103,9 @@ mod tests {
         };
         let (first, second) = (record("first", &a), record("second", &b));
         // The first one lands, worktree label and all, before the second asks.
-        let made = place(&world.project, &view, &first, &a).unwrap();
+        let made = place_thread(&world.project, &view, &first, &a, |_| {}).unwrap();
         view.herdr.worktree_mark(&made.pane_id, &a.to_string_lossy()).unwrap();
-        let also = place(&world.project, &view, &second, &b).unwrap();
+        let also = place_thread(&world.project, &view, &second, &b, |_| {}).unwrap();
         assert_eq!(also.workspace_id, made.workspace_id, "one Space, not one each");
         assert_eq!(world.thread_spaces().len(), 1, "{:?}", world.spaces());
         assert_eq!(world.spaces().len(), 2, "the coordinator's Space and the threads' one: {:?}", world.spaces());
