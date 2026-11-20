@@ -140,28 +140,23 @@ pub fn close_empty(ctx: &Ctx, project: &Project, herdr: &Core) -> Vec<anyhow::Er
 /// [`sync_home_label`]: the ticker runs it every tick, so it reads one Space
 /// list and does nothing else unless the label is wrong.
 ///
-/// It finds the Space the way placement does (`threads::threads_space`), with the
-/// panes left out: a Space renaming is owed to is named by a thread's record,
-/// which is cheaper and truer than a pane (`docs/thread-space.md` §4). A Space a
-/// record names that carries no label at all is the one case that needs the
-/// second look — hp's label never landed on it (§6.5).
+/// It finds the Space the way placement does — `threads::threads_space`, the one
+/// judgement — with the panes left out: this runs on a ticker tick and cannot
+/// afford a pane listing (`docs/thread-space.md` §4.2). So it can be answered by
+/// two sources only, "a record of this project names that Space" (which covers a
+/// Space with no name yet, and one named under a display name that has since
+/// changed) and "the Space carries today's name, exactly". It cannot answer with
+/// another project's `<other display name> Threads`: a name ending in ` Threads`
+/// alone is not this project's, and there is deliberately no second, laxer look
+/// after this one — that second look is how ten projects' ticks took turns
+/// renaming one Space (2026-11-20).
 pub fn sync_threads_label(project: &Project, herdr: &Core) {
     let label = crate::labels::threads_space_label(&project.display_name());
     let Ok(workspaces) = herdr.workspace_list() else {
         return;
     };
     let homes = crate::coordinator::coordinator_space_ids(project);
-    let named = |w: &crate::core::Workspace| crate::labels::is_threads_space_label(&w.label) || w.label.is_empty();
-    let found = crate::threads::threads_space(project, &workspaces, &[], &[], None)
-        .or_else(|| {
-            thread::list(project)
-                .into_iter()
-                .filter(|t| !t.workspace_id.is_empty() && !t.title.is_empty())
-                .find_map(|t| workspaces.iter().find(|w| w.workspace_id == t.workspace_id && named(w)).cloned())
-                .map(|w| w.workspace_id)
-        })
-        .filter(|id| !homes.contains(id));
-    let Some(id) = found else {
+    let Some(id) = crate::threads::threads_space(project, &workspaces, &[], &[], None).filter(|id| !homes.contains(id)) else {
         return;
     };
     if herdr.workspace_label(&id).unwrap_or_default() != label {
