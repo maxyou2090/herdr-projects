@@ -37,8 +37,18 @@ hp ticker status
 The plist has `RunAtLoad` and an unconditional `KeepAlive`: launchd starts the
 ticker after a reboot and after any exit, so a crashed or killed loop comes
 back on its own, and every exit leaves its reason in `~/.herdr-projects/.ticker.log`.
-`hp doctor` has a `ticker agent` line for a plist that is missing, out of date
-or not loaded; `hp doctor --fix` rewrites and reloads it.
+
+No `hp` command restarts a ticker that is running. A plist that is out of date
+(say, a build in a worktree ran one) is rewritten, and the new text is what the
+*next* start uses; the loop that is up keeps running. Unloading is reserved for
+a job launchd has and nothing is running under.
+
+`hp ticker status` prints the plist's state and repairs it: a missing or
+out-of-date plist is written, and a job launchd has not loaded is loaded, so a
+silent machine is one command from being announced again. A load that fails is
+written to `.ticker.log` too, and the plist launchd refused is put back. `hp
+doctor` has the same `ticker agent` line for a plist that is missing, out of
+date or not loaded; `hp doctor --fix` repairs it.
 
 ## 2. Create a project
 
