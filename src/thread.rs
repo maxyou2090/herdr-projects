@@ -221,6 +221,15 @@ fn write_record(project: &Project, thread: &Thread) -> Result<()> {
 /// touch only the fields its step owns, writes.
 pub fn update(project: &Project, id: &str, change: impl FnOnce(&mut Thread)) -> Result<Thread> {
     let _lock = project.lock()?;
+    update_locked(project, id, change)
+}
+
+/// The same write, for a caller that already holds `project.lock()`.
+///
+/// [`Project::lock`] opens the lock file each time, so a lock taken again in the
+/// same process waits on the one already held and never returns: every write a
+/// step makes inside somebody else's critical section has to come through here.
+pub fn update_locked(project: &Project, id: &str, change: impl FnOnce(&mut Thread)) -> Result<Thread> {
     let mut thread = load(project, id)?;
     change(&mut thread);
     thread.updated = project::now();
