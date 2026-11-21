@@ -1023,7 +1023,18 @@ pub fn open(ctx: &Ctx, slug: &str, options: &OpenOptions) -> Result<()> {
     } else {
         Some(lane_registry.coordinator_for(&project, &target_lane))
     };
+    // An **empty** socket is not the default session, it is no record at all:
+    // a record only `lanes.json` produced (`Project::coordinator` synthesizes
+    // it from the default lane) has an empty socket until an `open` writes
+    // one, and `session_key("")` coincides with the default session's key
+    // only by accident. Treating that as "bound to the default session"
+    // refused every first `open` in a named session (t-0083: `hp new demo`
+    // writes the registry, so `dev-hp open demo --session hp-dev` bailed with
+    // "belongs to the herdr session ``"). The refusal below stays as narrow as
+    // it was: a record that names another *live* session, or one that no
+    // longer runs (which `--rebind` moves).
     if let Some(record) = &previous
+        && !record.socket.trim().is_empty()
         && !crate::core::same_session(&record.socket, &socket)
     {
         if crate::core::session_alive(&ctx.env.hc_bin(), &record.socket, ctx.runner) {
@@ -2877,6 +2888,120 @@ mod tests {
         // An `Ambiguous` pane has no lane and is never a target, however idle.
         let ambiguous = vec![pane("w9:p9", "", "idle", 99)];
         assert!(nudge_target(&project, &ambiguous, now).is_empty(), "no lane, no nudge");
+    }
+}
+
+/// Where a project is opened is the session's business: `open` records it, and
+/// only a record that really names another session refuses (t-0083).
+#[cfg(test)]
+mod session_tests {
+    use super::*;
+    use crate::runner::{Cmd, Output, Runner};
+
+    fn ctx<'a>(home: &Path, root: &Path, runner: &'a dyn Runner) -> Ctx<'a> {
+        let env: &'static crate::paths::Env = Box::leak(Box::new(crate::paths::Env::for_test(home, &[])));
+        Ctx { env, root: root.to_path_buf(), config_dir: home.join("cfg"), runner, detached_ticker: false }
+    }
+
+    fn in_session(session: &str) -> OpenOptions {
+        OpenOptions {
+            session: crate::paths::SessionFlags { session: Some(session.into()) },
+            profile: Some("pi".into()),
+            ..OpenOptions::default()
+        }
+    }
+
+    /// `hp new` writes `lanes.json`; `coordinator.json` arrives with the first
+    /// `open`. In between, `Project::coordinator` synthesizes a record from the
+    /// default lane whose socket is empty — no record, not "the default
+    /// session".
+    fn registry_only(root: &Path) -> Project {
+        let project = crate::project::create(root, "demo", vec![]).unwrap();
+        crate::lanes::Registry {
+            lanes: vec![crate::lanes::Lane {
+                id: "c-1".into(),
+                name: "default".into(),
+                label: "Demo".into(),
+                ..Default::default()
+            }],
+            default: "c-1".into(),
+            next: 2,
+        }
+        .save(&project)
+        .unwrap();
+        assert!(!project.coordinator_path().exists(), "only lanes.json is there");
+        assert_eq!(project.coordinator().unwrap().socket, "", "and the record says nothing about a session");
+        project
+    }
+
+    /// The bug t-0083 records: the empty socket was read as the default session
+    /// (`session_key("")` is the default session's key), so the first `open` in
+    /// a named session bailed with "belongs to the herdr session ``".
+    #[test]
+    fn a_project_with_only_a_lane_registry_opens_in_a_named_session() {
+        let home = tempfile::tempdir().unwrap();
+        let root = home.path().join("root");
+        let project = registry_only(&root);
+        let fake = crate::fake_hc::FakeCore::new();
+
+        open(&ctx(home.path(), &root, &fake), "demo", &in_session("hp-dev")).unwrap();
+
+        assert_eq!(project.coordinator().unwrap().socket, "hp-dev", "the session this `open` ran in is recorded");
+    }
+
+    /// The refusal this must not loosen: a record naming another session that
+    /// still answers is opened there, not here.
+    #[test]
+    fn a_record_naming_another_live_session_still_refuses() {
+        let home = tempfile::tempdir().unwrap();
+        let root = home.path().join("root");
+        let project = registry_only(&root);
+        project.update_coordinator(|c| c.socket = "hp-other".into()).unwrap();
+        let fake = crate::fake_hc::FakeCore::new();
+
+        let error = open(&ctx(home.path(), &root, &fake), "demo", &in_session("hp-dev")).unwrap_err();
+
+        assert!(format!("{error:#}").contains("belongs to the herdr session `hp-other`"), "{error:#}");
+        assert_eq!(project.coordinator().unwrap().socket, "hp-other", "the record is not rewritten");
+    }
+
+    /// A session that is gone is not a wall: `--rebind` moves the project.
+    #[test]
+    fn a_session_that_no_longer_runs_needs_rebind() {
+        let home = tempfile::tempdir().unwrap();
+        let root = home.path().join("root");
+        let project = registry_only(&root);
+        project.update_coordinator(|c| c.socket = "hp-gone".into()).unwrap();
+        let fake = crate::fake_hc::FakeCore::new();
+        let gone = OneSessionGone { core: &fake, gone: "hp-gone" };
+
+        let error = open(&ctx(home.path(), &root, &gone), "demo", &in_session("hp-dev")).unwrap_err();
+        assert!(format!("{error:#}").contains("pass --rebind"), "{error:#}");
+        assert_eq!(project.coordinator().unwrap().socket, "hp-gone", "nothing happens without the flag");
+
+        open(&ctx(home.path(), &root, &gone), "demo", &OpenOptions { rebind: true, ..in_session("hp-dev") }).unwrap();
+        assert_eq!(project.coordinator().unwrap().socket, "hp-dev", "and with it the project moves");
+    }
+
+    /// A core where one named session does not answer; every other call is the
+    /// fake's. `hc server status` carries its session in `HC_SESSION`.
+    struct OneSessionGone<'a> {
+        core: &'a crate::fake_hc::FakeCore,
+        gone: &'a str,
+    }
+
+    impl Runner for OneSessionGone<'_> {
+        fn run(&self, cmd: &Cmd) -> anyhow::Result<Output> {
+            let asks_gone = cmd.env.iter().any(|(key, value)| key == "HC_SESSION" && value == self.gone);
+            if asks_gone && cmd.args.iter().map(String::as_str).eq(["server", "status"]) {
+                return Ok(Output { code: Some(1), stderr: format!("no session {}", self.gone), ..Output::default() });
+            }
+            self.core.run(cmd)
+        }
+
+        fn run_foreground(&self, cmd: &Cmd, poll: &mut dyn FnMut() -> bool) -> anyhow::Result<Option<i32>> {
+            self.core.run_foreground(cmd, poll)
+        }
     }
 }
 
