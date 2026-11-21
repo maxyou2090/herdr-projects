@@ -514,9 +514,13 @@ So visibility is a standing output, not an event:
   between turns, so the ticker records the start of the turn (from `working`
   to anything else) and the longest turn of the day in `.state/ticker.json`
   (`State::coordinator_turns`); `steps::turn_clock` is the one function that
-  reads it, `hp context` prints it and `hp thread audit` measures it
-  (`coordinator-long-turn`, ten minutes). The count and the wait are the
-  unhandled items this digest already lists, so the line costs no extra read.
+  reads it, `hp context` prints it, `hp thread audit` measures it
+  (`coordinator-long-turn`, ten minutes) and the ticker stops the turn on the
+  same number (`coordinator_turn_limit` in `PROJECT.md`, twenty minutes by
+  default; `off` to never) — see `operations.md`, Nudges. Once the turn is past
+  that limit the line adds `· the ticker will stop this turn at 20m`. The count
+  and the wait are the unhandled items this digest already lists, so the line
+  costs no extra read.
   A pane the ticker has never recorded — a thread's pane, a stopped ticker, a
   fresh project — prints no line at all rather than zeros.
 - **`hp lane list`** prints the same fact per lane and per live pane (the

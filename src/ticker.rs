@@ -1001,6 +1001,9 @@ pub fn tick(ctx: &Ctx, log: &Log, memory: &mut Memory) -> bool {
                 for fixed in &seen.repaired {
                     log.line(&format!("{slug}: lane {}'s coordinator repaired on pane {}: {}", fixed.lane, fixed.pane, fixed.why));
                 }
+                for stop in &seen.interrupted {
+                    log.line(&format!("{slug}: {}", steps::interrupt_note(stop.secs)));
+                }
                 reachable.push((project, seen))
             }
             Ok(None) => unreachable.push(project),
@@ -1192,6 +1195,9 @@ pub struct Seen {
     /// Every `Ambiguous` pane this tick with the resolver's reason, for the
     /// once-per-state `lane` item of §5.4.
     ambiguous: Vec<(String, String)>,
+    /// Coordinator turns this tick stopped for running past
+    /// `coordinator_turn_limit`, one log line each.
+    interrupted: Vec<steps::Interrupted>,
 }
 
 /// The `nudge held` line's tail: every lane that could not deliver, with its
@@ -1523,6 +1529,22 @@ fn tick_cheap_body(ctx: &Ctx, project: &Project, sessions: &mut Sessions, state:
     let live_panes: Vec<String> = panes.iter().map(|p| p.pane_id.clone()).collect();
     steps::track_coordinator_turns(state, &working, &live_panes, jiff::Timestamp::now());
 
+    // A turn past the project's limit is stopped here, on the same measurement
+    // the audit warns about at ten minutes (`PROJECT.md`'s
+    // `coordinator_turn_limit`, twenty minutes by default). The warning alone
+    // cannot reach a coordinator that is inside the turn it is about — the nudge
+    // waits for an empty input box in a quiet pane — so a runaway turn used to
+    // need a person to press Escape (2026-11-21, rexa: 41 minutes of ssh retries
+    // in one turn).
+    let mut interrupted = Vec::new();
+    if let Ok((settings, _)) = project.read_project_md() {
+        let stops = steps::interrupt_long_turns(project, state, &settings, &herdr, &coordinators, jiff::Timestamp::now());
+        interrupted = stops.stopped;
+        for error in stops.errors {
+            first_error.get_or_insert(error);
+        }
+    }
+
     let pass = thread_pass(project, &herdr, &record.socket, &open_threads(project), &agents, &panes, None)?;
     // Progress records of panes that are gone are dropped; a new agent in a
     // reused pane id is told apart by its terminal id.
@@ -1578,6 +1600,7 @@ fn tick_cheap_body(ctx: &Ctx, project: &Project, sessions: &mut Sessions, state:
             coordinator: !coordinators.is_empty(),
             session_lost: recorded_panes >= 2 && missing_panes == recorded_panes,
             nudge_held,
+            interrupted,
             lost_coordinators: repair.lost,
             repaired: repair.fixed,
             ambiguous,
@@ -2335,6 +2358,81 @@ mod tests {
     /// The other half: nothing to repair means an item and a named hold, not
     /// silence. `no coordinator is idle long enough` would send a reader
     /// looking for a busy coordinator that does not exist.
+    /// The 2026-11-21 incident end to end: a coordinator 41 minutes into one
+    /// turn, a ticker that stops it exactly once, the log line a person can act
+    /// on, and the `thread-audit` item the warning path still writes — the
+    /// warning could never reach a coordinator inside the turn it is about.
+    /// A thread's pane, however long it works, is never the ticker's to stop.
+    #[test]
+    fn a_coordinator_turn_past_the_limit_is_interrupted_once() {
+        let home = tempfile::tempdir().unwrap();
+        let root = home.path().join("root");
+        let project = project::create(&root, "rexa", vec![]).unwrap();
+        let core = crate::fake_hc::FakeCore::new();
+        let dir = project.canonical_dir().to_string_lossy().into_owned();
+        let pane = "hp-rexa-coordinator";
+        core.terminal(pane, &dir, &[("hp_agent", "hpc-rexa"), ("hp_kind", "pi"), ("hp_project", "rexa")]);
+        core.set_status(pane, "working");
+        core.set_turn(pane, 7);
+        // A thread's pane, working since long before: the audit may look at it,
+        // the ticker must not stop it.
+        let thread_pane = "hp-rexa-t-0001";
+        core.terminal(thread_pane, &format!("{dir}/threads/t-0001"), &[("hp_agent", "hp-rexa-t-0001"), ("hp_kind", "pi")]);
+        core.set_status(thread_pane, "working");
+        core.set_turn(thread_pane, 3);
+        project
+            .update_coordinator(|c| {
+                c.pane_id = pane.into();
+                c.agent_name = "hpc-rexa".into();
+                c.cwd = dir.clone();
+            })
+            .unwrap();
+
+        let now = jiff::Timestamp::now();
+        let ago = |secs: i64| now.checked_sub(jiff::SignedDuration::from_secs(secs)).unwrap().to_string();
+        // The turn the ticker measured, and an audit that has run before (a
+        // first sight only records the clock, so no item would be written).
+        let mut state = steps::State::default();
+        for (id, since) in [(pane, ago(41 * 60)), (thread_pane, ago(30 * 60))] {
+            state.coordinator_turns.insert(id.into(), steps::Turn { since, longest: 0, day: String::new() });
+        }
+        state.last_audit = ago(31 * 60);
+        steps::save_state(&project, &state).unwrap();
+        crate::coordinator::save_live(
+            &project,
+            &[
+                crate::coordinator::LivePane {
+                    pane_id: pane.into(),
+                    agent_status: "working".into(),
+                    state_change_seq: 7,
+                    pair_since: ago(41 * 60),
+                    ..Default::default()
+                },
+            ],
+        )
+        .unwrap();
+
+        let env = Env::for_test(home.path(), &[]);
+        let ctx = Ctx { env: &env, root: root.clone(), config_dir: home.path().join("cfg"), runner: &core, detached_ticker: false };
+        tick_project(&ctx, &project).unwrap();
+        let interrupts = || core.calls.borrow().iter().filter(|call| call.contains("--json interrupt")).cloned().collect::<Vec<_>>();
+        assert_eq!(interrupts().len(), 1, "the coordinator, once: {:?}", core.calls.borrow());
+        assert!(interrupts()[0].contains(&format!("interrupt {pane}")), "{:?}", interrupts());
+        let state = steps::load_state(&project);
+        assert_eq!(state.interrupted_turns.get(pane), Some(&7), "the stopped turn is remembered");
+        assert!(!state.interrupted_turns.contains_key(thread_pane), "a thread's pane is not the ticker's turn");
+        let items = inbox::unhandled(&project);
+        let long: Vec<&inbox::Item> = items.iter().filter(|item| item.kind == steps::AUDIT_KIND && item.event == "its coordinator's turn has run long").collect();
+        assert_eq!(long.len(), 1, "the warning is still written: {items:?}");
+
+        // The same turn, still saying `working` (a harness that ignored the
+        // stop key): the hand that stopped it stays its hand.
+        core.set_status(pane, "working");
+        core.set_turn(pane, 7);
+        tick_project(&ctx, &project).unwrap();
+        assert_eq!(interrupts().len(), 1, "once per turn, not once per tick: {:?}", core.calls.borrow());
+    }
+
     #[test]
     fn a_coordinator_that_is_gone_outright_leaves_one_item_and_a_named_hold() {
         let home = tempfile::tempdir().unwrap();

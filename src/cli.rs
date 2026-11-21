@@ -197,7 +197,7 @@ enum Command {
         #[arg(long)]
         yes: bool,
     },
-    /// Change one setting in PROJECT.md (name, coordinator_profile, thread_profile, auto_resolve_days, nudge, repos.add, repos.remove)
+    /// Change one setting in PROJECT.md (name, coordinator_profile, thread_profile, auto_resolve_days, nudge, coordinator_turn_limit, repos.add, repos.remove)
     Set { slug: String, key: String, value: String },
     /// Open a file: a text file in an editor in this terminal ($VISUAL, else $EDITOR), anything else with the system opener
     OpenFile { path: PathBuf },

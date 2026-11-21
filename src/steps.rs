@@ -187,6 +187,16 @@ pub struct State {
     /// ([`crate::audit::COORDINATOR_LONG_TURN_SECS`]).
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub coordinator_turns: BTreeMap<String, Turn>,
+    /// coordinator pane id -> core's `turn` counter for the turn the ticker
+    /// already stopped for running long (`PROJECT.md`'s
+    /// `coordinator_turn_limit`). One stop per turn: the same `turn` is never
+    /// interrupted twice, a turn that advanced is a new one and may be stopped
+    /// again, and a pane that is gone drops its entry. This is persisted but
+    /// not load-bearing: a ticker restarted with it lost stops that turn once
+    /// more, which is the harmless direction (the other one would leave a
+    /// runaway turn running).
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub interrupted_turns: BTreeMap<String, u64>,
     /// The default lane in force for this load. Not part of the file: the
     /// per-lane maps are keyed by lane id, and an empty lane argument reads as
     /// this one. `State::default()` (a test or a fresh ticker) falls back to
@@ -295,6 +305,104 @@ pub fn turn_text(secs: i64) -> String {
     }
 }
 
+/// How long a coordinator pane must have held its current `(status, turn)` pair
+/// before the ticker may stop that turn.
+///
+/// `open` reuses a recorded pane id, so the ticker's `coordinator_turns` can
+/// hold a start from the session that pane ran before: the first tick after
+/// `open` would then measure a minute-old priming turn as hours old and stop
+/// it. A pair younger than this is evidence that the clock in the state
+/// belongs to the previous program, not this one, so nothing is stopped on it
+/// — and a turn this long has a pair this old, so a real runaway turn never
+/// waits on this rule.
+pub const TURN_STOP_GRACE_SECS: i64 = 60;
+
+/// One coordinator turn the ticker stopped.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Interrupted {
+    pub pane: String,
+    /// How long the turn had run when it was stopped.
+    pub secs: i64,
+}
+
+/// What one pass over the coordinator panes did: the turns it stopped, and the
+/// stops core refused (the pane was gone, the session did not answer).
+#[derive(Debug, Default)]
+pub struct TurnStops {
+    pub stopped: Vec<Interrupted>,
+    pub errors: Vec<anyhow::Error>,
+}
+
+/// The ticker's log line after a stop. `slug: ` is the caller's, and the
+/// second half is what a person reading the log can act on.
+pub fn interrupt_note(secs: i64) -> String {
+    format!("interrupted the coordinator's turn after {} (set coordinator_turn_limit to change this)", turn_text(secs))
+}
+
+/// Stop a coordinator turn that has run past `PROJECT.md`'s
+/// `coordinator_turn_limit` (twenty minutes by default, `off` to never).
+///
+/// The measurement is [`turn_clock`], the same one `hp context` prints and the
+/// audit warns on at ten minutes: the warning says the turn is long, this ends
+/// it. Only a pane the resolver made **this tick's** coordinator is touched
+/// (`coordinators` comes from `coordinator::discover`, never a guess), only
+/// while its program says `working` — `blocked` waits for a person and `idle`
+/// is not a turn — and only when it has a lane: an `Ambiguous` pane is never
+/// prompted, so it is never interrupted either.
+///
+/// Once per turn, keyed by core's own `turn` counter
+/// ([`State::interrupted_turns`]): a successful stop records the turn, the next
+/// tick of the same turn stays its hand, and a turn that advanced (the harness
+/// started another) may be stopped again once it is long enough.
+///
+/// Nothing here writes an item, logs or prints: the caller does that, so this
+/// stays usable from the ticker and from a test.
+pub fn interrupt_long_turns(project: &Project, state: &mut State, settings: &Settings, hc: &crate::core::Core, coordinators: &[crate::coordinator::LivePane], now: jiff::Timestamp) -> TurnStops {
+    let mut stops = TurnStops::default();
+    // A pane that is gone keeps no record of a turn: its id can be reused by a
+    // later coordinator, and that one's turns are its own.
+    state.interrupted_turns.retain(|pane, _| coordinators.iter().any(|c| &c.pane_id == pane));
+    let Some(limit) = settings.coordinator_turn_limit.secs() else {
+        return stops; // `off`: a person has turned the hard stop off
+    };
+    let split = crate::lanes::split_in_use(project);
+    for pane in coordinators {
+        if pane.agent_status != "working" {
+            continue;
+        }
+        // Only a pane the resolver placed in a lane: on a split project an
+        // `Ambiguous` pane carries no lane, and nothing is typed into a pane
+        // whose lane nobody can name — nothing is stopped there either. A
+        // project without `lanes.json` has one lane and no lane field at all.
+        if split && pane.lane.is_empty() {
+            continue;
+        }
+        if state.interrupted_turns.get(&pane.pane_id) == Some(&pane.state_change_seq) {
+            continue;
+        }
+        if crate::thread::seconds_since(&pane.pair_since, now) < TURN_STOP_GRACE_SECS {
+            continue;
+        }
+        let Some(secs) = turn_clock(state, &pane.pane_id, now).and_then(|clock| clock.working_secs) else {
+            continue;
+        };
+        if secs < limit {
+            continue;
+        }
+        match hc.interrupt(&pane.pane_id) {
+            Ok(()) => {
+                state.interrupted_turns.insert(pane.pane_id.clone(), pane.state_change_seq);
+                stops.stopped.push(Interrupted { pane: pane.pane_id.clone(), secs });
+            }
+            // Recorded as a failure and retried on a later tick: the pane may
+            // be at its last breath, and a stop that never happened must not
+            // be remembered as one that did.
+            Err(error) => stops.errors.push(anyhow::anyhow!("{error}").context(format!("interrupt {} after {}", pane.pane_id, turn_text(secs)))),
+        }
+    }
+    stops
+}
+
 /// Accepts both the pre-lanes scalar shape and the per-lane map of §4.4. A
 /// scalar is the default lane's value; the key is [`crate::lanes::FALLBACK_ID`]
 /// because every scalar file predates lanes and therefore belongs to `c-1`.
@@ -377,6 +485,7 @@ pub fn save_state(project: &Project, state: &State) -> Result<()> {
         last_audit: &'a str,
         coordinator_lost: &'a BTreeMap<String, String>,
         coordinator_turns: &'a BTreeMap<String, Turn>,
+        interrupted_turns: &'a BTreeMap<String, u64>,
     }
     project::write_json(
         &path,
@@ -403,6 +512,7 @@ pub fn save_state(project: &Project, state: &State) -> Result<()> {
             last_audit: &state.last_audit,
             coordinator_lost: &state.coordinator_lost,
             coordinator_turns: &state.coordinator_turns,
+            interrupted_turns: &state.interrupted_turns,
         },
     )
 }
@@ -1714,6 +1824,130 @@ mod tests {
             Some(12 * 60 + 41),
             "{text}"
         );
+    }
+
+    /// One coordinator pane as `coordinator::discover` hands it over: its
+    /// program says `status` on core's `turn`, and the ticker first saw that
+    /// pair at `pair_since`.
+    fn live_coordinator(pane: &str, status: &str, turn: u64, pair_since: &str) -> crate::coordinator::LivePane {
+        crate::coordinator::LivePane {
+            pane_id: pane.into(),
+            agent_status: status.into(),
+            state_change_seq: turn,
+            pair_since: pair_since.into(),
+            ..crate::coordinator::LivePane::default()
+        }
+    }
+
+    /// A state whose turn clock for `pane` started at `since`, the way the
+    /// ticker's first sight of `working` writes it.
+    fn turn_started_at(pane: &str, since: &str) -> State {
+        let mut state = State::default();
+        state.coordinator_turns.insert(pane.into(), Turn { since: since.into(), longest: 0, day: since[..10].into() });
+        state
+    }
+
+    /// The default twenty minutes is where a coordinator's turn stops: once it
+    /// is past, the pane gets one `hc interrupt`, the same turn is never
+    /// stopped twice, and a turn that advanced may be stopped again.
+    #[test]
+    fn a_turn_past_the_limit_is_stopped_once_per_turn() {
+        let root = tempfile::tempdir().unwrap();
+        let project = project::create(root.path(), "rexa", vec![]).unwrap();
+        let pane = "hp-rexa-coordinator";
+        let core = crate::fake_hc::FakeCore::new();
+        core.terminal(pane, &project.canonical_dir().to_string_lossy(), &[("hp_agent", "hpc-rexa")]);
+        core.set_status(pane, "working");
+        core.set_turn(pane, 7);
+        let hc = crate::core::Core::new("hc", "", &core);
+        let settings = Settings::default();
+        let now = at("2026-11-21T07:45:00Z");
+        // The pair the ticker watches is as old as the turn: this working
+        // state is the one it measured, not a restart of the same pane.
+        let panes = [live_coordinator(pane, "working", 7, "2026-11-21T07:04:00Z")];
+        let mut state = turn_started_at(pane, "2026-11-21T07:04:00Z");
+
+        let stops = interrupt_long_turns(&project, &mut state, &settings, &hc, &panes, now);
+        assert!(stops.errors.is_empty(), "{:#?}", stops.errors);
+        assert_eq!(stops.stopped, [Interrupted { pane: pane.into(), secs: 41 * 60 }]);
+        assert_eq!(state.interrupted_turns.get(pane), Some(&7), "the turn that was stopped is remembered");
+        let interrupts = |core: &crate::fake_hc::FakeCore| core.calls.borrow().iter().filter(|call| call.contains("interrupt")).count();
+        assert_eq!(interrupts(&core), 1, "{:?}", core.calls.borrow());
+        assert!(core.calls.borrow().iter().any(|call| call.contains(&format!("interrupt {pane}"))), "{:?}", core.calls.borrow());
+
+        // The same turn, one tick later and still saying `working`: the hand
+        // that already stopped it stays its hand.
+        let stops = interrupt_long_turns(&project, &mut state, &settings, &hc, &panes, at("2026-11-21T07:45:15Z"));
+        assert!(stops.stopped.is_empty(), "{:#?}", stops.stopped);
+        assert_eq!(interrupts(&core), 1, "once per turn: {:?}", core.calls.borrow());
+
+        // A turn that advanced is a new turn; long again, it is stopped again.
+        core.set_turn(pane, 8);
+        let panes = [live_coordinator(pane, "working", 8, "2026-11-21T07:04:00Z")];
+        let stops = interrupt_long_turns(&project, &mut state, &settings, &hc, &panes, at("2026-11-21T07:46:00Z"));
+        assert_eq!(stops.stopped.len(), 1, "{:#?}", stops.stopped);
+        assert_eq!(interrupts(&core), 2, "{:?}", core.calls.borrow());
+
+        assert_eq!(
+            interrupt_note(21 * 60),
+            "interrupted the coordinator's turn after 21m00s (set coordinator_turn_limit to change this)"
+        );
+    }
+
+    /// The warning band, the `off` switch, a program that waits for a person,
+    /// and the first minute after a pane changed hands: none of them is
+    /// stopped, and none of them is stopped *silently twice* either.
+    #[test]
+    fn short_turns_off_blocked_panes_and_fresh_hand_overs_are_left_alone() {
+        let root = tempfile::tempdir().unwrap();
+        let project = project::create(root.path(), "rexa", vec![]).unwrap();
+        let pane = "hp-rexa-coordinator";
+        let core = crate::fake_hc::FakeCore::new();
+        core.terminal(pane, &project.canonical_dir().to_string_lossy(), &[("hp_agent", "hpc-rexa")]);
+        core.set_status(pane, "working");
+        core.set_turn(pane, 7);
+        let hc = crate::core::Core::new("hc", "", &core);
+        let now = at("2026-11-21T07:45:00Z");
+        let interrupts = |core: &crate::fake_hc::FakeCore| core.calls.borrow().iter().filter(|call| call.contains("interrupt")).count();
+        let panes = [live_coordinator(pane, "working", 7, "2026-11-21T07:04:00Z")];
+
+        // Twelve minutes is the warning's business ([`crate::audit`]), not the
+        // hard stop's: a legitimate slow `hp` action must not be cut.
+        let mut state = turn_started_at(pane, "2026-11-21T07:33:00Z");
+        let stops = interrupt_long_turns(&project, &mut state, &Settings::default(), &hc, &panes, now);
+        assert!(stops.stopped.is_empty() && stops.errors.is_empty(), "{stops:#?}");
+        assert_eq!(interrupts(&core), 0);
+
+        // `coordinator_turn_limit = "off"`: a person has turned it off.
+        let off = Settings { coordinator_turn_limit: crate::project::TurnLimit::Off, ..Settings::default() };
+        let mut state = turn_started_at(pane, "2026-11-21T07:04:00Z");
+        let stops = interrupt_long_turns(&project, &mut state, &off, &hc, &panes, now);
+        assert!(stops.stopped.is_empty(), "{stops:#?}");
+        assert_eq!(interrupts(&core), 0);
+
+        // A program waiting for a person is not a runaway turn.
+        let blocked = [live_coordinator(pane, "blocked", 7, "2026-11-21T07:04:00Z")];
+        let mut state = turn_started_at(pane, "2026-11-21T07:04:00Z");
+        let stops = interrupt_long_turns(&project, &mut state, &Settings::default(), &hc, &blocked, now);
+        assert!(stops.stopped.is_empty(), "{stops:#?}");
+        assert_eq!(interrupts(&core), 0);
+
+        // `open` reusing the pane id: the pair is a minute old, so the 41m
+        // clock in the state belongs to the program that ran before this one.
+        let fresh = [live_coordinator(pane, "working", 7, "2026-11-21T07:44:30Z")];
+        let mut state = turn_started_at(pane, "2026-11-21T07:04:00Z");
+        let stops = interrupt_long_turns(&project, &mut state, &Settings::default(), &hc, &fresh, now);
+        assert!(stops.stopped.is_empty(), "{stops:#?}");
+        assert_eq!(interrupts(&core), 0);
+
+        // A project with lanes stops only a pane whose lane it can name.
+        crate::lanes::Registry::default().save(&project).unwrap();
+        let ambiguous = [live_coordinator(pane, "working", 7, "2026-11-21T07:04:00Z")];
+        let mut state = turn_started_at(pane, "2026-11-21T07:04:00Z");
+        assert!(crate::lanes::split_in_use(&project));
+        let stops = interrupt_long_turns(&project, &mut state, &Settings::default(), &hc, &ambiguous, now);
+        assert!(stops.stopped.is_empty(), "{stops:#?}");
+        assert_eq!(interrupts(&core), 0);
     }
 
     #[test]
