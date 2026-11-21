@@ -139,7 +139,95 @@ pub struct Settings {
     pub thread_profile: String,
     pub auto_resolve_days: u32,
     pub nudge: bool,
+    /// How long one turn of the project's own coordinator may run before the
+    /// ticker interrupts it (`20m`, `5m`, `off`). See [`TurnLimit`].
+    #[serde(default)]
+    pub coordinator_turn_limit: TurnLimit,
     pub repos: Vec<Repo>,
+}
+
+/// `coordinator_turn_limit` in PROJECT.md: the point at which the ticker stops
+/// a coordinator that is still working on one turn.
+///
+/// A coordinator's turn is supposed to be an answer, an `hp task`, an
+/// `hp thread start`. The 2026-11-21 incident was 41 minutes of `sleep 45; ssh`
+/// retries in a coordinator's own turn, 28 dollars of tokens, and a
+/// ten-minute warning that could not be delivered into the busy turn it was
+/// about. Ten minutes is the audit's warning ([`crate::audit::COORDINATOR_LONG_TURN_SECS`]);
+/// twenty is where a turn stops being a slow answer and starts being the
+/// thread's work done in the wrong place, while still leaving room for a
+/// legitimate slow `hp` action (`thread resolve` copying a big tree, `open`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TurnLimit {
+    /// `off`: no turn is ever interrupted.
+    Off,
+    /// Minutes, from the `20m` shape.
+    Minutes(i64),
+}
+
+impl Default for TurnLimit {
+    fn default() -> Self {
+        TurnLimit::Minutes(TurnLimit::DEFAULT_MINUTES)
+    }
+}
+
+impl TurnLimit {
+    /// The default: twenty minutes, the value docs/operations.md explains.
+    pub const DEFAULT_MINUTES: i64 = 20;
+
+    /// Parses `off` or `<minutes>m`. Minutes only: a turn is measured and read
+    /// in minutes, and `20` without a unit would be as ambiguous as it looks.
+    pub fn parse(text: &str) -> Result<TurnLimit, String> {
+        let text = text.trim();
+        if text.eq_ignore_ascii_case("off") {
+            return Ok(TurnLimit::Off);
+        }
+        let Some(minutes) = text.strip_suffix('m').and_then(|n| n.trim().parse::<i64>().ok()) else {
+            return Err(format!("`{text}` is not a coordinator_turn_limit; write `20m` or `off`"));
+        };
+        if !(1..=1440).contains(&minutes) {
+            return Err(format!("`{text}` is not a coordinator_turn_limit; write 1m to 1440m, or `off`"));
+        }
+        Ok(TurnLimit::Minutes(minutes))
+    }
+
+    /// How many seconds a turn may run, `None` for `off`.
+    pub fn secs(self) -> Option<i64> {
+        match self {
+            TurnLimit::Off => None,
+            TurnLimit::Minutes(minutes) => Some(minutes * 60),
+        }
+    }
+
+    /// What PROJECT.md says, so a rewrite keeps the same value.
+    pub fn text(self) -> String {
+        match self {
+            TurnLimit::Off => "off".into(),
+            TurnLimit::Minutes(minutes) => format!("{minutes}m"),
+        }
+    }
+}
+
+impl std::fmt::Display for TurnLimit {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.text())
+    }
+}
+
+impl Serialize for TurnLimit {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error> {
+        serializer.serialize_str(&self.text())
+    }
+}
+
+impl<'de> Deserialize<'de> for TurnLimit {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> std::result::Result<TurnLimit, D::Error> {
+        let text = String::deserialize(deserializer)?;
+        // A bad value is a `config-error` item (the ticker writes one for a
+        // PROJECT.md that does not parse), never a panic and never a silent
+        // fallback to a limit the project did not ask for.
+        TurnLimit::parse(&text).map_err(serde::de::Error::custom)
+    }
 }
 
 impl Default for Settings {
@@ -154,6 +242,7 @@ impl Default for Settings {
             // empty for ten seconds, because on herdr 0.9.1 a prompt merges with
             // half-typed text (docs/history/herdr-notes-herdr1.md, stage 2).
             nudge: true,
+            coordinator_turn_limit: TurnLimit::default(),
             repos: Vec::new(),
         }
     }
@@ -722,6 +811,32 @@ pub fn create(root: &Path, name: &str, repos: Vec<Repo>) -> Result<Project> {
 mod tests {
     use super::*;
 
+    /// The three shapes `coordinator_turn_limit` takes, and the fourth: a value
+    /// nobody can read. A bad one must fail the PROJECT.md parse (the ticker
+    /// then writes one `config-error` item, like every other unusable setting)
+    /// rather than panic or silently fall back to twenty minutes.
+    #[test]
+    fn the_coordinator_turn_limit_reads_minutes_off_and_nothing_else() {
+        assert_eq!(TurnLimit::default(), TurnLimit::Minutes(20));
+        let read = |text: &str| parse_project_md(&format!("+++\ncoordinator_turn_limit = \"{text}\"\n+++\n\nBody\n")).map(|(s, _)| s.coordinator_turn_limit);
+        assert_eq!(read("20m").unwrap(), TurnLimit::Minutes(20));
+        assert_eq!(read("5m").unwrap(), TurnLimit::Minutes(5));
+        assert_eq!(read("off").unwrap(), TurnLimit::Off);
+        assert_eq!(read("OFF").unwrap(), TurnLimit::Off, "case is not a way to get it wrong");
+        for bad in ["abc", "20", "0m", "-5m", "m", ""] {
+            let error = format!("{:#}", read(bad).unwrap_err());
+            assert!(error.contains("coordinator_turn_limit"), "`{bad}` must say which setting failed: {error}");
+        }
+        // A file without the key keeps the default; writing it back keeps the
+        // value in the same `20m` shape a person typed.
+        let (settings, _) = parse_project_md("+++\nname = \"X\"\n+++\n").unwrap();
+        assert_eq!(settings.coordinator_turn_limit, TurnLimit::Minutes(20));
+        assert_eq!(TurnLimit::Minutes(5).text(), "5m");
+        assert_eq!(TurnLimit::Off.text(), "off");
+        assert_eq!(TurnLimit::Minutes(20).secs(), Some(1200));
+        assert_eq!(TurnLimit::Off.secs(), None);
+    }
+
     /// An older `hp` wrote the lifecycle state into `.state/project.json`. The
     /// `status` key is gone from the struct, so the file must still parse:
     /// `#[serde(default)]` ignores the stale key, and the former slugs it sits
@@ -830,6 +945,7 @@ mod tests {
         assert_eq!(settings.coordinator_profile, "claude");
         assert_eq!(settings.auto_resolve_days, 7);
         assert!(settings.nudge);
+        assert_eq!(settings.coordinator_turn_limit, TurnLimit::Minutes(20), "twenty minutes unless PROJECT.md says otherwise");
         assert!(project.dir().join(PR_FOLLOWUP).is_file());
         assert!(project.dir().join(COORDINATOR_SWEEP).is_file());
         assert!(crate::routine::load_all(&project).1.is_empty(), "the default routines parse");

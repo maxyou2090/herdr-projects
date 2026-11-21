@@ -41,6 +41,9 @@ pub const CALL_TIMEOUT: Duration = Duration::from_secs(10);
 pub const AGENT_START_TIMEOUT: Duration = Duration::from_secs(20);
 /// How long `agent_prompt_confirmed` lets core watch for the turn to start.
 pub const PROMPT_WAIT: Duration = Duration::from_secs(8);
+/// How long `interrupt` waits for core: `hc interrupt` watches for an effect for
+/// ten seconds of its own, and this call must outlast that watch.
+pub const INTERRUPT_TIMEOUT: Duration = Duration::from_secs(15);
 
 /// Label keys this binary owns. Nothing else writes them.
 pub const L_WS: &str = "hp_ws";
@@ -1202,6 +1205,14 @@ impl<'a> Core<'a> {
         let mut args: Vec<&str> = vec!["keys", target];
         args.extend(keys.iter().map(String::as_str));
         self.json(&args, CALL_TIMEOUT).map(|_| ())
+    }
+
+    /// Presses the harness's stop key in a terminal: `hc interrupt`, the same
+    /// escape a person would type. What core reports (`stopped`, or a key sent
+    /// with no effect) is not read here: the caller records that it tried, and
+    /// the pane's own status is the answer on the next tick.
+    pub fn interrupt(&self, pane: &str) -> Result<(), CoreError> {
+        self.json(&["interrupt", pane], INTERRUPT_TIMEOUT).map(|_| ())
     }
 
     /// Pasting text without a submit is not something core offers: `send` is

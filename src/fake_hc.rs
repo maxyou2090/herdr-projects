@@ -188,6 +188,15 @@ impl FakeCore {
         }
     }
 
+    /// Puts a terminal back on the turn it was in, for the harness that keeps
+    /// saying `working` after the stop key (test only: the real core advances
+    /// the turn when `interrupt` lands).
+    pub fn set_turn(&self, name: &str, turn: u64) {
+        if let Some(mut term) = self.find_mut(name) {
+            term.turn = turn;
+        }
+    }
+
     fn find(&self, id: &str) -> Option<Terminal> {
         self.terminals.borrow().iter().find(|t| t.name == id || t.address == id).cloned()
     }
@@ -300,6 +309,23 @@ impl FakeCore {
                     None => fail("not_found", &format!("no terminal {id}")),
                 }
             }
+            // `hc interrupt` presses the stop key and turns a working program
+            // idle, which is one turn more (`turn += 1`), exactly as the real
+            // core does (`{"key":"esc","outcome":"stopped"}`). A test that
+            // wants a harness which ignored the escape sets the same turn back
+            // with [`FakeCore::set_turn`].
+            ("interrupt", [id]) => match self.find_mut(id) {
+                Some(mut term) => {
+                    let working = term.status.as_deref() == Some("working");
+                    if working {
+                        term.status = Some("idle".into());
+                        term.turn += 1;
+                    }
+                    let outcome = if working { "stopped" } else { "nothing_to_stop" };
+                    ok(serde_json::json!({"key": "esc", "outcome": outcome}).to_string())
+                }
+                None => fail("not_found", &format!("no terminal {id}")),
+            },
             ("read", [id, rest @ ..]) => {
                 let _ = rest;
                 match self.find(id) {

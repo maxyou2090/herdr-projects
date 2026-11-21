@@ -11,12 +11,13 @@ use crate::paths::Ctx;
 use crate::project::{self, Project, Settings};
 
 /// The keys `set` accepts, with what they hold.
-pub const KEYS: [(&str, &str); 7] = [
+pub const KEYS: [(&str, &str); 8] = [
     ("name", "text"),
     ("coordinator_profile", "profile name"),
     ("thread_profile", "profile name"),
     ("auto_resolve_days", "number (0 = never)"),
     ("nudge", "true/false"),
+    ("coordinator_turn_limit", "20m, 5m or off"),
     ("repos.add", "PATH or PATH@MACHINE"),
     ("repos.remove", "PATH"),
 ];
@@ -91,6 +92,10 @@ pub fn set_in(text: &str, key: &str, value: &str) -> Result<String> {
             doc[key] = toml_edit::value(n);
         }
         "nudge" => doc[key] = toml_edit::value(parse_bool(value)?),
+        "coordinator_turn_limit" => {
+            let limit = crate::project::TurnLimit::parse(value).map_err(|why| anyhow::anyhow!(why))?;
+            doc[key] = toml_edit::value(limit.text());
+        }
         "repos.add" => {
             if value.is_empty() {
                 bail!("give a repository path");
@@ -253,6 +258,15 @@ mod tests {
         let edited = set_in(MD, "auto_resolve_days", "9").unwrap();
         assert!(edited.contains("goal = \"\""), "{edited}");
         assert_eq!(project::parse_project_md(&edited).unwrap().0.auto_resolve_days, 9);
+        // `coordinator_turn_limit` is a string setting (`20m`, `5m`, `off`) and
+        // an unreadable value is refused here rather than written for the
+        // ticker to complain about on every tick.
+        let limited = set_in(MD, "coordinator_turn_limit", "off").unwrap();
+        assert!(limited.contains("coordinator_turn_limit = \"off\""), "{limited}");
+        assert_eq!(project::parse_project_md(&limited).unwrap().0.coordinator_turn_limit, crate::project::TurnLimit::Off);
+        assert_eq!(project::parse_project_md(&set_in(MD, "coordinator_turn_limit", "5m").unwrap()).unwrap().0.coordinator_turn_limit.secs(), Some(300));
+        assert!(set_in(MD, "coordinator_turn_limit", "abc").is_err());
+        assert!(set_in(MD, "coordinator_turn_limit", "0m").is_err());
     }
 
     #[test]

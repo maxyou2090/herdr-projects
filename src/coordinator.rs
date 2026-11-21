@@ -1660,8 +1660,8 @@ fn digest_for(ctx: &Ctx, project: &Project, prefix: &str) -> Result<(String, Vec
             let _ = writeln!(out, "Name: {}", project.display_name());
             let _ = writeln!(
                 out,
-                "Settings: coordinator_profile={} thread_profile={} auto_resolve_days={} nudge={}",
-                settings.coordinator_profile, settings.thread_profile, settings.auto_resolve_days, settings.nudge
+                "Settings: coordinator_profile={} thread_profile={} auto_resolve_days={} nudge={} coordinator_turn_limit={}",
+                settings.coordinator_profile, settings.thread_profile, settings.auto_resolve_days, settings.nudge, settings.coordinator_turn_limit
             );
             out.push_str(&crate::profiles::context_text(ctx, project, &settings));
             out.push_str(&crate::assign::context_line(ctx, project));
@@ -1790,6 +1790,15 @@ fn turn_line(project: &Project, view: &crate::lanes::View, items: &[inbox::Item]
             if items.len() == 1 { "" } else { "s" },
             crate::steps::turn_text(waited)
         ));
+    }
+    // The one thing the turn's owner can still do about it: the ticker stops a
+    // turn that runs past `PROJECT.md`'s `coordinator_turn_limit`. Said only
+    // once the turn is already past it, because before that it is not news.
+    if let (Ok((settings, _)), Some(secs)) = (project.read_project_md(), clock.working_secs)
+        && let Some(limit) = settings.coordinator_turn_limit.secs()
+        && secs >= limit
+    {
+        parts.push(format!("the ticker will stop this turn at {}", settings.coordinator_turn_limit));
     }
     Some(format!("This pane: {}\n", parts.join(" · ")))
 }
