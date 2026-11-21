@@ -9,12 +9,26 @@
 //! The resume table in [`resume_args`] is **maintained by hand**. It came from
 //! Herdr 1's session-state page (herdr.dev, "Native agent session restore",
 //! 0.9.1) when this binary was a Herdr 1 plugin. In the herdr-core port the
-//! core supplies the native session id (the `hp_session` label, read back as
+//! core supplied the native session id (the `hp_session` label, read back as
 //! `Agent::agent_session`) but it carries no resume table, so nothing upstream
 //! keeps these flags current: when a harness renames its resume flag, edit the
-//! table here and the test that pins it at the bottom of this file. A kind that
-//! is not in the table resumes nothing — `open` starts that conversation anew
-//! instead of guessing a flag.
+//! table here and the test at the bottom of this file. A kind that is not in
+//! the table resumes nothing — `open` starts that conversation anew instead of
+//! guessing a flag.
+//!
+//! [`fresh_session_args`] is the other half and is why a coordinator survives a
+//! closed Space. Core never writes `hp_session`, so after the herdr-core port no
+//! record ever had a session id to resume (`docs/herdr-core-port.md`, t-0082).
+//! The fix is to stop waiting for core to report one: `hp` names the session
+//! itself, writes the id into the coordinator record **before** the agent starts,
+//! and passes it on every launch. A harness that answers "open the session with
+//! this id, create it when it does not exist" can then be resumed by id alone.
+//!
+//! Each entry of that table is a flag verified against the harness's own
+//! `--help` on this machine, never from memory: pi's `--session-id <id>` does
+//! exactly the "existing or new" thing. Harnesses verified to have no such flag
+//! (codex, agy) and harnesses not checked at all stay out of it, which keeps
+//! today's behaviour for them: no id recorded, a fresh conversation each time.
 
 pub const KINDS: [&str; 24] = [
     "pi", "claude", "codex", "gemini", "cursor", "devin", "agy", "cline", "omp", "mastracode", "opencode", "copilot", "kimi", "kiro", "droid",
@@ -43,6 +57,36 @@ pub fn resume_args(kind: &str, id: &str) -> Option<Vec<String>> {
         _ => return None,
     };
     Some(args)
+}
+
+/// The arguments that open the session `id` for `kind`, creating it when it does
+/// not exist yet — the flag a harness uses to accept an id from its caller.
+/// `None` for every kind whose CLI has no such flag (see the module comment:
+/// each entry is verified by hand).
+pub fn fresh_session_args(kind: &str, id: &str) -> Option<Vec<String>> {
+    if id.is_empty() || id.starts_with('-') {
+        return None;
+    }
+    let args: Vec<String> = match kind {
+        // `pi --session-id <id>`: the current directory's session with that id,
+        // created when it is not there yet. Needs letters, digits, `.`, `_`,
+        // `-`, and a letter or digit at both ends — [`session_id`] satisfies it.
+        "pi" => vec!["--session-id".into(), id.into()],
+        _ => return None,
+    };
+    Some(args)
+}
+
+/// The session id `hp` hands a coordinator whose harness accepts one:
+/// `hp-<12 hex>`. Made from the nanosecond clock, this process's pid and a
+/// counter through a digest, so two coordinators started in the same second —
+/// or in the same process — differ, and no crate is added for it.
+pub fn session_id() -> String {
+    static CALLS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos()).unwrap_or_default();
+    let calls = CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let mixed = format!("{}:{nanos}:{calls}", std::process::id());
+    format!("hp-{}", &crate::thread::sha256_hex(mixed.as_bytes())[..12])
 }
 
 /// Whether `value` looks like a model name: `opus`, `gpt-5.5`,
@@ -109,6 +153,31 @@ mod tests {
         assert_eq!(refused(&["--model", "a b"]), (vec![], strings(&["--model", "a b"])));
         assert_eq!(refused(&["--model", "$(id)"]), (vec![], strings(&["--model", "$(id)"])));
         assert_eq!(refused(&["opus"]), (vec![], strings(&["opus"])));
+    }
+
+    #[test]
+    fn a_fresh_session_flag_is_only_the_kinds_this_table_holds() {
+        assert_eq!(fresh_session_args("pi", "hp-0123456789ab").unwrap(), ["--session-id", "hp-0123456789ab"]);
+        // Verified to have no caller-chosen id on start: they must stay out.
+        for kind in ["codex", "agy", "claude", "gemini", "opencode"] {
+            assert_eq!(fresh_session_args(kind, "hp-0123456789ab"), None, "{kind}");
+        }
+        assert_eq!(fresh_session_args("pi", ""), None);
+        assert_eq!(fresh_session_args("pi", "--dangerous"), None);
+    }
+
+    /// pi accepts letters, digits, `.`, `_`, `-` and demands a letter or digit at
+    /// both ends: an id outside that rule would make `open` fail to start at all.
+    #[test]
+    fn a_generated_session_id_is_one_pi_accepts_and_differs_each_time() {
+        let first = session_id();
+        let second = session_id();
+        assert!(first.starts_with("hp-"), "{first}");
+        assert_eq!(first.len(), "hp-".len() + 12, "{first}");
+        assert!(first.chars().all(|c| c.is_ascii_alphanumeric() || c == '-'), "{first}");
+        assert!(first.chars().next().is_some_and(|c| c.is_ascii_alphanumeric()), "{first}");
+        assert!(first.chars().last().is_some_and(|c| c.is_ascii_alphanumeric()), "{first}");
+        assert_ne!(first, second, "two coordinators in the same second must not share an id");
     }
 
     #[test]

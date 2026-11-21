@@ -72,11 +72,26 @@ terminals and labels:
 | pane | one terminal; its **name** is the pane id (`hp-<slug>-<suffix>`) |
 | agent | a terminal labelled `hp_agent=<name>` and `hp_kind=<kind>` |
 | agent status | the terminal's 7501 `status.state` (`idle`, `working`, `done`, `blocked`, `error`) |
-| agent session id | the `hp_session` label |
+| agent session id | the `hp_session` label — **read, never written by core** |
 | a worktree thread | a terminal labelled `hp_worktree=<checkout path>` |
 | "workspace close" | `hc kill` + `hc rm` on every terminal of the Space |
 
 Rules that follow from this, worth keeping:
+
+- **hp names a coordinator's session itself.** Core has no notion of a native
+  agent session, and nothing in `hc` or the app writes that `hp_session` label
+  (a Herdr 1 integration used to). So waiting for core to report one left every
+  coordinator record without a session, and closing a Space then running `open`
+  again opened a brand-new conversation (t-0082, 2026-11-21). `open` now makes
+  the id for a coordinator that has nothing to resume
+  (`agents::session_id`, `hp-<12 hex>`), writes it into `coordinator.json` and
+  the lane **before** the agent starts, and launches with it
+  (`agents::fresh_session_args`): pi's `--session-id <id>` opens the session
+  with that id and creates it when it is missing, so the id alone is what a
+  later `open` resumes by. Harnesses whose CLI has no such flag (codex, agy, and
+  every kind not verified by hand) are unchanged: no id is recorded, and a
+  restart starts anew. The label is still read (`Agent::agent_session`), so an
+  upstream that starts reporting it needs no change here.
 
 - **A pane id is a terminal name, never an address.** Core addresses (`t7`) are
   reused after a terminal ends and after a core restart; a name we choose does
