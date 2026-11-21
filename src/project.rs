@@ -398,6 +398,16 @@ impl Project {
     /// commit 4).
     pub fn update_coordinator(&self, change: impl FnOnce(&mut Coordinator)) -> Result<Coordinator> {
         let _lock = self.lock()?;
+        self.update_coordinator_locked(change)
+    }
+
+    /// The same write, for a caller that already holds `project.lock()`.
+    ///
+    /// [`Project::lock`] opens the lock file each time, so a lock taken again in
+    /// the same process waits on the one already held and never returns: `open`
+    /// holds the lock from making its Space to the record that names it
+    /// (2026-11-21), and every write inside that section comes through here.
+    pub fn update_coordinator_locked(&self, change: impl FnOnce(&mut Coordinator)) -> Result<Coordinator> {
         let mut record = crate::lanes::read_coordinator(self).unwrap_or_default();
         change(&mut record);
         record.updated = now();

@@ -93,6 +93,15 @@ Rules that follow from this, worth keeping:
   restart starts anew. The label is still read (`Agent::agent_session`), so an
   upstream that starts reporting it needs no change here.
 
+  For pi the **value** in the record chooses the flag, because the two are not
+  interchangeable: an id `hp` minted is reopened with `--session-id` — the same
+  argument the first launch got, since the flag opens an existing session or
+  creates it — while a path from before the port (`/Users/…/2026-11-06T03-59-43-694Z_01a1af03.jsonl`)
+  keeps `--session`. `pi --session hp-<12 hex>` is not a resume at all: it
+  answers "No session found matching" until pi has written that session file,
+  exits, and leaves the pane at a shell — while `hp-agent` has already reported
+  a status, so `open` believed the coordinator started (2026-11-21, my-net).
+
 - **A pane id is a terminal name, never an address.** Core addresses (`t7`) are
   reused after a terminal ends and after a core restart; a name we choose does
   not. Records (`coordinator.json`, `threads/*.toml`) store the name.

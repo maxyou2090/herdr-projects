@@ -738,24 +738,27 @@ fn names_a_session(args: &[String]) -> bool {
     })
 }
 
-/// The arguments for the start that follows a resume that failed, after giving
-/// the record the id of the session it is about to open. The id the record held
-/// names a session that cannot be opened here any more (a renamed folder, a
-/// deleted session file); leaving it there would make every later `open` fail on
-/// it before starting fresh again. `None` for a harness that cannot take one:
-/// the record is left empty, which is what a fresh `open` mints an id from.
-fn reissue_session(project: &Project, lane: &str, pane: &str, profile: &str, kind: &str, base_args: &[String]) -> Result<Vec<String>> {
+/// The arguments for the start that follows a resume that failed: a fresh
+/// session with an id `hp` names itself, returned with it — `None` when the
+/// harness cannot take one, which is the shape it had before t-0082.
+///
+/// **Nothing is written here.** A resume fails for two different reasons: the
+/// session cannot be opened any more (a renamed folder, a deleted session file),
+/// and the pane is gone (a tick closed the Space, the terminal finished). The
+/// second says nothing about the session, and writing a new id for it threw a
+/// good conversation away: my-net's `01a1af03` path became `hp-777adb0db462` on
+/// 2026-11-21 because the pane the resume went into had just been closed. So the
+/// id is written by the caller **after** the start has succeeded, and a start
+/// that fails leaves the record naming the session it still has.
+fn fresh_retry(kind: &str, base_args: &[String]) -> (Option<String>, Vec<String>) {
     let mut args = base_args.to_vec();
-    let Some((id, fresh_args)) = fresh_session(kind, base_args, false) else {
-        project.update_coordinator(|c| c.agent_session.clear())?;
-        return Ok(args);
-    };
-    project.update_coordinator(|c| c.agent_session = id.clone())?;
-    if !lane.is_empty() {
-        crate::lanes::sync_instance(project, lane, pane, &id, profile, &project::now())?;
+    match fresh_session(kind, base_args, false) {
+        Some((id, fresh_args)) => {
+            args.extend(fresh_args);
+            (Some(id), args)
+        }
+        None => (None, args),
     }
-    args.extend(fresh_args);
-    Ok(args)
 }
 
 /// The lane `open` acts on: the one `--lane` names (created on the spot when it
@@ -1219,6 +1222,16 @@ pub fn open(ctx: &Ctx, slug: &str, options: &OpenOptions) -> Result<()> {
     let reusable = previous.as_ref().filter(|record| {
         !options.new && panes.iter().any(|p| pane_matches(record, p)) && !agents.iter().any(|a| a.pane_id == record.pane_id)
     });
+    // Making the Space and its tab, and writing the record and the lane instance
+    // that name them, are one step under the project lock — the lock
+    // `spaces::close_empty` holds from its listings to its closes. Without it a
+    // tick read the space list while this Space was seconds old and nobody
+    // recorded it yet, judged it an empty home Space, and closed it under the
+    // coordinator being started (my-net, 2026-11-21). Writes inside the section
+    // go through the `*_locked` forms: a second `project.lock()` in one process
+    // waits on the first and never returns. The lock is released before the
+    // agent is started: that wait is the agent's, not a placement's.
+    let lock = project.lock()?;
     let (workspace_id, tab_id, pane_id) = if let Some(terminal) = &here {
         let pane = panes.iter().find(|p| &p.terminal_id == terminal).with_context(|| format!("the terminal {terminal} is not listed by the herdr session at {socket}"))?;
         // This pane's Space becomes the project's recorded home: its names
@@ -1272,7 +1285,7 @@ pub fn open(ctx: &Ctx, slug: &str, options: &OpenOptions) -> Result<()> {
     // agent starts, so a command killed midway still leaves one to resume, and
     // the same id then opens the existing session or creates it.
     let fresh = fresh_session(&kind, &base_args, !resume.is_empty());
-    let record = project.update_coordinator(|c| {
+    let record = project.update_coordinator_locked(|c| {
         *c = Coordinator {
             socket: socket.clone(),
             workspace_id,
@@ -1292,7 +1305,8 @@ pub fn open(ctx: &Ctx, slug: &str, options: &OpenOptions) -> Result<()> {
             updated: String::new(),
         }
     })?;
-    crate::lanes::sync_instance(&project, &target_lane.id, &record.pane_id, &record.agent_session, &record.profile, &project::now())?;
+    crate::lanes::sync_instance_locked(&project, &target_lane.id, &record.pane_id, &record.agent_session, &record.profile, &project::now())?;
+    drop(lock);
 
     let mut args = base_args.clone();
     args.extend(resume.iter().cloned());
@@ -1305,18 +1319,28 @@ pub fn open(ctx: &Ctx, slug: &str, options: &OpenOptions) -> Result<()> {
         return run_here(ctx, &herdr, &project, HereRun { record: &record, lane_id: Some(&target_lane.id), args: &args, base_args: &base_args, prefix: &prefix, resuming: !resume.is_empty() });
     }
     let mut started = start_when_shell_ready(&herdr, &name, &kind, &record.pane_id, &args);
+    // The id the retry mints, if the resume failed: recorded only once the
+    // retry has actually come up (`fresh_retry`).
+    let mut retry = None;
     if let Err(error) = &started
         && !resume.is_empty()
         && error.code != "agent_not_ready"
     {
         // The recorded session may be gone: start fresh once.
         println!("resuming session {} failed ({error}); starting a fresh {kind}", record.agent_session);
-        let retry_args = reissue_session(&project, &target_lane.id, &record.pane_id, &record.profile, &kind, &base_args)?;
+        let (minted, retry_args) = fresh_retry(&kind, &base_args);
         started = herdr.agent_start(&name, &kind, &record.pane_id, &retry_args);
+        if started.is_ok() {
+            retry = minted;
+        }
     }
     match started {
         Ok(agent) => {
-            let session_id = agent.session_id().to_string();
+            // The session the agent reports, else the id hp minted for this
+            // launch — it was started with it. Only a start that worked changes
+            // the record (2026-11-21).
+            let reported = agent.session_id().to_string();
+            let session_id = if reported.is_empty() { retry.clone().unwrap_or_default() } else { reported };
             if !session_id.is_empty() {
                 project.update_coordinator(|c| {
                     c.agent_session = session_id.clone();
@@ -1328,6 +1352,10 @@ pub fn open(ctx: &Ctx, slug: &str, options: &OpenOptions) -> Result<()> {
                     Some((id, _)) => println!("started {kind} as {name} with session {id}; it reads AGENTS.md and primes itself"),
                     None => println!("started {kind} as {name}; it reads AGENTS.md and primes itself"),
                 }
+            } else if retry.is_some() {
+                // Said out loud: the conversation the record named did not open,
+                // and the one that started is new.
+                println!("started {kind} as {name} with a new session; the recorded one did not open");
             } else {
                 println!("started {kind} as {name}, resuming session {}", record.agent_session);
             }
@@ -1370,10 +1398,18 @@ fn run_here(ctx: &Ctx, herdr: &Core, project: &Project, run: HereRun<'_>) -> Res
     };
     let (code, detected) = launch(run.args)?;
     if resuming && !detected && code != Some(0) {
-        // The recorded session may be gone: start fresh once.
+        // The recorded session may be gone: start fresh once. The id is written
+        // only after the retry has run, and a retry that fails leaves the record
+        // naming the session it still has (2026-11-21).
         println!("resuming session {} failed; starting a fresh {kind}", record.agent_session);
-        let retry_args = reissue_session(project, run.lane_id.unwrap_or_default(), &record.pane_id, &record.profile, kind, run.base_args)?;
-        launch(&retry_args)?;
+        let (minted, retry_args) = fresh_retry(kind, run.base_args);
+        let (code, detected) = launch(&retry_args)?;
+        if let Some(id) = minted.filter(|_| detected || code == Some(0)) {
+            let _ = project.update_coordinator(|c| c.agent_session = id.clone());
+            if let Some(lane) = run.lane_id.filter(|lane| !lane.is_empty()) {
+                let _ = crate::lanes::sync_instance(project, lane, &record.pane_id, &id, &record.profile, &project::now());
+            }
+        }
     }
     println!("{kind} exited; this pane is back at your shell");
     Ok(())
@@ -2497,9 +2533,10 @@ mod tests {
             .unwrap_or_else(|| panic!("no agent was launched: {:?}", fake.calls.borrow()))
     }
 
-    /// The launch line reopens a recorded session with `id` — `--session <id>`
-    /// rather than the `--session-id <id>` a fresh coordinator gets (`--session`
-    /// is a prefix of the other, so the flag is counted, not substring-matched).
+    /// The launch line reopens the **path** `id` a record from before the port
+    /// holds — `--session <path>`. An id `hp` minted is reopened with
+    /// `--session-id` instead (the same flag a first launch gets: it opens the
+    /// session or creates it, `agents::resume_args`).
     fn reopens(line: &str, id: &str) -> bool {
         line.replace("--session-id", "").contains("--session") && line.contains(id)
     }
@@ -2560,9 +2597,92 @@ mod tests {
         assert_eq!(record.agent_session, id, "the id is kept, not replaced");
         assert_ne!(record.pane_id, pane, "it starts in a fresh pane");
         let line = launch_line(&fake);
-        assert!(reopens(line.as_str(), &id), "the recorded session is reopened: {line}");
-        assert!(!line.contains("--session-id"), "a resume never also names a new one: {line}");
+        // `hp` names the id itself (t-0082), so it is reopened by id: pi's
+        // `--session-id` opens the session that id names, or creates it. The
+        // same flag on the first launch, which is why one id is all a record
+        // needs (`agents::resume_args`).
+        assert!(line.contains("--session-id") && line.contains(&id), "the id the record holds is opened by id: {line}");
         assert_eq!(crate::lanes::Registry::load(&project).unwrap().get("c-1").cloned().unwrap().agent_session, id);
+    }
+
+    /// A project whose record names a pane that is still at a shell prompt, on a
+    /// session path from before the port — my-net's shape on 2026-11-21, when
+    /// `open` typed a resume into a pane a tick had just closed. Returns the
+    /// pane's id, so a test can make that launch fail.
+    fn recorded_pane(fake: &crate::fake_hc::FakeCore, project: &Project, session: &str) -> String {
+        let dir = project.canonical_dir().to_string_lossy().into_owned();
+        let term = fake.terminal("hpc-demo", &dir, &[("hp_ws", "whome"), ("hp_tab", "whome-t")]);
+        project
+            .update_coordinator(|c| {
+                c.agent = "pi".into();
+                c.agent_session = session.into();
+                c.workspace_id = "whome".into();
+                c.tab_id = "whome-t".into();
+                c.pane_id = term.name.clone();
+                c.cwd = dir.clone();
+            })
+            .unwrap();
+        term.name
+    }
+
+    /// 2026-11-21, my-net: `open` resumed the recorded conversation into a pane
+    /// the ticker had closed, the launch failed — and `reissue_session` had
+    /// already rewritten the record's session path to `hp-777adb0db462`. The
+    /// conversation was unreachable until it was typed back by hand. A start
+    /// that fails says nothing about the session, so the record keeps it.
+    #[test]
+    fn a_launch_that_fails_keeps_the_session_the_record_named() {
+        let home = tempfile::tempdir().unwrap();
+        let root = home.path().join("root");
+        let project = crate::project::create(&root, "demo", vec![]).unwrap();
+        let fake = crate::fake_hc::FakeCore::new();
+        let old = "/Users/someone/.pi/agent/sessions/x/2026-11-06T03-59-43-694Z_01a1af03.jsonl";
+        let pane = recorded_pane(&fake, &project, old);
+        // Listed while live (so `open` reuses it), then refusing the launch the
+        // way a closed pane does: twice, so the fresh retry fails too.
+        fake.finished_on_send(&pane, 2);
+        let ctx = open_ctx(home.path(), &root, &fake);
+
+        open(&ctx, "demo", &OpenOptions { profile: Some("pi".into()), ..OpenOptions::default() }).unwrap();
+
+        let record = project.coordinator().unwrap();
+        assert_eq!(record.agent_session, old, "the record still names the session it had");
+        assert_eq!(
+            crate::lanes::Registry::load(&project).unwrap().get("c-1").cloned().unwrap().agent_session,
+            old,
+            "and so does the lane"
+        );
+        assert!(fake.calls.borrow().iter().rev().take(2).any(|call| call.contains("hp-agent")), "the fresh retry was attempted: {:?}", fake.calls.borrow());
+    }
+
+    /// The other half: when the retry does come up, the id `hp` minted for it is
+    /// written to the record and the lane — after the start, not before.
+    #[test]
+    fn a_fresh_retry_that_starts_writes_its_id_and_a_failed_one_does_not() {
+        let home = tempfile::tempdir().unwrap();
+        let root = home.path().join("root");
+        let project = crate::project::create(&root, "demo", vec![]).unwrap();
+        let fake = crate::fake_hc::FakeCore::new();
+        let old = "/Users/someone/.pi/agent/sessions/x/2026-11-06T03-59-43-694Z_01a1af03.jsonl";
+        let pane = recorded_pane(&fake, &project, old);
+        // Only the resume fails; the fresh launch is typed into the same pane and
+        // comes up, as a pane that was busy rather than gone would.
+        fake.finished_on_send(&pane, 1);
+        let ctx = open_ctx(home.path(), &root, &fake);
+
+        open(&ctx, "demo", &OpenOptions { profile: Some("pi".into()), ..OpenOptions::default() }).unwrap();
+
+        let record = project.coordinator().unwrap();
+        assert_ne!(record.agent_session, old, "the resume failed, so a fresh session was opened");
+        assert!(record.agent_session.starts_with("hp-"), "the id is the one hp minted: {:?}", record.agent_session);
+        assert_eq!(
+            crate::lanes::Registry::load(&project).unwrap().get("c-1").cloned().unwrap().agent_session,
+            record.agent_session,
+            "the lane records the id the start came up with"
+        );
+        let line = launch_line(&fake);
+        assert!(line.contains("--session-id"), "the retry names the fresh session: {line}");
+        assert!(line.contains(&record.agent_session), "and it is the recorded one: {line}");
     }
 
     /// A session reference from before the port — a pi session **path**, as rexa

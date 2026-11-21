@@ -30,6 +30,10 @@ pub struct Terminal {
     pub reason: String,
     pub pid: Option<u32>,
     pub exit_code: Option<i32>,
+    /// Sends still to refuse the way a terminal whose program exited does, for a
+    /// pane that dies while `open` is between listing it and typing the launch
+    /// (see [`FakeCore::finished_on_send`]).
+    pub fail_sends: usize,
     /// When a killed program will be gone, for a terminal that takes its time
     /// to die (see [`FakeCore::dies_in`]). `None` means the kill lands at once.
     pub exits_at: Option<std::time::Instant>,
@@ -108,6 +112,7 @@ impl FakeCore {
             reason: String::new(),
             pid: None,
             exit_code: None,
+            fail_sends: 0,
             exits_at: None,
         };
         self.terminals.borrow_mut().push(term.clone());
@@ -154,6 +159,17 @@ impl FakeCore {
                 term.exit_code = Some(1);
                 term.exits_at = None;
             }
+        }
+    }
+
+    /// Makes the next `times` sends to this terminal fail the way core fails one
+    /// whose program has exited — `finished`, "‹pane› has finished" — while `ls`
+    /// and `get` keep answering as for a live one. That is the shape `open` sees
+    /// when the pane it just listed is closed before it types the launch
+    /// (my-net, 2026-11-21).
+    pub fn finished_on_send(&self, name: &str, times: usize) {
+        if let Some(mut term) = self.find_mut(name) {
+            term.fail_sends = times;
         }
     }
 
@@ -259,6 +275,10 @@ impl FakeCore {
                 let Some(mut term) = self.find_mut(id) else {
                     return fail("not_found", &format!("no terminal {id}"));
                 };
+                if term.fail_sends > 0 {
+                    term.fail_sends -= 1;
+                    return fail("finished", &format!("{id} has finished"));
+                }
                 if term.status.as_deref() == Some("blocked") {
                     return fail("blocked", "the program is waiting for a person; pass --force to type anyway");
                 }

@@ -29,7 +29,9 @@ pub struct Space {
 /// that two ways: a record names it (`pane_id`, `tab_id`), or the pane names
 /// itself (`hp_tab_label` is that thread's tab). Both are needed — the record is
 /// written after `tab_create`, and until it is, the pane is all there is
-/// (`docs/thread-space.md` §5).
+/// (`docs/thread-space.md` §5). A coordinator's tab says its own name the same
+/// way (`hp_tab_label = coordinator`), which is what keeps the Space it was made
+/// in from being judged empty before `open` has written its record.
 ///
 /// Takes no lock: [`close_empty`] takes it around this call and the close, and
 /// `hp sweep` reads without one.
@@ -97,11 +99,15 @@ pub fn empty(ctx: &Ctx, project: &Project, herdr: &Core, include_focused: bool) 
     // own Space from before t-0062, closed with its last tab at resolve.
     if let Ok((settings, _)) = project.read_project_md() {
         let home = project::home_label(&settings.name, &project.slug);
+        // The registry is read here, under the caller's lock, and only when a
+        // home Space of this project is a candidate at all.
+        let lanes = crate::lanes::Registry::load(project);
         for w in workspaces.iter().filter(|w| w.worktree.is_none() && w.label == home && !in_use.contains(&w.workspace_id) && !coordinators.contains(&w.workspace_id)) {
             let own: Vec<_> = panes.iter().filter(|p| p.workspace_id == w.workspace_id).collect();
             if own.is_empty()
                 || own.len() != w.pane_count
                 || own.iter().any(|p| live_thread_pane(p))
+                || own.iter().any(|p| coordinator_pane(project, lanes.as_ref(), p))
                 || agents.iter().any(|a| a.workspace_id == w.workspace_id)
                 || (!include_focused && (w.focused || own.iter().any(|p| p.focused)))
                 || !own.iter().all(|p| herdr.pane_idle_shell(&p.pane_id))
@@ -130,6 +136,25 @@ pub fn empty(ctx: &Ctx, project: &Project, herdr: &Core, include_focused: bool) 
         }
     }
     found
+}
+
+/// Whether a pane's own labels say it is this project's `coordinator` tab, in a
+/// lane that is still open. `open` names the Space and the tab seconds before it
+/// writes `coordinator.json` and the lane instance (`keep_names`, then the
+/// records), and until then a home Space holding only that pane looked exactly
+/// like a leftover nobody uses: the tick closed it under the new coordinator
+/// 2.8s after it was made (my-net, 2026-11-21). The pane's own `hp_tab_label` is
+/// the same evidence the thread rule reads, for the same reason — it is written
+/// first, the record last. A lane that has been closed protects nothing
+/// (`docs/lanes.md` §6.4), and one the pane does not name yet is the window
+/// itself.
+fn coordinator_pane(project: &Project, lanes: Option<&crate::lanes::Registry>, pane: &Pane) -> bool {
+    pane.tokens.get(L_TAB_LABEL).is_some_and(|label| label == crate::labels::coordinator_tab_label())
+        && pane.tokens.get(crate::labels::PROJECT_TOKEN).is_none_or(|slug| slug == &project.slug)
+        && pane
+            .tokens
+            .get(crate::lanes::TOKEN)
+            .is_none_or(|lane| lanes.is_some_and(|registry| registry.lane_of(lane).is_some_and(|lane| lane.is_open())))
 }
 
 /// Closes a Space. Never `--group`: herdr refuses a Space with worktree

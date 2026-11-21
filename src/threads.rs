@@ -1796,6 +1796,69 @@ mod tests {
         assert!(empty.iter().any(|s| s.id == fresh.workspace_id), "nothing names it any more: {empty:?}");
     }
 
+    /// 2026-11-21, my-net: `open` made a home Space and its `coordinator` tab at
+    /// 07:21:56.7 and wrote their names, a tick judged the Space empty at
+    /// 07:21:59.5 and killed the pane, and `coordinator.json` only came at
+    /// 07:22:00 — 2.8s too late. The pane's own `hp_tab_label` is the only
+    /// claim the Space has until the record exists.
+    #[test]
+    fn a_home_space_holding_only_an_unrecorded_coordinator_tab_is_not_empty() {
+        let world = FakeProject::new();
+        // A thread of this project, which is what gets the sweep past its cheap
+        // early return (`twins`): without one nothing can be an orphan home.
+        start_home(&world, "Earlier");
+        let dir = world.project.canonical_dir().to_string_lossy().into_owned();
+        // The Space `open` just made: the home label, one `coordinator` tab, and
+        // no record or lane instance naming either of them yet.
+        let pane = world.core.terminal("hp-demo-1", &dir, &[("hp_ws", "wnew"), ("hp_ws_label", "Demo"), ("hp_tab_label", "coordinator")]);
+        let env = crate::paths::Env::for_test(world._home.path(), &[]);
+        let ctx = world.ctx(&env);
+        let herdr = Core::new("hc", "", &world.core);
+
+        let empty = crate::spaces::empty(&ctx, &world.project, &herdr, false);
+        assert!(!empty.iter().any(|s| s.id == "wnew"), "the tab says what it is: {empty:?}");
+
+        // Take that self-claim away and the Space is what it looked like before
+        // the fix: a leftover home Space with a shell in it.
+        herdr.set_labels(&pane.name, &[(crate::core::L_TAB_LABEL.to_string(), String::new())]).unwrap();
+        let empty = crate::spaces::empty(&ctx, &world.project, &herdr, false);
+        assert!(empty.iter().any(|s| s.id == "wnew"), "nothing names it any more: {empty:?}");
+    }
+
+    /// The record still names the Space the coordinator lived in before, and the
+    /// new one holds only that unrecorded tab: the pane's claim is the one that
+    /// counts (my-net on 2026-11-21). A tab whose `hp_lane` names a **closed**
+    /// lane protects nothing, though — that lane is retired (`docs/lanes.md`
+    /// §6.4) — and neither does one of another project.
+    #[test]
+    fn an_unrecorded_coordinator_tab_whose_lane_is_closed_protects_nothing() {
+        let world = FakeProject::new();
+        start_home(&world, "Earlier");
+        let dir = world.project.canonical_dir().to_string_lossy().into_owned();
+        let pane = world.core.terminal("hp-demo-1", &dir, &[("hp_ws", "wnew"), ("hp_ws_label", "Demo"), ("hp_tab_label", "coordinator")]);
+        let env = crate::paths::Env::for_test(world._home.path(), &[]);
+        let ctx = world.ctx(&env);
+        let herdr = Core::new("hc", "", &world.core);
+        // FakeProject records `whome` as the coordinator's Space: an old one, so
+        // the new Space is nobody's by record.
+        assert_ne!(world.project.coordinator().unwrap().workspace_id, "wnew");
+
+        let empty = crate::spaces::empty(&ctx, &world.project, &herdr, false);
+        assert!(!empty.iter().any(|s| s.id == "wnew"), "the pane names a lane nobody closed yet: {empty:?}");
+
+        // A registry whose only lane is closed: the pane claims a retired line.
+        crate::lanes::Registry {
+            lanes: vec![crate::lanes::Lane { id: "c-1".into(), name: "default".into(), label: "Demo".into(), status: crate::lanes::Status::Closed, ..Default::default() }],
+            default: "c-1".into(),
+            next: 2,
+        }
+        .save(&world.project)
+        .unwrap();
+        herdr.set_labels(&pane.name, &[(crate::lanes::TOKEN.to_string(), "c-1".to_string())]).unwrap();
+        let empty = crate::spaces::empty(&ctx, &world.project, &herdr, false);
+        assert!(empty.iter().any(|s| s.id == "wnew"), "a closed lane protects nothing: {empty:?}");
+    }
+
     /// The tick's recycle holds the project lock across "list, judge, close",
     /// and a placement holds that same lock from its Space lookup to the record
     /// naming its pane (`threads::place_thread`). That is what makes them one
