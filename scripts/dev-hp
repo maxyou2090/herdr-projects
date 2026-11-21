@@ -2,6 +2,11 @@
 # Development only: run the binary with the scratch root and a scrubbed
 # environment, so it can never attach to the core session it was started from.
 # Pass --session hp-dev on open, adopt-workspace and doctor.
+#
+# Careful with the ticker: `open` starts one, and every root's LaunchAgent uses
+# the same label (`dev.hp.ticker`, `ticker::AGENT_LABEL`), so the agent this root
+# boots out is the real root's. Put it back afterwards with `hp ticker start`
+# (the installed binary, `~/.herdr-projects`) and check `hp doctor` (t-0082).
 repo=$(cd "$(dirname "$0")/.." && pwd)
 exec env -u HC_SESSION -u HC_TERMINAL_ID -u HC_BIN_PATH \
   HERDR_PROJECTS_ROOT="$repo/.dev-root" "$repo/target/release/hp" "$@"

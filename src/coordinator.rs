@@ -711,6 +711,53 @@ fn recorded_kind(config: &crate::profiles::Config, record: &Coordinator) -> Stri
     }
 }
 
+/// The session id `open` hands a coordinator it is about to start, with the
+/// arguments that open it — `None` when this launch must not carry one:
+/// a recorded session is being resumed, the harness's CLI has no flag for an id
+/// its caller chooses, or the profile and safety arguments already name a
+/// session themselves (pi refuses `--session-id` beside `--session`,
+/// `--continue`, `--resume` and `--no-session`). In those cases hp keeps its
+/// hands off and behaves as it did before (t-0082).
+fn fresh_session(kind: &str, base_args: &[String], resuming: bool) -> Option<(String, Vec<String>)> {
+    if resuming || names_a_session(base_args) {
+        return None;
+    }
+    let id = crate::agents::session_id();
+    crate::agents::fresh_session_args(kind, &id).map(|args| (id, args))
+}
+
+/// Whether `args` already decide which session the agent opens: the flags a
+/// harness refuses beside one it is given, with or without a value. `-c` and
+/// `-r` are pi's short forms of `--continue` and `--resume`.
+fn names_a_session(args: &[String]) -> bool {
+    const FLAGS: [&str; 6] = ["--session", "--session-id", "--continue", "--resume", "-c", "-r"];
+    args.iter().any(|arg| {
+        arg == "--no-session"
+            || FLAGS.iter().any(|flag| arg == flag)
+            || arg.starts_with("--session=") || arg.starts_with("--session-id=") || arg.starts_with("--resume=")
+    })
+}
+
+/// The arguments for the start that follows a resume that failed, after giving
+/// the record the id of the session it is about to open. The id the record held
+/// names a session that cannot be opened here any more (a renamed folder, a
+/// deleted session file); leaving it there would make every later `open` fail on
+/// it before starting fresh again. `None` for a harness that cannot take one:
+/// the record is left empty, which is what a fresh `open` mints an id from.
+fn reissue_session(project: &Project, lane: &str, pane: &str, profile: &str, kind: &str, base_args: &[String]) -> Result<Vec<String>> {
+    let mut args = base_args.to_vec();
+    let Some((id, fresh_args)) = fresh_session(kind, base_args, false) else {
+        project.update_coordinator(|c| c.agent_session.clear())?;
+        return Ok(args);
+    };
+    project.update_coordinator(|c| c.agent_session = id.clone())?;
+    if !lane.is_empty() {
+        crate::lanes::sync_instance(project, lane, pane, &id, profile, &project::now())?;
+    }
+    args.extend(fresh_args);
+    Ok(args)
+}
+
 /// The lane `open` acts on: the one `--lane` names (created on the spot when it
 /// does not exist, or picked for it when the flag has no value), else the
 /// registry's default lane. The registry is written first when the project has
@@ -1204,6 +1251,16 @@ pub fn open(ctx: &Ctx, slug: &str, options: &OpenOptions) -> Result<()> {
         .filter(|r| !options.new && recorded_kind(&config, r) == kind && recorded_profile(r) == profile.name && !r.agent_session.is_empty())
         .and_then(|r| crate::agents::resume_args(&kind, &r.agent_session))
         .unwrap_or_default();
+    let legacy = crate::profiles::legacy_agent(&config, &settings, Role::Coordinator);
+    let base_args = crate::profiles::expand_home(&crate::profiles::launch_args(&profile, &safety.coordinator_agent_args, &legacy), &ctx.env.home);
+    let base_args = safety.launch_args(&kind, &base_args);
+    // A coordinator starting with no session to resume gets one `hp` names
+    // itself, because core never writes `hp_session` and a record without an id
+    // cannot be resumed at all (t-0082): closing the Space and running `open`
+    // again would open a new conversation. The id is written below, before the
+    // agent starts, so a command killed midway still leaves one to resume, and
+    // the same id then opens the existing session or creates it.
+    let fresh = fresh_session(&kind, &base_args, !resume.is_empty());
     let record = project.update_coordinator(|c| {
         *c = Coordinator {
             socket: socket.clone(),
@@ -1214,22 +1271,27 @@ pub fn open(ctx: &Ctx, slug: &str, options: &OpenOptions) -> Result<()> {
             cwd: cwd.clone(),
             agent: kind.clone(),
             profile: profile.name.clone(),
-            // Kept only for the resume; the ticker records a fresh agent's own.
-            agent_session: if resume.is_empty() { String::new() } else { previous.as_ref().map(|r| r.agent_session.clone()).unwrap_or_default() },
+            // The session this launch has to resume, or the id `hp` made up for
+            // the one it starts; the ticker records a fresh agent's own.
+            agent_session: match (&resume, &fresh) {
+                (args, _) if !args.is_empty() => previous.as_ref().map(|r| r.agent_session.clone()).unwrap_or_default(),
+                (_, Some((id, _))) => id.clone(),
+                _ => String::new(),
+            },
             updated: String::new(),
         }
     })?;
     crate::lanes::sync_instance(&project, &target_lane.id, &record.pane_id, &record.agent_session, &record.profile, &project::now())?;
 
-    let legacy = crate::profiles::legacy_agent(&config, &settings, Role::Coordinator);
-    let base_args = crate::profiles::expand_home(&crate::profiles::launch_args(&profile, &safety.coordinator_agent_args, &legacy), &ctx.env.home);
-    let base_args = safety.launch_args(&kind, &base_args);
     let mut args = base_args.clone();
     args.extend(resume.iter().cloned());
+    if let Some((_, fresh_args)) = &fresh {
+        args.extend(fresh_args.iter().cloned());
+    }
     if here.is_some() {
         report_tokens(&herdr, &project, &record.pane_id);
         ticker::start(ctx)?;
-        return run_here(ctx, &herdr, &project, HereRun { record: &record, lane_id: Some(&target_lane.id), args: &args, base_args: &base_args, prefix: &prefix });
+        return run_here(ctx, &herdr, &project, HereRun { record: &record, lane_id: Some(&target_lane.id), args: &args, base_args: &base_args, prefix: &prefix, resuming: !resume.is_empty() });
     }
     let mut started = start_when_shell_ready(&herdr, &name, &kind, &record.pane_id, &args);
     if let Err(error) = &started
@@ -1238,7 +1300,8 @@ pub fn open(ctx: &Ctx, slug: &str, options: &OpenOptions) -> Result<()> {
     {
         // The recorded session may be gone: start fresh once.
         println!("resuming session {} failed ({error}); starting a fresh {kind}", record.agent_session);
-        started = herdr.agent_start(&name, &kind, &record.pane_id, &base_args);
+        let retry_args = reissue_session(&project, &target_lane.id, &record.pane_id, &record.profile, &kind, &base_args)?;
+        started = herdr.agent_start(&name, &kind, &record.pane_id, &retry_args);
     }
     match started {
         Ok(agent) => {
@@ -1250,7 +1313,10 @@ pub fn open(ctx: &Ctx, slug: &str, options: &OpenOptions) -> Result<()> {
                 crate::lanes::sync_instance(&project, &target_lane.id, &record.pane_id, &session_id, &record.profile, &project::now())?;
             }
             if resume.is_empty() {
-                println!("started {kind} as {name}; it reads AGENTS.md and primes itself");
+                match &fresh {
+                    Some((id, _)) => println!("started {kind} as {name} with session {id}; it reads AGENTS.md and primes itself"),
+                    None => println!("started {kind} as {name}; it reads AGENTS.md and primes itself"),
+                }
             } else {
                 println!("started {kind} as {name}, resuming session {}", record.agent_session);
             }
@@ -1274,7 +1340,7 @@ pub fn open(ctx: &Ctx, slug: &str, options: &OpenOptions) -> Result<()> {
 fn run_here(ctx: &Ctx, herdr: &Core, project: &Project, run: HereRun<'_>) -> Result<()> {
     let record = run.record;
     let kind = &record.agent;
-    let resuming = run.args.len() > run.base_args.len();
+    let resuming = run.resuming;
     if resuming {
         println!("starting {kind} as {} in this pane, resuming session {}; quit it to return to this shell", record.agent_name, record.agent_session);
     } else {
@@ -1295,8 +1361,8 @@ fn run_here(ctx: &Ctx, herdr: &Core, project: &Project, run: HereRun<'_>) -> Res
     if resuming && !detected && code != Some(0) {
         // The recorded session may be gone: start fresh once.
         println!("resuming session {} failed; starting a fresh {kind}", record.agent_session);
-        project.update_coordinator(|c| c.agent_session.clear())?;
-        launch(run.base_args)?;
+        let retry_args = reissue_session(project, run.lane_id.unwrap_or_default(), &record.pane_id, &record.profile, kind, run.base_args)?;
+        launch(&retry_args)?;
     }
     println!("{kind} exited; this pane is back at your shell");
     Ok(())
@@ -1310,6 +1376,9 @@ struct HereRun<'a> {
     args: &'a [String],
     base_args: &'a [String],
     prefix: &'a str,
+    /// A recorded session is being reopened — not a fresh one that merely
+    /// carries an id.
+    resuming: bool,
 }
 
 /// Names the agent Herdr detects in the recorded pane and records its
@@ -2403,6 +2472,135 @@ mod tests {
 
         assert_eq!(fake.terminals.borrow().len(), 2, "`--new` starts another even beside an invisible one: {:?}", fake.calls.borrow());
         assert_ne!(project.coordinator().unwrap().pane_id, pane, "and the record follows the new coordinator");
+    }
+
+    /// The line `hc send` typed to launch an agent: where the launch arguments
+    /// show up in the fake's call log.
+    fn launch_line(fake: &crate::fake_hc::FakeCore) -> String {
+        fake.calls
+            .borrow()
+            .iter()
+            .rev()
+            .find(|call| call.contains("hp-agent"))
+            .cloned()
+            .unwrap_or_else(|| panic!("no agent was launched: {:?}", fake.calls.borrow()))
+    }
+
+    /// The launch line reopens a recorded session with `id` — `--session <id>`
+    /// rather than the `--session-id <id>` a fresh coordinator gets (`--session`
+    /// is a prefix of the other, so the flag is counted, not substring-matched).
+    fn reopens(line: &str, id: &str) -> bool {
+        line.replace("--session-id", "").contains("--session") && line.contains(id)
+    }
+
+    /// Core never writes `hp_session`, so no record had a session to resume and a
+    /// closed Space meant a brand-new conversation (t-0082). A coordinator that
+    /// starts with nothing to resume gets an id `hp` makes up, written into the
+    /// record and the lane **before** the agent starts, and handed to the launch.
+    #[test]
+    fn a_first_open_names_the_session_records_it_and_passes_it_on() {
+        let home = tempfile::tempdir().unwrap();
+        let root = home.path().join("root");
+        let project = crate::project::create(&root, "demo", vec![]).unwrap();
+        let fake = crate::fake_hc::FakeCore::new();
+        let ctx = open_ctx(home.path(), &root, &fake);
+        let options = OpenOptions { profile: Some("pi".into()), ..OpenOptions::default() };
+
+        open(&ctx, "demo", &options).unwrap();
+
+        let record = project.coordinator().unwrap();
+        assert!(record.agent_session.starts_with("hp-"), "the record carries the id hp made up: {:?}", record.agent_session);
+        let lane = crate::lanes::Registry::load(&project).unwrap().get("c-1").cloned().unwrap();
+        assert_eq!(lane.agent_session, record.agent_session, "the lane records the same id `open` wrote");
+        let line = launch_line(&fake);
+        assert!(line.contains("--session-id"), "the agent is launched with the id it will be resumed by: {line}");
+        assert!(line.contains(&record.agent_session), "and it is the recorded one: {line}");
+
+        // A second coordinator started with `--new` is another conversation.
+        open(&ctx, "demo", &OpenOptions { new: true, ..options }).unwrap();
+        let second = project.coordinator().unwrap().agent_session;
+        assert!(second.starts_with("hp-") && second != record.agent_session, "`--new` gets its own id: {second}");
+        let line = launch_line(&fake);
+        assert!(line.contains(&second), "and passes that one: {line}");
+    }
+
+    /// The point of the recorded id: close the coordinator's pane (its Space goes
+    /// with it) and open the project again — the same session is reopened by the
+    /// id the record already holds, and no new one is handed out.
+    #[test]
+    fn a_reopened_project_resumes_the_recorded_session_instead_of_a_new_one() {
+        let home = tempfile::tempdir().unwrap();
+        let root = home.path().join("root");
+        let project = crate::project::create(&root, "demo", vec![]).unwrap();
+        let fake = crate::fake_hc::FakeCore::new();
+        let ctx = open_ctx(home.path(), &root, &fake);
+        let options = OpenOptions { profile: Some("pi".into()), ..OpenOptions::default() };
+        open(&ctx, "demo", &options).unwrap();
+        let (pane, id) = {
+            let record = project.coordinator().unwrap();
+            (record.pane_id.clone(), record.agent_session.clone())
+        };
+
+        // The Space is closed: its terminal is gone from the session.
+        fake.finish(&pane, "killed");
+        open(&ctx, "demo", &options).unwrap();
+
+        let record = project.coordinator().unwrap();
+        assert_eq!(record.agent_session, id, "the id is kept, not replaced");
+        assert_ne!(record.pane_id, pane, "it starts in a fresh pane");
+        let line = launch_line(&fake);
+        assert!(reopens(line.as_str(), &id), "the recorded session is reopened: {line}");
+        assert!(!line.contains("--session-id"), "a resume never also names a new one: {line}");
+        assert_eq!(crate::lanes::Registry::load(&project).unwrap().get("c-1").cloned().unwrap().agent_session, id);
+    }
+
+    /// A session reference from before the port — a pi session **path**, as rexa
+    /// and my-net still have — keeps resuming the way it did, and a profile or
+    /// safety setting that already picks a session leaves hp's hands off
+    /// entirely (pi refuses `--session-id` beside them).
+    #[test]
+    fn an_old_session_path_is_resumed_as_it_was_and_a_named_session_is_left_alone() {
+        let home = tempfile::tempdir().unwrap();
+        let root = home.path().join("root");
+        let project = crate::project::create(&root, "demo", vec![]).unwrap();
+        let fake = crate::fake_hc::FakeCore::new();
+        let options = OpenOptions { profile: Some("pi".into()), ..OpenOptions::default() };
+        project
+            .update_coordinator(|c| {
+                c.agent = "pi".into();
+                c.agent_session = "/Users/someone/.pi/agent/sessions/x/old.jsonl".into();
+            })
+            .unwrap();
+
+        let ctx = open_ctx(home.path(), &root, &fake);
+        open(&ctx, "demo", &options).unwrap();
+
+        let record = project.coordinator().unwrap();
+        assert_eq!(record.agent_session, "/Users/someone/.pi/agent/sessions/x/old.jsonl", "a stored path is not overwritten by a fresh id");
+        let line = launch_line(&fake);
+        assert!(reopens(&line, "old.jsonl"), "{line}");
+        assert!(!line.contains("--session-id"), "{line}");
+    }
+
+    /// A `--continue` a profile already carries decides the session, so hp adds
+    /// no id of its own: pi refuses the two together, and the record keeps the
+    /// shape it has today (no session).
+    #[test]
+    fn a_launch_that_already_names_a_session_gets_no_id_from_hp() {
+        let home = tempfile::tempdir().unwrap();
+        let root = home.path().join("root");
+        let project = crate::project::create(&root, "demo", vec![]).unwrap();
+        std::fs::create_dir_all(home.path().join("cfg")).unwrap();
+        std::fs::write(home.path().join("cfg/config.toml"), "[profiles.picont]\nagent = \"pi\"\nargs = [\"--continue\"]\n").unwrap();
+        let fake = crate::fake_hc::FakeCore::new();
+        let ctx = open_ctx(home.path(), &root, &fake);
+
+        open(&ctx, "demo", &OpenOptions { profile: Some("picont".into()), ..OpenOptions::default() }).unwrap();
+
+        assert_eq!(project.coordinator().unwrap().agent_session, "", "hp does not name a session the caller already named");
+        let line = launch_line(&fake);
+        assert!(line.contains("--continue"), "the profile's own argument still reaches the agent: {line}");
+        assert!(!line.contains("--session-id"), "{line}");
     }
 
     /// The other side of the same judgement: a live unlabeled pane that the
