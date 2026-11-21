@@ -924,15 +924,20 @@ hp task done <slug> "<title>"        # ticks the box; keeps the line
 hp task delete <slug> "<title>"      # removes the line and its notes; the heading stays
 hp task thread <slug> "<title>" <thread-id> [--owner O]
 hp task thread <slug> "<title>" --clear   # remove the recorded id
-hp task tidy <slug> [--dry-run]     # blank lines and empty headings; never a task line or note
+hp task tidy <slug> [--dry-run] [--prune-empty]   # blank lines; --prune-empty also drops an empty list heading
 ```
 
 `hp task tidy` is the one writer that may touch the bytes no task owns: when a
 list loses its last task, or `move`/`delete` leaves a gap, the blank lines stay
-with the heading (`delete` keeps an empty heading on purpose). `tidy` removes
-the blank lines straight under a heading, trims a section's tail and the file's
-end, drops a `## ` heading whose body is blank lines only, and leaves one blank
-line between the neighbours — nothing else, and a second run changes nothing.
+with the heading (`delete` keeps an empty heading on purpose). By default
+`tidy` only removes blank lines: the ones straight under a heading, a section's
+tail and the file's end, leaving one blank line after `# Tasks` — nothing else,
+and a second run changes nothing. It never removes a `## ` heading on its own,
+because `# Tasks` / `## Backlog` is the skeleton `hp new` writes and `hp task
+add` puts back; `--prune-empty` asks for that too — a heading whose whole body
+is blank lines goes with it, one blank line left between its neighbours.
+`doctor` reads the same list with pruning off, so a fresh project is never
+reported as untidy.
 
 Each is one `project.lock()`-protected read-modify-write of `TASKS.md` that
 preserves every other section byte-for-byte — including CRLF/LF, comments,

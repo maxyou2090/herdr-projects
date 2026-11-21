@@ -88,12 +88,14 @@ fn lane_notes(project: &project::Project, agents: &[crate::core::Agent]) -> Vec<
     notes
 }
 
-/// `tasks <slug>`: the blank lines and empty headings that `hp task add`,
-/// `move` and `delete` leave behind, since they only ever move whole task
-/// blocks. Read only and a hint, never a failure: the file still parses, and
-/// only `hp task tidy` may change it.
+/// `tasks <slug>`: the blank lines that `hp task add`, `move` and `delete`
+/// leave behind, since they only ever move whole task blocks. Read only and a
+/// hint, never a failure: the file still parses, and only `hp task tidy` may
+/// change it. Pruning is off here: an empty `## Backlog` is the skeleton `hp
+/// task add` writes, so reporting it would warn on every fresh project (and
+/// `tidy` would then delete what `add` puts back).
 fn tasks_line(project: &project::Project) -> (Option<bool>, String) {
-    let findings = crate::tasks::untidiness(&crate::tasks::read(&project.dir()));
+    let findings = crate::tasks::untidiness(&crate::tasks::read(&project.dir()), false);
     if findings.is_empty() {
         return (Some(true), "TASKS.md is tidy".into());
     }
@@ -766,8 +768,25 @@ mod tests {
         assert!(detail.contains("(and 2 more)"), "{detail}");
 
         // Tidied, the line is an ordinary ok line.
-        crate::tasks::tidy(&project, false).unwrap();
+        crate::tasks::tidy(&project, false, false).unwrap();
         assert_eq!(tasks_line(&project), (Some(true), "TASKS.md is tidy".to_string()));
+    }
+
+    /// The skeleton `hp new` writes (`# Tasks\n\n## Backlog\n`) is tidy, and
+    /// so is what `hp task tidy` leaves behind: `doctor` never warns about an
+    /// empty heading, because `hp task add` keeps writing that heading back.
+    #[test]
+    fn doctor_calls_the_house_skeleton_tidy() {
+        let home = tempfile::tempdir().unwrap();
+        let project = project::create(home.path(), "demo", vec![]).unwrap();
+        assert_eq!(tasks_line(&project), (Some(true), "TASKS.md is tidy".to_string()));
+        // An empty `## Backlog` under a blank line or two is a blank-line
+        // finding only; the heading itself is never the complaint.
+        std::fs::write(project.dir().join("TASKS.md"), "# Tasks\n\n## Backlog\n\n\n- [ ] A\n").unwrap();
+        let (mark, detail) = tasks_line(&project);
+        assert_eq!(mark, None, "{detail}");
+        assert!(detail.contains("2 blank line(s) under \"## Backlog\""), "{detail}");
+        assert!(!detail.contains("empty section"), "{detail}");
     }
 
     #[test]

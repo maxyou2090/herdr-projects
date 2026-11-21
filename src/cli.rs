@@ -262,12 +262,15 @@ enum TaskCommand {
         slug: String,
         title: String,
     },
-    /// Remove only stale blank lines and empty headings; no task line, note or heading text changes
+    /// Clear stale blank lines; no task line, note or heading text changes, and no heading goes without --prune-empty
     Tidy {
         slug: String,
         /// Print every place it would change, with line numbers, and write nothing
         #[arg(long)]
         dry_run: bool,
+        /// Also remove a `## ` heading whose whole body is blank lines (never on by default: `## Backlog` is the skeleton `hp task add` writes)
+        #[arg(long)]
+        prune_empty: bool,
     },
     /// Record the thread that runs a task, optionally setting its owner in the same write
     Thread {
@@ -829,9 +832,9 @@ pub fn run() -> Result<()> {
                 println!("{}", crate::tasks::delete(&project, &title, lane.as_deref())?);
                 Ok(())
             }
-            TaskCommand::Tidy { slug, dry_run } => {
+            TaskCommand::Tidy { slug, dry_run, prune_empty } => {
                 let project = Project::load(&ctx.root, &slug)?;
-                println!("{}", crate::tasks::tidy(&project, dry_run)?);
+                println!("{}", crate::tasks::tidy(&project, dry_run, prune_empty)?);
                 Ok(())
             }
             TaskCommand::Thread { slug, title, thread, clear, owner } => {
