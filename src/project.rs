@@ -499,7 +499,9 @@ pub fn list_slugs(root: &Path) -> Vec<String> {
     slugs
 }
 
-const TASKS_TEMPLATE: &str = "# Tasks\n\n## Backlog\n";
+/// The skeleton `hp new` writes and `hp task add` keeps: `## Backlog` with no
+/// task is a list, not litter, so no writer removes it unless asked.
+pub(crate) const TASKS_TEMPLATE: &str = "# Tasks\n\n## Backlog\n";
 
 const INSTRUCTIONS_TEMPLATE: &str = "\
 # Instructions
