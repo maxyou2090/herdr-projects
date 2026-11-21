@@ -88,6 +88,20 @@ fn lane_notes(project: &project::Project, agents: &[crate::core::Agent]) -> Vec<
     notes
 }
 
+/// `tasks <slug>`: the blank lines and empty headings that `hp task add`,
+/// `move` and `delete` leave behind, since they only ever move whole task
+/// blocks. Read only and a hint, never a failure: the file still parses, and
+/// only `hp task tidy` may change it.
+fn tasks_line(project: &project::Project) -> (Option<bool>, String) {
+    let findings = crate::tasks::untidiness(&crate::tasks::read(&project.dir()));
+    if findings.is_empty() {
+        return (Some(true), "TASKS.md is tidy".into());
+    }
+    let shown: Vec<String> = findings.iter().take(2).map(crate::tasks::Finding::summary).collect();
+    let more = if findings.len() > 2 { format!(" (and {} more)", findings.len() - 2) } else { String::new() };
+    (None, format!("{}{more}; `hp task tidy {}` cleans them", shown.join("; "), project.slug))
+}
+
 /// How long `doctor --fix` waits for the ticker it just loaded to take the lock.
 const AGENT_WAIT: Duration = Duration::from_secs(10);
 
@@ -394,6 +408,8 @@ fn report(
         } else {
             check(&mut out, None, &label, format!("{}; `doctor --fix` repairs this", problems.join("; ")));
         }
+        let (mark, detail) = tasks_line(&project);
+        check(&mut out, mark, &format!("tasks {slug}"), detail);
         // The routine journal is append-only and never rotated: a hint, never a
         // failure, once it is long enough that a person may want to clean it.
         if let Some(lines) = crate::routine::journal_lines(&project).filter(|lines| *lines > 2000) {
@@ -724,6 +740,34 @@ mod tests {
         // worth showing: nothing else would name it.
         let hand = crate::core::Agent { pane_id: "t9".into(), cwd: rexa_dir.clone(), agent: "claude".into(), ..Default::default() };
         assert_eq!(coordinator_rows(&rexa, None, std::slice::from_ref(&hand), &rexa_dir), vec!["t9 (claude, started by hand)".to_string()]);
+    }
+
+    /// The blank lines `hp task delete` leaves behind sit in no task, so until
+    /// `hp task tidy` existed only a person could clean them up (`doctor` is the
+    /// reminder, never the repair).
+    #[test]
+    fn doctor_points_at_blank_lines_the_task_list_kept() {
+        let home = tempfile::tempdir().unwrap();
+        let project = project::create(home.path(), "demo", vec![]).unwrap();
+        std::fs::write(project.dir().join("TASKS.md"), "# Tasks\n\n## Backlog\n\n\n\n- [x] A\n").unwrap();
+        let (mark, detail) = tasks_line(&project);
+        assert_eq!(mark, None, "a hint, never a failure: {detail}");
+        assert!(detail.contains("3 blank line(s) under \"## Backlog\""), "{detail}");
+        assert!(detail.contains("`hp task tidy demo` cleans them"), "{detail}");
+
+        // More places than the line shows are counted, not listed.
+        std::fs::write(
+            project.dir().join("TASKS.md"),
+            "# Tasks\n\n\n## Backlog\n- [ ] A\n\n\n## Later\n- [ ] B\n\n\n## Empty\n\n",
+        )
+        .unwrap();
+        let (mark, detail) = tasks_line(&project);
+        assert_eq!(mark, None, "{detail}");
+        assert!(detail.contains("(and 2 more)"), "{detail}");
+
+        // Tidied, the line is an ordinary ok line.
+        crate::tasks::tidy(&project, false).unwrap();
+        assert_eq!(tasks_line(&project), (Some(true), "TASKS.md is tidy".to_string()));
     }
 
     #[test]
