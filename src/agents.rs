@@ -43,6 +43,22 @@ pub fn is_kind(kind: &str) -> bool {
 /// a kind whose resume flag this table does not name (see the module comment:
 /// these are each harness CLI's own flag, kept by hand, not a core-provided
 /// table).
+pub fn resume_args(kind: &str, id: &str) -> Option<Vec<String>> {
+    if id.is_empty() || id.starts_with('-') {
+        return None;
+    }
+    let args: Vec<String> = match kind {
+        "claude" | "cursor" | "grok" | "devin" | "droid" | "qodercli" | "qwen" | "hermes" => vec!["--resume".into(), id.into()],
+        "codex" => vec!["resume".into(), id.into()],
+        "omp" | "copilot" => vec![format!("--resume={id}")],
+        "pi" | "opencode" | "kimi" | "kilo" => vec!["--session".into(), id.into()],
+        "agy" | "letta" => vec!["--conversation".into(), id.into()],
+        "mastracode" => vec!["--thread".into(), id.into()],
+        _ => return None,
+    };
+    Some(args)
+}
+
 /// The arguments that open the session `id` for `kind`, creating it when it does
 /// not exist yet — the flag a harness uses to accept an id from its caller.
 /// `None` for every kind whose CLI has no such flag (see the module comment:
@@ -71,22 +87,6 @@ pub fn session_id() -> String {
     let calls = CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let mixed = format!("{}:{nanos}:{calls}", std::process::id());
     format!("hp-{}", &crate::thread::sha256_hex(mixed.as_bytes())[..12])
-}
-
-pub fn resume_args(kind: &str, id: &str) -> Option<Vec<String>> {
-    if id.is_empty() || id.starts_with('-') {
-        return None;
-    }
-    let args: Vec<String> = match kind {
-        "claude" | "cursor" | "grok" | "devin" | "droid" | "qodercli" | "qwen" | "hermes" => vec!["--resume".into(), id.into()],
-        "codex" => vec!["resume".into(), id.into()],
-        "omp" | "copilot" => vec![format!("--resume={id}")],
-        "pi" | "opencode" | "kimi" | "kilo" => vec!["--session".into(), id.into()],
-        "agy" | "letta" => vec!["--conversation".into(), id.into()],
-        "mastracode" => vec!["--thread".into(), id.into()],
-        _ => return None,
-    };
-    Some(args)
 }
 
 /// Whether `value` looks like a model name: `opus`, `gpt-5.5`,
