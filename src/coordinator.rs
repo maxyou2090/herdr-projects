@@ -2533,9 +2533,10 @@ mod tests {
             .unwrap_or_else(|| panic!("no agent was launched: {:?}", fake.calls.borrow()))
     }
 
-    /// The launch line reopens a recorded session with `id` — `--session <id>`
-    /// rather than the `--session-id <id>` a fresh coordinator gets (`--session`
-    /// is a prefix of the other, so the flag is counted, not substring-matched).
+    /// The launch line reopens the **path** `id` a record from before the port
+    /// holds — `--session <path>`. An id `hp` minted is reopened with
+    /// `--session-id` instead (the same flag a first launch gets: it opens the
+    /// session or creates it, `agents::resume_args`).
     fn reopens(line: &str, id: &str) -> bool {
         line.replace("--session-id", "").contains("--session") && line.contains(id)
     }
@@ -2596,8 +2597,11 @@ mod tests {
         assert_eq!(record.agent_session, id, "the id is kept, not replaced");
         assert_ne!(record.pane_id, pane, "it starts in a fresh pane");
         let line = launch_line(&fake);
-        assert!(reopens(line.as_str(), &id), "the recorded session is reopened: {line}");
-        assert!(!line.contains("--session-id"), "a resume never also names a new one: {line}");
+        // `hp` names the id itself (t-0082), so it is reopened by id: pi's
+        // `--session-id` opens the session that id names, or creates it. The
+        // same flag on the first launch, which is why one id is all a record
+        // needs (`agents::resume_args`).
+        assert!(line.contains("--session-id") && line.contains(&id), "the id the record holds is opened by id: {line}");
         assert_eq!(crate::lanes::Registry::load(&project).unwrap().get("c-1").cloned().unwrap().agent_session, id);
     }
 

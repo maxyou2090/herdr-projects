@@ -22,13 +22,25 @@
 //! The fix is to stop waiting for core to report one: `hp` names the session
 //! itself, writes the id into the coordinator record **before** the agent starts,
 //! and passes it on every launch. A harness that answers "open the session with
-//! this id, create it when it does not exist" can then be resumed by id alone.
+//! this id, create it when it does not exist" can then be resumed by id alone —
+//! and that is one flag, not two: the `--session-id <id>` of [`fresh_session_args`]
+//! opens an existing session or creates it, so the first `open` and every later
+//! one use the same argument.
 //!
 //! Each entry of that table is a flag verified against the harness's own
 //! `--help` on this machine, never from memory: pi's `--session-id <id>` does
 //! exactly the "existing or new" thing. Harnesses verified to have no such flag
 //! (codex, agy) and harnesses not checked at all stay out of it, which keeps
 //! today's behaviour for them: no id recorded, a fresh conversation each time.
+//!
+//! pi needs one further distinction, in [`resume_args`]: **what the recorded
+//! value is** picks the flag, because the two are not interchangeable. An id
+//! `hp` minted is opened with `--session-id` (existing or new); a path a record
+//! from before the port holds — pi's sessions are
+//! `/Users/…/2026-11-06T03-59-43-694Z_01a1af03.jsonl` — is opened with
+//! `--session`. `pi --session hp-<12 hex>` is not a resume at all: pi answers
+//! "No session found matching" and exits when that session file does not exist
+//! yet, which `hp-agent` had already reported as started (2026-11-21, my-net).
 
 pub const KINDS: [&str; 24] = [
     "pi", "claude", "codex", "gemini", "cursor", "devin", "agy", "cline", "omp", "mastracode", "opencode", "copilot", "kimi", "kiro", "droid",
@@ -43,6 +55,10 @@ pub fn is_kind(kind: &str) -> bool {
 /// a kind whose resume flag this table does not name (see the module comment:
 /// these are each harness CLI's own flag, kept by hand, not a core-provided
 /// table).
+///
+/// pi is the one kind whose flag depends on the value: an id `hp` minted (see
+/// [`is_minted_session`]) is opened with `--session-id`, existing or new, and a
+/// path from a record made before the port with `--session`.
 pub fn resume_args(kind: &str, id: &str) -> Option<Vec<String>> {
     if id.is_empty() || id.starts_with('-') {
         return None;
@@ -51,7 +67,12 @@ pub fn resume_args(kind: &str, id: &str) -> Option<Vec<String>> {
         "claude" | "cursor" | "grok" | "devin" | "droid" | "qodercli" | "qwen" | "hermes" => vec!["--resume".into(), id.into()],
         "codex" => vec!["resume".into(), id.into()],
         "omp" | "copilot" => vec![format!("--resume={id}")],
-        "pi" | "opencode" | "kimi" | "kilo" => vec!["--session".into(), id.into()],
+        "opencode" | "kimi" | "kilo" => vec!["--session".into(), id.into()],
+        // `pi --session hp-<12 hex>` says "No session found matching" while the
+        // session file does not exist yet (pi writes it after the first turn),
+        // exits, and leaves the pane at a shell — while `hp-agent` had already
+        // reported a status, so `open` believed it started (2026-11-21).
+        "pi" => vec![if is_minted_session(id) { "--session-id".into() } else { "--session".into() }, id.into()],
         "agy" | "letta" => vec!["--conversation".into(), id.into()],
         "mastracode" => vec!["--thread".into(), id.into()],
         _ => return None,
@@ -59,10 +80,22 @@ pub fn resume_args(kind: &str, id: &str) -> Option<Vec<String>> {
     Some(args)
 }
 
+/// Whether a recorded session value is an id `hp` named itself
+/// ([`session_id`], `hp-<12 hex>`) rather than a path from a record made before
+/// the port (pi's are `/Users/…/2026-11-06T03-59-43-694Z_01a1af03.jsonl`). Only
+/// the shape answers: an id never holds a separator, a path always does.
+pub fn is_minted_session(value: &str) -> bool {
+    value.starts_with("hp-") && !value.contains('/') && !value.contains('\\')
+}
+
 /// The arguments that open the session `id` for `kind`, creating it when it does
 /// not exist yet — the flag a harness uses to accept an id from its caller.
 /// `None` for every kind whose CLI has no such flag (see the module comment:
 /// each entry is verified by hand).
+///
+/// "Open, creating it when it is missing" is also what makes it the resume flag
+/// for such an id ([`resume_args`]): one id, one argument, first launch or
+/// hundredth.
 pub fn fresh_session_args(kind: &str, id: &str) -> Option<Vec<String>> {
     if id.is_empty() || id.starts_with('-') {
         return None;
@@ -191,5 +224,25 @@ mod tests {
         assert_eq!(resume_args("claude", "--dangerous"), None);
         assert!(is_kind("claude") && !is_kind("chatgpt"));
         assert_eq!(KINDS.len(), 24);
+    }
+
+    /// pi's two shapes, and only pi's: an id `hp` minted is `--session-id` (open
+    /// it, create it when missing), the path a record from before the port holds
+    /// is `--session`. Getting this backwards is the 2026-11-21 my-net failure:
+    /// `pi --session hp-<12 hex>` finds no session, exits, and the pane is back
+    /// at a shell while `open` reports a coordinator that started.
+    #[test]
+    fn pi_resumes_a_minted_id_by_id_and_an_old_path_by_path() {
+        assert_eq!(resume_args("pi", "hp-0123456789ab").unwrap(), ["--session-id", "hp-0123456789ab"]);
+        let path = "/Users/maxyou/.pi/agent/sessions/--Users-maxyou-.herdr-projects-my-net--/2026-11-06T03-59-43-694Z_01a1af03.jsonl";
+        assert_eq!(resume_args("pi", path).unwrap(), ["--session", path]);
+        assert_eq!(resume_args("pi", "old.jsonl").unwrap(), ["--session", "old.jsonl"], "no separator, but a file name is a path");
+        assert!(!is_minted_session(path) && !is_minted_session("old.jsonl"), "a path is never an id");
+        assert!(is_minted_session("hp-0123456789ab") && is_minted_session(&session_id()), "and an id is what hp makes");
+        // The kinds that share pi's flag stay on it: their ids are not hp's.
+        for kind in ["opencode", "kimi", "kilo"] {
+            assert_eq!(resume_args(kind, "hp-0123456789ab").unwrap(), ["--session", "hp-0123456789ab"], "{kind}");
+        }
+        assert_eq!(resume_args("pi", "hp-0123456789ab"), fresh_session_args("pi", "hp-0123456789ab"), "one flag, first launch or later one");
     }
 }
