@@ -124,7 +124,7 @@ enum Command {
         #[command(subcommand)]
         command: InboxCommand,
     },
-    /// TASKS.md: add, move, tick, delete or thread a task without touching any other byte
+    /// TASKS.md: add, move, tick, delete, tidy or thread a task without touching any other byte
     Task {
         #[command(subcommand)]
         command: TaskCommand,
@@ -261,6 +261,13 @@ enum TaskCommand {
     Delete {
         slug: String,
         title: String,
+    },
+    /// Remove only stale blank lines and empty headings; no task line, note or heading text changes
+    Tidy {
+        slug: String,
+        /// Print every place it would change, with line numbers, and write nothing
+        #[arg(long)]
+        dry_run: bool,
     },
     /// Record the thread that runs a task, optionally setting its owner in the same write
     Thread {
@@ -820,6 +827,11 @@ pub fn run() -> Result<()> {
                 let project = Project::load(&ctx.root, &slug)?;
                 let lane = task_caller_lane(&ctx, &project);
                 println!("{}", crate::tasks::delete(&project, &title, lane.as_deref())?);
+                Ok(())
+            }
+            TaskCommand::Tidy { slug, dry_run } => {
+                let project = Project::load(&ctx.root, &slug)?;
+                println!("{}", crate::tasks::tidy(&project, dry_run)?);
                 Ok(())
             }
             TaskCommand::Thread { slug, title, thread, clear, owner } => {

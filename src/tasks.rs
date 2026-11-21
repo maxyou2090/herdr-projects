@@ -4,7 +4,9 @@
 //! `hp task` is the only writer: every write is one `Project::lock()`-protected
 //! read-modify-write that leaves every other byte of the file alone (other
 //! sections, blank lines, comments, indentation, CRLF and a missing final
-//! newline). The read path never rewrites anything.
+//! newline). The one exception is `tidy`, which is asked for the blank lines
+//! and empty headings no task owns and touches nothing else. The read path
+//! never rewrites anything.
 //!
 //! Headings can be shared (`## Backlog`) or belong to one lane
 //! (`## <lane label or name>/<list>`), following `docs/lanes.md` §8. A project
@@ -579,6 +581,264 @@ pub fn delete(project: &Project, title: &str, lane: Option<&str>) -> Result<Stri
     })
 }
 
+/// One place `hp task tidy` changes: blank lines beside a heading, or a `## `
+/// heading with nothing but blank lines under it. `hp doctor` prints these same
+/// findings from the same function, so the two can never disagree about what
+/// is untidy.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Finding {
+    /// 1-based first line the change touches.
+    pub line: usize,
+    /// 1-based last line it touches (`line` when it is one line).
+    pub last: usize,
+    /// Blank lines taken out; `Some(0)` when a whole empty section goes and
+    /// `None` when a blank line the file lacks is put back.
+    removed: Option<usize>,
+    /// The place without a count or a verb: `blank line(s) under "## Backlog"`.
+    what: String,
+}
+
+impl Finding {
+    /// `3 blank line(s) under "## Backlog"`: what `hp doctor` says, and what
+    /// `--dry-run` prints after the line numbers.
+    pub fn summary(&self) -> String {
+        match self.removed {
+            Some(count) if count > 0 => format!("{count} {}", self.what),
+            _ => self.what.clone(),
+        }
+    }
+
+    /// The same place in `tidy`'s own words: `removed 3 blank line(s) under "## Backlog"`.
+    fn removal(&self) -> String {
+        match self.removed {
+            Some(count) if count > 0 => format!("removed {count} {}", self.what),
+            Some(_) => format!("removed {}", self.what),
+            None => format!("added {}", self.what),
+        }
+    }
+}
+
+/// One line of the plan: where it came from in the file (`None` for a blank
+/// line the plan inserts) and whether a task owns it.
+#[derive(Debug, Clone)]
+struct Kept {
+    line: Option<usize>,
+    text: String,
+    ending: String,
+    blank: bool,
+    protected: bool,
+}
+
+/// What `hp task tidy` would change in `text`, in file order: the one read that
+/// `hp doctor` and `--dry-run` share.
+pub fn untidiness(text: &str) -> Vec<Finding> {
+    plan(&Document::parse(text).lines).1
+}
+
+/// `hp task tidy`: the one writer allowed to touch the blank lines and the
+/// empty headings a task list accumulates — the ones `add`, `move` and
+/// `delete` leave behind, because they only ever move whole task blocks and an
+/// empty list keeps its heading on purpose.
+///
+/// What it may change is narrow: blank lines straight under a heading, the
+/// previous section's tail, a `## ` heading whose whole body is blank lines,
+/// the blank line after `# Tasks` and the file's end. A task line, its notes
+/// (blank lines inside them included), a heading's text, an HTML comment and
+/// the newline style are never touched, and a second run changes nothing.
+/// `--dry-run` prints every place with its line numbers and writes nothing.
+pub fn tidy(project: &Project, dry_run: bool) -> Result<String> {
+    let _lock = project.lock()?;
+    let path = project.dir().join("TASKS.md");
+    let original = read_file(&path)?;
+    let (lines, findings) = plan(&Document::parse(&original).lines);
+    let mut updated = Document { lines }.render();
+    preserve_last_newline(&original, &mut updated);
+    if findings.is_empty() || updated == original {
+        return Ok("TASKS.md is already tidy; nothing was changed".to_string());
+    }
+    if dry_run {
+        let mut out: Vec<String> = findings
+            .iter()
+            .map(|finding| {
+                let at = if finding.line == finding.last { format!("line {}", finding.line) } else { format!("line {}-{}", finding.line, finding.last) };
+                format!("{at}: {}", finding.summary())
+            })
+            .collect();
+        out.push(format!("tidied \"{}\": --dry-run, {} place(s); TASKS.md is unchanged", project.slug, findings.len()));
+        return Ok(out.join("\n"));
+    }
+    crate::project::write_atomic(&path, updated.as_bytes())?;
+    if findings.len() == 1 {
+        return Ok(format!("tidied \"{}\": {}; nothing else changed", project.slug, findings[0].removal()));
+    }
+    let mut out: Vec<String> = findings.iter().map(Finding::removal).collect();
+    out.push(format!("tidied \"{}\": {}; nothing else changed", project.slug, tidy_totals(&findings)));
+    Ok(out.join("\n"))
+}
+
+/// The one-line total under the per-place lines: the same numbers, summed.
+fn tidy_totals(findings: &[Finding]) -> String {
+    let blanks: usize = findings.iter().filter_map(|finding| finding.removed).sum();
+    let sections = findings.iter().filter(|finding| finding.removed == Some(0)).count();
+    let added = findings.iter().filter(|finding| finding.removed.is_none()).count();
+    let mut parts: Vec<String> = Vec::new();
+    if blanks > 0 {
+        parts.push(format!("removed {blanks} blank line(s)"));
+    }
+    if sections > 0 {
+        parts.push(format!("removed {sections} empty section(s)"));
+    }
+    if added > 0 {
+        parts.push(format!("added {added} blank line(s)"));
+    }
+    parts.join(", ")
+}
+
+/// The lined plan: the file as it would be, and the places that change. Both
+/// come from one pass, so a message can never name a line the write did not
+/// touch.
+fn plan(lines: &[RawLine]) -> (Vec<RawLine>, Vec<Finding>) {
+    let newline = newline_of(lines);
+    // A task's block — its line and the indented notes, blank lines between
+    // them included — is protected whole. `block_end` already knows where it
+    // ends, so a blank line after the last note is not part of it.
+    let mut protected = vec![false; lines.len()];
+    let mut at = 0;
+    while at < lines.len() {
+        if is_task_line(&lines[at].text) {
+            let end = block_end(lines, at);
+            protected[at..end].iter_mut().for_each(|flag| *flag = true);
+            at = end;
+        } else {
+            at += 1;
+        }
+    }
+    // `## ` sections that hold nothing but blank lines: the heading goes with
+    // them, or it keeps a body of its own for ever.
+    let mut sections: Vec<(usize, usize, String)> = Vec::new();
+    let mut at = 0;
+    while at < lines.len() {
+        if lines[at].text.starts_with("## ") {
+            let mut end = at + 1;
+            while end < lines.len() && !lines[end].text.starts_with("## ") {
+                end += 1;
+            }
+            if lines[at + 1..end].iter().all(|line| line.text.trim().is_empty()) {
+                sections.push((at, end, lines[at].text.clone()));
+            }
+            at = end;
+        } else {
+            at += 1;
+        }
+    }
+    // What is left in file order once those sections are gone.
+    let mut kept: Vec<Kept> = Vec::new();
+    let mut findings: Vec<Finding> = Vec::new();
+    let mut section = 0;
+    let mut at = 0;
+    while at < lines.len() {
+        if section < sections.len() && sections[section].0 == at {
+            let (start, end, heading) = sections[section].clone();
+            findings.push(Finding { line: start + 1, last: end, removed: Some(0), what: format!("empty section \"{heading}\"") });
+            // One blank line between the two neighbours: two paragraphs must
+            // not glue together where a heading sat.
+            if kept.iter().any(|line| !line.blank) {
+                kept.push(Kept { line: None, text: String::new(), ending: newline.clone(), blank: true, protected: false });
+            }
+            section += 1;
+            at = end;
+            continue;
+        }
+        kept.push(Kept {
+            line: Some(at),
+            text: lines[at].text.clone(),
+            ending: lines[at].ending.clone(),
+            blank: lines[at].text.trim().is_empty(),
+            protected: protected[at],
+        });
+        at += 1;
+    }
+    // Runs of blank lines: structural ones are trimmed, the rest are left.
+    let mut out: Vec<Kept> = Vec::new();
+    let mut at = 0;
+    while at < kept.len() {
+        if !kept[at].blank {
+            out.push(kept[at].clone());
+            at += 1;
+            continue;
+        }
+        let mut end = at;
+        while end < kept.len() && kept[end].blank {
+            end += 1;
+        }
+        let run = &kept[at..end];
+        let keep = if run.iter().any(|line| line.protected) {
+            run.len()
+        } else {
+            blank_target(&kept, at, end).map_or(run.len(), |target| target.min(run.len()))
+        };
+        out.extend(run.iter().take(keep).cloned());
+        if keep < run.len() {
+            let gone: Vec<usize> = run[keep..].iter().filter_map(|line| line.line).collect();
+            if let (Some(first), Some(last)) = (gone.iter().min(), gone.iter().max()) {
+                findings.push(Finding { line: first + 1, last: last + 1, removed: Some(gone.len()), what: blank_place(&kept, at, end) });
+            }
+        }
+        at = end;
+    }
+    // `# Tasks` and the section under it keep exactly one blank line between
+    // them, so a file with none gets that one line back.
+    let mut fixed: Vec<Kept> = Vec::with_capacity(out.len() + 1);
+    for line in out {
+        let glued = line.text.starts_with("## ")
+            && fixed.last().is_some_and(|prev| prev.text.starts_with("# ") && !prev.text.starts_with("## "));
+        if glued && let Some(header) = fixed.last() {
+            let number = header.line.map_or(1, |index| index + 1);
+            findings.push(Finding { line: number, last: number, removed: None, what: format!("the blank line after \"{}\"", header.text) });
+            fixed.push(Kept { line: None, text: String::new(), ending: newline.clone(), blank: true, protected: false });
+        }
+        fixed.push(line);
+    }
+    findings.sort_by_key(|finding| (finding.line, finding.last));
+    (fixed.into_iter().map(|line| RawLine { text: line.text, ending: line.ending }).collect(), findings)
+}
+
+/// How many blank lines a run keeps: `None` leaves it as the file has it.
+fn blank_target(kept: &[Kept], start: usize, end: usize) -> Option<usize> {
+    // Nothing follows: no blank line survives at the end of the file.
+    if end == kept.len() {
+        return Some(0);
+    }
+    // Nothing above it that this command owns.
+    if start == 0 {
+        return None;
+    }
+    let prev = &kept[start - 1].text;
+    if prev.starts_with("## ") {
+        return Some(0);
+    }
+    if prev.starts_with("# ") {
+        return Some(1);
+    }
+    if kept[end].text.starts_with("## ") {
+        return Some(1);
+    }
+    // Between two tasks or a task and loose text: not structural, left alone.
+    None
+}
+
+/// Where a run of blank lines sits, in words: `blank line(s) under "## Backlog"`,
+/// `blank line(s) before "## Later"`, `blank line(s) at the end of the file`.
+fn blank_place(kept: &[Kept], start: usize, end: usize) -> String {
+    if end == kept.len() {
+        return "blank line(s) at the end of the file".to_string();
+    }
+    if start > 0 && kept[start - 1].text.starts_with('#') {
+        return format!("blank line(s) under \"{}\"", kept[start - 1].text);
+    }
+    format!("blank line(s) before \"{}\"", kept[end].text)
+}
+
 /// What `hp task thread` writes onto the task line.
 #[derive(Debug, Clone, Default)]
 pub struct ThreadOptions<'a> {
@@ -971,21 +1231,19 @@ fn task_block(
     lines
 }
 
-fn with_tasks<T>(project: &Project, change: impl FnOnce(&mut Document) -> Result<T>) -> Result<T> {
-    let _lock = project.lock()?;
-    let path = project.dir().join("TASKS.md");
-    // Read *inside* the lock: a write never starts from a copy read before it.
-    let original = match std::fs::read_to_string(&path) {
-        Ok(text) => text,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => String::new(),
+/// TASKS.md as its bytes are; a missing file is an empty one.
+fn read_file(path: &Path) -> Result<String> {
+    match std::fs::read_to_string(path) {
+        Ok(text) => Ok(text),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(String::new()),
         Err(error) => bail!("could not read {}: {error}", path.display()),
-    };
-    let mut document = Document::parse(&original);
-    let answer = change(&mut document)?;
-    let mut updated = document.render();
-    // Preserve a missing final newline when the write appended at EOF: the
-    // separator before the new content still has to be added, but the file's
-    // own "does it end with a newline" property is part of its bytes.
+    }
+}
+
+/// Preserve a missing final newline when the write appended at EOF: the
+/// separator before the new content still has to be added, but the file's own
+/// "does it end with a newline" property is part of its bytes.
+fn preserve_last_newline(original: &str, updated: &mut String) {
     if !original.trim().is_empty() && !original.ends_with('\n') && updated.ends_with('\n') {
         if updated.ends_with("\r\n") {
             updated.truncate(updated.len() - 2);
@@ -993,6 +1251,17 @@ fn with_tasks<T>(project: &Project, change: impl FnOnce(&mut Document) -> Result
             updated.pop();
         }
     }
+}
+
+fn with_tasks<T>(project: &Project, change: impl FnOnce(&mut Document) -> Result<T>) -> Result<T> {
+    let _lock = project.lock()?;
+    let path = project.dir().join("TASKS.md");
+    // Read *inside* the lock: a write never starts from a copy read before it.
+    let original = read_file(&path)?;
+    let mut document = Document::parse(&original);
+    let answer = change(&mut document)?;
+    let mut updated = document.render();
+    preserve_last_newline(&original, &mut updated);
     if updated != original {
         crate::project::write_atomic(&path, updated.as_bytes())?;
     }
@@ -1005,6 +1274,15 @@ fn with_tasks<T>(project: &Project, change: impl FnOnce(&mut Document) -> Result
 struct RawLine {
     text: String,
     ending: String,
+}
+
+/// The file's own line ending: the first one it uses, else LF.
+fn newline_of(lines: &[RawLine]) -> String {
+    lines
+        .iter()
+        .find(|line| !line.ending.is_empty())
+        .map(|line| line.ending.clone())
+        .unwrap_or_else(|| "\n".to_string())
 }
 
 #[derive(Debug, Clone)]
@@ -1049,11 +1327,7 @@ impl Document {
     }
 
     fn newline(&self) -> String {
-        self.lines
-            .iter()
-            .find(|line| !line.ending.is_empty())
-            .map(|line| line.ending.clone())
-            .unwrap_or_else(|| "\n".to_string())
+        newline_of(&self.lines)
     }
 
     fn blank(&self) -> bool {
@@ -1901,5 +2175,129 @@ mod tests {
         assert!(delegated(text, "rotate the leaked SIGNING key", "Do it.\n").unwrap().contains("Key id 42."));
     }
 
+    // ------------------------------------------------------------ tidy
+
+    /// The shape law's TASKS.md was found in: `hp task delete` empties a list
+    /// and leaves its blank lines behind, and no command may touch them.
+    const LAW: &str = "# Tasks\n\n## Backlog\n\n\n\n- [x] A\n";
+
+    #[test]
+    fn tidy_removes_the_blank_lines_left_under_a_heading_and_nothing_else() {
+        let (_home, project) = temp_project("demo");
+        write_tasks(&project, LAW);
+        let before = parse(LAW);
+        let message = tidy(&project, false).unwrap();
+        assert_eq!(message, "tidied \"demo\": removed 3 blank line(s) under \"## Backlog\"; nothing else changed");
+        let after = read_tasks(&project);
+        assert_eq!(after, "# Tasks\n\n## Backlog\n- [x] A\n");
+        // The tasks are the same tasks: nothing but blank lines moved.
+        assert_eq!(parse(&after), before);
+        // A second run finds nothing and writes nothing.
+        assert_eq!(tidy(&project, false).unwrap(), "TASKS.md is already tidy; nothing was changed");
+        assert_eq!(read_tasks(&project), after);
+    }
+
+    #[test]
+    fn tidy_trims_the_header_the_section_tails_and_the_end_of_the_file() {
+        let (_home, project) = temp_project("demo");
+        write_tasks(&project, "# Tasks\n\n\n\n## Backlog\n- [ ] A\n\n\n## Later\n- [ ] B\n\n\n");
+        let message = tidy(&project, false).unwrap();
+        assert_eq!(read_tasks(&project), "# Tasks\n\n## Backlog\n- [ ] A\n\n## Later\n- [ ] B\n");
+        assert!(message.contains("removed 2 blank line(s) under \"# Tasks\""), "{message}");
+        assert!(message.contains("removed 1 blank line(s) before \"## Later\""), "{message}");
+        assert!(message.contains("removed 2 blank line(s) at the end of the file"), "{message}");
+        assert!(message.contains("tidied \"demo\": removed 5 blank line(s); nothing else changed"), "{message}");
+    }
+
+    #[test]
+    fn tidy_keeps_blank_lines_that_are_part_of_a_task_s_notes() {
+        let (_home, project) = temp_project("demo");
+        let text = "# Tasks\n\n## Backlog\n- [ ] A\n  first\n\n  second\n\n\n## Later\n- [ ] B\n";
+        write_tasks(&project, text);
+        let before = parse(text).remove(0).description;
+        tidy(&project, false).unwrap();
+        let after = read_tasks(&project);
+        // The note's own blank line stays; the two blanks after it are the
+        // section's tail and become one.
+        assert!(after.contains("- [ ] A\n  first\n\n  second\n\n## Later"), "{after:?}");
+        assert_eq!(parse(&after).remove(0).description, before);
+    }
+
+    #[test]
+    fn tidy_removes_an_empty_section_and_keeps_one_blank_line_between_its_neighbours() {
+        let (_home, project) = temp_project("demo");
+        write_tasks(&project, "# Tasks\n\n## Backlog\n- [ ] A\n## Empty\n\n\n## Later\n- [ ] B\n");
+        let message = tidy(&project, false).unwrap();
+        assert_eq!(read_tasks(&project), "# Tasks\n\n## Backlog\n- [ ] A\n\n## Later\n- [ ] B\n");
+        assert!(message.contains("removed empty section \"## Empty\""), "{message}");
+        assert!(parse(&read_tasks(&project)).iter().all(|task| task.list != "Empty"), "no task may be invented");
+    }
+
+    #[test]
+    fn tidy_dry_run_names_the_lines_and_writes_nothing() {
+        let (_home, project) = temp_project("demo");
+        write_tasks(&project, LAW);
+        let path = project.dir().join("TASKS.md");
+        let before = std::fs::read(&path).unwrap();
+        let stamp = std::fs::metadata(&path).unwrap().modified().unwrap();
+        let message = tidy(&project, true).unwrap();
+        assert_eq!(message.lines().next().unwrap(), "line 4-6: 3 blank line(s) under \"## Backlog\"");
+        assert!(message.contains("--dry-run"), "{message}");
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+        assert_eq!(std::fs::metadata(&path).unwrap().modified().unwrap(), stamp);
+    }
+
+    #[test]
+    fn tidy_keeps_the_crlf_line_ending() {
+        let (_home, project) = temp_project("demo");
+        write_tasks(&project, "# Tasks\r\n\r\n## Backlog\r\n\r\n\r\n- [ ] A\r\n");
+        tidy(&project, false).unwrap();
+        let after = read_tasks(&project);
+        assert_eq!(after, "# Tasks\r\n\r\n## Backlog\r\n- [ ] A\r\n");
+        assert!(!after.split("\r\n").any(|line| line.contains('\n')), "{after:?}");
+    }
+
+    #[test]
+    fn tidy_leaves_a_tidy_file_alone_and_puts_the_header_s_blank_line_back() {
+        let (_home, project) = temp_project("demo");
+        let tidy_text = "# Tasks\n\n## Backlog\n- [ ] A\n\n## Later\n- [ ] B\n";
+        write_tasks(&project, tidy_text);
+        assert!(untidiness(tidy_text).is_empty(), "{:?}", untidiness(tidy_text));
+        assert_eq!(tidy(&project, false).unwrap(), "TASKS.md is already tidy; nothing was changed");
+        assert_eq!(read_tasks(&project), tidy_text);
+        // `# Tasks` sits straight on its list: that one blank line comes back.
+        write_tasks(&project, "# Tasks\n## Backlog\n- [ ] A\n");
+        let message = tidy(&project, false).unwrap();
+        assert_eq!(read_tasks(&project), "# Tasks\n\n## Backlog\n- [ ] A\n");
+        assert!(message.contains("added the blank line after \"# Tasks\""), "{message}");
+        // And the file it wrote keeps every other command working on it.
+        add(&project, "Backlog", "After the tidy", &AddOptions::default()).unwrap();
+        done(&project, "After the tidy", Some("c-1")).unwrap();
+        delete(&project, "A", None).unwrap();
+        assert_eq!(read_tasks(&project), "# Tasks\n\n## Backlog\n- [x] After the tidy\n");
+    }
+
+    #[test]
+    fn untidiness_names_each_place_in_file_order() {
+        let found = untidiness("# Tasks\n\n\n## Backlog\n- [ ] A\n\n\n## Later\n- [ ] B\n");
+        let places: Vec<String> = found.iter().map(Finding::summary).collect();
+        assert_eq!(places, ["1 blank line(s) under \"# Tasks\"", "1 blank line(s) before \"## Later\""]);
+        // The run's first blank line stays, so the reported line is the one
+        // that goes: the second blank of each pair.
+        assert_eq!((found[0].line, found[0].last), (3, 3));
+        assert_eq!((found[1].line, found[1].last), (7, 7));
+    }
+
+    #[test]
+    fn untidiness_reports_an_empty_section_with_its_own_lines() {
+        let found = untidiness("# Tasks\n\n## Backlog\n- [ ] A\n\n## Old\n\n\n## Later\n- [ ] B\n");
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert_eq!(found[0].summary(), "empty section \"## Old\"");
+        assert_eq!((found[0].line, found[0].last), (6, 8));
+        // The shared fixture's one stale area is that same empty section: its
+        // notes, comments and headings are all already tidy.
+        let places: Vec<String> = untidiness(DIRTY).iter().map(Finding::summary).collect();
+        assert_eq!(places, ["empty section \"## 抢修/Doing\""]);
+    }
 
 }
