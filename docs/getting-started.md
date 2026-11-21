@@ -30,7 +30,7 @@ files. `hp doctor --fix` repairs what it can: the `~/.local/bin/hp` link and the
 Start the ticker, and let the machine keep it:
 
 ```bash
-hp ticker start      # writes ~/Library/LaunchAgents/dev.hp.ticker.plist and loads it
+hp ticker start      # writes ~/Library/LaunchAgents/dev.hp.ticker.<root hash>.plist and loads it
 hp ticker status
 ```
 

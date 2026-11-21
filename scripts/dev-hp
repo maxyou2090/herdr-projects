@@ -3,10 +3,11 @@
 # environment, so it can never attach to the core session it was started from.
 # Pass --session hp-dev on open, adopt-workspace and doctor.
 #
-# Careful with the ticker: `open` starts one, and every root's LaunchAgent uses
-# the same label (`dev.hp.ticker`, `ticker::AGENT_LABEL`), so the agent this root
-# boots out is the real root's. Put it back afterwards with `hp ticker start`
-# (the installed binary, `~/.herdr-projects`) and check `hp doctor` (t-0082).
+# Every root has its own LaunchAgent label (`dev.hp.ticker.<hash of the
+# canonical root>`, `ticker::agent_label`), so the ticker this root starts is
+# separate from the real root's: neither can boot the other's out or rewrite its
+# plist (before t-0083 both used `dev.hp.ticker`, and a dev run replaced the
+# real one). Check both with `hp ticker status` under each root.
 repo=$(cd "$(dirname "$0")/.." && pwd)
 exec env -u HC_SESSION -u HC_TERMINAL_ID -u HC_BIN_PATH \
   HERDR_PROJECTS_ROOT="$repo/.dev-root" "$repo/target/release/hp" "$@"

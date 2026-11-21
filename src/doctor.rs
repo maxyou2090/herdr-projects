@@ -133,6 +133,27 @@ fn ticker_agent_line(env: &Env, root: &Path, runner: &dyn Runner, fix: bool, run
         });
     }
     if !state.installed {
+        // Between the two labels: this root still runs under the shared
+        // `dev.hp.ticker` job, which keeps the ticker alive exactly as the
+        // derived one would. Not a warning, and named, because `ticker stop`
+        // and `ticker start` is what moves it (t-0083).
+        if let Some(legacy) = &state.legacy {
+            return Some((
+                state.loaded.then_some(true),
+                if state.loaded {
+                    format!(
+                        "{path} is not written yet; this root still runs under the old shared LaunchAgent {}, and `hp ticker stop && hp ticker start` moves it to the label `{}`",
+                        legacy.display(),
+                        crate::ticker::agent_label(root)
+                    )
+                } else {
+                    format!(
+                        "{} is this root's old shared LaunchAgent but launchd has not loaded it, and {path} is not written; run `hp ticker stop && hp ticker start`",
+                        legacy.display()
+                    )
+                },
+            ));
+        }
         return Some((
             None,
             format!(
@@ -152,8 +173,8 @@ fn ticker_agent_line(env: &Env, root: &Path, runner: &dyn Runner, fix: bool, run
         return Some((
             None,
             format!(
-                "{path} is written but launchd has not loaded it, so nothing starts the ticker; run `hp doctor --fix` or `hp ticker start` to load it (`launchctl bootstrap gui/<uid> {})",
-                crate::ticker::AGENT_LABEL
+                "{path} is written (label `{}`) but launchd has not loaded it, so nothing starts the ticker; run `hp doctor --fix` or `hp ticker start` to load it (`launchctl bootstrap gui/<uid> {path}`)",
+                crate::ticker::agent_label(root)
             ),
         ));
     }
@@ -190,6 +211,18 @@ fn report(
     let _ = writeln!(out, "version:    {}", crate::VERSION);
     let _ = writeln!(out, "root:       {}", root.display());
     let _ = writeln!(out, "config dir: {}", config_dir.display());
+    // Which LaunchAgent belongs to this root: the label is derived from the
+    // canonical root (t-0083), so naming both halves here is what lets a
+    // person tell two roots' jobs apart — the real root's and a scratch
+    // root's (`scripts/dev-hp`) now have one each.
+    if cfg!(target_os = "macos") {
+        let _ = writeln!(
+            out,
+            "ticker:     label {}, plist {}",
+            crate::ticker::agent_label(root),
+            crate::ticker::agent_path(&env.home, root).display()
+        );
+    }
     let _ = writeln!(out);
 
     let app = env.herdr_app_bin();
@@ -650,8 +683,8 @@ mod tests {
         crate::ticker::install_agent(home, &binary, root, runner).unwrap();
     }
 
-    fn plist_path(home: &Path) -> std::path::PathBuf {
-        home.join(format!("Library/LaunchAgents/{}.plist", crate::ticker::AGENT_LABEL))
+    fn plist_path(home: &Path, root: &Path) -> std::path::PathBuf {
+        crate::ticker::agent_path(home, root)
     }
 
     /// 2026-11-18: law's coordinator pane (t5h) has a shell sitting in rexa's
@@ -709,6 +742,45 @@ mod tests {
         assert!(detail.contains("hp ticker start"), "{detail}");
     }
 
+    /// Between the two labels (t-0083): this root's own plist is not written
+    /// yet and the job keeping the ticker alive is the shared `dev.hp.ticker`
+    /// one. That is the state after an upgrade and before the ticker's next
+    /// start, so it is not a warning — and the line names the command that
+    /// moves it.
+    #[test]
+    fn doctor_accepts_the_old_shared_agent_until_the_next_start() {
+        if !cfg!(target_os = "macos") {
+            return;
+        }
+        let home = tempfile::tempdir().unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let env = Env::for_test(home.path(), &[]);
+        let runner = FakeRunner::new();
+        runner.on("launchctl print", ok(""));
+        runner.on("launchctl bootout", ok(""));
+        runner.on("launchctl bootstrap", ok(""));
+        installed(home.path(), root.path(), &runner);
+        // The same plist, moved back to the shared label the old release wrote.
+        let derived = crate::ticker::agent_path(home.path(), root.path());
+        let legacy = home.path().join("Library/LaunchAgents/dev.hp.ticker.plist");
+        let text = std::fs::read_to_string(&derived).unwrap();
+        std::fs::write(&legacy, text.replace(&crate::ticker::agent_label(root.path()), crate::ticker::LEGACY_AGENT_LABEL)).unwrap();
+        std::fs::remove_file(&derived).unwrap();
+
+        let (mark, detail) = ticker_agent_line(&env, root.path(), &runner, false, true).unwrap();
+        assert_eq!(mark, Some(true), "{detail}");
+        assert!(detail.contains("old shared LaunchAgent"), "{detail}");
+        assert!(detail.contains("dev.hp.ticker.plist"), "{detail}");
+        assert!(detail.contains("hp ticker stop"), "{detail}");
+
+        // launchd does not have it either: now nothing keeps the ticker alive.
+        let orphan = FakeRunner::new();
+        orphan.on("launchctl print", fail(113, "Could not find service"));
+        let (mark, detail) = ticker_agent_line(&env, root.path(), &orphan, false, true).unwrap();
+        assert_eq!(mark, None, "{detail}");
+        assert!(detail.contains("has not loaded it"), "{detail}");
+    }
+
     #[test]
     fn doctor_warns_about_a_plist_launchd_did_not_load() {
         if !cfg!(target_os = "macos") {
@@ -725,6 +797,9 @@ mod tests {
         let (mark, detail) = ticker_agent_line(&env, root.path(), &runner, false, true).unwrap();
         assert_eq!(mark, None, "{detail}");
         assert!(detail.contains("has not loaded it"), "{detail}");
+        // It names this root's own label, which is what `launchctl bootstrap`
+        // needs and what tells two roots' jobs apart (t-0083).
+        assert!(detail.contains(&crate::ticker::agent_label(root.path())), "{detail}");
     }
 
     #[test]
@@ -737,7 +812,7 @@ mod tests {
         let env = Env::for_test(home.path(), &[]);
         let runner = FakeRunner::new();
         runner.on("launchctl print", ok(""));
-        let path = plist_path(home.path());
+        let path = plist_path(home.path(), root.path());
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         std::fs::write(&path, "<plist><dict><key>KeepAlive</key><dict><key>SuccessfulExit</key><false/></dict></dict></plist>").unwrap();
         let (mark, detail) = ticker_agent_line(&env, root.path(), &runner, false, true).unwrap();
