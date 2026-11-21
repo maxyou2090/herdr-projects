@@ -97,8 +97,12 @@ pub fn decide_start(lock: &LockState, my_version: &str, stop_file_exists: bool) 
     }
 }
 
-/// The LaunchAgent that keeps the ticker alive across reboots and crashes.
-pub const AGENT_LABEL: &str = "dev.hp.ticker";
+/// The LaunchAgent label every root used before labels were derived from the
+/// root (t-0083). One label for the whole machine meant `scripts/dev-hp open`
+/// booted the **real** ticker out and rewrote its plist. Kept as the prefix of
+/// [`agent_label`] and for the one-time migration, and as the label a ticker
+/// started before the change is still running under.
+pub const LEGACY_AGENT_LABEL: &str = "dev.hp.ticker";
 
 const LAUNCHCTL_TIMEOUT: Duration = Duration::from_secs(10);
 
@@ -108,8 +112,44 @@ const LAUNCHCTL_TIMEOUT: Duration = Duration::from_secs(10);
 /// recovered while somebody is still looking at the screen.
 const THROTTLE_SECS: u32 = 60;
 
-fn agent_path_in(home: &Path) -> PathBuf {
-    home.join("Library/LaunchAgents").join(format!("{AGENT_LABEL}.plist"))
+/// The LaunchAgent label of `root`'s ticker: [`LEGACY_AGENT_LABEL`] plus a
+/// fingerprint of the canonical root. Two roots keep two jobs and two plists,
+/// so a scratch root (`scripts/dev-hp`) can neither unload nor overwrite the
+/// real one's. `ticker start`, `stop`, `status` and `doctor` all read the label
+/// from here, so they cannot disagree about which job is this root's.
+pub fn agent_label(root: &Path) -> String {
+    format!("{LEGACY_AGENT_LABEL}.{}", root_tag(root))
+}
+
+/// A short fingerprint of the root: FNV-1a over its canonical path, folded to
+/// 32 bits. It is stable across builds on purpose — a hash that moved with the
+/// compiler would mint a new label on every rebuild and leave the previous job
+/// loaded for ever.
+fn root_tag(root: &Path) -> String {
+    let canonical = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for byte in canonical.to_string_lossy().as_bytes() {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x0100_0000_01b3);
+    }
+    format!("{:08x}", ((hash >> 32) as u32) ^ (hash as u32))
+}
+
+fn agent_path_in(home: &Path, label: &str) -> PathBuf {
+    home.join("Library/LaunchAgents").join(format!("{label}.plist"))
+}
+
+/// The plist of `root`'s ticker.
+pub fn agent_path(home: &Path, root: &Path) -> PathBuf {
+    agent_path_in(home, &agent_label(root))
+}
+
+/// The retired shared plist, and the copy of it moved aside by
+/// [`migrate_legacy_agent`] while a ticker still runs under that job.
+fn legacy_paths(home: &Path) -> [PathBuf; 2] {
+    let live = agent_path_in(home, LEGACY_AGENT_LABEL);
+    let aside = PathBuf::from(format!("{}.migrated", live.display()));
+    [live, aside]
 }
 
 /// The plist text for a ticker of `root`.
@@ -128,7 +168,7 @@ fn agent_plist(binary: &Path, root: &Path, log: &Path) -> String {
         "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
 <!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n\
 <plist version=\"1.0\">\n<dict>\n\
-  <key>Label</key><string>{AGENT_LABEL}</string>\n\
+  <key>Label</key><string>{label}</string>\n\
   <key>ProgramArguments</key>\n  <array>\n\
     <string>{binary}</string>\n    <string>--root</string>\n    <string>{root}</string>\n    <string>ticker</string>\n    <string>run</string>\n\
   </array>\n\
@@ -139,6 +179,7 @@ fn agent_plist(binary: &Path, root: &Path, log: &Path) -> String {
   <key>StandardOutPath</key><string>{log}</string>\n\
   <key>StandardErrorPath</key><string>{log}</string>\n\
 </dict>\n</plist>\n",
+        label = agent_label(root),
         binary = escape(&binary.to_string_lossy()),
         root = escape(&root.to_string_lossy()),
         log = escape(&log.to_string_lossy()),
@@ -156,6 +197,88 @@ fn plist_program(text: &str) -> Option<String> {
     Some(rest[start..end].to_string())
 }
 
+/// The `--root` a plist's ticker runs, from its `ProgramArguments`.
+fn plist_root(text: &str) -> Option<String> {
+    let rest = text.split("<key>ProgramArguments</key>").nth(1)?;
+    let after = rest.split("<string>--root</string>").nth(1)?;
+    let start = after.find("<string>")? + "<string>".len();
+    let end = after[start..].find("</string>")? + start;
+    // `agent_plist` escapes these three; anything else is written as it is.
+    Some(after[start..end].replace("&lt;", "<").replace("&gt;", ">").replace("&amp;", "&"))
+}
+
+/// Whether the root a plist names is `root`, canonical where both exist (a
+/// root that is not there yet has no canonical form).
+fn same_root(named: &str, root: &Path) -> bool {
+    let named_path = Path::new(named);
+    match (named_path.canonicalize(), root.canonicalize()) {
+        (Ok(one), Ok(other)) => one == other,
+        _ => named_path == root,
+    }
+}
+
+/// Whether the plist at `path` is this root's ticker.
+fn plist_of_root(path: &Path, root: &Path) -> bool {
+    std::fs::read_to_string(path).is_ok_and(|text| plist_root(&text).is_some_and(|named| same_root(&named, root)))
+}
+
+/// This root's plist under the shared label, still on disk or moved aside.
+pub fn legacy_plist(home: &Path, root: &Path) -> Option<PathBuf> {
+    legacy_paths(home).into_iter().find(|path| plist_of_root(path, root))
+}
+
+/// The one-time move off the shared `dev.hp.ticker` job (t-0083).
+///
+/// That label was the same string for every root, so a `scripts/dev-hp open`
+/// booted the real ticker out (SIGTERM through `bootout`) and rewrote its
+/// plist to the scratch root. The new label is [`agent_label`]; this retires
+/// the old job **only when its plist says it is this root's** (`--root` in
+/// `ProgramArguments`). A plist that names another root, or names none, is
+/// left exactly where it is: it is that root's ticker.
+///
+/// `bootout` is SIGTERM, so a job a ticker is still running under is not
+/// unloaded: its plist is moved aside instead (a reboot then loads only the new
+/// one), and `ticker stop` boots the job out with that file as its proof.
+fn migrate_legacy_agent(home: &Path, root: &Path, log: &Log, runner: &dyn Runner, running: bool) {
+    let [live, aside] = legacy_paths(home);
+    if live.exists() && !plist_of_root(&live, root) {
+        log.line(&format!(
+            "left {} alone: it is the LaunchAgent of another root, not {}",
+            live.display(),
+            root.display()
+        ));
+        return;
+    }
+    if !live.exists() && !plist_of_root(&aside, root) {
+        return;
+    }
+    let uid = unsafe { libc_getuid() };
+    if running {
+        // The ticker that holds the lock was started by this very job: one
+        // `bootout` would be its SIGTERM. Moving the plist aside is enough to
+        // keep a reboot from loading it beside the new job.
+        if live.exists() && std::fs::rename(&live, &aside).is_ok() {
+            log.line(&format!(
+                "the shared LaunchAgent `{LEGACY_AGENT_LABEL}` ({}) is this root's and a ticker still runs under it, so its job was left loaded and its plist moved to {}; a reboot loads only `{}`, and `hp ticker stop` unloads the old job",
+                live.display(),
+                aside.display(),
+                agent_label(root)
+            ));
+        }
+        return;
+    }
+    launchctl(runner, &["bootout", &format!("gui/{uid}/{LEGACY_AGENT_LABEL}")]);
+    let removed = live.exists() || aside.exists();
+    let _ = std::fs::remove_file(&live);
+    let _ = std::fs::remove_file(&aside);
+    if removed {
+        log.line(&format!(
+            "moved this root off the shared LaunchAgent `{LEGACY_AGENT_LABEL}` to `{}`: the old job is unloaded and its plist removed, and nothing was running under it",
+            agent_label(root)
+        ));
+    }
+}
+
 /// The LaunchAgent as `doctor` sees it: whether the plist is there, whether it
 /// is the text [`install_agent`] would write now (an old `KeepAlive` is what
 /// the 2026-11-17 accident left on disk), and whether launchd has the job
@@ -165,6 +288,10 @@ pub struct AgentState {
     pub installed: bool,
     pub current: bool,
     pub loaded: bool,
+    /// This root's plist under the shared label t-0083 retired, while it is
+    /// still on disk: the state between the two labels, after an upgrade and
+    /// before the ticker's next start.
+    pub legacy: Option<PathBuf>,
     /// The program the plist on disk runs, when it could be read.
     pub program: Option<String>,
 }
@@ -175,23 +302,42 @@ pub fn agent_state(home: &Path, binary: &Path, root: &Path, runner: &dyn Runner)
     if !cfg!(target_os = "macos") {
         return None;
     }
-    let path = agent_path_in(home);
+    let path = agent_path(home, root);
     let text = std::fs::read_to_string(&path).ok();
+    let legacy = legacy_plist(home, root);
     Some(AgentState {
         installed: text.is_some(),
         current: text.as_deref().is_some_and(|text| text == agent_plist(binary, root, &log_path(root))),
-        loaded: agent_loaded(runner),
+        // The question `doctor` and `ticker status` ask is "would launchd start
+        // the ticker again", and the old shared job answers it just as well as
+        // the derived one while the two overlaps.
+        loaded: agent_loaded(root, runner) || (legacy.is_some() && label_loaded(LEGACY_AGENT_LABEL, runner)),
+        legacy,
         program: text.as_deref().and_then(plist_program),
         path,
     })
 }
 
-/// Whether launchd holds the job, asked of launchd itself rather than guessed
-/// from the plist: `launchctl print` fails for a label that is not loaded.
-fn agent_loaded(runner: &dyn Runner) -> bool {
+/// Whether launchd holds this root's job, asked of launchd itself rather than
+/// guessed from the plist: `launchctl print` fails for a label that is not
+/// loaded.
+fn agent_loaded(root: &Path, runner: &dyn Runner) -> bool {
+    label_loaded(&agent_label(root), runner)
+}
+
+fn label_loaded(label: &str, runner: &dyn Runner) -> bool {
     let uid = unsafe { libc_getuid() };
-    let print = Cmd::new("launchctl", LAUNCHCTL_TIMEOUT).args(["print", &format!("gui/{uid}/{AGENT_LABEL}")]);
+    let print = Cmd::new("launchctl", LAUNCHCTL_TIMEOUT).args(["print", &format!("gui/{uid}/{label}")]);
     runner.run(&print).map(|out| out.success()).unwrap_or(false)
+}
+
+/// The LaunchAgent label this process runs under, when launchd started it:
+/// this root's own label, or the shared one every root used before t-0083.
+/// Only those two count — `XPC_SERVICE_NAME` set to anything else is not a job
+/// of this ticker, and unloading it would end somebody else's.
+fn ticker_job_label(root: &Path) -> Option<String> {
+    let name = std::env::var("XPC_SERVICE_NAME").ok()?;
+    (name == agent_label(root) || name == LEGACY_AGENT_LABEL).then_some(name)
 }
 
 fn launchctl(runner: &dyn Runner, args: &[&str]) {
@@ -257,7 +403,7 @@ fn agent_lock(root: &Path) -> AgentLock {
 }
 
 fn load_agent(home: &Path, binary: &Path, root: &Path, runner: &dyn Runner, force: bool) -> Result<LoadReport> {
-    let path = agent_path_in(home);
+    let path = agent_path(home, root);
     let text = agent_plist(binary, root, &log_path(root));
     let log = Log { path: log_path(root) };
     let uid = unsafe { libc_getuid() };
@@ -270,8 +416,12 @@ fn load_agent(home: &Path, binary: &Path, root: &Path, runner: &dyn Runner, forc
     // loaded starts nothing. It can also fail on a launchd hiccup while the job
     // is loaded, which is why a failure here never leads to a `bootout` of a
     // ticker that holds the lock.
-    let loaded = agent_loaded(runner);
+    let loaded = agent_loaded(root, runner);
     let running = lock_state(root) != LockState::Free;
+    // Before anything else, and even when this root's text is already right: a
+    // job left on the shared label is this root's only if its plist says so
+    // (t-0083).
+    migrate_legacy_agent(home, root, &log, runner, running);
     let mut report = LoadReport::default();
     if current && loaded && !force {
         return Ok(report);
@@ -300,7 +450,7 @@ fn load_agent(home: &Path, binary: &Path, root: &Path, runner: &dyn Runner, forc
         return Ok(report);
     }
     if loaded {
-        launchctl(runner, &["bootout", &format!("gui/{uid}/{AGENT_LABEL}")]);
+        launchctl(runner, &["bootout", &format!("gui/{uid}/{}", agent_label(root))]);
         report.bounced = true;
     }
     let bootstrap = || Cmd::new("launchctl", LAUNCHCTL_TIMEOUT).args(["bootstrap", &format!("gui/{uid}"), &path.to_string_lossy()]);
@@ -350,11 +500,21 @@ fn revert_plist(path: &Path, previous: Option<&str>, log: &Log, runner: &dyn Run
 ///
 /// `home` and `runner` are parameters rather than the process's own, so a test
 /// can never unload the LaunchAgent of the machine it runs on.
-pub fn remove_agent(home: &Path, runner: &dyn Runner) {
-    let path = agent_path_in(home);
+pub fn remove_agent(home: &Path, root: &Path, runner: &dyn Runner) {
+    let path = agent_path(home, root);
     let uid = unsafe { libc_getuid() };
-    launchctl(runner, &["bootout", &format!("gui/{uid}/{AGENT_LABEL}")]);
+    launchctl(runner, &["bootout", &format!("gui/{uid}/{}", agent_label(root))]);
     let _ = std::fs::remove_file(&path);
+    // The old shared job this root still runs under, if any: a loaded job with
+    // `KeepAlive` is what would start the ticker again right after `stop`. Only
+    // a plist that names this root is unloaded — another root's job is its
+    // own, which is the whole point of the derived label.
+    for file in legacy_paths(home) {
+        if plist_of_root(&file, root) {
+            launchctl(runner, &["bootout", &format!("gui/{uid}/{LEGACY_AGENT_LABEL}")]);
+            let _ = std::fs::remove_file(&file);
+        }
+    }
 }
 
 unsafe extern "C" {
@@ -482,7 +642,7 @@ pub fn stop(ctx: &Ctx) -> Result<()> {
     // Unload it after the wait: with an unconditional `KeepAlive` the job is
     // what would start the loop again, so it goes last, and removing it is
     // also the SIGTERM for a ticker that ignored the stop file.
-    remove_agent(&ctx.env.home, ctx.runner);
+    remove_agent(&ctx.env.home, &ctx.root, ctx.runner);
     let free = wait_until_free(root, STOP_WAIT);
     let _ = std::fs::remove_file(stop_path(root));
     if free {
@@ -574,7 +734,10 @@ fn status_agent(ctx: &Ctx, wait: Duration) -> String {
         return format!("agent:  {path} is loaded, and launchd restarts the ticker after any exit");
     }
     let why = if !state.installed {
-        "there is no plist".to_string()
+        match &state.legacy {
+            Some(legacy) => format!("there is no plist for this root's own label yet; it still runs under the old shared one ({})", legacy.display()),
+            None => "there is no plist".to_string(),
+        }
     } else if !state.current {
         // Naming the program is what made the 2026-11-19 accident legible: a
         // build in a worktree had rewritten the plist to point at itself.
@@ -742,10 +905,10 @@ fn run_logged(ctx: &Ctx, log: &Log) -> Result<()> {
         // Under launchd, exiting means being started again a moment later: two
         // tickers would trade the lock for ever. Unload the job (not the plist,
         // so `doctor` sees it was written but is not loaded) and step aside.
-        if std::env::var("XPC_SERVICE_NAME").map(|name| name == AGENT_LABEL).unwrap_or(false) {
+        if let Some(label) = ticker_job_label(root) {
             let uid = unsafe { libc_getuid() };
             log.line("this instance is launchd's job and another ticker has the lock; unloading the job");
-            launchctl(ctx.runner, &["bootout", &format!("gui/{uid}/{AGENT_LABEL}")]);
+            launchctl(ctx.runner, &["bootout", &format!("gui/{uid}/{label}")]);
         }
         return Ok(());
     }
@@ -1600,7 +1763,7 @@ mod tests {
         runner.on("launchctl bootout", ok(""));
         runner.on("launchctl bootstrap", ok(""));
         let binary = Path::new("/opt/hp/hp");
-        let plist = home.path().join(format!("Library/LaunchAgents/{AGENT_LABEL}.plist"));
+        let plist = plist_in(home.path(), &root);
 
         install_agent(home.path(), binary, &root, &runner).unwrap();
         assert!(std::fs::read_to_string(&plist).unwrap().contains("<key>KeepAlive</key><true/>"));
@@ -1628,12 +1791,12 @@ mod tests {
         file
     }
 
-    fn plist_in(home: &Path) -> PathBuf {
-        home.join(format!("Library/LaunchAgents/{AGENT_LABEL}.plist"))
+    fn plist_in(home: &Path, root: &Path) -> PathBuf {
+        agent_path(home, root)
     }
 
-    fn write_plist(home: &Path, text: &str) {
-        let path = plist_in(home);
+    fn write_plist(home: &Path, root: &Path, text: &str) {
+        let path = plist_in(home, root);
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         std::fs::write(&path, text).unwrap();
     }
@@ -1646,7 +1809,7 @@ mod tests {
         let home = tempfile::tempdir().unwrap();
         let root = home.path().join("root");
         std::fs::create_dir(&root).unwrap();
-        write_plist(home.path(), "<plist><dict><key>KeepAlive</key><dict><key>SuccessfulExit</key><false/></dict></dict></plist>");
+        write_plist(home.path(), &root, "<plist><dict><key>KeepAlive</key><dict><key>SuccessfulExit</key><false/></dict></dict></plist>");
         let runner = FakeRunner::new();
         runner.on("launchctl print", ok(""));
         runner.on("launchctl bootout", ok(""));
@@ -1658,7 +1821,7 @@ mod tests {
         assert!(report.kept_running, "{report:?}");
         assert_eq!(runner.count("launchctl bootout"), 0, "a running ticker must not be unloaded to refresh a plist");
         assert_eq!(runner.count("launchctl bootstrap"), 0);
-        assert!(std::fs::read_to_string(plist_in(home.path())).unwrap().contains("<key>KeepAlive</key><true/>"));
+        assert!(std::fs::read_to_string(plist_in(home.path(), &root)).unwrap().contains("<key>KeepAlive</key><true/>"));
         let log = std::fs::read_to_string(root.join(".ticker.log")).unwrap_or_default();
         assert!(log.contains("left it running"), "{log}");
         drop(lock);
@@ -1694,7 +1857,7 @@ mod tests {
         let root = home.path().join("root");
         std::fs::create_dir(&root).unwrap();
         let old = "<plist><dict><key>KeepAlive</key><dict><key>SuccessfulExit</key><false/></dict></dict></plist>";
-        write_plist(home.path(), old);
+        write_plist(home.path(), &root, old);
         let runner = FakeRunner::new();
         runner.on("launchctl print", ok(""));
         runner.on("launchctl bootout", ok(""));
@@ -1704,7 +1867,7 @@ mod tests {
         assert!(format!("{error:#}").contains("Input/output error"), "{error:#}");
         let log = std::fs::read_to_string(root.join(".ticker.log")).unwrap_or_default();
         assert!(log.contains("launchctl bootstrap failed: Bootstrap failed: 5: Input/output error"), "{log}");
-        assert_eq!(std::fs::read_to_string(plist_in(home.path())).unwrap(), old, "the plist launchd refused is not left behind");
+        assert_eq!(std::fs::read_to_string(plist_in(home.path(), &root)).unwrap(), old, "the plist launchd refused is not left behind");
     }
 
     /// The repair the accident asks for: `hp ticker status` is the command a
@@ -1719,7 +1882,7 @@ mod tests {
         let root = home.path().join("root");
         std::fs::create_dir(&root).unwrap();
         let binary = crate::paths::binary().unwrap();
-        write_plist(home.path(), &agent_plist(&binary, &root, &log_path(&root)));
+        write_plist(home.path(), &root, &agent_plist(&binary, &root, &log_path(&root)));
         let env = Env::for_test(home.path(), &[]);
         let runner = FakeRunner::new();
         runner.on("launchctl print", fail(113, "Could not find service"));
@@ -1743,7 +1906,7 @@ mod tests {
         let root = home.path().join("root");
         std::fs::create_dir(&root).unwrap();
         let binary = crate::paths::binary().unwrap();
-        write_plist(home.path(), &agent_plist(&binary, &root, &log_path(&root)));
+        write_plist(home.path(), &root, &agent_plist(&binary, &root, &log_path(&root)));
         let env = Env::for_test(home.path(), &[]);
         let runner = FakeRunner::new();
         runner.on("launchctl print", ok(""));
@@ -1771,7 +1934,7 @@ mod tests {
         let root = home.path().join("root");
         std::fs::create_dir(&root).unwrap();
         let elsewhere = Path::new("/Users/me/.herdr/worktrees/x/target/release/hp");
-        write_plist(home.path(), &agent_plist(elsewhere, &root, &log_path(&root)));
+        write_plist(home.path(), &root, &agent_plist(elsewhere, &root, &log_path(&root)));
         let env = Env::for_test(home.path(), &[]);
         let runner = FakeRunner::new();
         runner.on("launchctl print", ok(""));
@@ -1807,10 +1970,10 @@ mod tests {
         // While the other holder is inside, nothing is written and no launchctl
         // runs: the pair cannot be split by a second process.
         assert!(wait.recv_timeout(Duration::from_millis(300)).is_err(), "install did not wait for the other process");
-        assert!(!plist_in(home.path()).exists());
+        assert!(!plist_in(home.path(), &root).exists());
         drop(guard);
         assert!(wait.recv_timeout(Duration::from_secs(10)).unwrap().unwrap());
-        assert!(plist_in(home.path()).exists());
+        assert!(plist_in(home.path(), &root).exists());
         spawned.join().unwrap();
     }
 
@@ -1850,7 +2013,7 @@ mod tests {
         .unwrap();
         releaser.join().unwrap();
 
-        let plist = home.path().join(format!("Library/LaunchAgents/{AGENT_LABEL}.plist"));
+        let plist = plist_in(home.path(), &root);
         let text = std::fs::read_to_string(&plist).unwrap_or_default();
         assert!(text.contains("<key>KeepAlive</key><true/>"), "no LaunchAgent written: {text}");
         assert_eq!(runner.count("launchctl bootstrap"), 1);
@@ -1911,7 +2074,7 @@ mod tests {
         let root = home.path().join("root");
         project::create(&root, "demo", vec![]).unwrap();
         let binary = crate::paths::binary().unwrap();
-        write_plist(home.path(), &agent_plist(&binary, &root, &log_path(&root)));
+        write_plist(home.path(), &root, &agent_plist(&binary, &root, &log_path(&root)));
         let env = Env::for_test(home.path(), &[]);
         let runner = FakeRunner::new();
         runner.on("launchctl print", ok(""));
@@ -2239,6 +2402,141 @@ mod tests {
         assert!(!tick_project(&ctx, &f.project).unwrap());
         assert!(runner.calls.borrow().iter().all(|c| !c.env.iter().any(|(_, v)| *v == gone)));
         assert_eq!(runner.count("agent list"), 0);
+    }
+
+    /// Two roots, two jobs: the label is derived from the canonical root, so a
+    /// scratch root (`scripts/dev-hp`) can neither unload nor rewrite the real
+    /// root's LaunchAgent (t-0083). Before this, every root shared one label, so
+    /// `dev-hp open` booted the real ticker out and pointed its plist at the
+    /// scratch root.
+    #[test]
+    fn each_root_gets_its_own_launch_agent_label() {
+        let home = tempfile::tempdir().unwrap();
+        let mut roots = Vec::new();
+        for name in ["real", "scratch"] {
+            let dir = home.path().join(name);
+            std::fs::create_dir(&dir).unwrap();
+            roots.push(dir);
+        }
+        let (real, scratch) = (&roots[0], &roots[1]);
+        let label = agent_label(real);
+        assert!(label.starts_with("dev.hp.ticker."), "{label}");
+        assert_eq!(label, agent_label(real), "one root, one label, every time");
+        assert_eq!(label, agent_label(&real.join(".")), "another spelling of the same folder is the same root");
+        assert_ne!(label, agent_label(scratch), "two roots must never share a job");
+        assert_eq!(
+            agent_path(home.path(), real),
+            home.path().join(format!("Library/LaunchAgents/{label}.plist")),
+            "the plist file follows the label"
+        );
+        assert_ne!(agent_path(home.path(), real), agent_path(home.path(), scratch), "and so does the file");
+    }
+
+    /// The two halves of a plist are one root: the label it is loaded under, and
+    /// the `--root` its program ticks.
+    #[test]
+    fn a_plist_names_its_own_label_and_its_own_root() {
+        let root = Path::new("/Users/me/.herdr-projects");
+        let plist = agent_plist(Path::new("/opt/hp/hp"), root, &log_path(root));
+        assert!(plist.contains(&format!("<key>Label</key><string>{}</string>", agent_label(root))), "{plist}");
+        assert_eq!(plist_root(&plist).as_deref(), Some("/Users/me/.herdr-projects"), "{plist}");
+        assert_eq!(plist_program(&plist).as_deref(), Some("/opt/hp/hp"), "{plist}");
+    }
+
+    /// A plist as the shared label wrote it: the same program and root, under
+    /// `dev.hp.ticker`.
+    fn legacy_plist(binary: &Path, root: &Path) -> String {
+        let ours = format!("<key>Label</key><string>{}</string>", agent_label(root));
+        let theirs = format!("<key>Label</key><string>{LEGACY_AGENT_LABEL}</string>");
+        agent_plist(binary, root, &log_path(root)).replace(&ours, &theirs)
+    }
+
+    fn legacy_file(home: &Path) -> PathBuf {
+        agent_path_in(home, LEGACY_AGENT_LABEL)
+    }
+
+    fn write_legacy(home: &Path, text: &str) -> PathBuf {
+        let path = legacy_file(home);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, text).unwrap();
+        path
+    }
+
+    /// How often this root's job was unloaded from under `label`. Whole lines,
+    /// because `dev.hp.ticker` is a prefix of every derived label.
+    fn unloaded(runner: &FakeRunner, label: &str) -> usize {
+        let line = format!("launchctl bootout gui/{}/{label}", unsafe { libc_getuid() });
+        runner.calls.borrow().iter().filter(|cmd| cmd.display() == line).count()
+    }
+
+    #[test]
+    fn the_shared_job_is_replaced_when_its_plist_is_this_roots() {
+        let home = tempfile::tempdir().unwrap();
+        let root = home.path().join("root");
+        std::fs::create_dir(&root).unwrap();
+        let legacy = write_legacy(home.path(), &legacy_plist(Path::new("/opt/hp/hp"), &root));
+        let runner = FakeRunner::new();
+        runner.on("launchctl print", fail(113, "Could not find service"));
+        runner.on("launchctl bootout", ok(""));
+        runner.on("launchctl bootstrap", ok(""));
+
+        install_agent(home.path(), Path::new("/opt/hp/hp"), &root, &runner).unwrap();
+
+        assert!(!legacy.exists(), "this root's shared plist is gone");
+        assert_eq!(unloaded(&runner, LEGACY_AGENT_LABEL), 1, "and the job it named is unloaded");
+        assert!(agent_path(home.path(), &root).exists(), "the derived plist is the one left behind");
+        let log = std::fs::read_to_string(root.join(".ticker.log")).unwrap_or_default();
+        assert!(log.contains("moved this root off the shared LaunchAgent"), "{log}");
+    }
+
+    /// The accident itself: the shared plist points at another root. Touching it
+    /// is exactly what t-0083 exists to stop.
+    #[test]
+    fn another_roots_shared_job_is_left_alone() {
+        let home = tempfile::tempdir().unwrap();
+        let root = home.path().join("root");
+        std::fs::create_dir(&root).unwrap();
+        let other = Path::new("/Users/someone/.herdr-projects");
+        let written = legacy_plist(Path::new("/opt/hp/hp"), other);
+        let legacy = write_legacy(home.path(), &written);
+        let runner = FakeRunner::new();
+        runner.on("launchctl print", fail(113, "Could not find service"));
+        runner.on("launchctl bootout", ok(""));
+        runner.on("launchctl bootstrap", ok(""));
+
+        install_agent(home.path(), Path::new("/opt/hp/hp"), &root, &runner).unwrap();
+
+        assert_eq!(std::fs::read_to_string(&legacy).unwrap(), written, "another root's plist is not rewritten");
+        assert_eq!(unloaded(&runner, LEGACY_AGENT_LABEL), 0, "and its job is not unloaded");
+        assert!(agent_path(home.path(), &root).exists(), "this root gets its own plist anyway");
+    }
+
+    /// A ticker started by the shared job is still running: `bootout` would be
+    /// its SIGTERM, so the job stays loaded and only its plist is moved aside —
+    /// a reboot then loads the new one alone, and `ticker stop` ends the old job
+    /// with that file as its proof.
+    #[test]
+    fn a_running_shared_job_is_moved_aside_and_stopped_with_the_next_stop() {
+        let home = tempfile::tempdir().unwrap();
+        let root = home.path().join("root");
+        std::fs::create_dir(&root).unwrap();
+        write_legacy(home.path(), &legacy_plist(Path::new("/opt/hp/hp"), &root));
+        let [_, aside] = legacy_paths(home.path());
+        let runner = FakeRunner::new();
+        runner.on("launchctl print", fail(113, "Could not find service"));
+        runner.on("launchctl bootout", ok(""));
+        runner.on("launchctl bootstrap", ok(""));
+        let lock = hold_lock(&root);
+
+        install_agent(home.path(), Path::new("/opt/hp/hp"), &root, &runner).unwrap();
+        assert_eq!(unloaded(&runner, LEGACY_AGENT_LABEL), 0, "a running ticker is not unloaded to change its label");
+        assert!(!legacy_file(home.path()).exists(), "the plist is not left where a reboot would load it");
+        assert!(aside.exists(), "it is kept as the proof of which root the loaded job is");
+
+        remove_agent(home.path(), &root, &runner);
+        assert_eq!(unloaded(&runner, LEGACY_AGENT_LABEL), 1, "`ticker stop` unloads the old job");
+        assert!(!aside.exists(), "and drops its file");
+        drop(lock);
     }
 
     #[test]
