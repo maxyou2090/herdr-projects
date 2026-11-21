@@ -306,6 +306,26 @@ A record is one of the three pieces of evidence then, not the condition: the
 listing order in `spaces::empty` (records **after** the three core lists) comes
 from the same rule.
 
+**The coordinator's Space is the same Space.** `open` makes the project's home
+Space and its `coordinator` tab, names them, and writes `coordinator.json` and
+the lane instance only after — so for a moment that Space is a plain home Space
+with one `coordinator` tab and no record, exactly the shape the orphan-home rule
+closes. Two things say it is somebody's, and both are needed:
+
+- **the lock** — `open` holds `project.lock()` from that Space being made and
+  named to the record and the lane instance that name it, the lock
+  `spaces::close_empty` holds from its listings to its closes (2026-11-21;
+  writes inside that section go through the `*_locked` forms of
+  `project::update_coordinator` and `lanes::sync_instance`);
+- **the pane's own claim** — a pane whose `hp_tab_label` is `coordinator` and
+  whose project and lane (`hp_project`, `hp_lane`) are still open makes its
+  Space in use, which is what covers an `open` that dies between `tab_create`
+  and its record. A lane that has been closed protects nothing, and neither
+  does a `coordinator` tab of another project.
+
+Without the first, a tick read the listings while the new Space was 2.8 seconds
+old and closed it under the coordinator being started (my-net, 2026-11-21).
+
 **Forget.** `spaces::forget` clears the `workspace_id` of every unresolved
 thread naming the closed Space, so the next placement creates a new one instead
 of writing into an id nothing lists.

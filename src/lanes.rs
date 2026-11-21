@@ -1366,22 +1366,39 @@ pub fn project_for_command(ctx: &Ctx, handle: &str, explicit: Option<&str>) -> R
 /// `last_active`, and the profile it was launched with). Read-modify-write
 /// under the project lock, never a whole-file overwrite from a stale copy.
 pub fn sync_instance(project: &Project, lane_id: &str, pane_id: &str, agent_session: &str, profile: &str, last_active: &str) -> Result<()> {
-    Registry::update(project, |registry| {
-        if let Some(lane) = registry.lanes.iter_mut().find(|lane| lane.id == lane_id) {
-            lane.pane_id = pane_id.to_string();
-            // A new instance with no session yet must clear the previous one,
-            // exactly as `coordinator.json` is replaced: otherwise `--new`
-            // would inherit a retired coordinator's session id.
-            lane.agent_session = agent_session.to_string();
-            if !profile.is_empty() {
-                lane.profile = profile.to_string();
-            }
-            if !last_active.is_empty() {
-                lane.last_active = last_active.to_string();
-            }
-        }
-    })?;
+    Registry::update(project, |registry| set_instance(registry, lane_id, pane_id, agent_session, profile, last_active))?;
     Ok(())
+}
+
+/// The same write, for a caller that already holds `project.lock()` (`open`,
+/// which keeps the lock from making its Space to the lane instance that names
+/// it). A second `lock()` in one process waits on the first and never returns,
+/// so every write inside such a section has a `*_locked` form.
+pub fn sync_instance_locked(project: &Project, lane_id: &str, pane_id: &str, agent_session: &str, profile: &str, last_active: &str) -> Result<()> {
+    if !exists(project) {
+        return Ok(());
+    }
+    let Some(mut registry) = Registry::load(project) else {
+        return Ok(());
+    };
+    set_instance(&mut registry, lane_id, pane_id, agent_session, profile, last_active);
+    registry.save(project)
+}
+
+fn set_instance(registry: &mut Registry, lane_id: &str, pane_id: &str, agent_session: &str, profile: &str, last_active: &str) {
+    if let Some(lane) = registry.lanes.iter_mut().find(|lane| lane.id == lane_id) {
+        lane.pane_id = pane_id.to_string();
+        // A new instance with no session yet must clear the previous one,
+        // exactly as `coordinator.json` is replaced: otherwise `--new`
+        // would inherit a retired coordinator's session id.
+        lane.agent_session = agent_session.to_string();
+        if !profile.is_empty() {
+            lane.profile = profile.to_string();
+        }
+        if !last_active.is_empty() {
+            lane.last_active = last_active.to_string();
+        }
+    }
 }
 
 /// The ticker's refresh of §4.1's instance hints: for every open lane whose
