@@ -14,7 +14,11 @@ use crate::runner::{Cmd, Runner};
 pub const STARTING_TIMEOUT_SECS: i64 = 300;
 pub const BLOCKED_DEBOUNCE_SECS: i64 = 30;
 pub const NOT_READY_SECS: i64 = 60;
-pub const MEMORY_CAP_CHARS: usize = 32_000;
+/// How much of `MEMORY.md` plus `memory/*.md` one brief inlines, in UTF-8
+/// bytes: what is left over is listed by name. Bytes, not characters, because
+/// the reader (`read`, in pi) cuts at 51_200 bytes: 30_000 bytes of memory plus
+/// the other sections keeps every brief under that, so one read gets it all.
+pub const MEMORY_CAP_BYTES: usize = 30_000;
 pub const LIBRARY_CAP_KB: u64 = 50 * 1024;
 pub const MAX_LAUNCH_ATTEMPTS: u32 = 3;
 
@@ -454,54 +458,76 @@ fn brief_header(input: &BriefInput) -> String {
     out
 }
 
+/// The one line in the header that says how big this file is: a reader that
+/// stops at a limit (pi's `read`: 51_200 bytes or 2000 lines) then knows to
+/// continue with an offset instead of acting on half a brief.
+fn size_note(bytes: usize) -> String {
+    format!("\n> 本文件 {bytes} 字节；`read` 上限 51200 字节 / 2000 行，被截断时用 offset 继续读\n")
+}
+
+/// The brief: header, then the task, then the thread skill and the project
+/// instructions, then memory, the progress note and the paths. The task comes
+/// before memory on purpose: memory is unbounded in practice, and anything
+/// pushed past a reader's limit is exactly the part a thread must not miss.
 pub fn compose_brief(input: &BriefInput) -> String {
-    let mut brief = brief_header(input);
-    brief.push('\n');
-    brief.push_str(include_str!("../skill/THREAD.md").trim_end());
-    brief.push_str("\n\n");
+    let header = brief_header(input);
+    let mut body = String::from("\n");
     if input.restart {
-        brief.push_str(
+        body.push_str(
             "**A previous attempt at this task exists on this branch.** Read its report at the report path below first, look at what is already on the branch, and continue from there.\n\n",
         );
     }
-    brief.push_str("# Project instructions\n\n");
-    brief.push_str(input.instructions.trim());
-    brief.push_str("\n\n# Project memory\n\n");
-    brief.push_str(input.memory_index.trim());
-    brief.push('\n');
+    body.push_str("# Task\n\n");
+    body.push_str(input.task.trim());
+    body.push_str("\n\n");
+    body.push_str(include_str!("../skill/THREAD.md").trim_end());
+    body.push_str("\n\n# Project instructions\n\n");
+    body.push_str(input.instructions.trim());
+    body.push_str("\n\n# Project memory\n\n");
+    body.push_str(input.memory_index.trim());
+    body.push('\n');
 
-    let mut used = input.memory_index.chars().count();
+    let mut used = input.memory_index.len();
     let mut left_out = Vec::new();
     for (name, text) in input.memory_files {
-        let size = text.chars().count();
-        if used + size <= MEMORY_CAP_CHARS {
+        let size = text.len();
+        if used + size <= MEMORY_CAP_BYTES {
             used += size;
-            brief.push_str(&format!("\n## memory/{name}\n\n{}\n", text.trim()));
+            body.push_str(&format!("\n## memory/{name}\n\n{}\n", text.trim()));
         } else {
             left_out.push(format!("memory/{name}"));
         }
     }
     if !left_out.is_empty() {
-        brief.push_str(&format!(
-            "\nNot inlined because project memory is over {MEMORY_CAP_CHARS} characters: {}.\n",
+        body.push_str(&format!(
+            "\nNot inlined because project memory is over {MEMORY_CAP_BYTES} bytes: {}.\n",
             left_out.join(", ")
         ));
     }
 
-    brief.push_str("\n# Progress\n\n");
+    body.push_str("\n# Progress\n\n");
     if input.report_prefix.is_empty() {
-        brief.push_str("Report progress with `hp report --activity '...'` if that command exists on this machine (use `--activity 'Waiting for you'` before asking the user something, and `--done` when finished); otherwise skip it.\n");
+        body.push_str("Report progress with `hp report --activity '...'` if that command exists on this machine (use `--activity 'Waiting for you'` before asking the user something, and `--done` when finished); otherwise skip it.\n");
     } else {
-        brief.push_str(&crate::progress::guidance(input.report_prefix, None));
-        brief.push('\n');
+        body.push_str(&crate::progress::guidance(input.report_prefix, None));
+        body.push('\n');
     }
-    brief.push_str("\n# Task\n\n");
-    brief.push_str(input.task.trim());
-    brief.push_str(&format!(
-        "\n\n# Paths\n\n- Report: `{}`\n- Library folder for files meant for the user: `{}`\n- Uploads from the user: `{}`\n",
+    body.push_str(&format!(
+        "\n# Paths\n\n- Report: `{}`\n- Library folder for files meant for the user: `{}`\n- Uploads from the user: `{}`\n",
         input.report_path, input.library_path, input.uploads_path
     ));
-    brief
+
+    // The note counts its own digits, so settle it before writing it down.
+    let mut bytes = header.len() + body.len();
+    let note = loop {
+        let note = size_note(bytes);
+        let total = header.len() + note.len() + body.len();
+        if total == bytes {
+            break note;
+        }
+        bytes = total;
+    };
+    format!("{header}{note}{body}")
 }
 
 /// Reads the project's instructions and memory and composes the brief.
@@ -1233,7 +1259,7 @@ mod tests {
     fn brief_order_and_memory_cap() {
         let files = vec![
             ("a.md".to_string(), "alpha fact".to_string()),
-            ("b.md".to_string(), "x".repeat(MEMORY_CAP_CHARS)),
+            ("b.md".to_string(), "x".repeat(MEMORY_CAP_BYTES)),
             ("c.md".to_string(), "gamma fact".to_string()),
         ];
         let repos = vec![project::Repo { path: "/srv/app".into(), ..Default::default() }, project::Repo { path: "/home/me/lib".into(), ..Default::default() }];
@@ -1253,20 +1279,29 @@ mod tests {
         };
         let brief = compose_brief(&input);
         let pos = |needle: &str| brief.find(needle).unwrap_or_else(|| panic!("missing {needle}"));
-        // The header comes first: name, repos, uploads, library, report.
+        // The header comes first: name, repos, uploads, library, report, then
+        // its own size line.
         assert!(brief.starts_with("# Project\n\n- Project: Demo (`demo`)\n- Repos:\n  - /srv/app\n"));
         assert!(pos("- Repos:\n  - /srv/app\n  - /home/me/lib\n") < pos("- Uploads"));
-        assert!(pos("Uploads, files from the user: `/root/demo/uploads`") < pos("# Thread brief"));
-        assert!(pos("# Thread brief") < pos("previous attempt"));
-        assert!(pos("previous attempt") < pos("Always run the tests."));
+        assert!(pos("Uploads, files from the user: `/root/demo/uploads`") < pos("> 本文件"));
+        assert!(pos("> 本文件") < pos("# Task"));
+        // The task is next, before the skill text, the instructions and memory:
+        // a reader that stops at its limit has the job, not the memory.
+        assert!(pos("# Task") < MEMORY_CAP_BYTES, "task at {}", pos("# Task"));
+        assert!(pos("previous attempt") < pos("# Task"));
+        assert!(pos("# Task") < pos("# Thread brief"));
+        assert!(pos("Do the thing.") < pos("# Thread brief"));
+        assert!(pos("# Thread brief") < pos("Always run the tests."));
         assert!(pos("Always run the tests.") < pos("# Memory"));
         assert!(pos("# Memory") < pos("alpha fact"));
         assert!(pos("alpha fact") < pos("# Progress"));
-        assert!(pos("/bin/hp --root /r report --activity") < pos("Do the thing."));
-        assert!(pos("Do the thing.") < pos("# Paths"));
+        assert!(pos("# Progress") < pos("# Paths"));
+        assert!(pos("# Task") < pos("# Project memory"));
         assert!(brief.contains("gamma fact"));
-        assert!(brief.contains("Not inlined because project memory is over 32000 characters: memory/b.md."));
+        assert!(brief.contains("Not inlined because project memory is over 30000 bytes: memory/b.md."));
         assert!(!brief.contains(&"x".repeat(100)));
+        // The header line states this file's own size, so a cut-short read says so.
+        assert!(brief.contains(&format!("> 本文件 {} 字节；`read` 上限 51200 字节 / 2000 行", brief.len())), "{brief}");
         // No operational settings reach a thread.
         for word in ["auto_resolve_days", "nudge", "coordinator_agent", "thread_agent"] {
             assert!(!brief.contains(word), "{word}");
@@ -1276,6 +1311,68 @@ mod tests {
         assert!(!fresh.contains("previous attempt"));
         assert!(fresh.contains("- Repos: (none)\n"));
         assert!(fresh.contains("if that command exists on this machine"), "no prefix: the note is the fallback");
+    }
+
+    fn brief_with_memory(memory_index: &str, memory_files: &[(String, String)]) -> String {
+        compose_brief(&BriefInput {
+            project_name: "Demo",
+            slug: "demo",
+            repos: &[],
+            uploads_path: "/root/demo/uploads",
+            instructions: "",
+            memory_index,
+            memory_files,
+            task: "Do the thing.",
+            restart: false,
+            report_path: "/wt/.herdr-project/demo-t-0001/report.md",
+            library_path: "/wt/.herdr-project/demo-t-0001/library",
+            report_prefix: "",
+        })
+    }
+
+    #[test]
+    fn the_memory_cap_counts_bytes_not_characters() {
+        // 10_001 characters, 30_003 bytes: under the old character cap, over
+        // the byte one, so it is listed rather than inlined.
+        let cn = ("cn.md".to_string(), "记".repeat(10_001));
+        assert!(cn.1.chars().count() < MEMORY_CAP_BYTES && cn.1.len() > MEMORY_CAP_BYTES);
+        let brief = brief_with_memory("# Memory\n- [Big](memory/cn.md)", std::slice::from_ref(&cn));
+        assert!(!brief.contains(&cn.1), "the 30 KB Chinese body was inlined");
+        assert!(brief.contains("Not inlined because project memory is over 30000 bytes: memory/cn.md."), "{brief}");
+
+        // Exactly the cap in English still fits; one byte more does not.
+        let exact = ("en.md".to_string(), "x".repeat(MEMORY_CAP_BYTES));
+        let brief = brief_with_memory("", std::slice::from_ref(&exact));
+        assert!(brief.contains(&exact.1), "a body of exactly the cap was left out");
+        assert!(!brief.contains("Not inlined"), "{brief}");
+        let over = ("en.md".to_string(), "x".repeat(MEMORY_CAP_BYTES + 1));
+        let brief = brief_with_memory("", &[over]);
+        assert!(brief.contains("Not inlined because project memory is over 30000 bytes: memory/en.md."));
+
+        // The index counts against the cap too.
+        let brief = brief_with_memory(&"i".repeat(MEMORY_CAP_BYTES), std::slice::from_ref(&exact));
+        assert!(brief.contains("Not inlined because project memory is over 30000 bytes: memory/en.md."));
+    }
+
+    #[test]
+    fn a_brief_with_huge_memory_keeps_the_task_near_the_top() {
+        let root = tempfile::tempdir().unwrap();
+        let project = project::create(root.path(), "demo", vec![]).unwrap();
+        std::fs::create_dir_all(project.dir().join("memory")).unwrap();
+        // A small index and every body far over the cap: the case that used to
+        // push `# Task` past a reader's limit.
+        std::fs::write(project.dir().join("MEMORY.md"), "# Memory\n\n- [Big](memory/big.md): 大\n- [Wide](memory/wide.md): 宽\n").unwrap();
+        std::fs::write(project.dir().join("memory/big.md"), "记".repeat(20_000)).unwrap();
+        std::fs::write(project.dir().join("memory/wide.md"), "w".repeat(40_000)).unwrap();
+        let brief = brief_for(&project, &Thread::default(), "Do the thing.", false).unwrap();
+        let task = brief.find("# Task").unwrap();
+        let memory = brief.find("# Project memory").unwrap();
+        assert!(task < memory, "task at {task}, memory at {memory}");
+        assert!(task < MEMORY_CAP_BYTES, "task at {task}");
+        assert!(brief.len() < 51_200, "brief is {} bytes", brief.len());
+        assert!(!brief.contains(&"w".repeat(1000)), "the 40 KB body was inlined");
+        assert!(brief.contains("Not inlined because project memory is over 30000 bytes: memory/big.md, memory/wide.md."), "{brief}");
+        assert!(brief.ends_with(&format!("- Uploads from the user: `{}`\n", project.dir().join("uploads").to_string_lossy())));
     }
 
     #[test]
@@ -1406,3 +1503,5 @@ mod tests {
         assert!(matches!(copy_home_local(&project, &t, true, &runner).outcome, CopyOutcome::Failed(_)));
     }
 }
+
+
