@@ -408,6 +408,112 @@ pub struct Core<'a> {
     runner: &'a dyn Runner,
 }
 
+/// One session's view, held for the length of a ticker pass.
+///
+/// `hc ls` plus one `hc get` per terminal is how every listing here is built,
+/// and a tick used to ask for the same listing again and again — `keep_names`
+/// twice per coordinator, the Space names, the empty-Space sweep three times —
+/// so most of a 25-second round was spent re-reading a view that had not
+/// changed (2026-11-23, t-0091). A pass turns this on ([`begin`]); everything
+/// else in the binary, one-shot commands included, reads the session as it is at
+/// that moment and never touches it.
+///
+/// The view is only as good as its invalidations: a write that changes a pane's
+/// labels patches the entry, and anything that can add, end or re-state a
+/// terminal drops the whole thing ([`forget`]). A caller that must judge on a
+/// fresh listing (the empty-Space sweep, which closes Spaces) asks for one with
+/// [`refresh_if_older`].
+pub mod view {
+    use super::Term;
+    use std::cell::RefCell;
+    use std::collections::BTreeMap;
+    use std::time::{Duration, Instant};
+
+    #[derive(Default)]
+    struct Held {
+        ids: BTreeMap<String, Vec<String>>,
+        terms: BTreeMap<(String, String), Term>,
+        since: Option<Instant>,
+    }
+
+    thread_local! {
+        /// Thread-local, not global: the ticker is one thread, and a test
+        /// binary runs its scenarios side by side — a shared cache keyed by
+        /// session would let one test's fake core answer another's calls.
+        static HELD: RefCell<Option<Held>> = const { RefCell::new(None) };
+    }
+
+    /// Runs `f` against the held view, when there is one.
+    fn with<R>(f: impl FnOnce(&mut Held) -> R) -> Option<R> {
+        HELD.with(|held| held.borrow_mut().as_mut().map(f))
+    }
+
+    /// Starts a pass: an empty view, held until [`end`].
+    pub fn begin() {
+        HELD.with(|held| *held.borrow_mut() = Some(Held { since: Some(Instant::now()), ..Held::default() }));
+    }
+
+    /// Ends it: the next read goes to core.
+    pub fn end() {
+        HELD.with(|held| *held.borrow_mut() = None);
+    }
+
+    /// Drops every held answer but keeps the pass open: called after a write
+    /// that could change what core lists (a start, a close, a new tab).
+    pub fn forget() {
+        with(|view| {
+            view.ids.clear();
+            view.terms.clear();
+            view.since = Some(Instant::now());
+        });
+    }
+
+    /// [`forget`] when the held view is older than `max`: for a caller that
+    /// judges on it (closing Spaces), a listing from the start of a slow pass is
+    /// not good enough.
+    pub fn refresh_if_older(max: Duration) {
+        with(|view| {
+            if view.since.is_some_and(|since| since.elapsed() > max) {
+                view.ids.clear();
+                view.terms.clear();
+                view.since = Some(Instant::now());
+            }
+        });
+    }
+
+    pub(super) fn ids(session: &str) -> Option<Vec<String>> {
+        with(|view| view.ids.get(session).cloned()).flatten()
+    }
+
+    pub(super) fn put_ids(session: &str, ids: &[String]) {
+        with(|view| {
+            view.ids.insert(session.to_string(), ids.to_vec());
+        });
+    }
+
+    pub(super) fn term(session: &str, pane: &str) -> Option<Term> {
+        with(|view| view.terms.get(&(session.to_string(), pane.to_string())).cloned()).flatten()
+    }
+
+    pub(super) fn put_term(session: &str, pane: &str, term: &Term) {
+        with(|view| {
+            view.terms.insert((session.to_string(), pane.to_string()), term.clone());
+        });
+    }
+
+    /// A label write, patched into the held view: the labels are the whole
+    /// change, so the next `terminals()` sees them without another `hc get`.
+    pub(super) fn relabel(session: &str, pane: &str, pairs: &[(&str, &str)]) {
+        with(|view| {
+            if let Some(term) = view.terms.get_mut(&(session.to_string(), pane.to_string())) {
+                for (key, value) in pairs {
+                    term.labels.insert((*key).to_string(), (*value).to_string());
+                }
+            }
+        });
+    }
+}
+
 /// A recorded socket path from Herdr 1 means "the default session" here.
 pub fn session_key(raw: &str) -> String {
     let raw = raw.trim();
@@ -489,6 +595,27 @@ impl<'a> Core<'a> {
     /// Every live terminal of this session, with its labels: `hc ls` prints one
     /// short row per terminal and leaves the labels to `hc get`.
     fn terminals(&self) -> Result<Vec<Term>, CoreError> {
+        let ids = match view::ids(&self.session) {
+            Some(ids) => ids,
+            None => {
+                let ids = self.row_ids()?;
+                view::put_ids(&self.session, &ids);
+                ids
+            }
+        };
+        let mut out = Vec::new();
+        for id in ids {
+            if let Ok(term) = self.term(&id)
+                && term.live()
+            {
+                out.push(term);
+            }
+        }
+        Ok(out)
+    }
+
+    /// The terminal ids `hc ls` lists for this session, in its order.
+    fn row_ids(&self) -> Result<Vec<String>, CoreError> {
         let result = self.json(&["ls"], CALL_TIMEOUT)?;
         let rows = result["terminals"].as_array().cloned().unwrap_or_default();
         let mut out = Vec::new();
@@ -499,31 +626,33 @@ impl<'a> Core<'a> {
                 .or_else(|| row["address"].as_str())
                 .unwrap_or_default()
                 .to_string();
-            if id.is_empty() {
-                continue;
-            }
-            if let Ok(term) = self.term(&id)
-                && term.live()
-            {
-                out.push(term);
+            if !id.is_empty() {
+                out.push(id);
             }
         }
         Ok(out)
     }
 
     fn term(&self, pane: &str) -> Result<Term, CoreError> {
+        if let Some(term) = view::term(&self.session, pane) {
+            return Ok(term);
+        }
         let result = self.json(&["get", pane], CALL_TIMEOUT)?;
-        serde_json::from_value(result).map_err(|e| CoreError {
+        let term: Term = serde_json::from_value(result).map_err(|e| CoreError {
             code: "failed".into(),
             message: format!("`hc get {pane}` reply changed: {e}"),
-        })
+        })?;
+        view::put_term(&self.session, pane, &term);
+        Ok(term)
     }
 
     fn label(&self, pane: &str, pairs: &[(&str, &str)]) -> Result<(), CoreError> {
         let args: Vec<String> = pairs.iter().map(|(k, v)| format!("{k}={v}")).collect();
         let mut all: Vec<&str> = vec!["label", pane];
         all.extend(args.iter().map(String::as_str));
-        self.json(&all, CALL_TIMEOUT).map(|_| ())
+        self.json(&all, CALL_TIMEOUT).map(|_| ())?;
+        view::relabel(&self.session, pane, pairs);
+        Ok(())
     }
 
     /// Writes labels onto a terminal. Herdr 1's token reports are labels here:
@@ -667,6 +796,9 @@ impl<'a> Core<'a> {
         args.extend(argv.iter().cloned());
         let refs: Vec<&str> = args.iter().map(String::as_str).collect();
         let result = self.json(&refs, Duration::from_secs(20))?;
+        // A terminal that did not exist a moment ago: the held view is wrong
+        // about the set of terminals now.
+        view::forget();
         // `hc run` answers with the short row `hc ls` prints; the labels it was
         // given come back only from `hc get`.
         let id = result["name"].as_str().filter(|n| !n.is_empty()).or_else(|| result["address"].as_str()).unwrap_or_default();
@@ -932,6 +1064,9 @@ impl<'a> Core<'a> {
         }
         let deadline = std::time::Instant::now() + END_WAIT;
         loop {
+            // Whether it is gone yet is the whole question: ask core, not a
+            // view held from before the kill.
+            view::forget();
             match self.terminal_fate(pane) {
                 Ok(fate) if !fate.live() => break,
                 // Gone from core's own view: nothing to remove.
@@ -943,11 +1078,13 @@ impl<'a> Core<'a> {
                 Ok(_) => std::thread::sleep(END_POLL),
             }
         }
-        match self.json(&["rm", pane], CALL_TIMEOUT) {
+        let removed = match self.json(&["rm", pane], CALL_TIMEOUT) {
             Ok(_) => Ok(()),
             Err(error) if error.code == "pane_not_found" => Ok(()),
             Err(error) => Err(error),
-        }
+        };
+        view::forget();
+        removed
     }
 
     /// A Space's label, as the overview shows it.
@@ -1120,6 +1257,9 @@ impl<'a> Core<'a> {
         self.json(&["send", pane, &line], AGENT_START_TIMEOUT)?;
         let deadline = std::time::Instant::now() + AGENT_START_TIMEOUT;
         loop {
+            // The program's status is what this waits for: never read it from a
+            // view held from before the send.
+            view::forget();
             let agent = self.agent(pane)?;
             if agent.reported_status_blocked() {
                 return Err(CoreError {
@@ -1164,12 +1304,16 @@ impl<'a> Core<'a> {
     /// Submits a prompt. core refuses to type into a `blocked` program unless
     /// forced, which is what the caller wants to hear about.
     pub fn agent_prompt(&self, target: &str, text: &str) -> Result<(), CoreError> {
-        self.json(&["send", target, text], CALL_TIMEOUT).map(|_| ())
+        let sent = self.json(&["send", target, text], CALL_TIMEOUT).map(|_| ());
+        view::forget();
+        sent
     }
 
     /// Submits a prompt and returns core's word on whether the turn started.
     pub fn agent_prompt_confirmed(&self, target: &str, text: &str) -> Result<(), CoreError> {
-        let result = self.json(&["send", target, text], PROMPT_WAIT + Duration::from_secs(5))?;
+        let result = self.json(&["send", target, text], PROMPT_WAIT + Duration::from_secs(5));
+        view::forget();
+        let result = result?;
         match result["started"].as_bool() {
             Some(true) => Ok(()),
             // The program does not report status, or it took the text without
@@ -1204,7 +1348,9 @@ impl<'a> Core<'a> {
         let keys: Vec<String> = keys.iter().map(|k| key_name(k)).collect();
         let mut args: Vec<&str> = vec!["keys", target];
         args.extend(keys.iter().map(String::as_str));
-        self.json(&args, CALL_TIMEOUT).map(|_| ())
+        let sent = self.json(&args, CALL_TIMEOUT).map(|_| ());
+        view::forget();
+        sent
     }
 
     /// Presses the harness's stop key in a terminal: `hc interrupt`, the same
@@ -1212,13 +1358,17 @@ impl<'a> Core<'a> {
     /// with no effect) is not read here: the caller records that it tried, and
     /// the pane's own status is the answer on the next tick.
     pub fn interrupt(&self, pane: &str) -> Result<(), CoreError> {
-        self.json(&["interrupt", pane], INTERRUPT_TIMEOUT).map(|_| ())
+        let pressed = self.json(&["interrupt", pane], INTERRUPT_TIMEOUT).map(|_| ());
+        view::forget();
+        pressed
     }
 
     /// Pasting text without a submit is not something core offers: `send` is
     /// paste plus Enter, and that is what every caller here wants.
     pub fn pane_send_text(&self, pane: &str, text: &str) -> Result<(), CoreError> {
-        self.json(&["send", pane, text], CALL_TIMEOUT).map(|_| ())
+        let sent = self.json(&["send", pane, text], CALL_TIMEOUT).map(|_| ());
+        view::forget();
+        sent
     }
 
     /// With no windows to focus, the honest answer is how to reach the pane.
@@ -1349,6 +1499,55 @@ mod tests {
         assert_eq!(parse_version("hc 0.1.21"), Some(Version(0, 1, 21)));
         assert_eq!(parse_version("hc 0.1.21-preview.1"), Some(Version(0, 1, 21)));
         assert_eq!(parse_version("herdr"), None);
+    }
+
+    /// A pass reads the session once: `hc ls` and one `hc get` per terminal,
+    /// however many listings the pass asks for, and a label this binary writes
+    /// shows up in the held view without another `hc get` (t-0091).
+    #[test]
+    fn a_held_view_lists_once_and_a_label_write_patches_it() {
+        let fake = crate::fake_hc::FakeCore::new();
+        let herdr = Core::new("hc", "", &fake);
+        fake.terminal("t52", "/r/rexa", &[("hp_ws", "sp1")]);
+        fake.terminal("t53", "/r/rexa", &[("hp_ws", "sp1")]);
+
+        view::begin();
+        let first = herdr.terminals().unwrap();
+        let second = herdr.terminals().unwrap();
+        assert_eq!(first.len(), 2);
+        assert_eq!(second.len(), 2);
+        assert_eq!(fake.calls.borrow().iter().filter(|c| c.as_str() == "hc --json ls").count(), 1, "{:?}", fake.calls.borrow());
+        assert_eq!(fake.calls.borrow().iter().filter(|c| c.starts_with("hc --json get")).count(), 2, "{:?}", fake.calls.borrow());
+
+        // A label write is the whole change: no `hc get` needed to see it.
+        herdr.set_labels("t52", &[("hp_ws_label".to_string(), "REXA".to_string())]).unwrap();
+        let labels = herdr.workspace_label("sp1").unwrap();
+        assert_eq!(labels, "REXA");
+        assert_eq!(fake.calls.borrow().iter().filter(|c| c.starts_with("hc --json get")).count(), 2, "{:?}", fake.calls.borrow());
+
+        // Outside a pass the session is read as it is.
+        view::end();
+        let gets = fake.calls.borrow().iter().filter(|c| c.starts_with("hc --json get")).count();
+        herdr.terminals().unwrap();
+        assert!(fake.calls.borrow().iter().filter(|c| c.starts_with("hc --json get")).count() > gets + 1);
+    }
+
+    /// A terminal that core starts or ends is not in the held view: the write
+    /// that changed the session drops it, so the next listing is the truth.
+    #[test]
+    fn a_held_view_is_dropped_when_the_session_changes() {
+        let fake = crate::fake_hc::FakeCore::new();
+        let herdr = Core::new("hc", "", &fake);
+        fake.terminal("t52", "/r/rexa", &[]);
+        view::begin();
+        assert_eq!(herdr.terminals().unwrap().len(), 1);
+        let path = std::path::Path::new("/r/rexa");
+        let made = herdr.pane_close("t52");
+        assert!(made.is_ok());
+        fake.terminal("t53", "/r/rexa", &[]);
+        assert_eq!(herdr.terminals().unwrap().len(), 1, "the held list was dropped: the new terminal is seen, the closed one is not");
+        view::end();
+        let _ = path;
     }
 
     #[test]

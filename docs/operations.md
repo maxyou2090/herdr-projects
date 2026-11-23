@@ -17,6 +17,54 @@ and what is still open.
 - **Tools are found even under a bare `PATH`.** The binary appends `/opt/homebrew/bin`, `/usr/local/bin`, `~/.local/bin` and `~/.cargo/bin` to its own `PATH`, so a ticker started by launchd finds `gh` and `rsync`.
 - **Cleanup is part of the flow, never forced.** Resolving a thread removes its worktree (Herdr and git refuse a dirty one, and the plugin never forces) and, once its pull request is merged, its local branch. Reports and library files always stay. Text from reports, pull requests and command output is never placed in a prompt.
 
+## How fast a tick is
+
+A round over ten projects with a few thousand thread records takes about a
+second. It used to take twenty-five, and up to a hundred (the 15-second `TICK`
+could not keep up, so `thread start`, briefs and nudges all waited for the next
+round instead of the next tick). Three things made the difference, and they are
+worth knowing when touching the tick path:
+
+- **The session view is held for one pass.** `hc ls` plus one `hc get` per
+  terminal is how every listing is built, and a tick asked for the same listing
+  again and again — twice per coordinator for the names, three times for the
+  empty-Space sweep. `core::view::begin()`/`end()` around a pass makes one
+  listing serve every reader in it. Writes patch or drop it: a `hc label` patches
+  the pane's labels, anything that starts, ends or re-states a terminal drops the
+  whole view, and the empty-Space sweep gets a listing no older than three
+  seconds before it judges. It is off everywhere else — a one-shot command reads
+  the session as it is.
+- **The window is asked once per pass too** (`app::begin()`/`end()`):
+  `herdr-app status` and `herdr-app ls`, not once or twice per coordinator. A
+  rename or a close drops it, so the confirming read after a rename still goes to
+  the window. A name that is already right therefore costs no app call at all
+  beyond that one read.
+- **Nothing writes what is already true.** A pane's `hp_project`/`hp_display`/
+  `hp_lane` labels are written only when they differ from what the pane says, and
+  a note that would repeat every tick ("the app does not show `sp…` yet") is
+  printed once per change, while the retry behind it keeps running.
+- **One `gh` call per project, not per thread.** The pull-request check (every
+  two minutes) lists the repository's pull requests once and answers for every
+  branch of the project's open threads; a `gh` call is a few seconds of network,
+  and several of them in one round was the last thing that could still make one
+  long.
+
+`HP_TICK_TIMINGS=1` in the ticker's environment writes one line per project per
+tick with the milliseconds of each stage, and one line for the round:
+
+```
+timings rexa: 206ms (load 0, state 0, lists 0, repair 0, discover 5, coordinator_pane 0,
+  keep_names 0, turns 0, thread_list 20, threads 0, nudge 0, save_state 4, slow 0,
+  slow_load 0, slow_thread_list 13, copy 0, launch 0, slow_state 0, items 25, audit 12,
+  pr 0, resolve 14, routines 13, housekeeping 94)
+timings round: 872ms
+```
+
+Unset — or `0`, `false`, `off`, empty — is the ticker exactly as it was: no line,
+no extra call. To measure the real root without disturbing it, stop its ticker,
+run `HP_TICK_TIMINGS=1 hp --root ~/.herdr-projects ticker run` in the foreground
+for a few rounds, then `hp ticker start`.
+
 ## Where things live
 
 ```

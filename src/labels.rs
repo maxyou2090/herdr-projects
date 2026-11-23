@@ -181,6 +181,28 @@ pub fn report_pane(herdr: &Core, pane: &str, display: &str, slug: &str, lane: Op
     let _ = herdr.set_labels(pane, &pairs);
 }
 
+/// [`report_pane`], skipped when the pane's own labels already say all of it.
+///
+/// The ticker reports every coordinator and every live thread pane on every
+/// tick, and each report was a process even when the labels were already right.
+/// `tokens` is what core lists for that pane (`Agent::tokens`, `Pane::tokens`);
+/// a pane that is not in the list at all gets the write as before, since a
+/// missing pane is not evidence that its labels are right.
+pub fn report_pane_unless(herdr: &Core, pane: &str, display: &str, slug: &str, lane: Option<&str>, tokens: Option<&std::collections::BTreeMap<String, String>>) {
+    let Some(tokens) = tokens else {
+        return report_pane(herdr, pane, display, slug, lane);
+    };
+    let says = |key: &str, value: &str| tokens.get(key).is_some_and(|current| current == value);
+    let same = says(PROJECT_TOKEN, slug)
+        && says("hp_display", display)
+        // A lane only matters when it is claimed: `report_pane` never clears one.
+        && lane.is_none_or(|lane| says(crate::lanes::TOKEN, lane));
+    if same {
+        return;
+    }
+    report_pane(herdr, pane, display, slug, lane);
+}
+
 /// Clears every label this binary set on a pane: its project, display name and
 /// lane claim.
 pub fn clear_pane(herdr: &Core, pane: &str) {
