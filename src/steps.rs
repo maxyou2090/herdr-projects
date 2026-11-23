@@ -1268,7 +1268,16 @@ pub fn pull_requests(ctx: &Ctx, project: &Project, state: &mut State, memory: &m
     }
     state.last_pr_check = now.to_string();
 
-    for t in thread::list(project) {
+    let threads = thread::list(project);
+    // Every branch this check would have asked `gh` about, per origin, asked in
+    // one call each: a per-thread `gh pr list --head` is three seconds of
+    // network, and one project can have several threads that name no pull
+    // request yet (t-0091). Built on the first thread that needs it; a failure
+    // is remembered and reported per thread exactly as a per-thread failure was.
+    let mut lookups: std::collections::BTreeMap<String, Result<std::collections::BTreeMap<String, String>, String>> = Default::default();
+    let mut looked = false;
+
+    for t in threads {
         if t.status != Status::Open {
             continue;
         }
@@ -1290,14 +1299,25 @@ pub fn pull_requests(ctx: &Ctx, project: &Project, state: &mut State, memory: &m
         } else if !t.pr.is_empty() {
             t.pr.clone()
         } else if t.kind == thread::Kind::Worktree {
-            match pr::find_by_branch(ctx.runner, &t.origin, &t.branch) {
-                Ok(found) => {
-                    gh_worked(project, memory, now, &mut errors);
-                    found.unwrap_or_default()
+            if !looked {
+                looked = true;
+                for (origin, branches) in open_branches(project) {
+                    let answer = pr::find_by_branch_many(ctx.runner, &origin, &branches).map_err(|error| format!("{error:#}"));
+                    lookups.insert(origin, answer);
                 }
-                Err(error) => {
-                    gh_failed(project, memory, &error, now, &mut errors);
+            }
+            match lookups.get(&t.origin) {
+                Some(Ok(found)) => {
+                    gh_worked(project, memory, now, &mut errors);
+                    found.get(&t.branch).cloned().unwrap_or_default()
+                }
+                Some(Err(error)) => {
+                    gh_failed(project, memory, &anyhow::anyhow!("{error}"), now, &mut errors);
                     continue;
+                }
+                None => {
+                    gh_worked(project, memory, now, &mut errors);
+                    String::new()
                 }
             }
         } else {
@@ -1357,6 +1377,20 @@ fn gh_worked(project: &Project, memory: &mut Memory, now: jiff::Timestamp, error
     if memory.gh.record(true, "", now, memory.outage_secs) == Some(OutageEvent::Recovered) {
         errors.extend(inbox::write(project, "outage", "gh", "working again", "`gh` is working again; pull request follow-up has resumed", "").err());
     }
+}
+
+/// The branches of a project's open worktree threads that name no pull request
+/// yet, per origin: what one batched `gh pr list` answers for
+/// (`pr::find_by_branch_many`).
+fn open_branches(project: &Project) -> std::collections::BTreeMap<String, Vec<String>> {
+    let mut out: std::collections::BTreeMap<String, Vec<String>> = Default::default();
+    for t in thread::list(project) {
+        if t.status != Status::Open || t.kind != thread::Kind::Worktree || t.branch.is_empty() || t.origin.is_empty() {
+            continue;
+        }
+        out.entry(t.origin.clone()).or_default().push(t.branch.clone());
+    }
+    out
 }
 
 fn gh_failed(project: &Project, memory: &mut Memory, error: &anyhow::Error, now: jiff::Timestamp, errors: &mut Vec<anyhow::Error>) {

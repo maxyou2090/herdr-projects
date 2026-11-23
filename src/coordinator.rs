@@ -1506,10 +1506,12 @@ pub fn keep_names(herdr: &Core, project: &Project, pane: &str) -> (String, Strin
     // The Space a project owns is named by its display name (`REXA`, `Herdr
     // Projects`), and the host that draws it is `name_place`'s business.
     let label = project.display_name();
-    let (space, tab, notes) = herdr.name_place(pane, &label, crate::labels::coordinator_tab_label());
-    for note in notes {
-        println!("{note}");
-    }
+    let tab_label = crate::labels::coordinator_tab_label();
+    let (space, tab, notes) = herdr.name_place(pane, &label, tab_label);
+    // The ticker runs this every tick: a name that has not landed yet is
+    // retried every tick (that is the repair), but its note is said once per
+    // change instead of once per tick.
+    crate::notes::say_once(&format!("{pane}|{label}|{tab_label}"), &notes);
     (space, tab)
 }
 
@@ -2062,6 +2064,83 @@ mod tests {
         keep_names(&herdr, &project, &term.address);
         assert_eq!(app.renamed.borrow().len(), renames, "an already named tab is not renamed again");
         assert_eq!(app.spaces.borrow()[0].1, "REXA");
+    }
+
+    /// A ticker pass names every coordinator of every project: the window and
+    /// the core are each asked once for the whole pass, not once per
+    /// coordinator, and a pass over names that are already right renames
+    /// nothing (t-0091).
+    #[test]
+    fn one_pass_asks_the_window_and_the_core_once() {
+        let root = tempfile::tempdir().unwrap();
+        let project = crate::project::create(root.path(), "REXA", vec![]).unwrap();
+        let fake = crate::fake_hc::FakeCore::new();
+        let app = crate::fake_hc::FakeApp::new(&fake);
+        let herdr = Core::new("hc", "", &app);
+        let space = app.shown_space("REXA");
+        let first = fake.terminal("t52", "/r/rexa", &[(crate::core::L_APP_SPACE, space.as_str())]);
+        let second = fake.terminal("t53", "/r/rexa", &[(crate::core::L_APP_SPACE, space.as_str())]);
+        // Once, as `open` does it: this is what makes the names right, and it
+        // is not what the pass below is measured on.
+        keep_names(&herdr, &project, &first.name);
+        keep_names(&herdr, &project, &second.name);
+        let before = app.calls.borrow().len();
+
+        crate::core::view::begin();
+        crate::app::begin();
+        keep_names(&herdr, &project, &first.name);
+        keep_names(&herdr, &project, &first.name);
+        keep_names(&herdr, &project, &second.name);
+        let during: Vec<String> = app.calls.borrow()[before..].to_vec();
+        crate::app::end();
+        crate::core::view::end();
+
+        let app_calls: Vec<&String> = during.iter().filter(|line| line.starts_with("herdr-app")).collect();
+        let hc_lists: Vec<&String> = during.iter().filter(|line| line.starts_with("hc --json ls")).collect();
+        assert_eq!(app_calls.len(), 2, "one `status`, one `ls` for the pass: {during:?}");
+        assert_eq!(hc_lists.len(), 1, "one `hc ls` for the pass: {during:?}");
+        assert!(
+            during.iter().all(|line| !line.contains("rename") && !line.contains("hc --json label")),
+            "names already right are not renamed: {during:?}"
+        );
+        assert_eq!(
+            during.iter().filter(|line| line.contains("hc --json get")).count(),
+            2,
+            "one `hc get` per pane, not one per name: {during:?}"
+        );
+    }
+
+    /// A wrong name is still repaired: in the pass that sees it, and — for a
+    /// change somebody makes in the window mid-pass — in the next one. A held
+    /// view is a snapshot of one pass, never a reason to stop renaming.
+    #[test]
+    fn a_wrong_name_is_still_repaired() {
+        let root = tempfile::tempdir().unwrap();
+        let project = crate::project::create(root.path(), "REXA", vec![]).unwrap();
+        let fake = crate::fake_hc::FakeCore::new();
+        let app = crate::fake_hc::FakeApp::new(&fake);
+        let herdr = Core::new("hc", "", &app);
+        let space = app.shown_space("old name");
+        let term = fake.terminal("t52", "/r/rexa", &[(crate::core::L_APP_SPACE, space.as_str())]);
+
+        crate::core::view::begin();
+        crate::app::begin();
+        keep_names(&herdr, &project, &term.name);
+        assert_eq!(app.spaces.borrow()[0].1, "REXA", "a Space under another name is renamed in this pass");
+        // The window renames it behind hp's back while the pass is running: a
+        // snapshot cannot see that, and the tick that follows puts it right.
+        app.spaces.borrow_mut()[0].1 = "somebody else".into();
+        keep_names(&herdr, &project, &term.name);
+        crate::app::end();
+        crate::core::view::end();
+
+        crate::core::view::begin();
+        crate::app::begin();
+        keep_names(&herdr, &project, &term.name);
+        crate::app::end();
+        crate::core::view::end();
+        assert_eq!(app.spaces.borrow()[0].1, "REXA", "the next pass puts it right again");
+        assert!(app.renamed.borrow().len() >= 1);
     }
 
     #[test]

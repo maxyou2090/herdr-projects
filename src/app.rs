@@ -6,9 +6,62 @@
 //! answer with the ids the app gave the space, the tab and the terminal, and a
 //! machine without the app falls back to plain `hc` (reached with `hc attach`).
 
+use std::cell::RefCell;
 use std::time::Duration;
 
 use crate::runner::{Cmd, Runner};
+
+// The window's view, held for the length of a ticker pass.
+//
+// `herdr-app status` and `herdr-app ls` answer in a few milliseconds, but a tick
+// asked for them once or twice per coordinator — and every rename path asked
+// again to confirm. A pass answers each once and every reader in the pass reads
+// that (`begin`); anything that renames or closes forgets it, so the confirming
+// read after a rename still goes to the window. Outside a pass nothing is held:
+// a one-shot command always sees the window as it is.
+thread_local! {
+    static HELD: RefCell<Option<Held>> = const { RefCell::new(None) };
+}
+
+#[derive(Default)]
+struct Held {
+    running: Option<bool>,
+    ls: Option<Option<serde_json::Value>>,
+}
+
+/// Starts a pass: nothing read yet, each answer held until [`end`].
+pub fn begin() {
+    HELD.with(|held| *held.borrow_mut() = Some(Held::default()));
+}
+
+/// Ends it: the next read asks the window.
+pub fn end() {
+    HELD.with(|held| *held.borrow_mut() = None);
+}
+
+/// Drops the held view (a Space or tab was renamed, opened or closed).
+pub fn forget() {
+    HELD.with(|held| {
+        if let Some(held) = held.borrow_mut().as_mut() {
+            held.ls = None;
+        }
+    });
+}
+
+/// One answer per pass, fetched by `fetch` the first time it is asked for.
+fn held<T>(pick: impl Fn(&mut Held) -> &mut Option<T>, fetch: impl FnOnce() -> T) -> T
+where
+    T: Clone,
+{
+    HELD.with(|cell| {
+        let mut held = cell.borrow_mut();
+        let Some(held) = held.as_mut() else {
+            return fetch();
+        };
+        let slot = pick(held);
+        slot.get_or_insert_with(fetch).clone()
+    })
+}
 
 /// `HERDR_APP_BIN`, else `herdr-app`.
 pub fn bin() -> String {
@@ -17,10 +70,12 @@ pub fn bin() -> String {
 
 /// The app answers only while its window is open; `status` is that check.
 pub fn running(runner: &dyn Runner) -> bool {
-    runner
-        .run(&Cmd::new(bin(), Duration::from_secs(5)).arg("status"))
-        .map(|out| out.success())
-        .unwrap_or(false)
+    held(|held| &mut held.running, || {
+        runner
+            .run(&Cmd::new(bin(), Duration::from_secs(5)).arg("status"))
+            .map(|out| out.success())
+            .unwrap_or(false)
+    })
 }
 
 /// The ids a space or a tab came with.
@@ -66,6 +121,8 @@ fn placed(reply: &serde_json::Value) -> Option<Placed> {
 /// A Space for a project: named after it, starting in its folder, not stealing
 /// focus.
 pub fn space_new(runner: &dyn Runner, name: &str, folder: &str) -> Option<Placed> {
+    // A Space that did not exist a moment ago: the held view is wrong about
+    // the list now.
     let args = vec![
         "--name".to_string(),
         name.to_string(),
@@ -74,17 +131,29 @@ pub fn space_new(runner: &dyn Runner, name: &str, folder: &str) -> Option<Placed
         "--focus".to_string(),
         "false".to_string(),
     ];
-    placed(&call(runner, "space.new", &args)?)
+    let placed = call(runner, "space.new", &args);
+    forget();
+    placed_from(placed.as_ref())
+}
+
+fn placed_from(reply: Option<&serde_json::Value>) -> Option<Placed> {
+    placed(reply?)
 }
 
 /// Ends every terminal of a Space, as `hp` means it.
 pub fn space_close(runner: &dyn Runner, space: &str) -> bool {
     let args = vec!["--id".to_string(), space.to_string(), "--confirmed".to_string(), "true".to_string()];
-    call(runner, "space.close", &args).is_some()
+    let closed = call(runner, "space.close", &args).is_some();
+    forget();
+    closed
 }
 
 /// Every space, tab and terminal the window shows (`herdr-app ls`).
 pub fn ls(runner: &dyn Runner) -> Option<serde_json::Value> {
+    held(|held| &mut held.ls, || ls_now(runner))
+}
+
+fn ls_now(runner: &dyn Runner) -> Option<serde_json::Value> {
     let out = runner.run(&Cmd::new(bin(), Duration::from_secs(10)).arg("ls")).ok()?;
     if !out.success() {
         return None;
@@ -125,13 +194,17 @@ pub fn tab_rename(runner: &dyn Runner, tab: &str, name: &str) -> bool {
 /// `tab.rename`, with the app's own words when it refuses.
 pub fn tab_name(runner: &dyn Runner, tab: &str, name: &str) -> Result<(), String> {
     let args = vec!["--id".to_string(), tab.to_string(), "--name".to_string(), name.to_string()];
-    call_strict(runner, "tab.rename", &args).map(|_| ())
+    let renamed = call_strict(runner, "tab.rename", &args).map(|_| ());
+    forget();
+    renamed
 }
 
 /// Names a Space: the name a person reads above its tabs.
 pub fn space_rename(runner: &dyn Runner, space: &str, name: &str) -> Result<(), String> {
     let args = vec!["--id".to_string(), space.to_string(), "--name".to_string(), name.to_string()];
-    call_strict(runner, "space.rename", &args).map(|_| ())
+    let renamed = call_strict(runner, "space.rename", &args).map(|_| ());
+    forget();
+    renamed
 }
 
 /// What the window shows for a Space and the terminal in it: the Space's own
@@ -178,7 +251,9 @@ pub fn shown_in(view: &serde_json::Value, space: &str, terminal: &str) -> Option
 
 pub fn tab_close(runner: &dyn Runner, tab: &str) -> bool {
     let args = vec!["--id".to_string(), tab.to_string()];
-    call(runner, "tab.close", &args).is_some()
+    let closed = call(runner, "tab.close", &args).is_some();
+    forget();
+    closed
 }
 
 #[cfg(test)]

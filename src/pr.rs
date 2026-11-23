@@ -316,6 +316,68 @@ pub fn find_by_branch(runner: &dyn Runner, origin: &str, branch: &str) -> Result
     Ok(listed.into_iter().next().map(|p| p.url))
 }
 
+/// [`find_by_branch`] for many branches at once: one `gh` call per repository
+/// instead of one per thread.
+///
+/// A due PR check used to ask `gh pr list --head=<branch>` for every open thread
+/// that names no pull request — three seconds of network each, and several at
+/// once in one project, which turned a ticker round that takes a second into one
+/// that takes seventeen (2026-11-23, t-0091). This asks once and answers for
+/// every branch of the project: same fields, same ranking (open, then merged,
+/// then the rest, newest first), same fork rule (a fork's pull request is found
+/// only through a report's `PR:` line).
+///
+/// The one difference is the window: `--limit 200` newest rather than twenty per
+/// branch, so a branch whose pull request is older than the two hundred newest in
+/// the repository answers `None` where a per-branch ask might have found it. That
+/// fallback exists for a thread that names no pull request at all; anything
+/// already written down is not looked up again.
+pub fn find_by_branch_many(runner: &dyn Runner, origin: &str, branches: &[String]) -> Result<std::collections::BTreeMap<String, String>> {
+    let mut found = std::collections::BTreeMap::new();
+    let Some(Remote { host, repo }) = parse_remote(origin) else {
+        return Ok(found);
+    };
+    let wanted: std::collections::BTreeSet<&str> = branches.iter().map(String::as_str).filter(|b| !b.is_empty()).collect();
+    if wanted.is_empty() {
+        return Ok(found);
+    }
+    let out = runner.run(&gh(&host).args([
+        "pr",
+        "list",
+        "--repo",
+        &repo,
+        "--state",
+        "all",
+        "--limit",
+        "200",
+        "--json",
+        "url,state,createdAt,headRefName",
+    ]))?;
+    if !out.success() {
+        bail!("gh pr list: {}", out.error_text());
+    }
+    #[derive(Deserialize, Default)]
+    #[serde(default, rename_all = "camelCase")]
+    struct Listed {
+        url: String,
+        state: String,
+        created_at: String,
+        head_ref_name: String,
+    }
+    let mut listed: Vec<Listed> = serde_json::from_str(&out.stdout)?;
+    listed.retain(|p| valid_pr_url(&p.url) && wanted.contains(p.head_ref_name.as_str()));
+    let rank = |state: &str| match state.to_ascii_uppercase().as_str() {
+        "OPEN" => 0,
+        "MERGED" => 1,
+        _ => 2,
+    };
+    listed.sort_by(|a, b| rank(&a.state).cmp(&rank(&b.state)).then_with(|| b.created_at.cmp(&a.created_at)));
+    for pr in listed {
+        found.entry(pr.head_ref_name).or_insert(pr.url);
+    }
+    Ok(found)
+}
+
 /// One line describing what changed between two summaries; fields only.
 pub fn describe_change(old: Option<&Summary>, new: &Summary) -> String {
     let mut parts = vec![format!("state {}", new.state)];
@@ -439,6 +501,34 @@ mod tests {
         for bad in ["", "https://gitlab.com/o/r", "git@github.com:o", "https://github.com/o/r/extra"] {
             assert_eq!(normalize_origin(bad), None, "{bad}");
         }
+    }
+
+    /// One `gh` call answers for every branch of a project: the round that used
+    /// to ask per thread takes one network round trip (t-0091).
+    #[test]
+    fn one_listing_answers_for_every_branch() {
+        use crate::runner::fake::{FakeRunner, ok};
+        let runner = FakeRunner::new();
+        runner.on(
+            "gh pr list",
+            ok(r#"[{"url":"https://github.com/o/r/pull/3","state":"MERGED","createdAt":"2026-01-02","headRefName":"hp/o/t-0003-x"},
+                  {"url":"https://github.com/o/r/pull/2","state":"OPEN","createdAt":"2026-01-01","headRefName":"hp/o/t-0002-y"},
+                  {"url":"https://github.com/o/r/pull/1","state":"OPEN","createdAt":"2026-01-05","headRefName":"hp/o/t-0002-y"},
+                  {"url":"https://github.com/o/r/pull/9","state":"OPEN","createdAt":"2026-01-09","headRefName":"somebody-else"}]"#),
+        );
+        let branches: Vec<String> = ["hp/o/t-0002-y", "hp/o/t-0003-x", "hp/o/t-0004-z"].iter().map(|b| b.to_string()).collect();
+        let found = find_by_branch_many(&runner, "git@github.com:o/r.git", &branches).unwrap();
+        assert_eq!(runner.count("gh pr list"), 1, "one call for three branches");
+        // The newest open pull request wins, as `find_by_branch` ranks them.
+        assert_eq!(found["hp/o/t-0002-y"], "https://github.com/o/r/pull/1");
+        assert_eq!(found["hp/o/t-0003-x"], "https://github.com/o/r/pull/3");
+        assert!(!found.contains_key("hp/o/t-0004-z"), "no pull request is no entry");
+        assert!(!found.contains_key("somebody-else"), "only the branches asked about are answered");
+        // Nothing to ask about, and nothing off GitHub: no `gh` call at all.
+        let quiet = FakeRunner::new();
+        assert!(find_by_branch_many(&quiet, "https://gitlab.com/o/r", &branches).unwrap().is_empty());
+        assert!(find_by_branch_many(&quiet, "git@github.com:o/r.git", &[]).unwrap().is_empty());
+        assert_eq!(quiet.count("gh"), 0);
     }
 
     #[test]

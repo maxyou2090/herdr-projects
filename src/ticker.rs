@@ -32,6 +32,117 @@ const IDLE_EXIT: Duration = Duration::from_secs(300);
 const START_WAIT: Duration = Duration::from_secs(10);
 const LOG_CAP: u64 = 1_000_000;
 
+/// `HP_TICK_TIMINGS=1` in the ticker's environment: every tick writes one line
+/// per stage of every project and one line for the round, all in milliseconds
+/// (`timings <slug>: 8412ms (lists 900, keep_names 700, …)`).
+///
+/// Anything else — unset, empty, `0`, `false`, `off` — is today's ticker
+/// exactly: no extra line, no extra call, no extra `Instant::now()`.
+///
+/// This exists because the loop was measured by guesswork and the guesses were
+/// wrong: a 15-second tick took 90–100 seconds a round (2026-11-23, t-0091),
+/// and the only honest way to cut it is to see which stage costs what.
+pub const TIMINGS_VAR: &str = "HP_TICK_TIMINGS";
+
+pub fn timings_from_env() -> bool {
+    let value = std::env::var(TIMINGS_VAR).unwrap_or_default();
+    let value = value.trim().to_ascii_lowercase();
+    !(value.is_empty() || value == "0" || value == "false" || value == "no" || value == "off")
+}
+
+/// Where a round's milliseconds went, per project, when [`TIMINGS_VAR`] asks
+/// for them. Stage marks are boundaries: `stage` closes the stage that was
+/// running and opens the named one, so a sequence of marks around the calls of
+/// a pass costs one call per stage and one line at the end of the round.
+#[derive(Debug, Default)]
+pub struct Timings {
+    on: bool,
+    open: Option<(&'static str, String, Instant)>,
+    spans: Vec<(String, Vec<(&'static str, Duration)>)>,
+}
+
+impl Timings {
+    pub fn off() -> Timings {
+        Timings::default()
+    }
+
+    pub fn on() -> Timings {
+        Timings { on: true, ..Timings::default() }
+    }
+
+    pub fn from_env() -> Timings {
+        if timings_from_env() { Timings::on() } else { Timings::off() }
+    }
+
+    /// Closes the running stage and opens `name` under `owner` (a project slug,
+    /// or `round` for the whole pass).
+    pub fn stage(&mut self, owner: &str, name: &'static str) {
+        if !self.on {
+            return;
+        }
+        self.close();
+        self.open = Some((name, owner.to_string(), Instant::now()));
+    }
+
+    /// Closes the running stage and opens none: the end of a pass.
+    pub fn stop(&mut self) {
+        if self.on {
+            self.close();
+        }
+    }
+
+    /// Milliseconds an owner's stages add up to.
+    #[cfg(test)]
+    pub fn total(&self, owner: &str) -> Duration {
+        self.spans
+            .iter()
+            .filter(|(name, _)| name == owner)
+            .flat_map(|(_, spans)| spans.iter().map(|(_, took)| *took))
+            .sum()
+    }
+
+    fn close(&mut self) {
+        if let Some((name, owner, at)) = self.open.take() {
+            match self.spans.iter_mut().find(|(who, _)| *who == owner) {
+                Some((_, spans)) => spans.push((name, at.elapsed())),
+                None => self.spans.push((owner, vec![(name, at.elapsed())])),
+            }
+        }
+    }
+
+    /// One line per owner, stages in the order they ran, and — for a whole
+    /// tick — the round's own wall time. Empties the record, so the next round
+    /// starts clean.
+    fn drain(&mut self, round: Option<Duration>) -> Vec<String> {
+        if !self.on {
+            return Vec::new();
+        }
+        let mut lines = Vec::new();
+        for (owner, spans) in std::mem::take(&mut self.spans) {
+            if owner == ROUND {
+                continue;
+            }
+            let total: Duration = spans.iter().map(|(_, took)| *took).sum();
+            let stages: Vec<String> = spans.iter().map(|(name, took)| format!("{name} {}", took.as_millis())).collect();
+            lines.push(format!("timings {owner}: {}ms ({})", total.as_millis(), stages.join(", ")));
+        }
+        if let Some(round) = round {
+            lines.push(format!("timings round: {}ms", round.as_millis()));
+        }
+        lines
+    }
+}
+
+/// The [`Timings`] owner of the whole pass. Named so the per-project lines can
+/// skip it: its time is the one the round line prints.
+const ROUND: &str = "round";
+
+/// How old the held session view may be when the empty-Space sweep judges on
+/// it. A normal round is well under this, so the sweep reads the snapshot the
+/// round started with; a round that ran long (a `gh` call, a copy) drops it and
+/// takes its own before closing anything.
+const VIEW_FRESH: Duration = Duration::from_secs(3);
+
 fn lock_path(root: &Path) -> PathBuf {
     root.join(".ticker.lock")
 }
@@ -933,6 +1044,7 @@ fn run_logged(ctx: &Ctx, log: &Log) -> Result<()> {
     log.line(&format!("ticker {} started (pid {})", info.version, info.pid));
     let mut last_reachable = Instant::now();
     let mut memory = Memory::new(ctx);
+    let mut brief_timings = Timings::from_env();
     loop {
         if stop_path(root).exists() {
             log.line("stop file found; exiting");
@@ -958,7 +1070,16 @@ fn run_logged(ctx: &Ctx, log: &Log) -> Result<()> {
                 break;
             }
             if briefs && Instant::now() >= next_brief {
+                // Timed like a tick when `HP_TICK_TIMINGS` asks: a brief pass
+                // that reads every project's threads is part of what a person
+                // waits for after `thread start`.
+                let at = Instant::now();
+                brief_timings.stage("brief", "pass");
                 briefs = brief_pass(ctx, log);
+                brief_timings.stop();
+                for line in brief_timings.drain(Some(at.elapsed())) {
+                    log.line(&line);
+                }
                 next_brief = Instant::now() + BRIEF_POLL;
             }
             std::thread::sleep(Duration::from_millis(500));
@@ -972,7 +1093,23 @@ fn run_logged(ctx: &Ctx, log: &Log) -> Result<()> {
 /// project's session was reachable. A failure in one project never stops the
 /// others.
 pub fn tick(ctx: &Ctx, log: &Log, memory: &mut Memory) -> bool {
+    tick_with(ctx, log, memory, &mut Timings::from_env())
+}
+
+/// [`tick`] with the timings the caller holds, so `HP_TICK_TIMINGS` is read in
+/// one place and a test can ask for the lines without touching the process
+/// environment.
+pub fn tick_with(ctx: &Ctx, log: &Log, memory: &mut Memory, timings: &mut Timings) -> bool {
+    let round_at = Instant::now();
+    // One view of the session for the whole round: every project reads the same
+    // `hc ls` and the same `hc get` per pane instead of one full listing per
+    // Space it names (t-0091). Writes inside the round patch or drop it.
+    crate::core::view::begin();
+    // And one view of the window: `herdr-app status` and `ls`, once for every
+    // project in the round instead of twice per coordinator.
+    crate::app::begin();
     memory.tick += 1;
+    timings.stage(ROUND, "rename");
     // Renames first: a project that moves is ticked under its new slug.
     for line in crate::rename::pending_pass(ctx) {
         log.line(&line);
@@ -981,10 +1118,11 @@ pub fn tick(ctx: &Ctx, log: &Log, memory: &mut Memory) -> bool {
     let mut unreachable = Vec::new();
     let mut sessions = Sessions::new(ctx);
     for slug in project::list_slugs(&ctx.root) {
+        timings.stage(&slug, "load");
         let Ok(project) = Project::load(&ctx.root, &slug) else {
             continue;
         };
-        match tick_cheap(ctx, &project, &mut sessions) {
+        match tick_cheap(ctx, &project, &mut sessions, timings) {
             Ok(Some(seen)) => {
                 let held = (!seen.nudge_held.is_empty()).then(|| held_text(&seen.nudge_held));
                 match (&held, memory.nudge_held.get(&slug)) {
@@ -1012,15 +1150,23 @@ pub fn tick(ctx: &Ctx, log: &Log, memory: &mut Memory) -> bool {
     }
     let any_reachable = !reachable.is_empty() || sessions.any_reachable();
     for (project, seen) in &reachable {
-        for error in tick_slow(ctx, project, seen, memory, log) {
+        timings.stage(&project.slug, "slow");
+        for error in tick_slow(ctx, project, seen, memory, log, timings) {
             log.line(&format!("{}: {error:#}", project.slug));
         }
     }
     // No coordinator: due routines are recorded as skipped, nothing fires.
+    timings.stage(ROUND, "headless");
     for project in &unreachable {
         for error in headless_routines(project) {
             log.line(&format!("{}: {error:#}", project.slug));
         }
+    }
+    timings.stop();
+    crate::core::view::end();
+    crate::app::end();
+    for line in timings.drain(Some(round_at.elapsed())) {
+        log.line(&line);
     }
     any_reachable
 }
@@ -1031,6 +1177,13 @@ pub fn tick(ctx: &Ctx, log: &Log, memory: &mut Memory) -> bool {
 /// with `thread brief`.
 /// Returns whether a started thread still waits for its brief.
 pub fn brief_pass(ctx: &Ctx, log: &Log) -> bool {
+    crate::core::view::begin();
+    let waiting = brief_pass_in(ctx, log);
+    crate::core::view::end();
+    waiting
+}
+
+fn brief_pass_in(ctx: &Ctx, log: &Log) -> bool {
     let mut waiting = false;
     let mut lists: std::collections::BTreeMap<String, Option<Vec<Agent>>> = Default::default();
     for slug in project::list_slugs(&ctx.root) {
@@ -1214,8 +1367,9 @@ pub fn tick_project(ctx: &Ctx, project: &Project) -> Result<bool> {
 
 #[cfg(test)]
 pub fn tick_project_with(ctx: &Ctx, project: &Project, memory: &mut Memory) -> Result<bool> {
-    match tick_cheap(ctx, project, &mut Sessions::new(ctx))? {
-        Some(seen) => match tick_slow(ctx, project, &seen, memory, &Log::at(std::env::temp_dir().join("hp-test-tick.log"))).into_iter().next() {
+    let mut timings = Timings::off();
+    match tick_cheap(ctx, project, &mut Sessions::new(ctx), &mut timings)? {
+        Some(seen) => match tick_slow(ctx, project, &seen, memory, &Log::at(std::env::temp_dir().join("hp-test-tick.log")), &mut timings).into_iter().next() {
             Some(error) => Err(error),
             None => Ok(true),
         },
@@ -1329,7 +1483,8 @@ fn thread_pass(project: &Project, herdr: &Core, socket: &str, threads: &[thread:
             })?;
         }
         if live.pane_exists {
-            crate::labels::report_pane(herdr, &t.pane_id, &crate::labels::thread_display(t), slug, None);
+            let tokens = panes.iter().find(|p| p.pane_id == t.pane_id).map(|p| &p.tokens);
+            crate::labels::report_pane_unless(herdr, &t.pane_id, &crate::labels::thread_display(t), slug, None, tokens);
         }
         // A thread sitting idle with a failed retry on its pane has lost its
         // turn: no report is coming, so it is reported for the coordinator
@@ -1432,11 +1587,13 @@ pub(crate) fn open_threads(project: &Project) -> Vec<thread::Thread> {
 /// The tick's heartbeat, written for every active project before anything can
 /// return early. `hp context` runs in another process, so the persisted state
 /// is the only place the two meet: the time goes there and nowhere else.
-fn tick_cheap(ctx: &Ctx, project: &Project, sessions: &mut Sessions) -> Result<Option<Seen>> {
+fn tick_cheap(ctx: &Ctx, project: &Project, sessions: &mut Sessions, timings: &mut Timings) -> Result<Option<Seen>> {
+    timings.stage(&project.slug, "state");
     let mut state = steps::load_state(project);
     let before = state.clone();
     state.tick_at = project::now();
-    let result = tick_cheap_body(ctx, project, sessions, &mut state);
+    let result = tick_cheap_body(ctx, project, sessions, &mut state, timings);
+    timings.stage(&project.slug, "save_state");
     let saved = if state == before { Ok(()) } else { steps::save_state(project, &state) };
     match result {
         Err(error) => Err(error),
@@ -1447,7 +1604,7 @@ fn tick_cheap(ctx: &Ctx, project: &Project, sessions: &mut Sessions) -> Result<O
 /// Returns `Ok(None)` when the project's session cannot be reached, or it has
 /// no record and no agent works in its folder: then no state is read, so
 /// nothing is ever reported as gone.
-fn tick_cheap_body(ctx: &Ctx, project: &Project, sessions: &mut Sessions, state: &mut steps::State) -> Result<Option<Seen>> {
+fn tick_cheap_body(ctx: &Ctx, project: &Project, sessions: &mut Sessions, state: &mut steps::State, timings: &mut Timings) -> Result<Option<Seen>> {
     let recorded = project.coordinator();
     let record = match recorded {
         Some(record) => record,
@@ -1456,6 +1613,7 @@ fn tick_cheap_body(ctx: &Ctx, project: &Project, sessions: &mut Sessions, state:
             None => return Ok(None),
         },
     };
+    timings.stage(&project.slug, "lists");
     let Some((mut agents, panes)) = sessions.get(ctx, &record.socket).cloned() else {
         return Ok(None);
     };
@@ -1468,6 +1626,7 @@ fn tick_cheap_body(ctx: &Ctx, project: &Project, sessions: &mut Sessions, state:
     // that is gone outright is named. Without this the tick sees no coordinator
     // at all and holds every notification with the generic "not idle long
     // enough" (2026-11-18, t-0053).
+    timings.stage(slug, "repair");
     let repair = coordinator::repair(project, &herdr, &agents, &project::now())?;
     if let Some(refreshed) = &repair.agents {
         // The list was read before the repair wrote a label: take core's word
@@ -1484,6 +1643,7 @@ fn tick_cheap_body(ctx: &Ctx, project: &Project, sessions: &mut Sessions, state:
     // launched or primed here; `open` starts them and AGENTS.md primes them.
     let previous = coordinator::live(project);
     let now_text = project::now();
+    timings.stage(slug, "discover");
     let coordinators = coordinator::discover(project, &record, &previous, &agents, &now_text);
     if coordinators != previous {
         coordinator::save_live(project, &coordinators)?;
@@ -1511,12 +1671,15 @@ fn tick_cheap_body(ctx: &Ctx, project: &Project, sessions: &mut Sessions, state:
         // A pane the resolver could not place keeps no claim at all: rule 4
         // never assigns an `Ambiguous` pane a lane.
         let lane = (!c.lane.is_empty()).then(|| c.lane.clone());
-        crate::labels::report_pane(&herdr, &c.pane_id, &crate::labels::coordinator_display(project, lane.as_deref()), slug, lane.as_deref());
+        timings.stage(slug, "coordinator_pane");
+        let tokens = agents.iter().find(|a| a.pane_id == c.pane_id).map(|a| &a.tokens);
+        crate::labels::report_pane_unless(&herdr, &c.pane_id, &crate::labels::coordinator_display(project, lane.as_deref()), slug, lane.as_deref(), tokens);
         // The names that pane's Space and tab must show, repaired here rather
         // than on demand: the ticker already visits every coordinator, so one
         // that was never named — a coordinator started in a terminal the app
         // made carries no `hp_ws` (t-0051) — is put right on the next tick.
         // `keep_names` prints a line only when a name did not land.
+        timings.stage(slug, "keep_names");
         crate::coordinator::keep_names(&herdr, project, &c.pane_id);
     }
 
@@ -1537,6 +1700,7 @@ fn tick_cheap_body(ctx: &Ctx, project: &Project, sessions: &mut Sessions, state:
     // need a person to press Escape (2026-11-21, rexa: 41 minutes of ssh retries
     // in one turn).
     let mut interrupted = Vec::new();
+    timings.stage(slug, "turns");
     if let Ok((settings, _)) = project.read_project_md() {
         let stops = steps::interrupt_long_turns(project, state, &settings, &herdr, &coordinators, jiff::Timestamp::now());
         interrupted = stops.stopped;
@@ -1545,7 +1709,10 @@ fn tick_cheap_body(ctx: &Ctx, project: &Project, sessions: &mut Sessions, state:
         }
     }
 
-    let pass = thread_pass(project, &herdr, &record.socket, &open_threads(project), &agents, &panes, None)?;
+    timings.stage(slug, "thread_list");
+    let open = open_threads(project);
+    timings.stage(slug, "threads");
+    let pass = thread_pass(project, &herdr, &record.socket, &open, &agents, &panes, None)?;
     // Progress records of panes that are gone are dropped; a new agent in a
     // reused pane id is told apart by its terminal id.
     let live_ids: Vec<String> = panes.iter().map(|p| p.pane_id.clone()).collect();
@@ -1564,6 +1731,7 @@ fn tick_cheap_body(ctx: &Ctx, project: &Project, sessions: &mut Sessions, state:
     // being that — is recorded per lane, because the ticker's log is not what
     // a coordinator reads: `hp context` is (see `steps::held_note`).
     let mut nudge_held: std::collections::BTreeMap<String, String> = Default::default();
+    timings.stage(slug, "nudge");
     if let Ok((settings, _)) = project.read_project_md() {
         let now = jiff::Timestamp::now();
         let targets = coordinator::nudge_target(project, &coordinators, now);
@@ -1610,7 +1778,9 @@ fn tick_cheap_body(ctx: &Ctx, project: &Project, sessions: &mut Sessions, state:
 
 /// Copies and launches, then inbox items, pull requests, routines,
 /// auto-resolve and housekeeping.
-fn tick_slow(ctx: &Ctx, project: &Project, seen: &Seen, memory: &mut Memory, log: &Log) -> Vec<anyhow::Error> {
+fn tick_slow(ctx: &Ctx, project: &Project, seen: &Seen, memory: &mut Memory, log: &Log, timings: &mut Timings) -> Vec<anyhow::Error> {
+    let slug = &project.slug;
+    timings.stage(slug, "slow_load");
     let mut errors = Vec::new();
     let mut copy_notes: std::collections::BTreeMap<String, Vec<String>> = Default::default();
     let herdr = Core::new(ctx.env.hc_bin(), &seen.socket, ctx.runner);
@@ -1619,7 +1789,9 @@ fn tick_slow(ctx: &Ctx, project: &Project, seen: &Seen, memory: &mut Memory, log
     let transitions = &seen.transitions;
 
     // Local threads: copy home when the report changed, then launches.
+    timings.stage(slug, "slow_thread_list");
     let local = open_threads(project);
+    timings.stage(slug, "copy");
     // One-time backfill for worktrees placed before `skills::prepare` wrote the
     // shared `.agents` link into `info/exclude`: without it a direct
     // `herdr worktree remove` reads the link as untracked work and refuses
@@ -1652,11 +1824,14 @@ fn tick_slow(ctx: &Ctx, project: &Project, seen: &Seen, memory: &mut Memory, log
             }
         }
     }
+    timings.stage(slug, "launch");
     launch_pass(ctx, project, seen, &local, &mut may_start, &mut errors);
 
+    timings.stage(slug, "slow_state");
     let mut state = steps::load_state(project);
     let before = state.clone();
 
+    timings.stage(slug, "items");
     errors.extend(steps::write_thread_items(project, &mut state, transitions, seen.session_lost, &copy_notes).err());
     errors.extend(steps::write_stuck_items(project, &mut state, &seen.stuck).err());
     errors.extend(steps::write_idle_notes(project, &mut state, now).err());
@@ -1666,6 +1841,7 @@ fn tick_slow(ctx: &Ctx, project: &Project, seen: &Seen, memory: &mut Memory, log
     // goes unnoticed. It runs before the routines so a new finding is already
     // in the inbox when this tick decides whether a sweep has news. The lists
     // are the ones this tick already made.
+    timings.stage(slug, "audit");
     match steps::audit_items(project, &mut state, &herdr, &seen.socket, now, &seen.agents, &seen.panes) {
         Ok(written) if !written.is_empty() => {
             let what: Vec<String> = written.iter().map(|f| format!("{} {}", f.subject(), f.kind)).collect();
@@ -1685,14 +1861,18 @@ fn tick_slow(ctx: &Ctx, project: &Project, seen: &Seen, memory: &mut Memory, log
     // be found anywhere: one `coordinator` item per lane, so a project nobody is
     // watching still says that no prompt can reach it. Nothing restarts it.
     errors.extend(steps::write_coordinator_lost_items(project, &mut state, &seen.lost_coordinators).err());
+    timings.stage(slug, "pr");
     errors.extend(steps::pull_requests(ctx, project, &mut state, memory, now));
+    timings.stage(slug, "resolve");
     errors.extend(steps::resolve_merged(ctx, project, &mut state, now));
+    timings.stage(slug, "routines");
     errors.extend(routine_pass(project, &mut state, seen.coordinator));
     if let Ok((settings, _)) = project.read_project_md() {
         errors.extend(steps::auto_resolve(ctx, project, &settings, memory, now));
     }
     // Backstop for inbox items whose thread is long resolved: they can no
     // longer be acted on, and unhandled ones are re-announced forever.
+    timings.stage(slug, "housekeeping");
     match steps::archive_items_of_resolved_threads(project, now) {
         Ok(archived) if !archived.is_empty() => {
             let mut per_thread: std::collections::BTreeMap<&str, usize> = Default::default();
@@ -1705,7 +1885,10 @@ fn tick_slow(ctx: &Ctx, project: &Project, seen: &Seen, memory: &mut Memory, log
         Ok(_) => {}
         Err(error) => errors.push(error.context("archiving items of resolved threads")),
     }
-    // Orphan home Spaces and the thread Space once empty.
+    // Orphan home Spaces and the thread Space once empty. The sweep decides
+    // whether to close a Space from the session's listing, so it is given one no
+    // older than a round: the held view is dropped when it predates this.
+    crate::core::view::refresh_if_older(VIEW_FRESH);
     errors.extend(crate::spaces::close_empty(ctx, project, &herdr));
     // The home Space's label and the thread Space's follow the project's name
     // without an `open`.
@@ -1729,6 +1912,36 @@ mod tests {
             version: version.into(),
             ..Info::default()
         })
+    }
+
+    /// `HP_TICK_TIMINGS`: one line per project and one for the round when it is
+    /// on, nothing at all when it is off — the ticker's log stays byte for byte
+    /// what it was.
+    #[test]
+    fn timings_say_where_a_round_went_and_nothing_when_off() {
+        let mut on = Timings::on();
+        on.stage("demo", "lists");
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        on.stage("demo", "threads");
+        on.stage("demo", "housekeeping");
+        on.stage(ROUND, "headless");
+        on.stop();
+        assert!(on.total("demo") >= std::time::Duration::from_millis(2), "the stages add up");
+        let lines = on.drain(Some(std::time::Duration::from_millis(42)));
+        assert_eq!(lines.len(), 2, "{lines:?}");
+        assert!(lines[0].starts_with("timings demo: "), "{}", lines[0]);
+        for stage in ["lists ", "threads ", "housekeeping "] {
+            assert!(lines[0].contains(stage), "{} is in {}", stage, lines[0]);
+        }
+        assert_eq!(lines[1], "timings round: 42ms");
+        assert!(lines[0].contains("lists 2") || lines[0].contains("lists 3"), "the millisecond count is real: {}", lines[0]);
+
+        let mut off = Timings::off();
+        off.stage("demo", "lists");
+        off.stop();
+        assert!(off.drain(Some(std::time::Duration::from_millis(42))).is_empty(), "switched off writes nothing");
+        // The switch is the environment, and only a real value turns it on.
+        assert!(!timings_from_env() || std::env::var(TIMINGS_VAR).is_ok());
     }
 
     #[test]
@@ -2431,6 +2644,42 @@ mod tests {
         core.set_turn(pane, 7);
         tick_project(&ctx, &project).unwrap();
         assert_eq!(interrupts().len(), 1, "once per turn, not once per tick: {:?}", core.calls.borrow());
+    }
+
+    /// A whole tick, off and on: off adds nothing to the log (every line is the
+    /// line it was), on says what each stage cost.
+    #[test]
+    fn a_tick_says_nothing_about_timings_unless_asked() {
+        let home = tempfile::tempdir().unwrap();
+        let root = home.path().join("root");
+        let project = project::create(&root, "demo", vec![]).unwrap();
+        let core = crate::fake_hc::FakeCore::new();
+        let dir = project.canonical_dir().to_string_lossy().into_owned();
+        let term = core.terminal("hp-demo-1", &dir, &[("hp_agent", "hpc-demo"), ("hp_kind", "pi"), ("hp_lane", "default")]);
+        core.set_status(&term.name, "idle");
+        project
+            .update_coordinator(|c| {
+                c.pane_id = term.name.clone();
+                c.agent_name = "hpc-demo".into();
+                c.cwd = dir.clone();
+            })
+            .unwrap();
+        let env = Env::for_test(home.path(), &[]);
+        let ctx = Ctx { env: &env, root: root.clone(), config_dir: home.path().join("cfg"), runner: &core, detached_ticker: false };
+
+        let quiet = home.path().join("quiet.log");
+        let mut memory = Memory::new(&ctx);
+        tick_with(&ctx, &Log::at(quiet.clone()), &mut memory, &mut Timings::off());
+        let quiet = std::fs::read_to_string(&quiet).unwrap_or_default();
+        assert!(!quiet.contains("timings"), "nothing about timings when off: {quiet}");
+
+        let loud = home.path().join("loud.log");
+        let mut memory = Memory::new(&ctx);
+        tick_with(&ctx, &Log::at(loud.clone()), &mut memory, &mut Timings::on());
+        let loud = std::fs::read_to_string(&loud).unwrap();
+        assert!(loud.contains("timings demo: "), "a line per project: {loud}");
+        assert!(loud.contains("(load "), "with its stages: {loud}");
+        assert!(loud.lines().any(|line| line.contains("timings round: ")), "and one for the round: {loud}");
     }
 
     #[test]

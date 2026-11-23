@@ -140,6 +140,23 @@ pub trait Runner {
 pub struct RealRunner;
 
 const POLL: Duration = Duration::from_millis(20);
+const POLL_FIRST: Duration = Duration::from_millis(1);
+
+/// How long to wait before looking for the child's exit again.
+///
+/// The wait starts at a millisecond and doubles up to [`POLL`], because a flat
+/// 20 ms sleep was the price of *every* process this binary starts: `hc get`
+/// answers in about five, and a ticker tick runs a few hundred of them, so 20
+/// ms each was most of a 25-second round (2026-11-23, t-0091). A long command
+/// still settles into the 20 ms wait after five looks, so a live child costs
+/// nothing to watch.
+fn poll_delay(waited: Duration) -> Duration {
+    if waited >= Duration::from_millis(160) {
+        POLL
+    } else {
+        POLL_FIRST.max(waited / 4)
+    }
+}
 
 impl Runner for RealRunner {
     fn run(&self, cmd: &Cmd) -> Result<Output> {
@@ -183,6 +200,7 @@ impl Runner for RealRunner {
         let stderr_thread = child.stderr.take().map(read_all);
 
         let deadline = Instant::now() + cmd.timeout;
+        let started = Instant::now();
         let mut timed_out = false;
         let status = loop {
             if let Some(status) = child.try_wait()? {
@@ -193,7 +211,7 @@ impl Runner for RealRunner {
                 kill(&mut child, cmd.own_group);
                 break child.wait().ok();
             }
-            std::thread::sleep(POLL);
+            std::thread::sleep(poll_delay(started.elapsed()));
         };
 
         if let Some(thread) = stdin_thread {
@@ -405,6 +423,17 @@ pub mod fake {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The wait between looks starts at a millisecond: a `hc get` that answers in
+    /// five used to cost twenty, and a ticker round runs hundreds of them.
+    #[test]
+    fn the_wait_between_looks_starts_short() {
+        assert_eq!(poll_delay(Duration::ZERO), POLL_FIRST);
+        assert_eq!(poll_delay(Duration::from_millis(1)), POLL_FIRST);
+        assert!(poll_delay(Duration::from_millis(40)) < POLL);
+        assert_eq!(poll_delay(Duration::from_millis(160)), POLL, "a long command settles into the plain wait");
+        assert_eq!(poll_delay(Duration::from_secs(60)), POLL);
+    }
 
     #[test]
     fn captures_output_and_exit_code() {
