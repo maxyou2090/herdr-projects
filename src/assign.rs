@@ -62,6 +62,28 @@ pub fn context_line(ctx: &Ctx, project: &Project) -> String {
     }
 }
 
+/// An owner is who is responsible, so it never becomes a way around the
+/// user's naming: an on-request profile cannot own a task at all
+/// (`hp task add --owner`, `hp task thread --owner`). It is still refused
+/// later, at launch, by the allow-list that `Assignable` reads.
+pub fn check_owner(ctx: &Ctx, project: &Project, owner: &str) -> Result<()> {
+    let config = crate::profiles::load(&ctx.config_dir)?;
+    refuse_on_request(&config, &Owner::parse(owner)).map_err(|error| {
+        anyhow::anyhow!("{error} Assignable: {}", load(ctx, project).map(|a| a.line()).unwrap_or_else(|e| format!("config-error: {e:#}")))
+    })
+}
+
+/// The pure part of [`check_owner`].
+pub fn refuse_on_request(config: &crate::profiles::Config, owner: &Owner) -> Result<()> {
+    let Owner::Agent { profile: Some(profile) } = owner else {
+        return Ok(());
+    };
+    if !config.profiles.get(profile).is_some_and(|entry| entry.on_request) {
+        return Ok(());
+    }
+    bail!("`{profile}` is on request only: the user names it in a request, it is never a task owner.")
+}
+
 /// `assignable <slug> [--check OWNER]`.
 pub fn run(ctx: &Ctx, slug: &str, check: Option<&str>) -> Result<()> {
     let project = Project::load(&ctx.root, slug)?;
@@ -101,5 +123,26 @@ mod tests {
         assert!(error.contains("only start on this machine"), "{error}");
         assert_eq!(assignable.line(), "claude, codex-fast");
         assert_eq!(Assignable::default().line(), "(none; only me)");
+    }
+
+    /// An on-request profile is the user's to name, so it is never in the list
+    /// an owner is checked against, and never an owner at all even when a
+    /// project's allow-list names it (t-0088).
+    #[test]
+    fn an_on_request_profile_is_never_an_owner() {
+        let text = "[profiles.sol]\nagent = \"codex\"\nmodel = \"gpt-6.2-sol\"\non_request = true\n\n[profiles.luna]\nagent = \"omp\"\n";
+        let config: crate::profiles::Config = toml::from_str(text).unwrap();
+        let error = refuse_on_request(&config, &agent(Some("sol"))).unwrap_err().to_string();
+        assert!(error.contains("`sol` is on request only"), "{error}");
+        assert!(refuse_on_request(&config, &agent(Some("luna"))).is_ok());
+        for ok in [Owner::Me, Owner::Unassigned, agent(None), Owner::Person("Priya Rao".into())] {
+            refuse_on_request(&config, &ok).unwrap();
+        }
+        // Even a list that names it does not make it assignable.
+        let safety = crate::project::Safety { thread_profiles: Some(vec!["luna".into(), "sol".into()]), ..Default::default() };
+        let local: Vec<String> = crate::profiles::usable(&config, &safety, crate::profiles::Role::Thread, &[], "luna").into_iter().map(|p| p.name).collect();
+        let assignable = Assignable { local };
+        assert_eq!(assignable.line(), "luna");
+        assert!(assignable.check(&agent(Some("sol"))).is_err());
     }
 }

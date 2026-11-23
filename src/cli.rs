@@ -621,6 +621,9 @@ enum ProfileCommand {
         agent: String,
         #[command(flatten)]
         fields: ProfileFields,
+        /// Use it only when the user names it in a request: never a default, never a task owner, and this project's allow-list need not name it
+        #[arg(long)]
+        on_request: bool,
     },
     /// Change a profile's fields; --arg replaces its arguments (a person at a terminal only)
     Edit {
@@ -632,6 +635,12 @@ enum ProfileCommand {
         /// Remove all its extra arguments
         #[arg(long, conflicts_with = "args")]
         clear_args: bool,
+        /// Make it on request only
+        #[arg(long, conflicts_with = "no_on_request")]
+        on_request: bool,
+        /// Make it an ordinary profile again (one the allow-lists govern)
+        #[arg(long = "no-on-request", conflicts_with = "on_request")]
+        no_on_request: bool,
     },
     /// Remove a profile (a person at a terminal only)
     Remove { name: String },
@@ -702,17 +711,25 @@ fn profile_change(ctx: &Ctx, command: ProfileCommand) -> Result<crate::profiles:
     use crate::profiles::{Change, Entry, Role};
     Ok(match command {
         ProfileCommand::List { .. } | ProfileCommand::Resolve { .. } => bail!("`profile list` and `profile resolve` change nothing"),
-        ProfileCommand::Add { name, agent, fields } => Change::Add {
+        ProfileCommand::Add { name, agent, fields, on_request } => Change::Add {
             name,
-            entry: Entry { agent, model: fields.model.unwrap_or_default(), effort: fields.effort.unwrap_or_default(), args: fields.args, description: fields.description.unwrap_or_default() },
+            entry: Entry {
+                agent,
+                model: fields.model.unwrap_or_default(),
+                effort: fields.effort.unwrap_or_default(),
+                args: fields.args,
+                description: fields.description.unwrap_or_default(),
+                on_request,
+            },
         },
-        ProfileCommand::Edit { name, agent, fields, clear_args } => Change::Edit {
+        ProfileCommand::Edit { name, agent, fields, clear_args, on_request, no_on_request } => Change::Edit {
             name,
             agent,
             model: fields.model,
             effort: fields.effort,
             description: fields.description,
             args: if clear_args { Some(Vec::new()) } else { (!fields.args.is_empty()).then_some(fields.args) },
+            on_request: on_request.then_some(true).or(no_on_request.then_some(false)),
         },
         ProfileCommand::Remove { name } => Change::Remove { name },
         ProfileCommand::Allow { role, names, project, all } => Change::Allow {
@@ -755,7 +772,15 @@ pub fn run() -> Result<()> {
             let config = crate::profiles::load(&ctx.config_dir)?;
             let thread = thread_profile.unwrap_or_else(|| config.new_project_default(crate::profiles::Role::Thread));
             let coordinator = coordinator_profile.unwrap_or_else(|| config.new_project_default(crate::profiles::Role::Coordinator));
-            for name in [&thread, &coordinator] {
+            for (key, name) in [("thread_profile", &thread), ("coordinator_profile", &coordinator)] {
+                if config.profiles.get(name.as_str()).is_some_and(|entry| entry.on_request) {
+                    // A project default is picked silently on every launch, and
+                    // `set <slug> {key}` refuses an on-request profile, so such a
+                    // project could not be fixed with a command afterwards.
+                    bail!(
+                        "`{name}` is on request only: the user names it per thread, it cannot be a project default. Use `hp profile edit {name} --no-on-request`, or pick another profile for {key}"
+                    );
+                }
                 if config.get(name).is_none() {
                     bail!("there is no profile `{name}`; `profile list` shows them");
                 }
@@ -810,6 +835,9 @@ pub fn run() -> Result<()> {
         Command::Task { command } => match command {
             TaskCommand::Add { slug, list, title, owner, lane, notes } => {
                 let project = Project::load(&ctx.root, &slug)?;
+                if let Some(owner) = owner.as_deref() {
+                    crate::assign::check_owner(&ctx, &project, owner)?;
+                }
                 let options = crate::tasks::AddOptions { owner: owner.as_deref(), lane: lane.as_deref(), notes: notes.as_deref() };
                 println!("{}", crate::tasks::add(&project, &list, &title, &options)?);
                 Ok(())
@@ -839,6 +867,9 @@ pub fn run() -> Result<()> {
             }
             TaskCommand::Thread { slug, title, thread, clear, owner } => {
                 let project = Project::load(&ctx.root, &slug)?;
+                if let Some(owner) = owner.as_deref() {
+                    crate::assign::check_owner(&ctx, &project, owner)?;
+                }
                 let lane = task_caller_lane(&ctx, &project);
                 let options = crate::tasks::ThreadOptions { thread: thread.as_deref(), owner: owner.as_deref(), clear };
                 println!("{}", crate::tasks::record_thread(&project, &title, &options, lane.as_deref())?);

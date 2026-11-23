@@ -68,6 +68,16 @@ pub struct Entry {
     pub effort: String,
     pub args: Vec<String>,
     pub description: String,
+    /// `on_request = true`: a thread may use it only when the user names it in
+    /// a request. It is never a default, never a task owner, and a project's
+    /// allow-list does not have to name it (see [`Role::Thread`] in
+    /// [`resolve`]). Written only when true, like every other empty field.
+    #[serde(skip_serializing_if = "is_false")]
+    pub on_request: bool,
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -85,6 +95,31 @@ impl Profile {
 
     pub fn agent(&self) -> &str {
         &self.entry.agent
+    }
+
+    /// Whether the user must name this profile for a thread to get it.
+    pub fn on_request(&self) -> bool {
+        self.entry.on_request
+    }
+
+    /// One entry of `context`'s `On request only:` line:
+    /// `codex-sol-medium (codex gpt-6.2-sol, medium) — Sol at medium effort`.
+    pub fn on_request_note(&self) -> String {
+        let e = &self.entry;
+        let mut parts = vec![e.agent.clone()];
+        if !e.model.is_empty() {
+            parts.push(e.model.clone());
+        }
+        let mut detail = parts.join(" ");
+        if !e.effort.is_empty() {
+            detail.push_str(&format!(", {}", e.effort));
+        }
+        let mut line = format!("{} ({detail})", self.name);
+        if !e.description.is_empty() {
+            line.push_str(" — ");
+            line.push_str(&e.description);
+        }
+        line
     }
 
     /// The agent CLI arguments this profile launches with: the model and
@@ -170,6 +205,13 @@ impl Config {
             Role::Thread => safety.thread_profiles.clone(),
             Role::Coordinator => safety.coordinator_profiles.clone(),
         }
+    }
+
+    /// The user's on-request profiles, in name order. Unlike the built-ins
+    /// these are not filtered by what is installed here: the user wrote them,
+    /// and `context` says plainly that they are the user's to name.
+    pub fn on_request(&self) -> Vec<Profile> {
+        self.profiles.keys().filter(|n| self.profiles[*n].on_request).filter_map(|n| self.get(n)).collect()
     }
 
     /// The default `new` writes into PROJECT.md for `role`.
@@ -276,7 +318,9 @@ pub fn typed_args(agent: &str, model: &str, effort: &str) -> Result<Vec<String>>
 
 /// The profile `role` launches with in `project`: `requested`, else the
 /// project's default. Refused when it does not exist or the allow-list does
-/// not name it.
+/// not name it, with one exception: a thread may be asked for an on-request
+/// profile by name, and that bypasses the thread allow-list. A default is
+/// never on-request, and a coordinator never is.
 pub fn resolve(config: &Config, safety: &project::Safety, settings: &project::Settings, role: Role, requested: Option<&str>, slug: &str) -> Result<Profile> {
     let default = match role {
         Role::Thread => &settings.thread_profile,
@@ -286,7 +330,13 @@ pub fn resolve(config: &Config, safety: &project::Safety, settings: &project::Se
     let profile = config
         .get(name)
         .with_context(|| format!("there is no profile `{name}`; `profile list` shows them, and the user adds one with `profile add`"))?;
-    check_allowed(config, safety, role, name, slug)?;
+    // An on-request profile is the user's to name: `--profile NAME` on this
+    // very thread. Never the project default (that would pick it silently) and
+    // never a coordinator.
+    let named_on_request = requested.is_some() && role == Role::Thread && profile.entry.on_request;
+    if !named_on_request {
+        check_allowed(config, safety, role, name, slug)?;
+    }
     Ok(profile)
 }
 
@@ -416,7 +466,15 @@ pub fn detect(env: &Env) -> Vec<String> {
 #[derive(Debug, Clone, PartialEq)]
 pub enum Change {
     Add { name: String, entry: Entry },
-    Edit { name: String, agent: Option<String>, model: Option<String>, effort: Option<String>, description: Option<String>, args: Option<Vec<String>> },
+    Edit {
+        name: String,
+        agent: Option<String>,
+        model: Option<String>,
+        effort: Option<String>,
+        description: Option<String>,
+        args: Option<Vec<String>>,
+        on_request: Option<bool>,
+    },
     Remove { name: String },
     /// `names: None` removes the list: every profile is allowed.
     Allow { role: Role, project: Option<PathBuf>, names: Option<Vec<String>> },
@@ -469,11 +527,14 @@ pub fn apply_in(text: &str, change: &Change) -> Result<(String, String)> {
             if !entry.args.is_empty() {
                 t["args"] = string_array(&entry.args);
             }
+            if entry.on_request {
+                t["on_request"] = toml_edit::value(true);
+            }
             profiles[name] = Item::Table(t);
             let replaces = if crate::agents::is_kind(name) { format!(" (it replaces the built-in `{name}`)") } else { String::new() };
             format!("added profile `{name}`{replaces}: {}", Profile { name: name.clone(), entry: entry.clone(), builtin: false }.summary())
         }
-        Change::Edit { name, agent, model, effort, description, args } => {
+        Change::Edit { name, agent, model, effort, description, args, on_request } => {
             let mut entry = current.profiles.get(name).cloned().with_context(|| format!("there is no profile `{name}` in config.toml; `profile add` makes one"))?;
             if let Some(agent) = agent {
                 if *agent != entry.agent && effort.is_none() && effort_values(agent).is_none() {
@@ -490,6 +551,9 @@ pub fn apply_in(text: &str, change: &Change) -> Result<(String, String)> {
             if let Some(args) = args {
                 entry.args = args.clone();
             }
+            if let Some(on_request) = on_request {
+                entry.on_request = *on_request;
+            }
             validate(name, &entry)?;
             let t = doc["profiles"][name.as_str()].as_table_mut().with_context(|| format!("[profiles.{name}] is not a table"))?;
             t["agent"] = toml_edit::value(&entry.agent);
@@ -505,7 +569,13 @@ pub fn apply_in(text: &str, change: &Change) -> Result<(String, String)> {
             } else {
                 t["args"] = string_array(&entry.args);
             }
-            format!("changed profile `{name}`: {}", Profile { name: name.clone(), entry, builtin: false }.summary())
+            if entry.on_request {
+                t["on_request"] = toml_edit::value(true);
+            } else {
+                t.remove("on_request");
+            }
+            let note = if entry.on_request { " · on request" } else { "" };
+            format!("changed profile `{name}`: {}{note}", Profile { name: name.clone(), entry, builtin: false }.summary())
         }
         Change::Remove { name } => {
             if !current.profiles.contains_key(name) {
@@ -599,7 +669,14 @@ pub fn list_text(ctx: &Ctx, project: Option<&Project>) -> Result<String> {
     let mut out = String::new();
     let _ = writeln!(out, "Profiles (built-ins: the agent CLIs installed and signed in here: {}):", if detected.is_empty() { "none found".to_string() } else { detected.join(", ") });
     for p in config.listed(&detected) {
-        let _ = writeln!(out, "  {:<14} {}{}", p.name, p.summary(), if p.builtin { "  (built-in)" } else { "" });
+        let note = if p.builtin {
+            "  (built-in)".to_string()
+        } else if p.on_request() {
+            " · on request".to_string()
+        } else {
+            String::new()
+        };
+        let _ = writeln!(out, "  {:<14} {}{note}", p.name, p.summary());
     }
     let _ = writeln!(out, "\nDefaults for new projects: thread_profile = {}, coordinator_profile = {}", config.new_project_default(Role::Thread), config.new_project_default(Role::Coordinator));
     if let Some(project) = project {
@@ -627,19 +704,23 @@ pub fn list_text(ctx: &Ctx, project: Option<&Project>) -> Result<String> {
 /// The `context` block: the profiles the coordinator may choose for threads,
 /// one line each, and what it may open another coordinator with.
 pub fn context_text(ctx: &Ctx, project: &Project, settings: &project::Settings) -> String {
-    use std::fmt::Write as _;
     let (config, safety) = match (load(&ctx.config_dir), project.safety(&ctx.config_dir)) {
         (Ok(c), Ok(s)) => (c, s),
         (Err(e), _) | (_, Err(e)) => return format!("config-error: {e:#}\n"),
     };
-    let detected = detect(ctx.env);
+    context_text_for(&config, &safety, &detect(ctx.env), settings)
+}
+
+/// The `context` profile block from what was read, so a test can pin it.
+pub fn context_text_for(config: &Config, safety: &project::Safety, detected: &[String], settings: &project::Settings) -> String {
+    use std::fmt::Write as _;
     let mut out = String::new();
     for role in [Role::Thread, Role::Coordinator] {
         let default = match role {
             Role::Thread => &settings.thread_profile,
             Role::Coordinator => &settings.coordinator_profile,
         };
-        let names = usable(&config, &safety, role, &detected, default);
+        let names = usable(config, safety, role, detected, default);
         let _ = writeln!(out, "{} (--profile NAME; default {default}):", if role == Role::Thread { "Thread profiles" } else { "Coordinator profiles" });
         if names.is_empty() {
             let _ = writeln!(out, "- (none allowed; ask the user)");
@@ -648,19 +729,29 @@ pub fn context_text(ctx: &Ctx, project: &Project, settings: &project::Settings) 
             let _ = writeln!(out, "- {}: {}", p.name, p.summary());
         }
     }
+    // Separate on purpose: these are the user's to name in a request, never
+    // the coordinator's to choose by task difficulty.
+    let on_request = config.on_request();
+    if !on_request.is_empty() {
+        let notes: Vec<String> = on_request.iter().map(Profile::on_request_note).collect();
+        let _ = writeln!(out, "On request only: {}", notes.join(", "));
+    }
     out
 }
 
 /// The profiles to offer `role` in a project: the listed ones it may use,
 /// plus its default when that is allowed but not listed (an uninstalled
-/// built-in, say).
+/// built-in, say). An on-request profile is never one of them, even when the
+/// allow-list names it: it is the user's to name, so it cannot be picked, be
+/// a default, or be a task owner (`assign::Assignable` reads this).
 pub fn usable(config: &Config, safety: &project::Safety, role: Role, detected: &[String], default: &str) -> Vec<Profile> {
     let allowed = config.allowed(safety, role);
-    let ok = |name: &str| allowed.as_ref().is_none_or(|l| l.iter().any(|a| a == name));
+    let ok = |name: &str| !config.profiles.get(name).is_some_and(|e| e.on_request) && allowed.as_ref().is_none_or(|l| l.iter().any(|a| a == name));
     let mut out: Vec<Profile> = config.listed(detected).into_iter().filter(|p| ok(&p.name)).collect();
     if let Some(list) = &allowed {
         for name in list {
-            if !out.iter().any(|p| &p.name == name)
+            if ok(name)
+                && !out.iter().any(|p| &p.name == name)
                 && let Some(p) = config.get(name)
             {
                 out.push(p);
@@ -685,6 +776,9 @@ mod tests {
     }
 
     const CONFIG: &str = "root = \"~/p\" # mine\n\n[profiles.luna]\nagent = \"omp\"\nargs = [\"--config\", \"~/.omp/agent/luna.yml\"]\ndescription = \"Cheap tier\"\n\n[profiles.claude]\nagent = \"claude\"\nargs = [\"--dangerously-skip-permissions\"]\n\n[profiles.deep]\nagent = \"codex\"\nmodel = \"gpt-5.5\"\neffort = \"high\"\n\n[safety.default]\nthread_profiles = [\"claude\", \"luna\", \"deep\"]\n\n[safety.\"/p/demo\"]\nthread_profiles = [\"luna\"]\n";
+
+    /// Two profiles only the user may name, and one ordinary profile.
+    const ON_REQUEST: &str = "[profiles.neon]\nagent = \"agy\"\nmodel = \"gemini-4-neon-medium\"\non_request = true\n\n[profiles.sol]\nagent = \"codex\"\nmodel = \"gpt-6.2-sol\"\neffort = \"medium\"\ndescription = \"Sol at medium effort\"\non_request = true\n\n[profiles.luna]\nagent = \"omp\"\ndescription = \"Cheap tier\"\n\n[safety.default]\nthread_profiles = [\"luna\"]\n";
 
     /// The merged safety settings of `/p/demo` (`own`) or another project.
     fn safety_of(text: &str, dir: &str) -> project::Safety {
@@ -755,6 +849,89 @@ mod tests {
         // An empty list allows nothing.
         let empty = project::Safety { coordinator_profiles: Some(vec![]), ..project::Safety::default() };
         assert!(resolve(&config, &empty, &settings("claude"), Role::Coordinator, None, "x").unwrap_err().to_string().contains("allowed: none"));
+    }
+
+    #[test]
+    fn on_request_is_a_field_that_stays_off_unless_it_is_set() {
+        let config: Config = toml::from_str(ON_REQUEST).unwrap();
+        assert!(config.profiles["sol"].on_request);
+        let with_default: Config = toml::from_str(&format!("{ON_REQUEST}\n[defaults]\nthread_profile = \"luna\"\n")).unwrap();
+        assert_eq!(with_default.new_project_default(Role::Thread), "luna", "`hp new` writes `thread_profile` as it always did");
+        let on_request_default: Config = toml::from_str(&format!("{ON_REQUEST}\n[defaults]\nthread_profile = \"sol\"\n")).unwrap();
+        assert_eq!(on_request_default.new_project_default(Role::Thread), "sol", "`new_project_default` does not special-case it; such a default is simply refused at launch");
+        assert!(!config.profiles["luna"].on_request, "a profile without the key is ordinary");
+        // Written only when true: config.toml keeps its byte-for-byte style.
+        assert!(!toml::to_string(&Entry { agent: "omp".into(), ..Entry::default() }).unwrap().contains("on_request"));
+        assert!(toml::to_string(&Entry { agent: "omp".into(), on_request: true, ..Entry::default() }).unwrap().contains("on_request = true"));
+        // `profile add --on-request` writes it, `edit --no-on-request` removes it.
+        let entry = Entry { agent: "codex".into(), model: "gpt-6.2-sol".into(), effort: "medium".into(), description: "Sol".into(), on_request: true, ..Entry::default() };
+        let (text, message) = apply_in("", &Change::Add { name: "sol".into(), entry }).unwrap();
+        assert!(text.contains("[profiles.sol]\nagent = \"codex\"\nmodel = \"gpt-6.2-sol\"\neffort = \"medium\"\ndescription = \"Sol\"\non_request = true"), "{text}");
+        assert!(!message.contains("on request"), "the add message stays as it was: {message}");
+        let (text, _) = apply_in(
+            &text,
+            &Change::Edit { name: "sol".into(), agent: None, model: None, effort: None, description: None, args: None, on_request: Some(false) },
+        )
+        .unwrap();
+        assert!(!text.contains("on_request"), "{text}");
+        let (text, _) = apply_in(
+            &text,
+            &Change::Edit { name: "sol".into(), agent: None, model: None, effort: None, description: None, args: None, on_request: Some(true) },
+        )
+        .unwrap();
+        assert!(toml::from_str::<Config>(&text).unwrap().profiles["sol"].on_request, "{text}");
+    }
+
+    #[test]
+    fn a_named_thread_may_use_an_on_request_profile_and_no_one_else_may() {
+        let config: Config = toml::from_str(ON_REQUEST).unwrap();
+        let safety = safety_of(ON_REQUEST, "/p/demo");
+        assert_eq!(safety.thread_profiles, Some(strings(&["luna"])), "the fixture allows only luna");
+        // `--profile sol` is the user's naming, so the list does not apply.
+        assert_eq!(resolve(&config, &safety, &settings("luna"), Role::Thread, Some("sol"), "demo").unwrap().name, "sol");
+        assert_eq!(resolve(&config, &safety, &settings("luna"), Role::Thread, Some("neon"), "demo").unwrap().agent(), "agy");
+        // Never the default, even when PROJECT.md names it.
+        let error = resolve(&config, &safety, &settings("sol"), Role::Thread, None, "demo").unwrap_err().to_string();
+        assert!(error.contains("not allowed for threads in `demo`"), "{error}");
+        // Never a coordinator, which keeps its own allow-list.
+        let coordinator_safety = project::Safety { coordinator_profiles: Some(strings(&["luna"])), ..safety.clone() };
+        let error = resolve(&config, &coordinator_safety, &settings("sol"), Role::Coordinator, Some("sol"), "demo").unwrap_err().to_string();
+        assert!(error.contains("not allowed for the coordinator in `demo`"), "{error}");
+        assert_eq!(resolve(&config, &coordinator_safety, &settings("luna"), Role::Coordinator, Some("luna"), "demo").unwrap().name, "luna");
+        // The ordinary checks are untouched: an unknown name and an unknown
+        // harness are still refused, and so is a built-in off the list.
+        let error = resolve(&config, &safety, &settings("luna"), Role::Thread, Some("nope"), "demo").unwrap_err().to_string();
+        assert!(error.contains("no profile `nope`"), "{error}");
+        let error = resolve(&config, &safety, &settings("luna"), Role::Thread, Some("codex"), "demo").unwrap_err().to_string();
+        assert!(error.contains("not allowed for threads"), "{error}");
+        let bad = Entry { agent: "chagpt".into(), on_request: true, ..Entry::default() };
+        assert!(validate("x", &bad).unwrap_err().to_string().contains("unknown harness kind"));
+        // And the old arguments still only follow a built-in of their harness.
+        assert_eq!(launch_args(&config.get("sol").unwrap(), &strings(&["--dangerously-skip-permissions"]), "claude"), config.get("sol").unwrap().args());
+    }
+
+    #[test]
+    fn on_request_profiles_are_listed_apart_and_never_usable() {
+        let config: Config = toml::from_str(&format!("{ON_REQUEST}\n[defaults]\nthread_profile = \"luna\"\n")).unwrap();
+        let safety = safety_of(&format!("{ON_REQUEST}\n[defaults]\n"), "/p/demo");
+        let detected = strings(&["codex", "agy", "omp"]);
+        let settings = settings("luna");
+        // The list the coordinator may choose from is exactly what it was.
+        assert_eq!(usable(&config, &safety, Role::Thread, &detected, &settings.thread_profile).iter().map(|p| p.name.clone()).collect::<Vec<_>>(), strings(&["luna"]));
+        let text = context_text_for(&config, &safety, &detected, &settings);
+        let line = text.lines().find(|l| l.starts_with("On request only:")).expect("the line is there");
+        assert!(line.contains("sol") && line.contains("Sol at medium effort"), "{line}");
+        assert!(line.contains("neon"), "{line}");
+        assert!(!line.contains("luna"), "only the on-request ones: {line}");
+        assert_eq!(text.lines().filter(|l| l.starts_with("On request only:")).count(), 1);
+        // Without any, the line is absent and nothing else changed.
+        let plain_text = "[profiles.luna]\nagent = \"omp\"\n\n[safety.default]\nthread_profiles = [\"luna\"]\n";
+        let plain: Config = toml::from_str(plain_text).unwrap();
+        let old = context_text_for(&plain, &safety_of(plain_text, "/p/demo"), &detected, &settings);
+        assert!(!old.contains("On request only"), "{old}");
+        assert_eq!(old.lines().filter(|l| l.starts_with("Thread profiles")).count(), 1);
+        // `profile list` marks it at the end of its line.
+        assert_eq!(config.get("sol").unwrap().on_request_note(), "sol (codex gpt-6.2-sol, medium) — Sol at medium effort");
     }
 
     #[test]
@@ -829,12 +1006,20 @@ mod tests {
         assert!(apply_in("", &Change::Add { name: "x".into(), entry: Entry { agent: "gpt".into(), ..Entry::default() } }).is_err());
         assert!(apply_in("", &Change::Add { name: "bad name".into(), entry: luna.clone() }).is_err());
 
-        let edit = Change::Edit { name: "deep".into(), agent: None, model: Some(String::new()), effort: Some("xhigh".into()), description: None, args: Some(strings(&["--search"])) };
+        let edit = Change::Edit {
+            name: "deep".into(),
+            agent: None,
+            model: Some(String::new()),
+            effort: Some("xhigh".into()),
+            description: None,
+            args: Some(strings(&["--search"])),
+            on_request: None,
+        };
         let (text, _) = apply_in(&text, &edit).unwrap();
         let deep = toml::from_str::<Config>(&text).unwrap().profiles["deep"].clone();
         assert_eq!((deep.model.as_str(), deep.effort.as_str(), deep.args.clone()), ("", "xhigh", strings(&["--search"])));
         // Switching harness drops an effort the new one cannot take.
-        let (text, _) = apply_in(&text, &Change::Edit { name: "deep".into(), agent: Some("gemini".into()), model: None, effort: None, description: None, args: None }).unwrap();
+        let (text, _) = apply_in(&text, &Change::Edit { name: "deep".into(), agent: Some("gemini".into()), model: None, effort: None, description: None, args: None, on_request: None }).unwrap();
         assert_eq!(toml::from_str::<Config>(&text).unwrap().profiles["deep"].effort, "");
 
         let allow = Change::Allow { role: Role::Coordinator, project: Some("/p/demo".into()), names: Some(strings(&["claude"])) };
