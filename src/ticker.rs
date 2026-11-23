@@ -50,13 +50,20 @@ pub fn timings_from_env() -> bool {
     !(value.is_empty() || value == "0" || value == "false" || value == "no" || value == "off")
 }
 
-/// Where a round's milliseconds went, per project, when [`TIMINGS_VAR`] asks
-/// for them. Stage marks are boundaries: `stage` closes the stage that was
-/// running and opens the named one, so a sequence of marks around the calls of
-/// a pass costs one call per stage and one line at the end of the round.
+/// Where a round's milliseconds went, per project, and — for every round, asked
+/// for or not — how each stage adds up across the projects of the round.
+///
+/// Stage marks are boundaries: `stage` closes the stage that was running and
+/// opens the named one, so a sequence of marks around the calls of a pass costs
+/// one call per stage. The per-owner record is only written to the log when
+/// [`TIMINGS_VAR`] asks; the per-stage totals are the standing measurement
+/// (t-0095: a deployed ticker was five times slower per stage than the same
+/// binary in a terminal, and there was no way to see it from the deployed one —
+/// its environment is the plist's, so no variable could be added to it).
 #[derive(Debug, Default)]
 pub struct Timings {
-    on: bool,
+    /// Whether the per-project lines are written to `.ticker.log`.
+    log: bool,
     open: Option<(&'static str, String, Instant)>,
     spans: Vec<(String, Vec<(&'static str, Duration)>)>,
 }
@@ -67,28 +74,28 @@ impl Timings {
     }
 
     pub fn on() -> Timings {
-        Timings { on: true, ..Timings::default() }
+        Timings { log: true, ..Timings::default() }
     }
 
+    /// The timing record every round keeps, and the per-project log lines only
+    /// when [`TIMINGS_VAR`] asks for them.
     pub fn from_env() -> Timings {
         if timings_from_env() { Timings::on() } else { Timings::off() }
     }
 
     /// Closes the running stage and opens `name` under `owner` (a project slug,
-    /// or `round` for the whole pass).
+    /// or `round` for the whole pass). Recorded whether or not the log lines
+    /// were asked for: it is a handful of `Instant::now()` calls per project
+    /// (about 250 a round), and the round's stage totals are what a deployed
+    /// ticker has to answer with.
     pub fn stage(&mut self, owner: &str, name: &'static str) {
-        if !self.on {
-            return;
-        }
         self.close();
         self.open = Some((name, owner.to_string(), Instant::now()));
     }
 
     /// Closes the running stage and opens none: the end of a pass.
     pub fn stop(&mut self) {
-        if self.on {
-            self.close();
-        }
+        self.close();
     }
 
     /// Milliseconds an owner's stages add up to.
@@ -110,15 +117,34 @@ impl Timings {
         }
     }
 
+    /// Every stage of the round, its milliseconds summed over the projects that
+    /// ran it, most expensive first. Read before [`Timings::drain`], which is
+    /// what empties the record.
+    fn stage_totals(&self) -> Vec<Stage> {
+        let mut totals: Vec<Stage> = Vec::new();
+        for (_, spans) in &self.spans {
+            for (name, took) in spans {
+                let ms = u64::try_from(took.as_millis()).unwrap_or(u64::MAX);
+                match totals.iter_mut().find(|stage| stage.stage == *name) {
+                    Some(stage) => stage.ms += ms,
+                    None => totals.push(Stage { stage: name.to_string(), ms }),
+                }
+            }
+        }
+        totals.sort_by(|a, b| b.ms.cmp(&a.ms).then_with(|| a.stage.cmp(&b.stage)));
+        totals
+    }
+
     /// One line per owner, stages in the order they ran, and — for a whole
     /// tick — the round's own wall time. Empties the record, so the next round
-    /// starts clean.
+    /// starts clean, and writes the lines only when [`TIMINGS_VAR`] asks.
     fn drain(&mut self, round: Option<Duration>) -> Vec<String> {
-        if !self.on {
+        let spans = std::mem::take(&mut self.spans);
+        if !self.log {
             return Vec::new();
         }
         let mut lines = Vec::new();
-        for (owner, spans) in std::mem::take(&mut self.spans) {
+        for (owner, spans) in spans {
             if owner == ROUND {
                 continue;
             }
@@ -175,6 +201,20 @@ pub struct Rounds {
     /// The last [`ROUNDS_KEPT`] rounds, oldest first, for the median. Missing
     /// in a file written before this existed, which reads as no history.
     pub round_ms_recent: Vec<u64>,
+    /// The last round's stages, most expensive first: each stage's milliseconds
+    /// summed over every project that ran it, plus the round's own stages
+    /// (`rename`, `headless`). Only the last round is kept, and the number of
+    /// stages is the fixed set of names the code marks, so this file stays a
+    /// few dozen lines. Missing in a file written before this existed: an old
+    /// round, whose stages nobody recorded.
+    pub round_stages: Vec<Stage>,
+}
+
+/// One stage of a round, as `doctor` and `ticker status` print it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Stage {
+    pub stage: String,
+    pub ms: u64,
 }
 
 pub fn rounds_path(root: &Path) -> PathBuf {
@@ -190,13 +230,14 @@ pub fn load_rounds(root: &Path) -> Rounds {
 
 /// Records one round: one read, one write, in the same 15-second beat as
 /// `tick_at` (no `Instant::now()` and no file of its own).
-fn record_round(root: &Path, took: Duration) -> Result<Rounds> {
+fn record_round(root: &Path, took: Duration, stages: Vec<Stage>) -> Result<Rounds> {
     let mut rounds = load_rounds(root);
     let ms = u64::try_from(took.as_millis()).unwrap_or(u64::MAX);
     rounds.round_ms = ms;
     rounds.round_ms_recent.push(ms);
     let excess = rounds.round_ms_recent.len().saturating_sub(ROUNDS_KEPT);
     rounds.round_ms_recent.drain(..excess);
+    rounds.round_stages = stages;
     let path = rounds_path(root);
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir)?;
@@ -249,9 +290,22 @@ pub fn rounds_line(rounds: &Rounds) -> (RoundHealth, String) {
     text.push_str(&format!(" (TICK {tick}ms)"));
     let over = last > tick || median > tick;
     if over {
-        text.push_str(&format!(
-            " — over the {tick}ms TICK; set {TIMINGS_VAR}=1 for the per-stage breakdown"
-        ));
+        // Where the last round went, in the words of the stages that took it:
+        // the deployed ticker's environment is the plist's, so this line is the
+        // only way to learn that from the deployed one.
+        let worst: Vec<String> = rounds
+            .round_stages
+            .iter()
+            .filter(|stage| stage.ms > 0)
+            .take(3)
+            .map(|stage| format!("{} {}ms", stage.stage, stage.ms))
+            .collect();
+        text.push_str(&format!(" — over the {tick}ms TICK;"));
+        if worst.is_empty() {
+            text.push_str(&format!(" set {TIMINGS_VAR}=1 for the per-stage breakdown"));
+        } else {
+            text.push_str(&format!(" most of it: {}", worst.join(", ")));
+        }
     }
     (if over { RoundHealth::Slow } else { RoundHealth::Fine }, text)
 }
@@ -374,6 +428,16 @@ fn legacy_paths(home: &Path) -> [PathBuf; 2] {
 /// killed so that its exit code looked clean) stayed dead, and nothing said
 /// so: the 2026-11-17 14:39Z disappearance had no stop line, no crash line and
 /// no LaunchAgent loaded at all.
+///
+/// `ProcessType` is `Standard`, not `Background` (t-0095). `Background` puts the
+/// whole loop in launchd's throttled background policy, and every process it
+/// starts inherits it: measured on the same binary and root, a round took
+/// 9–25 s under `Background` and 0.9–1.5 s under `Standard`, because one
+/// `hc`/`herdr-app` spawn cost 40–55 ms there against 8–12 ms in a terminal
+/// (a `true` cost 15 ms against 3 ms). A loop with a 15-second beat cannot pay
+/// that: it must keep up, and the work it does is unavoidable subprocess calls,
+/// not CPU it could yield. `Standard` is launchd's own default for an agent,
+/// so writing it is saying what was already true for everything else.
 fn agent_plist(binary: &Path, root: &Path, log: &Path) -> String {
     let escape = |text: &str| text.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;");
     format!(
@@ -387,7 +451,7 @@ fn agent_plist(binary: &Path, root: &Path, log: &Path) -> String {
   <key>RunAtLoad</key><true/>\n\
   <key>KeepAlive</key><true/>\n\
   <key>ThrottleInterval</key><integer>{THROTTLE_SECS}</integer>\n\
-  <key>ProcessType</key><string>Background</string>\n\
+  <key>ProcessType</key><string>Standard</string>\n\
   <key>StandardOutPath</key><string>{log}</string>\n\
   <key>StandardErrorPath</key><string>{log}</string>\n\
 </dict>\n</plist>\n",
@@ -1272,13 +1336,15 @@ pub fn tick_with(ctx: &Ctx, log: &Log, memory: &mut Memory, timings: &mut Timing
     crate::core::view::end();
     crate::app::end();
     let took = round_at.elapsed();
+    // Read before `drain`, which is what empties the record.
+    let stages = timings.stage_totals();
     for line in timings.drain(Some(took)) {
         log.line(&line);
     }
     // The standing measurement: no `HP_TICK_TIMINGS`, one small write per round,
-    // so `doctor` and `ticker status` can answer "how long is a round" without
-    // anybody having planned ahead to ask.
-    if let Err(error) = record_round(&ctx.root, took) {
+    // so `doctor` and `ticker status` can answer "how long is a round" and
+    // "which stage took it" without anybody having planned ahead to ask.
+    if let Err(error) = record_round(&ctx.root, took, stages) {
         log.line(&format!("the round's own time was not recorded: {error:#}"));
     }
     any_reachable
@@ -2101,6 +2167,12 @@ mod tests {
         assert!(plist.contains("<string>/opt/hp/hp</string>"), "{plist}");
         assert!(plist.contains("<string>--root</string>") && plist.contains("<string>ticker</string>") && plist.contains("<string>run</string>"), "{plist}");
         assert!(plist.contains("<key>StandardOutPath</key><string>/Users/me/.herdr-projects/.ticker.log</string>"), "{plist}");
+        // Not `Background`: launchd throttles that policy, and every process
+        // the loop starts inherits it. Measured 2026-11-23 on one binary and
+        // one root, a round was 9–25 s under `Background` and 0.9–1.5 s under
+        // `Standard` (t-0095) — this line is the whole difference.
+        assert!(plist.contains("<key>ProcessType</key><string>Standard</string>"), "{plist}");
+        assert!(!plist.contains("Background"), "{plist}");
     }
 
     #[test]
@@ -2809,6 +2881,14 @@ mod tests {
         assert_eq!(rounds.round_ms, printed, "the file says what the round printed: {rounds:?}");
         assert_eq!(rounds.round_ms_recent.last(), Some(&rounds.round_ms), "{rounds:?}");
         assert!(rounds.round_ms_recent.len() >= 2, "every round is kept, not only timed ones: {rounds:?}");
+        // And where the round went, without `HP_TICK_TIMINGS` having to be in
+        // the deployed ticker's environment (t-0095).
+        assert!(!rounds.round_stages.is_empty(), "the last round's stages are recorded: {rounds:?}");
+        assert!(rounds.round_stages.iter().any(|stage| stage.stage == "load"), "{rounds:?}");
+        assert!(
+            rounds.round_stages.windows(2).all(|pair| pair[0].ms >= pair[1].ms),
+            "most expensive first: {rounds:?}"
+        );
     }
 
     /// The standing measurement, with no ticker and no environment variable:
@@ -2830,36 +2910,108 @@ mod tests {
         assert_eq!(round_line(&root).1, "no round recorded yet");
 
         for ms in 1..=12u64 {
-            record_round(&root, Duration::from_millis(ms * 100)).unwrap();
+            record_round(&root, Duration::from_millis(ms * 100), Vec::new()).unwrap();
         }
         let rounds = load_rounds(&root);
         assert_eq!(rounds.round_ms, 1200, "the last round");
         assert_eq!(rounds.round_ms_recent, (3..=12).map(|ms| ms * 100).collect::<Vec<u64>>(), "the oldest two dropped");
         assert_eq!(rounds.round_ms_recent.len(), ROUNDS_KEPT);
+        assert!(rounds.round_stages.is_empty(), "no stages named, none recorded");
+    }
+
+    /// Where a round went, stage by stage, summed over every project that ran
+    /// it — the standing answer to "the deployed ticker is slow", which cannot
+    /// be asked for a `HP_TICK_TIMINGS=1` (its environment is the plist's).
+    #[test]
+    fn a_round_records_which_stages_took_the_time() {
+        let home = tempfile::tempdir().unwrap();
+        let root = home.path().join("root");
+        std::fs::create_dir(&root).unwrap();
+        let stages = vec![
+            Stage { stage: "housekeeping".into(), ms: 3120 },
+            Stage { stage: "pr".into(), ms: 2950 },
+            Stage { stage: "thread_list".into(), ms: 240 },
+            Stage { stage: "load".into(), ms: 0 },
+        ];
+        record_round(&root, Duration::from_millis(8000), stages.clone()).unwrap();
+        assert_eq!(load_rounds(&root).round_stages, stages, "only the last round's stages are kept");
+        record_round(&root, Duration::from_millis(700), Vec::new()).unwrap();
+        assert!(load_rounds(&root).round_stages.is_empty(), "the next round replaces them, it does not grow");
+    }
+
+    /// Stage totals as the round sees them: one number per stage name, whatever
+    /// project it ran in, most expensive first.
+    #[test]
+    fn stage_totals_add_the_projects_of_one_stage_together() {
+        let mut timings = Timings::off();
+        timings.stage("alpha", "lists");
+        std::thread::sleep(Duration::from_millis(5));
+        timings.stage("alpha", "housekeeping");
+        std::thread::sleep(Duration::from_millis(5));
+        timings.stage("beta", "lists");
+        std::thread::sleep(Duration::from_millis(5));
+        timings.stop();
+        let rest = timings.total("beta");
+        let totals = timings.stage_totals();
+        assert_eq!(totals.len(), 2, "two stage names, not four spans: {totals:?}");
+        let lists = totals.iter().find(|stage| stage.stage == "lists").expect("lists is there");
+        assert!(lists.ms >= 10, "both projects' `lists` add up: {totals:?}");
+        assert!(totals.iter().any(|stage| stage.stage == "housekeeping"), "{totals:?}");
+        assert!(totals.windows(2).all(|pair| pair[0].ms >= pair[1].ms), "most expensive first: {totals:?}");
+        assert!(!timings.log, "recording is not logging");
+        assert!(rest > Duration::ZERO);
     }
 
     /// What `doctor` and `ticker status` print, and what counts as slow: the
     /// last round or the median of the last ten, against the loop's own tick.
     #[test]
     fn a_round_over_the_tick_is_a_warning_with_the_way_to_the_stages() {
-        let normal = Rounds { round_ms: 93, round_ms_recent: vec![110; 10] };
+        let normal = Rounds { round_ms: 93, round_ms_recent: vec![110; 10], ..Rounds::default() };
         assert_eq!(rounds_line(&normal), (RoundHealth::Fine, "last 93ms, median of 10 110ms (TICK 15000ms)".to_string()));
         // An even count is the mean of the two middles, so one slow round
         // cannot claim the median by itself.
-        assert!(rounds_line(&Rounds { round_ms: 10, round_ms_recent: vec![1, 2, 3, 4] }).1.contains("median of 4 2ms"));
+        assert!(rounds_line(&Rounds { round_ms: 10, round_ms_recent: vec![1, 2, 3, 4], ..Rounds::default() }).1.contains("median of 4 2ms"));
 
-        let slow = Rounds { round_ms: 21840, round_ms_recent: vec![19300; 10] };
+        // An old file has no stages: the line can only point at the switch.
+        let slow = Rounds { round_ms: 21840, round_ms_recent: vec![19300; 10], ..Rounds::default() };
         let (health, text) = rounds_line(&slow);
         assert_eq!(health, RoundHealth::Slow, "over the tick is a warning: {text}");
         assert_eq!(
             text,
             format!("last 21840ms, median of 10 19300ms (TICK 15000ms) — over the 15000ms TICK; set {TIMINGS_VAR}=1 for the per-stage breakdown")
         );
+
+        // With them, the line says where the time went — the deployed ticker's
+        // environment cannot be given the switch (t-0095).
+        let with_stages = Rounds {
+            round_ms: 21840,
+            round_ms_recent: vec![19300; 10],
+            round_stages: vec![
+                Stage { stage: "housekeeping".into(), ms: 12000 },
+                Stage { stage: "lists".into(), ms: 6100 },
+                Stage { stage: "pr".into(), ms: 2950 },
+                Stage { stage: "thread_list".into(), ms: 240 },
+                Stage { stage: "load".into(), ms: 0 },
+            ],
+        };
+        assert_eq!(
+            rounds_line(&with_stages),
+            (
+                RoundHealth::Slow,
+                "last 21840ms, median of 10 19300ms (TICK 15000ms) — over the 15000ms TICK; most of it: housekeeping 12000ms, lists 6100ms, pr 2950ms"
+                    .to_string()
+            )
+        );
+        // A fast round says nothing about stages: the detail belongs to the slow
+        // line, so a healthy ticker prints exactly what it printed before.
+        let fast_with_stages = Rounds { round_stages: with_stages.round_stages.clone(), ..normal.clone() };
+        assert_eq!(rounds_line(&fast_with_stages).1, rounds_line(&normal).1);
+
         // Either half over the tick means the loop cannot keep up: a slow last
         // round, and a median that stays slow while the last round was quick.
-        assert_eq!(rounds_line(&Rounds { round_ms: 16000, round_ms_recent: vec![16000, 100, 100, 100] }).0, RoundHealth::Slow);
-        assert_eq!(rounds_line(&Rounds { round_ms: 900, round_ms_recent: vec![100, 21000, 21000, 21000] }).0, RoundHealth::Slow);
-        assert_eq!(rounds_line(&Rounds { round_ms: 15000, round_ms_recent: vec![15000] }).0, RoundHealth::Fine, "exactly the tick still keeps up");
+        assert_eq!(rounds_line(&Rounds { round_ms: 16000, round_ms_recent: vec![16000, 100, 100, 100], ..Rounds::default() }).0, RoundHealth::Slow);
+        assert_eq!(rounds_line(&Rounds { round_ms: 900, round_ms_recent: vec![100, 21000, 21000, 21000], ..Rounds::default() }).0, RoundHealth::Slow);
+        assert_eq!(rounds_line(&Rounds { round_ms: 15000, round_ms_recent: vec![15000], ..Rounds::default() }).0, RoundHealth::Fine, "exactly the tick still keeps up");
     }
 
     #[test]

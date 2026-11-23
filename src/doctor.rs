@@ -181,7 +181,7 @@ fn ticker_agent_line(env: &Env, root: &Path, runner: &dyn Runner, fix: bool, run
         return Some((
             None,
             format!(
-                "{path} is out of date (its KeepAlive does not restart every exit); run `hp doctor --fix` (or `hp ticker start`), which rewrites the plist and loads it again"
+                "{path} is out of date (not the plist this binary writes: an older one can run the loop in launchd's throttled background policy); run `hp doctor --fix` (or `hp ticker start`), which rewrites the plist and loads it again"
             ),
         ));
     }
@@ -392,7 +392,9 @@ fn report(
     // How long a round takes, which is the one number that says whether the loop
     // keeps up with its own 15 seconds: a slow round pushes every start, brief
     // and nudge to the next one. A warning, never a failure — the ticker still
-    // works, and `HP_TICK_TIMINGS=1` is where the stages are.
+    // works, and the line itself names the stages the last round spent most of
+    // its time in (`round_stages` in the root's `.state/ticker.json`, recorded
+    // every round; `HP_TICK_TIMINGS=1` is the per-project breakdown).
     {
         let (health, detail) = crate::ticker::round_line(root);
         let ok = match health {
@@ -977,18 +979,28 @@ mod tests {
             std::fs::create_dir_all(root.join(".state")).unwrap();
             crate::project::write_json(&crate::ticker::rounds_path(&root), rounds).unwrap();
         };
-        write(&crate::ticker::Rounds { round_ms: 93, round_ms_recent: vec![110; 10] });
+        write(&crate::ticker::Rounds { round_ms: 93, round_ms_recent: vec![110; 10], ..crate::ticker::Rounds::default() });
         let (text, fast) = lines(&root);
         assert!(text.contains("[ok  ] ticker round: last 93ms, median of 10 110ms (TICK 15000ms)"), "{text}");
         assert_eq!(fast, healthy, "a healthy round changes nothing else");
 
-        // Over the tick: a warning with the way to the stages, and the same
-        // verdict as before — a slow ticker is news, not a broken install.
-        write(&crate::ticker::Rounds { round_ms: 21840, round_ms_recent: vec![19300; 10] });
+        // Over the tick: a warning naming the stages the last round spent most
+        // of its time in (the ticker records them every round, so the deployed
+        // one — whose environment nobody can add a variable to — answers too),
+        // and the same verdict as before: a slow ticker is news, not a broken
+        // install.
+        write(&crate::ticker::Rounds {
+            round_ms: 21840,
+            round_ms_recent: vec![19300; 10],
+            round_stages: vec![
+                crate::ticker::Stage { stage: "housekeeping".into(), ms: 12000 },
+                crate::ticker::Stage { stage: "lists".into(), ms: 6100 },
+            ],
+        });
         let (text, slow) = lines(&root);
         assert!(
             text.contains(
-                "[warn] ticker round: last 21840ms, median of 10 19300ms (TICK 15000ms) — over the 15000ms TICK; set HP_TICK_TIMINGS=1 for the per-stage breakdown"
+                "[warn] ticker round: last 21840ms, median of 10 19300ms (TICK 15000ms) — over the 15000ms TICK; most of it: housekeeping 12000ms, lists 6100ms"
             ),
             "{text}"
         );

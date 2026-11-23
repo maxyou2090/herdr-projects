@@ -6,8 +6,8 @@
 //! answer with the ids the app gave the space, the tab and the terminal, and a
 //! machine without the app falls back to plain `hc` (reached with `hc attach`).
 
-use std::cell::RefCell;
-use std::time::Duration;
+use std::cell::{Cell, RefCell};
+use std::time::{Duration, Instant};
 
 use crate::runner::{Cmd, Runner};
 
@@ -21,7 +21,29 @@ use crate::runner::{Cmd, Runner};
 // a one-shot command always sees the window as it is.
 thread_local! {
     static HELD: RefCell<Option<Held>> = const { RefCell::new(None) };
+    /// Until when the window is left alone after a call to it hung.
+    static COOL_UNTIL: Cell<Option<Instant>> = const { Cell::new(None) };
 }
+
+/// How long `herdr-app status` gets. It answers in 20 ms, and in 40–160 ms
+/// under launchd's throttled background policy; two seconds is a margin, not a
+/// wait, and a window that cannot answer in two seconds is not going to name a
+/// Space this round either.
+const STATUS_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// How long `herdr-app ls` gets: the same list, ten or twenty times the work.
+const LS_TIMEOUT: Duration = Duration::from_secs(3);
+
+/// How long the window is left alone after a call to it timed out (t-0095).
+///
+/// A round asks the window once (`begin`), so a window that has stopped
+/// answering used to cost a fixed two timeouts *every* round and push the loop
+/// past its own 15-second beat for ever, while every caller's fallback — core's
+/// own labels — was already correct. Five minutes is long enough that the cost
+/// is paid once per outage, short enough that a window reopened by a person is
+/// used again while they are still looking at it. A window that is simply not
+/// running costs nothing to ask (it exits at once), so it does not cool.
+const COOLDOWN: Duration = Duration::from_secs(300);
 
 #[derive(Default)]
 struct Held {
@@ -68,13 +90,33 @@ pub fn bin() -> String {
     std::env::var("HERDR_APP_BIN").ok().filter(|v| !v.is_empty()).unwrap_or_else(|| "herdr-app".to_string())
 }
 
+/// Whether the window is cooling down after a call to it timed out: the
+/// round's answer is "no app", which every caller already handles by falling
+/// back to core's own labels.
+fn cooling() -> bool {
+    COOL_UNTIL.with(|until| until.get().is_some_and(|at| Instant::now() < at))
+}
+
+/// Remembers a call to the window that hung, so the next [`COOLDOWN`] of
+/// rounds do not each pay the same timeout.
+fn cool() {
+    COOL_UNTIL.with(|until| until.set(Some(Instant::now() + COOLDOWN)));
+}
+
 /// The app answers only while its window is open; `status` is that check.
 pub fn running(runner: &dyn Runner) -> bool {
+    if cooling() {
+        return false;
+    }
     held(|held| &mut held.running, || {
-        runner
-            .run(&Cmd::new(bin(), Duration::from_secs(5)).arg("status"))
-            .map(|out| out.success())
-            .unwrap_or(false)
+        match runner.run(&Cmd::new(bin(), STATUS_TIMEOUT).arg("status")) {
+            Ok(out) if out.timed_out => {
+                cool();
+                false
+            }
+            Ok(out) => out.success(),
+            Err(_) => false,
+        }
     })
 }
 
@@ -154,7 +196,14 @@ pub fn ls(runner: &dyn Runner) -> Option<serde_json::Value> {
 }
 
 fn ls_now(runner: &dyn Runner) -> Option<serde_json::Value> {
-    let out = runner.run(&Cmd::new(bin(), Duration::from_secs(10)).arg("ls")).ok()?;
+    if cooling() {
+        return None;
+    }
+    let out = runner.run(&Cmd::new(bin(), LS_TIMEOUT).arg("ls")).ok()?;
+    if out.timed_out {
+        cool();
+        return None;
+    }
     if !out.success() {
         return None;
     }
@@ -257,8 +306,21 @@ pub fn tab_close(runner: &dyn Runner, tab: &str) -> bool {
 }
 
 #[cfg(test)]
+fn cool_until(at: Option<Instant>) {
+    COOL_UNTIL.with(|until| until.set(at));
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
+    use crate::runner::fake::{ok, fail, FakeRunner};
+    use crate::runner::Output;
+
+    /// A call that never came back in time: what a window in a session the app
+    /// cannot reach does, and the one thing a round must not pay every time.
+    fn hung() -> Output {
+        Output { code: None, timed_out: true, ..Output::default() }
+    }
 
     #[test]
     fn a_placed_reply_names_the_space_tab_and_terminal() {
@@ -271,5 +333,77 @@ mod tests {
         assert_eq!(ids.space, "spf737521ee96965d6e315bb526093f20b");
         assert_eq!(ids.terminal, "t32");
         assert!(placed(&serde_json::json!({"error": "no space shown"})).is_none());
+    }
+
+    /// t-0095: a window that hung is asked once, then left alone for five
+    /// minutes, then asked once more — the fallback (core's own labels) is
+    /// correct either way, so a round must not spend two timeouts on it every
+    /// time.
+    #[test]
+    fn a_hung_window_is_asked_once_and_then_left_alone() {
+        cool_until(None);
+        let runner = FakeRunner::new();
+        runner.on("status", hung());
+        assert!(!running(&runner));
+        assert!(cooling(), "a timeout starts the cooldown");
+        assert!(!running(&runner), "still no app, from memory");
+        assert_eq!(runner.count("status"), 1, "the hung call is not repeated every round: {:#?}", runner.calls.borrow());
+        assert!(ls(&runner).is_none(), "no window while cooling");
+        assert_eq!(runner.count("herdr-app ls"), 0);
+
+        // The cooldown over: asked once more, then cooling again.
+        cool_until(Some(Instant::now()));
+        assert!(!cooling());
+        assert!(!running(&runner));
+        assert_eq!(runner.count("status"), 2, "the retry after the cooldown is one call");
+        assert!(cooling());
+        running(&runner);
+        assert_eq!(runner.count("status"), 2, "and the retry is not a new loop of timeouts");
+        cool_until(None);
+    }
+
+    /// A window that is not open exits at once, so asking costs nothing and the
+    /// answer may change a second from now (a person opens the app).
+    #[test]
+    fn a_window_that_is_not_running_is_asked_every_time() {
+        cool_until(None);
+        let runner = FakeRunner::new();
+        runner.on("status", fail(1, "no app"));
+        assert!(!running(&runner));
+        assert!(!running(&runner));
+        assert_eq!(runner.count("status"), 2);
+        assert!(!cooling(), "a refusal is not a hang");
+    }
+
+    /// `ls` is the slow call of the two (it walks every Space), so it cools on
+    /// its own: a status that answers while `ls` hangs must not be followed by
+    /// a second `ls` on the next round.
+    #[test]
+    fn a_hung_ls_cools_the_window() {
+        cool_until(None);
+        let runner = FakeRunner::new();
+        runner.on("herdr-app ls", hung());
+        assert!(ls(&runner).is_none());
+        assert!(cooling());
+        assert!(ls(&runner).is_none());
+        assert_eq!(runner.count("herdr-app ls"), 1, "the hung list is not repeated: {:#?}", runner.calls.borrow());
+        cool_until(None);
+    }
+
+    /// A window that answers is read once per pass, as before: the cooldown is
+    /// in front of the calls, not in place of the held view.
+    #[test]
+    fn a_window_that_answers_is_read_once_a_pass() {
+        cool_until(None);
+        let runner = FakeRunner::new();
+        runner.on("status", ok("{}"));
+        runner.on("herdr-app ls", ok("{\"spaces\": []}"));
+        begin();
+        assert!(running(&runner));
+        assert!(ls(&runner).is_some());
+        end();
+        assert_eq!(runner.count("status"), 1);
+        assert_eq!(runner.count("herdr-app ls"), 1);
+        assert!(!cooling());
     }
 }
