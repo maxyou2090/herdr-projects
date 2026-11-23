@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 use crate::core::Core;
 use crate::paths::Ctx;
 use crate::project::{self, Project, Settings};
-use crate::thread::{self, CopyOutcome, Group, Status, Thread};
+use crate::thread::{self, CopyOutcome, Group, Kind, Status, Thread};
 use crate::threads;
 use crate::{inbox, pr, routine};
 
@@ -173,6 +173,16 @@ pub struct State {
     pub last_audit: String,
     /// thread id -> when the ticker first saw its pull request merged.
     pub merged_seen: BTreeMap<String, String>,
+    /// thread id -> the report hash `auto_resolve_nopr` has seen standing and
+    /// since when ([`Steady`]). A hash that changed restarts the clock, and a
+    /// thread that is no longer registered drops its entry.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub nopr_steady: BTreeMap<String, Steady>,
+    /// Threads `auto_resolve_nopr` resolved by itself. The mark outlives a
+    /// `thread resolve --reopen`, which is the point: a thread a person
+    /// reopened is theirs, and the rule never collects it again.
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    pub nopr_resolved: BTreeSet<String>,
     /// When this project's last tick started, UTC. The ticker writes it every
     /// tick; `hp context` runs in another process and reads it to tell a live
     /// ticker from one that died holding a reason (see [`held_note`]).
@@ -209,6 +219,15 @@ pub struct State {
     /// [`crate::lanes::FALLBACK_ID`].
     #[serde(skip)]
     pub default_lane: String,
+}
+
+/// One thread's report as `auto_resolve_nopr` last saw it: the hash, and when
+/// that hash began ([`auto_resolve_nopr`]).
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Steady {
+    pub hash: String,
+    pub since: String,
 }
 
 /// What the ticker knows about one coordinator pane's current turn: when the
@@ -484,6 +503,8 @@ pub fn save_state(project: &Project, state: &State) -> Result<()> {
         session_item_written: bool,
         error_seen: &'a BTreeMap<String, String>,
         merged_seen: &'a BTreeMap<String, String>,
+        nopr_steady: &'a BTreeMap<String, Steady>,
+        nopr_resolved: &'a BTreeSet<String>,
         tick_at: &'a str,
         held_reason: String,
         held_since: String,
@@ -511,6 +532,8 @@ pub fn save_state(project: &Project, state: &State) -> Result<()> {
             session_item_written: state.session_item_written,
             error_seen: &state.error_seen,
             merged_seen: &state.merged_seen,
+            nopr_steady: &state.nopr_steady,
+            nopr_resolved: &state.nopr_resolved,
             tick_at: &state.tick_at,
             held_reason: value(&state.held_reason),
             held_since: value(&state.held_since),
@@ -1511,7 +1534,19 @@ fn resolve_after_copy(ctx: &Ctx, project: &Project, t: &Thread, reason: &str, me
     })?;
     let complete = copied.outcome == CopyOutcome::Complete;
     let cleaned = threads::clean(ctx, project, &resolved, &threads::Clean { keep_worktree: false, copy_complete: complete, merged_head });
-    let why = if reason == "auto" { "it was idle for `auto_resolve_days` and was resolved automatically; `thread resolve --reopen` undoes it".to_string() } else { format!("resolved ({reason})") };
+    let why = match reason {
+        "auto" => "it was idle for `auto_resolve_days` and was resolved automatically; `thread resolve --reopen` undoes it".to_string(),
+        // The one automatic close a reader is most likely to be surprised by:
+        // nobody asked for it, so the item says what was checked, where the
+        // report went and how to continue.
+        "auto-nopr" => format!(
+            "resolved automatically by `auto_resolve_nopr`: it had no pull request, no commit of its own, a clean worktree and a report that did not change for the whole window; its report is in {}, and `thread resolve --reopen {slug} {id}` undoes it",
+            thread::home_report_path(project, &t.id).display(),
+            slug = project.slug,
+            id = t.id
+        ),
+        _ => format!("resolved ({reason})"),
+    };
     let archived = inbox::done_for_thread(project, &t.id, &started)?;
     let mut notes = cleaned.notes;
     if archived > 0 {
@@ -1600,6 +1635,149 @@ pub fn auto_resolve(ctx: &Ctx, project: &Project, settings: &Settings, memory: &
         }
     }
     errors
+}
+
+/// What one tick of [`auto_resolve_nopr`] did: the threads it resolved (for a
+/// log line each) and what went wrong (a failed final copy is an error, and
+/// the next tick tries again).
+#[derive(Default)]
+pub struct NoprPass {
+    pub resolved: Vec<String>,
+    pub errors: Vec<anyhow::Error>,
+}
+
+/// The second automatic close (`PROJECT.md`'s `auto_resolve_nopr`): a thread
+/// that ran, wrote its report and produced **nothing else** is resolved after
+/// its report has stood still for the window. Smoke tests, verifications and
+/// investigations end exactly like that, and until this rule they waited for a
+/// person or for `auto_resolve_days` — a week — while `thread-list` grew.
+///
+/// Every condition is a way to be wrong about "this thread produced nothing":
+///
+/// 1. `Status::Open`.
+/// 2. It has a report, its group is [`Group::ReadyForReview`] (not working,
+///    not waiting on you) and its agent's last state is not `working`.
+/// 3. No pull request: `pr` empty and `pr_state` neither open nor merged.
+/// 4. No commit of its own: `git rev-list --count <base>..HEAD` is zero in its
+///    worktree. A `local` thread has no repository and an `adopted` pane is not
+///    ours; a record without a `base` cannot answer, so it is never collected.
+/// 5. A clean worktree (`git status --porcelain` empty), because uncommitted
+///    work is worth keeping even when it was never committed.
+/// 6. Its report hash has not changed for the window ([`Steady`]).
+/// 7. It was never resolved by this rule before: the mark survives
+///    `thread resolve --reopen`, so a thread a person reopened is theirs.
+///
+/// Off by default, for every project that does not ask: an unset setting costs
+/// nothing, not even a git call. The resolve is the ordinary one
+/// ([`resolve_after_copy`], reason `auto-nopr`), so the final copy, the
+/// worktree, the branch, the tab and the item are the ones a person would get
+/// from `thread resolve`.
+pub fn auto_resolve_nopr(ctx: &Ctx, project: &Project, settings: &Settings, state: &mut State, now: jiff::Timestamp) -> NoprPass {
+    let mut pass = NoprPass::default();
+    let Some(window) = settings.auto_resolve_nopr.secs() else {
+        return pass;
+    };
+    let threads = thread::list(project);
+    // Records about threads this project no longer has would age for ever.
+    // A resolved record stays (that is what keeps a reopened thread marked).
+    state.nopr_steady.retain(|id, _| threads.iter().any(|t| t.id == *id));
+    state.nopr_resolved.retain(|id| threads.iter().any(|t| t.id == *id));
+    for t in threads {
+        if t.status != Status::Open
+            || state.nopr_resolved.contains(&t.id)
+            || t.report_hash.is_empty()
+            || t.last_group != Group::ReadyForReview.token()
+            || t.last_state == "working"
+            || !nopr_no_pull_request(&t)
+        {
+            state.nopr_steady.remove(&t.id);
+            continue;
+        }
+        // The report's clock first (it is free and it is what has to stand
+        // still), then git: a busy thread costs no subprocess.
+        if steady_secs(state, &t, now).is_none_or(|secs| secs < window) {
+            continue;
+        }
+        if !nopr_produced_nothing(ctx, &t) {
+            // Something was produced. Drop the clock: if the thread later
+            // comes back to nothing, it waits the window again.
+            state.nopr_steady.remove(&t.id);
+            continue;
+        }
+        match resolve_after_copy(ctx, project, &t, "auto-nopr", String::new()) {
+            Ok(_) => {
+                state.nopr_steady.remove(&t.id);
+                state.nopr_resolved.insert(t.id.clone());
+                pass.resolved.push(t.id.clone());
+            }
+            Err(error) => pass.errors.push(error),
+        }
+    }
+    pass
+}
+
+/// Condition 3: the thread never opened a pull request. A `pr_state` of `open`
+/// counts even when the URL is empty (a record written before the URL was
+/// kept), and any other state is not an open pull request.
+fn nopr_no_pull_request(t: &Thread) -> bool {
+    t.pr.trim().is_empty() && !matches!(t.pr_state.to_ascii_lowercase().as_str(), "open" | "merged")
+}
+
+/// How long the thread's report has stood unchanged, recording the answer.
+///
+/// The first sight of a hash starts from the report's own
+/// `last_report_change`, not from now: a project that turns the rule on has
+/// threads whose reports already stood still, and they should not serve the
+/// window twice. A hash that changed since the last tick starts at now.
+fn steady_secs(state: &mut State, t: &Thread, now: jiff::Timestamp) -> Option<i64> {
+    let known = state.nopr_steady.get(&t.id).filter(|steady| steady.hash == t.report_hash).map(|steady| steady.since.clone());
+    let since = match known {
+        Some(since) => since,
+        None => {
+            let changed = state.nopr_steady.contains_key(&t.id);
+            let since = match t.last_report_change.parse::<jiff::Timestamp>() {
+                Ok(then) if !changed && then <= now => then.to_string(),
+                _ => now.to_string(),
+            };
+            state.nopr_steady.insert(t.id.clone(), Steady { hash: t.report_hash.clone(), since: since.clone() });
+            since
+        }
+    };
+    let since = since.parse::<jiff::Timestamp>().ok()?;
+    Some(now.as_second() - since.as_second())
+}
+
+/// Conditions 4 and 5: nothing on a branch of its own and nothing uncommitted.
+/// False whenever git cannot answer — an answer this rule does not have is
+/// never "nothing was produced".
+fn nopr_produced_nothing(ctx: &Ctx, t: &Thread) -> bool {
+    match t.kind {
+        Kind::Local | Kind::Adopted => true,
+        Kind::Worktree => {
+            let folder = if t.worktree_path.is_empty() { t.repo.as_str() } else { t.worktree_path.as_str() };
+            (!t.base.is_empty())
+                && git_count(ctx, folder, &t.base) == Some(0)
+                && git_text(ctx, folder, &["status", "--porcelain"]).is_some_and(|text| text.is_empty())
+        }
+        // A checkout thread has no branch of its own, so only its checkout can
+        // be dirty — and a dirty main checkout is somebody's work, never ours.
+        Kind::Checkout => git_text(ctx, &t.repo, &["status", "--porcelain"]).is_some_and(|text| text.is_empty()),
+    }
+}
+
+const NOPR_GIT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// The commits on `HEAD` that `base` does not have, or `None` when git could
+/// not answer (not a repository, no such ref, no git).
+fn git_count(ctx: &Ctx, folder: &str, base: &str) -> Option<usize> {
+    let range = format!("{base}..HEAD");
+    git_text(ctx, folder, &["rev-list", "--count", &range]).and_then(|text| text.parse().ok())
+}
+
+/// One `git -C <folder> …` call's trimmed stdout, `None` on any failure.
+fn git_text(ctx: &Ctx, folder: &str, args: &[&str]) -> Option<String> {
+    let out = ctx.runner.run(&crate::runner::Cmd::new("git", NOPR_GIT_TIMEOUT).args(["-C", folder]).args(args.iter().copied())).ok()?;
+    out.success().then(|| out.stdout.trim().to_string())
 }
 
 /// Item kinds a prompt-only routine ignores when it asks "did anything new
@@ -2747,6 +2925,31 @@ mod tests {
         assert!(runner.calls.borrow().is_empty(), "a project with no open threads asks nothing: {:?}", runner.calls.borrow());
     }
 
+    /// The two records the new rule keeps go through the pre-lanes
+    /// `LegacyState` too: a project without `lanes.json` is most of the real
+    /// ones, and a field that is missing there is dropped every tick.
+    #[test]
+    fn the_nopr_records_survive_the_pre_lanes_ticker_file() {
+        let root = tempfile::tempdir().unwrap();
+        let project = project::create(root.path(), "demo", vec![]).unwrap();
+        assert!(!crate::lanes::split_in_use(&project));
+        let mut state = State::default();
+        state.nopr_steady.insert(
+            "t-0001".into(),
+            Steady {
+                hash: "r1".into(),
+                since: "2026-11-23T10:00:00Z".into(),
+            },
+        );
+        state.nopr_resolved.insert("t-0002".into());
+        save_state(&project, &state).unwrap();
+        let text = std::fs::read_to_string(project.state_dir().join("ticker.json")).unwrap();
+        assert!(text.contains("nopr_steady"), "{text}");
+        let back = load_state(&project);
+        assert_eq!(back.nopr_steady, state.nopr_steady, "{text}");
+        assert!(back.nopr_resolved.contains("t-0002"), "{text}");
+    }
+
     #[test]
     fn short_outages_write_nothing_and_long_ones_write_one_item_each_way() {
         let mut outage = Outage::default();
@@ -2760,6 +2963,293 @@ mod tests {
         assert_eq!(outage.record(false, "e", at("2026-09-17T11:30:00Z"), 600), None);
         assert_eq!(outage.record(true, "", at("2026-09-17T11:31:00Z"), 600), Some(OutageEvent::Recovered));
         assert_eq!(outage.record(true, "", at("2026-09-17T11:32:00Z"), 600), None);
+    }
+
+    /// A project whose `auto_resolve_nopr` is on, and the context one tick
+    /// hands the step. The runner is the real one: two of the conditions are
+    /// git's own answers.
+    struct Nopr {
+        home: tempfile::TempDir,
+        project: Project,
+        settings: Settings,
+    }
+
+    fn nopr_project(window: crate::project::NoprWindow) -> Nopr {
+        let home = tempfile::tempdir().unwrap();
+        let project = project::create(home.path(), "demo", vec![]).unwrap();
+        let settings = Settings { auto_resolve_nopr: window, ..Default::default() };
+        Nopr { home, project, settings }
+    }
+
+    impl Nopr {
+        fn tick(&self, state: &mut State, now: &str) -> NoprPass {
+            let env = crate::paths::Env::for_test(self.home.path(), &[]);
+            let runner = crate::runner::RealRunner;
+            let ctx = Ctx { env: &env, root: self.home.path().to_path_buf(), config_dir: self.home.path().join("cfg"), runner: &runner, detached_ticker: false };
+            auto_resolve_nopr(&ctx, &self.project, &self.settings, state, at(now))
+        }
+
+        /// A thread that did everything right and produced nothing: a report
+        /// that has stood since `changed`, ready for review, its agent idle.
+        fn idle_thread(&self, changed: &str) -> Thread {
+            thread::allocate(&self.project, |t| {
+                t.title = "smoke".into();
+                t.status = Status::Open;
+                t.kind = Kind::Local;
+                t.report_hash = "r1".into();
+                t.last_report_change = changed.into();
+                t.last_state = "idle".into();
+                t.last_group = Group::ReadyForReview.token().into();
+            })
+            .unwrap()
+        }
+    }
+
+    fn git_run(dir: &std::path::Path, args: &[&str]) {
+        let out = std::process::Command::new("git").arg("-C").arg(dir).args(args).output().unwrap();
+        assert!(out.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&out.stderr));
+    }
+
+    /// A real repository with one commit on `base`, and a worktree of its own
+    /// on a thread branch: the shape a `worktree` thread is resolved from.
+    fn repo_with_worktree() -> (tempfile::TempDir, std::path::PathBuf, std::path::PathBuf) {
+        let home = tempfile::tempdir().unwrap();
+        let repo = home.path().join("repo");
+        let worktree = home.path().join("worktree");
+        std::fs::create_dir_all(&repo).unwrap();
+        git_run(&repo, &["init", "-q"]);
+        git_run(&repo, &["config", "user.email", "t@example.invalid"]);
+        git_run(&repo, &["config", "user.name", "Test"]);
+        std::fs::write(repo.join("README.md"), "base").unwrap();
+        git_run(&repo, &["add", "README.md"]);
+        git_run(&repo, &["commit", "-qm", "base"]);
+        git_run(&repo, &["branch", "base"]);
+        git_run(&repo, &["worktree", "add", "-q", "-b", "hp/demo/t-0001-test", worktree.to_str().unwrap(), "base"]);
+        (home, repo, worktree)
+    }
+
+    fn worktree_waiting(project: &Project, repo: &std::path::Path, worktree: &std::path::Path) -> Thread {
+        thread::allocate(project, |t| {
+            t.title = "test".into();
+            t.status = Status::Open;
+            t.kind = Kind::Worktree;
+            t.repo = repo.to_string_lossy().into_owned();
+            t.worktree_path = worktree.to_string_lossy().into_owned();
+            t.branch = "hp/demo/t-0001-test".into();
+            t.base = "base".into();
+            t.report_hash = "r1".into();
+            t.last_report_change = "2026-11-23T10:00:00Z".into();
+            t.last_state = "idle".into();
+            t.last_group = Group::ReadyForReview.token().into();
+        })
+        .unwrap()
+    }
+
+    /// The rule, in the order it runs: the report's clock starts where the
+    /// report last changed, a rewritten report restarts it, and once the
+    /// window is served the thread is resolved once — with `auto-nopr` as the
+    /// reason, one item that says what was checked and how to undo it, and the
+    /// thread's id on the record that keeps it from being collected again.
+    #[test]
+    fn a_thread_that_produced_nothing_is_resolved_once_its_report_stood_still() {
+        let nopr = nopr_project(crate::project::NoprWindow::Minutes(15));
+        let project = &nopr.project;
+        let mut state = State::default();
+        let t = nopr.idle_thread("2026-11-23T10:00:00Z");
+
+        // Ten minutes in: ten of fifteen served.
+        assert!(nopr.tick(&mut state, "2026-11-23T10:10:00Z").resolved.is_empty());
+        assert_eq!(state.nopr_steady[&t.id].since, "2026-11-23T10:00:00Z", "the clock starts at the report's own change");
+
+        // A new report: the clock restarts at the tick that saw it.
+        thread::update(project, &t.id, |t| {
+            t.report_hash = "r2".into();
+            t.last_report_change = "2026-11-23T10:14:00Z".into();
+        })
+        .unwrap();
+        assert!(nopr.tick(&mut state, "2026-11-23T10:16:00Z").resolved.is_empty());
+        assert_eq!(state.nopr_steady[&t.id].since, "2026-11-23T10:16:00Z", "a changed report is a new clock, not the old one");
+
+        // One minute short, then the window is served.
+        assert!(nopr.tick(&mut state, "2026-11-23T10:30:00Z").resolved.is_empty());
+        let pass = nopr.tick(&mut state, "2026-11-23T10:31:00Z");
+        assert_eq!(pass.resolved, [t.id.clone()], "{:#?}", pass.errors);
+        assert!(pass.errors.is_empty(), "{:#?}", pass.errors);
+
+        let record = thread::load(project, &t.id).unwrap();
+        assert_eq!(record.status, Status::Resolved);
+        assert_eq!(record.resolved_reason, "auto-nopr");
+        assert!(state.nopr_resolved.contains(&t.id), "the mark a reopen keeps");
+        assert!(!state.nopr_steady.contains_key(&t.id), "a resolved thread is not watched");
+        let items = inbox::unhandled(project);
+        let item = items.iter().find(|i| i.subject == t.id).expect("one item says what was done");
+        assert!(item.summary.contains("auto_resolve_nopr"), "{}", item.summary);
+        assert!(item.summary.contains("thread resolve --reopen demo"), "how to continue: {}", item.summary);
+        // Resolved once is done: a later tick with the window long served
+        // writes nothing at all.
+        assert!(nopr.tick(&mut state, "2026-11-23T12:00:00Z").resolved.is_empty());
+    }
+
+    /// Every way of being wrong about "it produced nothing": one tick each,
+    /// nothing resolved. The thread is otherwise the one the test above
+    /// resolves, so each case is the single difference.
+    #[test]
+    fn a_thread_with_anything_to_show_is_left_alone() {
+        let nopr = nopr_project(crate::project::NoprWindow::Minutes(15));
+        let project = &nopr.project;
+        let mut state = State::default();
+        let now = "2026-11-23T10:30:00Z";
+
+        // An open pull request, and a merged one.
+        for (pr, pr_state) in [("https://github.com/o/r/pull/1", "open"), ("https://github.com/o/r/pull/2", "merged")] {
+            let t = nopr.idle_thread("2026-11-23T10:00:00Z");
+            thread::update(project, &t.id, |t| {
+                t.pr = pr.into();
+                t.pr_state = pr_state.into();
+            })
+            .unwrap();
+            assert!(nopr.tick(&mut state, now).resolved.is_empty(), "{pr_state} pull request: {}", t.id);
+            thread::update(project, &t.id, |t| t.status = Status::Resolved).unwrap();
+        }
+
+        // The agent is still working, or the thread is waiting on a person.
+        for (state_name, group) in [("working", Group::ReadyForReview), ("idle", Group::WaitingOnYou), ("idle", Group::Working)] {
+            let t = nopr.idle_thread("2026-11-23T10:00:00Z");
+            thread::update(project, &t.id, |t| {
+                t.last_state = state_name.into();
+                t.last_group = group.token().into();
+            })
+            .unwrap();
+            assert!(nopr.tick(&mut state, now).resolved.is_empty(), "{state_name} {group:?}: {}", t.id);
+            thread::update(project, &t.id, |t| t.status = Status::Resolved).unwrap();
+        }
+
+        // No report at all.
+        let t = nopr.idle_thread("2026-11-23T10:00:00Z");
+        thread::update(project, &t.id, |t| {
+            t.report_hash.clear();
+            t.last_group = Group::Idle.token().into();
+        })
+        .unwrap();
+        assert!(nopr.tick(&mut state, now).resolved.is_empty(), "no report: {}", t.id);
+    }
+
+    /// The two git conditions need real answers: a branch with a commit of its
+    /// own is work, an uncommitted change is work, and a clean worktree with
+    /// nothing on its branch is the case the rule exists for.
+    #[test]
+    fn only_a_branch_with_nothing_on_it_is_collected() {
+        let (home, repo, worktree) = repo_with_worktree();
+        let root = home.path().join("root");
+        let project = project::create(&root, "demo", vec![]).unwrap();
+        let settings = Settings { auto_resolve_nopr: crate::project::NoprWindow::Minutes(15), ..Default::default() };
+        let env = crate::paths::Env::for_test(home.path(), &[]);
+        let runner = crate::runner::RealRunner;
+        let ctx = Ctx { env: &env, root, config_dir: home.path().join("cfg"), runner: &runner, detached_ticker: false };
+        let now = "2026-11-23T10:30:00Z";
+
+        // A commit on the thread's own branch: its branch is above `base`.
+        let committed = worktree_waiting(&project, &repo, &worktree);
+        std::fs::write(worktree.join("work.txt"), "something").unwrap();
+        git_run(&worktree, &["add", "work.txt"]);
+        git_run(&worktree, &["commit", "-qm", "work"]);
+        let mut state = State::default();
+        assert!(auto_resolve_nopr(&ctx, &project, &settings, &mut state, at(now)).resolved.is_empty());
+
+        // Nothing committed, but something uncommitted is just as much work.
+        git_run(&worktree, &["reset", "-q", "--hard", "base"]);
+        assert_eq!(git_count(&ctx, worktree.to_str().unwrap(), "base"), Some(0));
+        std::fs::write(worktree.join("work.txt"), "unsaved").unwrap();
+        let mut state = State::default();
+        assert!(auto_resolve_nopr(&ctx, &project, &settings, &mut state, at(now)).resolved.is_empty());
+
+        // Clean and uncommitted-nothing: this one is collected, and its folder
+        // is gone afterwards.
+        std::fs::remove_file(worktree.join("work.txt")).unwrap();
+        let mut state = State::default();
+        let pass = auto_resolve_nopr(&ctx, &project, &settings, &mut state, at(now));
+        assert_eq!(pass.resolved, [committed.id.clone()], "{:#?}", pass.errors);
+        assert!(!worktree.exists(), "the worktree is removed");
+        assert_eq!(thread::load(&project, &committed.id).unwrap().resolved_reason, "auto-nopr");
+    }
+
+    /// Off is the default and the whole promise of "nothing changes": no
+    /// record, no git call, no item.
+    #[test]
+    fn off_resolves_nothing() {
+        let nopr = nopr_project(crate::project::NoprWindow::Off);
+        let mut state = State::default();
+        let t = nopr.idle_thread("2026-11-23T10:00:00Z");
+        assert!(nopr.tick(&mut state, "2026-11-23T23:00:00Z").resolved.is_empty());
+        assert_eq!(thread::load(&nopr.project, &t.id).unwrap().status, Status::Open);
+        assert!(state.nopr_steady.is_empty() && state.nopr_resolved.is_empty());
+    }
+
+    /// A thread a person reopened is theirs: the mark outlives the resolve, so
+    /// the rule never takes it again however long its report stands still.
+    #[test]
+    fn a_reopened_thread_is_never_collected_again() {
+        let nopr = nopr_project(crate::project::NoprWindow::Minutes(15));
+        let project = &nopr.project;
+        let mut state = State::default();
+        let t = nopr.idle_thread("2026-11-23T10:00:00Z");
+        assert_eq!(nopr.tick(&mut state, "2026-11-23T10:20:00Z").resolved, [t.id.clone()]);
+
+        // `thread resolve --reopen` in one line.
+        thread::update(project, &t.id, |t| {
+            t.status = Status::Open;
+            t.resolved_reason.clear();
+        })
+        .unwrap();
+        assert!(nopr.tick(&mut state, "2026-11-23T11:00:00Z").resolved.is_empty());
+        assert!(nopr.tick(&mut state, "2026-11-24T11:00:00Z").resolved.is_empty());
+        assert_eq!(thread::load(project, &t.id).unwrap().status, Status::Open);
+    }
+
+    /// The two older automatic closes are untouched: resolve-on-merge still
+    /// resolves a merged thread, and `auto_resolve_days` still resolves an idle
+    /// one, both while the new rule is on.
+    #[test]
+    fn the_older_automatic_closes_still_work_beside_the_new_one() {
+        let nopr = nopr_project(crate::project::NoprWindow::Minutes(15));
+        let project = &nopr.project;
+        let env = crate::paths::Env::for_test(nopr.home.path(), &[]);
+        let runner = crate::runner::RealRunner;
+        let ctx = Ctx { env: &env, root: nopr.home.path().to_path_buf(), config_dir: nopr.home.path().join("cfg"), runner: &runner, detached_ticker: false };
+
+        // Merged: recorded first, then resolved after the grace.
+        let merged = thread::allocate(project, |t| {
+            t.title = "merged".into();
+            t.status = Status::Open;
+            t.kind = Kind::Local;
+            t.pr = "https://github.com/o/r/pull/3".into();
+            t.pr_state = "merged".into();
+            t.report_hash = "r1".into();
+            t.last_state = "idle".into();
+            t.last_group = Group::Landing.token().into();
+        })
+        .unwrap();
+        let mut state = State::default();
+        state.prs.insert(merged.id.clone(), pr::Summary { state: "MERGED".into(), head_oid: "abc".into(), ..Default::default() });
+        assert!(resolve_merged(&ctx, project, &mut state, at("2026-11-23T10:00:00Z")).is_empty());
+        assert!(resolve_merged(&ctx, project, &mut state, at("2026-11-23T10:11:00Z")).is_empty());
+        assert_eq!(thread::load(project, &merged.id).unwrap().resolved_reason, "merged");
+
+        // Idle for longer than `auto_resolve_days`.
+        let idle = thread::allocate(project, |t| {
+            t.title = "idle".into();
+            t.status = Status::Open;
+            t.kind = Kind::Local;
+            t.last_state = "idle".into();
+            t.last_group = Group::Idle.token().into();
+            t.last_state_change = "2026-11-01T00:00:00Z".into();
+            t.last_report_change = "2026-11-01T00:00:00Z".into();
+        })
+        .unwrap();
+        let mut memory = Memory::new(&ctx);
+        memory.started = at("2026-11-02T00:00:00Z");
+        assert!(auto_resolve(&ctx, project, &nopr.settings, &memory, at("2026-11-20T00:00:00Z")).is_empty());
+        assert_eq!(thread::load(project, &idle.id).unwrap().resolved_reason, "auto");
     }
 }
 

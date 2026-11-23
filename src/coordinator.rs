@@ -1662,8 +1662,8 @@ fn digest_for(ctx: &Ctx, project: &Project, prefix: &str) -> Result<(String, Vec
             let _ = writeln!(out, "Name: {}", project.display_name());
             let _ = writeln!(
                 out,
-                "Settings: coordinator_profile={} thread_profile={} auto_resolve_days={} nudge={} coordinator_turn_limit={}",
-                settings.coordinator_profile, settings.thread_profile, settings.auto_resolve_days, settings.nudge, settings.coordinator_turn_limit
+                "Settings: coordinator_profile={} thread_profile={} auto_resolve_days={} auto_resolve_nopr={} nudge={} coordinator_turn_limit={}",
+                settings.coordinator_profile, settings.thread_profile, settings.auto_resolve_days, settings.auto_resolve_nopr, settings.nudge, settings.coordinator_turn_limit
             );
             // The baseline the coordinator is told about, so it does not write
             // `--base` from memory (or forget it) when starting a thread.
