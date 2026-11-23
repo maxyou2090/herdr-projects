@@ -1176,11 +1176,14 @@ fn run_logged(ctx: &Ctx, log: &Log) -> Result<()> {
                 // Timed like a tick when `HP_TICK_TIMINGS` asks: a brief pass
                 // that reads every project's threads is part of what a person
                 // waits for after `thread start`.
-                let at = Instant::now();
                 brief_timings.stage("brief", "pass");
                 briefs = brief_pass(ctx, log);
                 brief_timings.stop();
-                for line in brief_timings.drain(Some(at.elapsed())) {
+                // No round line: a brief pass is not a round, and its own line
+                // already carries its wall time. Printing "timings round" here
+                // put a second, much smaller number under the same word as the
+                // tick's round, which is the number `doctor` now reports.
+                for line in brief_timings.drain(None) {
                     log.line(&line);
                 }
                 next_brief = Instant::now() + BRIEF_POLL;
