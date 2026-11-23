@@ -13,7 +13,7 @@ and what is still open.
 - **The binary does mechanics.** Starting a thread, copying reports, cleaning up after a resolve: each is one deterministic subcommand. It talks to core through `hc`, and everything core does not have — a Space, a tab, an agent — it builds out of core terminals and labels (`hp_ws`, `hp_tab`, `hp_agent`).
 - **Agents report their own progress.** `hp report --activity "..." [--done]`, run by the agent in its own terminal, writes one small JSON file per pane under `<root>/.progress/`; the ticker uses it for a thread's group and five minutes of activity. There is no percentage. Thread briefs and the coordinator skill carry the instructions, so any agent can report, and nothing has to be installed for it. herdr-core reads a program's own status from OSC 7501 as well: pi prints it itself, and for the harnesses that print none `hp-agent` reads the pane's screen every two seconds and reports `working`, `blocked` and back to `idle` from what it can prove (never guessing: an unreadable screen says nothing).
 - **Files are the record, prompts are nudges.** Threads write a report file, the ticker writes events to an inbox folder, and the coordinator reads state with `context` at the start of every turn. A missed prompt loses nothing.
-- **One ticker per projects root** checks every 15 seconds: coordinators (any agent in a project folder, also one started by hand in a project never opened), thread state and groups, the labels a pane carries, pending prompts, changed reports, pull requests (every two minutes), the registry audit (every 30 minutes), routines, auto-resolve.
+- **One ticker per projects root** checks every 15 seconds: coordinators (any agent in a project folder, also one started by hand in a project never opened), thread state and groups, the labels a pane carries, pending prompts, changed reports, pull requests (every five minutes), the registry audit (every 30 minutes), routines, auto-resolve.
 - **Tools are found even under a bare `PATH`.** The binary appends `/opt/homebrew/bin`, `/usr/local/bin`, `~/.local/bin` and `~/.cargo/bin` to its own `PATH`, so a ticker started by launchd finds `gh` and `rsync`.
 - **Cleanup is part of the flow, never forced.** Resolving a thread removes its worktree (Herdr and git refuse a dirty one, and the plugin never forces) and, once its pull request is merged, its local branch. Reports and library files always stay. Text from reports, pull requests and command output is never placed in a prompt.
 
@@ -44,7 +44,7 @@ worth knowing when touching the tick path:
   a note that would repeat every tick ("the app does not show `sp…` yet") is
   printed once per change, while the retry behind it keeps running.
 - **One `gh` call per project, not per thread.** The pull-request check (every
-  two minutes) lists the repository's pull requests once and answers for every
+  five minutes) lists the repository's pull requests once and answers for every
   branch of the project's open threads; a `gh` call is a few seconds of network,
   and several of them in one round was the last thing that could still make one
   long.

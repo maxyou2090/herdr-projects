@@ -1185,7 +1185,7 @@ fn stray_agent(view: &SessionView, t: &Thread) -> Option<StrayAgent> {
 }
 
 /// A last look for the thread's pull request before its branch is judged. The
-/// ticker checks pull requests every two minutes, so a thread that opens and
+/// ticker checks pull requests every five minutes, so a thread that opens and
 /// merges one and is resolved in between would otherwise keep its branch.
 /// What it finds is recorded, with the usual `pr` item when it is news.
 fn last_pr_lookup(ctx: &Ctx, project: &Project, t: &Thread) -> Option<crate::pr::Summary> {
