@@ -11,13 +11,14 @@ use crate::paths::Ctx;
 use crate::project::{self, Project, Settings};
 
 /// The keys `set` accepts, with what they hold.
-pub const KEYS: [(&str, &str); 8] = [
+pub const KEYS: [(&str, &str); 9] = [
     ("name", "text"),
     ("coordinator_profile", "profile name"),
     ("thread_profile", "profile name"),
     ("auto_resolve_days", "number (0 = never)"),
     ("nudge", "true/false"),
     ("coordinator_turn_limit", "20m, 5m or off"),
+    ("base", "git ref a worktree thread starts from"),
     ("repos.add", "PATH or PATH@MACHINE"),
     ("repos.remove", "PATH"),
 ];
@@ -95,6 +96,18 @@ pub fn set_in(text: &str, key: &str, value: &str) -> Result<String> {
         "coordinator_turn_limit" => {
             let limit = crate::project::TurnLimit::parse(value).map_err(|why| anyhow::anyhow!(why))?;
             doc[key] = toml_edit::value(limit.text());
+        }
+        // The ref a new worktree thread starts from. A value with whitespace in
+        // it is not a ref, and an empty one is not "unset": the line is what
+        // makes the project name a base at all, so removing it is a hand edit.
+        "base" => {
+            if value.is_empty() {
+                bail!("give a ref such as origin/main or port/herdr-core; to go back to the remote's default branch, remove the line from PROJECT.md");
+            }
+            if value.chars().any(char::is_whitespace) {
+                bail!("`{value}` has whitespace in it; a git ref does not");
+            }
+            doc[key] = toml_edit::value(value);
         }
         "repos.add" => {
             if value.is_empty() {
@@ -267,6 +280,15 @@ mod tests {
         assert_eq!(project::parse_project_md(&set_in(MD, "coordinator_turn_limit", "5m").unwrap()).unwrap().0.coordinator_turn_limit.secs(), Some(300));
         assert!(set_in(MD, "coordinator_turn_limit", "abc").is_err());
         assert!(set_in(MD, "coordinator_turn_limit", "0m").is_err());
+        // `base` is the ref a worktree thread starts from: a ref, so no
+        // whitespace, and never empty — the line is the setting, and removing
+        // it is a hand edit.
+        let based = set_in(MD, "base", "port/herdr-core").unwrap();
+        assert!(based.contains("base = \"port/herdr-core\""), "{based}");
+        assert_eq!(project::parse_project_md(&based).unwrap().0.base, "port/herdr-core");
+        assert_eq!(project::parse_project_md(&set_in(&based, "base", "origin/main").unwrap()).unwrap().0.base, "origin/main", "set again in place");
+        assert!(set_in(MD, "base", "").is_err(), "an empty base is refused, not written");
+        assert!(set_in(MD, "base", "port herdr core").is_err(), "a git ref has no whitespace");
     }
 
     #[test]

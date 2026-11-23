@@ -1663,13 +1663,22 @@ fn digest_for(ctx: &Ctx, project: &Project, prefix: &str) -> Result<(String, Vec
                 "Settings: coordinator_profile={} thread_profile={} auto_resolve_days={} nudge={} coordinator_turn_limit={}",
                 settings.coordinator_profile, settings.thread_profile, settings.auto_resolve_days, settings.nudge, settings.coordinator_turn_limit
             );
+            // The baseline the coordinator is told about, so it does not write
+            // `--base` from memory (or forget it) when starting a thread.
+            if !settings.base.is_empty() {
+                let _ = writeln!(out, "Base: {} (a new thread's worktree starts here unless --base says otherwise)", settings.base);
+            }
             out.push_str(&crate::profiles::context_text(ctx, project, &settings));
             out.push_str(&crate::assign::context_line(ctx, project));
             if settings.repos.is_empty() {
                 let _ = writeln!(out, "Repos: (none)");
             }
             for repo in &settings.repos {
-                let _ = writeln!(out, "Repo: {}", repo.path);
+                if repo.base.is_empty() {
+                    let _ = writeln!(out, "Repo: {}", repo.path);
+                } else {
+                    let _ = writeln!(out, "Repo: {} (base {})", repo.path, repo.base);
+                }
             }
         }
         Err(error) => {

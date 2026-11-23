@@ -1236,7 +1236,7 @@ mod tests {
             ("b.md".to_string(), "x".repeat(MEMORY_CAP_CHARS)),
             ("c.md".to_string(), "gamma fact".to_string()),
         ];
-        let repos = vec![project::Repo { path: "/srv/app".into() }, project::Repo { path: "/home/me/lib".into() }];
+        let repos = vec![project::Repo { path: "/srv/app".into(), ..Default::default() }, project::Repo { path: "/home/me/lib".into(), ..Default::default() }];
         let input = BriefInput {
             project_name: "Demo",
             slug: "demo",

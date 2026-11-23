@@ -197,7 +197,7 @@ enum Command {
         #[arg(long)]
         yes: bool,
     },
-    /// Change one setting in PROJECT.md (name, coordinator_profile, thread_profile, auto_resolve_days, nudge, coordinator_turn_limit, repos.add, repos.remove)
+    /// Change one setting in PROJECT.md (name, coordinator_profile, thread_profile, auto_resolve_days, nudge, coordinator_turn_limit, base, repos.add, repos.remove)
     Set { slug: String, key: String, value: String },
     /// Open a file: a text file in an editor in this terminal ($VISUAL, else $EDITOR), anything else with the system opener
     OpenFile { path: PathBuf },
@@ -383,6 +383,7 @@ enum ThreadCommand {
         /// Where the thread works, not which agent runs in it: `worktree` (its own worktree and branch under ~/.herdr/worktrees/…; the default with --repo), `checkout` (the repository's main checkout, no branch of its own), `local` (a folder of its own under the project's threads/<id>/, no repository; the default without a repo). Every kind puts the thread's tab in the project's thread Space, `<display name> Threads`; `tab` and `home` are the old names of `local` and still work (docs/thread-space.md)
         #[arg(long, value_name = "worktree|checkout|local")]
         kind: Option<String>,
+        /// The ref its worktree starts from (default: the repository's own `base` in PROJECT.md, else the project's, else the remote's default branch such as origin/main)
         #[arg(long, value_name = "REF")]
         base: Option<String>,
         /// The task; `-` reads standard input
@@ -768,7 +769,7 @@ pub fn run() -> Result<()> {
 
     match cli.command {
         Command::New { name, repos, thread_profile, coordinator_profile } => {
-            let repos = repos.into_iter().map(|path| project::Repo { path }).collect();
+            let repos = repos.into_iter().map(|path| project::Repo { path, ..Default::default() }).collect();
             let config = crate::profiles::load(&ctx.config_dir)?;
             let thread = thread_profile.unwrap_or_else(|| config.new_project_default(crate::profiles::Role::Thread));
             let coordinator = coordinator_profile.unwrap_or_else(|| config.new_project_default(crate::profiles::Role::Coordinator));
