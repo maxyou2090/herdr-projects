@@ -118,6 +118,43 @@ pub fn placement(kind: Option<Kind>, has_repo: bool) -> Result<Kind> {
     }
 }
 
+/// The ref a new thread's worktree starts from: `--base` when it is given, else
+/// the repository's own `base` in `[[repos]]`, else the project's `base`, else
+/// empty — nothing named, so placement keeps asking git for the remote's default
+/// branch (`origin/HEAD`, which is `origin/main` in most repositories), the way
+/// it did before there was a setting.
+///
+/// One project can hold repositories whose baselines differ (`port/herdr-core`
+/// beside a library still on `origin/main`), which is what the per-repository
+/// entry is for; `hp set` writes only the project's one, so that field is hand
+/// edited in PROJECT.md.
+pub fn thread_base(requested: Option<&str>, settings: &project::Settings, repo: &str) -> String {
+    if let Some(base) = requested.map(str::trim).filter(|base| !base.is_empty()) {
+        return base.to_string();
+    }
+    // A `[[repos]]` path is written canonical by `new` and `repos.add`, but the
+    // entry is hand-editable, so both spellings of the same folder count.
+    let mine = |r: &project::Repo| r.path == repo || std::fs::canonicalize(&r.path).is_ok_and(|p| p.to_string_lossy().as_ref() == repo);
+    if let Some(own) = settings.repos.iter().find(|r| mine(r)).map(|r| r.base.trim()).filter(|base| !base.is_empty()) {
+        return own.to_string();
+    }
+    settings.base.trim().to_string()
+}
+
+/// A named base ref has to be one this machine has, and the failure has to name
+/// what was asked and where: `port/herdr-core` exists in the main checkout of a
+/// repository that fetched it, not in another clone, and a thread must not start
+/// on a tree nobody named.
+fn check_base(runner: &dyn Runner, repo: &str, base: &str) -> Result<()> {
+    if git(runner, repo, &["rev-parse", "--show-toplevel"], GIT_TIMEOUT).is_err() {
+        bail!("{repo} is not a git repository, so a thread cannot start from `{base}`");
+    }
+    if git(runner, repo, &["rev-parse", "--verify", "--quiet", &format!("{base}^{{commit}}")], GIT_TIMEOUT).is_err() {
+        bail!("`{base}` is not a ref in {repo}; `hp set <project> base <ref>` changes the project's base, or pass --base");
+    }
+    Ok(())
+}
+
 /// Creates the workspace or tab, the thread directory and the brief, then
 /// returns. The agent is launched by the ticker, so there is one delivery path.
 pub fn start(ctx: &Ctx, slug: &str, args: StartArgs) -> Result<Thread> {
@@ -152,6 +189,15 @@ pub fn start(ctx: &Ctx, slug: &str, args: StartArgs) -> Result<Thread> {
 
     let profile = thread_profile(ctx, &project, args.profile.as_deref())?;
     let kind = placement(args.kind, !repo.is_empty())?;
+    // The ref the worktree starts from: `--base`, else the repository's own
+    // `base`, else the project's `base` (`hp set <project> base <ref>`). Checked
+    // here, before the record or the worktree exist: a project that names a ref
+    // this machine does not have must say so, not quietly fall back to another
+    // tree.
+    let base = thread_base(args.base.as_deref(), &settings, &repo);
+    if kind == Kind::Worktree && !base.is_empty() {
+        check_base(ctx.runner, &repo, &base)?;
+    }
     // Ownership is written once, at creation, from the lane the initiating
     // coordinator pane claims (§4.2). Everything else — open, adopt, ticker —
     // leaves an existing record's lane alone (§6.3).
@@ -161,7 +207,7 @@ pub fn start(ctx: &Ctx, slug: &str, args: StartArgs) -> Result<Thread> {
         t.kind = kind;
         t.repo = repo.clone();
         profile.apply(t);
-        t.base = args.base.clone().unwrap_or_default();
+        t.base = base;
         t.lane = lane;
     })?;
     let id = record.id.clone();
@@ -2340,6 +2386,53 @@ mod tests {
         assert_eq!(Kind::parse("checkout").unwrap(), Kind::Checkout);
         assert_eq!(Kind::parse("local").unwrap(), Kind::Local);
         assert!(Kind::parse("nowhere").is_err());
+    }
+
+    /// Where a worktree thread's ref comes from: the flag, then the repository's
+    /// own `base`, then the project's — and with none of them, nothing, which
+    /// keeps the old behaviour (the remote's default branch, asked from git).
+    #[test]
+    fn a_projects_base_is_used_unless_the_repo_or_the_flag_says_otherwise() {
+        let app = project::Repo { path: "/srv/app".into(), base: String::new() };
+        let settings = project::Settings { base: "port/herdr-core".into(), repos: vec![app.clone()], ..Default::default() };
+        assert_eq!(thread_base(None, &settings, "/srv/app"), "port/herdr-core");
+        assert_eq!(thread_base(Some("origin/main"), &settings, "/srv/app"), "origin/main", "--base overrides both");
+        assert_eq!(thread_base(Some("  "), &settings, "/srv/app"), "port/herdr-core", "an empty --base names nothing");
+        // A repository whose baseline differs from the project's says so itself.
+        let own = project::Settings { base: "port/herdr-core".into(), repos: vec![project::Repo { base: "origin/main".into(), ..app }], ..Default::default() };
+        assert_eq!(thread_base(None, &own, "/srv/app"), "origin/main");
+        assert_eq!(thread_base(None, &own, "/srv/other"), "port/herdr-core");
+        // Nothing set anywhere: no ref named, and placement keeps asking git.
+        assert_eq!(thread_base(None, &project::Settings::default(), "/srv/app"), "");
+    }
+
+    /// A base that names no ref this checkout has fails before a record or a
+    /// worktree exists, and says which ref and which repository.
+    #[test]
+    fn a_base_ref_is_checked_before_anything_is_created() {
+        let repo = tempfile::tempdir().unwrap();
+        let run = |args: &[&str]| {
+            let out = std::process::Command::new("git").arg("-C").arg(repo.path()).args(args).output().unwrap();
+            assert!(out.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&out.stderr));
+        };
+        run(&["init", "-q"]);
+        run(&["config", "user.email", "t@example.invalid"]);
+        run(&["config", "user.name", "Test"]);
+        std::fs::write(repo.path().join("README.md"), "one").unwrap();
+        run(&["add", "README.md"]);
+        run(&["commit", "-qm", "one"]);
+        run(&["branch", "port/herdr-core"]);
+        let path = repo.path().to_string_lossy().into_owned();
+        check_base(&crate::runner::RealRunner, &path, "port/herdr-core").unwrap();
+        check_base(&crate::runner::RealRunner, &path, "HEAD").unwrap();
+        let error = check_base(&crate::runner::RealRunner, &path, "port/not-there").unwrap_err().to_string();
+        assert!(error.contains("`port/not-there` is not a ref in "), "{error}");
+        assert!(error.contains(&path), "the repository is named: {error}");
+        assert!(error.contains("--base"), "and how to change it: {error}");
+        // A folder that is no repository reports that, not a missing ref.
+        let plain = tempfile::tempdir().unwrap();
+        let error = check_base(&crate::runner::RealRunner, &plain.path().to_string_lossy(), "main").unwrap_err().to_string();
+        assert!(error.contains("not a git repository"), "{error}");
     }
 
     /// `tab` and `home` were two names for what `local` is; the command line

@@ -119,9 +119,14 @@ pub fn now() -> String {
 
 /// A repository the project works in. `[[repos]]` in PROJECT.md; a line left
 /// by an older version may carry `machine = "..."`, which serde ignores.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 pub struct Repo {
     pub path: String,
+    /// The ref this repository's threads start from, when it differs from the
+    /// project's `base`: one project over repositories whose default branches
+    /// differ. Hand-edited in PROJECT.md; empty means the project's `base`.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub base: String,
 }
 
 /// `PROJECT.md` front matter. `repos` is last so the TOML tables follow the
@@ -143,6 +148,13 @@ pub struct Settings {
     /// ticker interrupts it (`20m`, `5m`, `off`). See [`TurnLimit`].
     #[serde(default)]
     pub coordinator_turn_limit: TurnLimit,
+    /// The ref a new worktree thread starts from when `--base` is not given
+    /// (`port/herdr-core`, `origin/main`), checked against the repository as it
+    /// is used. Empty, the default, keeps what came before: git's own choice of
+    /// the remote's default branch (`origin/HEAD`, and `origin/main` in most
+    /// repositories) — `new` never writes it.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub base: String,
     pub repos: Vec<Repo>,
 }
 
@@ -243,6 +255,7 @@ impl Default for Settings {
             // half-typed text (docs/history/herdr-notes-herdr1.md, stage 2).
             nudge: true,
             coordinator_turn_limit: TurnLimit::default(),
+            base: String::new(),
             repos: Vec::new(),
         }
     }
@@ -777,6 +790,7 @@ pub fn create(root: &Path, name: &str, repos: Vec<Repo>) -> Result<Project> {
                 .or_else(|_| std::path::absolute(&repo.path))
                 .map(|p| p.to_string_lossy().into_owned())
                 .unwrap_or(repo.path),
+            ..Repo::default()
         })
         .collect();
     let settings = Settings {
@@ -810,6 +824,11 @@ pub fn create(root: &Path, name: &str, repos: Vec<Repo>) -> Result<Project> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A `[[repos]]` entry as `new` writes it: a path and no `base` of its own.
+    fn repo(path: &str) -> Repo {
+        Repo { path: path.to_string(), ..Repo::default() }
+    }
 
     /// The three shapes `coordinator_turn_limit` takes, and the fourth: a value
     /// nobody can read. A bad one must fail the PROJECT.md parse (the ticker
@@ -933,7 +952,7 @@ mod tests {
     fn create_writes_the_skeleton_and_refuses_a_second_time() {
         let root = tempfile::tempdir().unwrap();
         let root = root.path().join("root");
-        let project = create(&root, "Demo", vec![Repo { path: "/srv/app".into() }, Repo { path: "/no/such/repo".into() }]).unwrap();
+        let project = create(&root, "Demo", vec![repo("/srv/app"), repo("/no/such/repo")]).unwrap();
         assert_eq!(project.slug, "demo");
         for sub in ["memory", "scratch", "routines", "threads", "inbox/done", "library", "uploads", ".state"] {
             assert!(project.dir().join(sub).is_dir(), "{sub}");
@@ -946,10 +965,13 @@ mod tests {
         assert_eq!(settings.auto_resolve_days, 7);
         assert!(settings.nudge);
         assert_eq!(settings.coordinator_turn_limit, TurnLimit::Minutes(20), "twenty minutes unless PROJECT.md says otherwise");
+        assert_eq!(settings.base, "", "`new` names no base: the remote's default branch, as before");
+        let front = std::fs::read_to_string(project.project_md()).unwrap();
+        assert!(!front.contains("base = "), "the key is not written at all, not written empty: {front}");
         assert!(project.dir().join(PR_FOLLOWUP).is_file());
         assert!(project.dir().join(COORDINATOR_SWEEP).is_file());
         assert!(crate::routine::load_all(&project).1.is_empty(), "the default routines parse");
-        assert_eq!(settings.repos, vec![Repo { path: "/srv/app".into() }, Repo { path: "/no/such/repo".into() }]);
+        assert_eq!(settings.repos, vec![repo("/srv/app"), repo("/no/such/repo")]);
         assert!(body.starts_with("# Instructions"));
         assert!(create(&root, "demo", vec![]).is_err());
     }
@@ -1092,7 +1114,7 @@ mod tests {
         // Written by a version that could place a repo on another machine.
         let text = "+++\nname = \"Demo\"\n\n[[repos]]\npath = \"/srv/app\"\nmachine = \"box\"\n\n[[repos]]\npath = \"/home/me/lib\"\n+++\n\n# Instructions\nBody\n";
         let (settings, _) = parse_project_md(text).unwrap();
-        assert_eq!(settings.repos, vec![Repo { path: "/srv/app".into() }, Repo { path: "/home/me/lib".into() }]);
+        assert_eq!(settings.repos, vec![repo("/srv/app"), repo("/home/me/lib")]);
     }
 
     #[test]
