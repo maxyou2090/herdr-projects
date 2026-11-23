@@ -531,6 +531,23 @@ fn an_on_request_profile_is_listed_apart_and_never_a_default_or_an_owner() {
     assert!(!out.status.success(), "`assignable --check` refuses an on-request profile");
     assert!(String::from_utf8_lossy(&out.stderr).contains("assignable: luna"), "{}", String::from_utf8_lossy(&out.stderr));
 
+    // `hp new` refuses it as a project default, on both flags: it would be
+    // picked silently on every launch, and `set <slug> thread_profile` refuses
+    // it afterwards, so such a project could not be fixed with a command.
+    let out = hp(home.path(), &["--root", root_arg, "new", "bad", "--thread-profile", "sol"]);
+    assert!(!out.status.success(), "an on-request profile is no thread default");
+    let err = String::from_utf8(out.stderr).unwrap();
+    assert!(err.contains("`sol` is on request only") && err.contains("cannot be a project default"), "{err}");
+    assert!(!root.join("bad").exists(), "nothing is created: {err}");
+    let out = hp(home.path(), &["--root", root_arg, "new", "bad", "--coordinator-profile", "sol"]);
+    assert!(!out.status.success(), "an on-request profile is no coordinator default");
+    assert!(String::from_utf8_lossy(&out.stderr).contains("cannot be a project default"), "{}", String::from_utf8_lossy(&out.stderr));
+    // An ordinary profile still passes, and the project starts on it.
+    let out = hp(home.path(), &["--root", root_arg, "new", "fine", "--thread-profile", "luna", "--coordinator-profile", "luna"]);
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    let project_md = std::fs::read_to_string(root.join("fine/PROJECT.md")).unwrap();
+    assert!(project_md.contains("thread_profile = \"luna\""), "{project_md}");
+
     // A coordinator may not be opened with it.
     let out = hp(home.path(), &["--root", root_arg, "open", "demo", "--profile", "sol"]);
     assert!(!out.status.success(), "an on-request profile is not for coordinators");

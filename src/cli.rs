@@ -772,7 +772,15 @@ pub fn run() -> Result<()> {
             let config = crate::profiles::load(&ctx.config_dir)?;
             let thread = thread_profile.unwrap_or_else(|| config.new_project_default(crate::profiles::Role::Thread));
             let coordinator = coordinator_profile.unwrap_or_else(|| config.new_project_default(crate::profiles::Role::Coordinator));
-            for name in [&thread, &coordinator] {
+            for (key, name) in [("thread_profile", &thread), ("coordinator_profile", &coordinator)] {
+                if config.profiles.get(name.as_str()).is_some_and(|entry| entry.on_request) {
+                    // A project default is picked silently on every launch, and
+                    // `set <slug> {key}` refuses an on-request profile, so such a
+                    // project could not be fixed with a command afterwards.
+                    bail!(
+                        "`{name}` is on request only: the user names it per thread, it cannot be a project default. Use `hp profile edit {name} --no-on-request`, or pick another profile for {key}"
+                    );
+                }
                 if config.get(name).is_none() {
                     bail!("there is no profile `{name}`; `profile list` shows them");
                 }
