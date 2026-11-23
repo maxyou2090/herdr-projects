@@ -389,6 +389,19 @@ fn report(
         check(&mut out, ok, "ticker agent", detail);
     }
 
+    // How long a round takes, which is the one number that says whether the loop
+    // keeps up with its own 15 seconds: a slow round pushes every start, brief
+    // and nudge to the next one. A warning, never a failure — the ticker still
+    // works, and `HP_TICK_TIMINGS=1` is where the stages are.
+    {
+        let (health, detail) = crate::ticker::round_line(root);
+        let ok = match health {
+            crate::ticker::RoundHealth::Slow => None,
+            crate::ticker::RoundHealth::NoData | crate::ticker::RoundHealth::Fine => Some(true),
+        };
+        check(&mut out, ok, "ticker round", detail);
+    }
+
     // Every project's priming files, and the binary path they carry: a
     // `plugin link` from another checkout or a moved plugin root breaks them
     // silently, and `--fix` rewrites them.
@@ -945,5 +958,40 @@ mod tests {
         let (mark, detail) = ticker_agent_line(&env, root.path(), &runner, false, true).unwrap();
         assert_eq!(mark, Some(true), "{detail}");
         assert!(detail.contains("KeepAlive is unconditional"), "{detail}");
+    }
+
+    /// `doctor` answers "how long is a round" on every root, from the file the
+    /// ticker writes every round — no environment variable, no real ticker.
+    #[test]
+    fn doctor_says_how_long_the_last_round_took() {
+        let home = tempfile::tempdir().unwrap();
+        let root = home.path().join("root");
+        std::fs::create_dir(&root).unwrap();
+        let env = Env::for_test(home.path(), &[]);
+        let runner = FakeRunner::new();
+        let session = SessionFlags { session: None };
+        let lines = |root: &Path| report(&env, root, &home.path().join("cfg"), &session, &runner, false);
+        let (text, healthy) = lines(&root);
+        assert!(text.contains("[ok  ] ticker round: no round recorded yet"), "{text}");
+        let write = |rounds: &crate::ticker::Rounds| {
+            std::fs::create_dir_all(root.join(".state")).unwrap();
+            crate::project::write_json(&crate::ticker::rounds_path(&root), rounds).unwrap();
+        };
+        write(&crate::ticker::Rounds { round_ms: 93, round_ms_recent: vec![110; 10] });
+        let (text, fast) = lines(&root);
+        assert!(text.contains("[ok  ] ticker round: last 93ms, median of 10 110ms (TICK 15000ms)"), "{text}");
+        assert_eq!(fast, healthy, "a healthy round changes nothing else");
+
+        // Over the tick: a warning with the way to the stages, and the same
+        // verdict as before — a slow ticker is news, not a broken install.
+        write(&crate::ticker::Rounds { round_ms: 21840, round_ms_recent: vec![19300; 10] });
+        let (text, slow) = lines(&root);
+        assert!(
+            text.contains(
+                "[warn] ticker round: last 21840ms, median of 10 19300ms (TICK 15000ms) — over the 15000ms TICK; set HP_TICK_TIMINGS=1 for the per-stage breakdown"
+            ),
+            "{text}"
+        );
+        assert_eq!(slow, healthy, "a slow round does not fail doctor");
     }
 }
