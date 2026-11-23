@@ -2060,6 +2060,9 @@ fn tick_slow(ctx: &Ctx, project: &Project, seen: &Seen, memory: &mut Memory, log
             ));
         }
         errors.extend(nopr.errors);
+        for line in &nopr.branches {
+            log.line(&format!("{}: {line}", project.slug));
+        }
         errors.extend(steps::auto_resolve(ctx, project, &settings, memory, now));
     }
     // Backstop for inbox items whose thread is long resolved: they can no

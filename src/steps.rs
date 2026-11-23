@@ -1644,6 +1644,10 @@ pub fn auto_resolve(ctx: &Ctx, project: &Project, settings: &Settings, memory: &
 pub struct NoprPass {
     pub resolved: Vec<String>,
     pub errors: Vec<anyhow::Error>,
+    /// One line per thread whose empty branch was looked at: the branch it
+    /// deleted, or the warning why the branch stayed (never an error: the
+    /// thread is resolved either way).
+    pub branches: Vec<String>,
 }
 
 /// The second automatic close (`PROJECT.md`'s `auto_resolve_nopr`): a thread
@@ -1671,7 +1675,10 @@ pub struct NoprPass {
 /// nothing, not even a git call. The resolve is the ordinary one
 /// ([`resolve_after_copy`], reason `auto-nopr`), so the final copy, the
 /// worktree, the branch, the tab and the item are the ones a person would get
-/// from `thread resolve`.
+/// from `thread resolve`. The one addition ([`delete_empty_branch`]): a
+/// `worktree` thread's local branch has nothing on it by construction, so it is
+/// deleted after the resolve instead of being left behind; a branch git refuses
+/// to delete is kept with one warning line, never as an error.
 pub fn auto_resolve_nopr(ctx: &Ctx, project: &Project, settings: &Settings, state: &mut State, now: jiff::Timestamp) -> NoprPass {
     let mut pass = NoprPass::default();
     let Some(window) = settings.auto_resolve_nopr.secs() else {
@@ -1706,6 +1713,11 @@ pub fn auto_resolve_nopr(ctx: &Ctx, project: &Project, settings: &Settings, stat
         }
         match resolve_after_copy(ctx, project, &t, "auto-nopr", String::new()) {
             Ok(_) => {
+                // The ordinary resolve keeps a branch no pull request vouched
+                // for; this thread never had one, so the empty branch it leaves
+                // is collected with it. After the resolve, because only then is
+                // the worktree out of the way of `git branch -D`.
+                pass.branches.extend(delete_empty_branch(ctx, &t));
                 state.nopr_steady.remove(&t.id);
                 state.nopr_resolved.insert(t.id.clone());
                 pass.resolved.push(t.id.clone());
@@ -1714,6 +1726,36 @@ pub fn auto_resolve_nopr(ctx: &Ctx, project: &Project, settings: &Settings, stat
         }
     }
     pass
+}
+
+/// After the resolve: delete the local branch of a `worktree` thread when it
+/// carries no commit of its own (`<base>..<branch>` is empty) — the one thing
+/// the ordinary resolve leaves behind, because it only deletes a branch its
+/// merged pull request vouched for. Local only: a remote branch is never
+/// touched, and a branch with anything on it is kept.
+///
+/// A failure is not an error. The branch may be checked out in another
+/// worktree (the usual reason git refuses), and the thread is resolved either
+/// way, so the caller gets one line to log: the deletion, or a warning naming
+/// what git said. `None` when there is no branch to judge or git cannot answer
+/// — a branch already gone is not news.
+fn delete_empty_branch(ctx: &Ctx, t: &Thread) -> Option<String> {
+    if t.kind != Kind::Worktree || t.base.is_empty() || t.branch.is_empty() {
+        return None;
+    }
+    let range = format!("{}..{}", t.base, t.branch);
+    match git_text(ctx, &t.repo, &["rev-list", "--count", &range]).and_then(|text| text.parse::<usize>().ok()) {
+        Some(0) => {}
+        // A commit of its own is work, kept silently; no answer at all is kept
+        // silently too (nothing to report, and never a guess).
+        _ => return None,
+    }
+    let what = format!("the empty branch {} (no commits of its own)", t.branch);
+    match ctx.runner.run(&crate::runner::Cmd::new("git", NOPR_GIT_TIMEOUT).args(["-C", &t.repo, "branch", "-D", &t.branch])) {
+        Ok(out) if out.success() => Some(format!("{}: deleted {what}", t.id)),
+        Ok(out) => Some(format!("{}: warning: kept {what}: {}", t.id, out.error_text())),
+        Err(error) => Some(format!("{}: warning: kept {what}: {error:#}", t.id)),
+    }
 }
 
 /// Condition 3: the thread never opened a pull request. A `pr_state` of `open`
@@ -3010,6 +3052,13 @@ mod tests {
         assert!(out.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&out.stderr));
     }
 
+    /// Whether the local branch is still there (a remote is never asked).
+    fn branch_exists(repo: &std::path::Path, branch: &str) -> bool {
+        let out = std::process::Command::new("git").arg("-C").arg(repo).args(["branch", "--list", branch]).output().unwrap();
+        assert!(out.status.success(), "git branch --list {branch}");
+        !out.stdout.iter().all(u8::is_ascii_whitespace)
+    }
+
     /// A real repository with one commit on `base`, and a worktree of its own
     /// on a thread branch: the shape a `worktree` thread is resolved from.
     fn repo_with_worktree() -> (tempfile::TempDir, std::path::PathBuf, std::path::PathBuf) {
@@ -3155,6 +3204,7 @@ mod tests {
         git_run(&worktree, &["commit", "-qm", "work"]);
         let mut state = State::default();
         assert!(auto_resolve_nopr(&ctx, &project, &settings, &mut state, at(now)).resolved.is_empty());
+        assert!(branch_exists(&repo, "hp/demo/t-0001-test"), "a branch with a commit of its own is work and stays");
 
         // Nothing committed, but something uncommitted is just as much work.
         git_run(&worktree, &["reset", "-q", "--hard", "base"]);
@@ -3163,14 +3213,48 @@ mod tests {
         let mut state = State::default();
         assert!(auto_resolve_nopr(&ctx, &project, &settings, &mut state, at(now)).resolved.is_empty());
 
-        // Clean and uncommitted-nothing: this one is collected, and its folder
-        // is gone afterwards.
+        // Clean and uncommitted-nothing: this one is collected, its folder is
+        // gone afterwards, and so is the empty branch it left behind.
         std::fs::remove_file(worktree.join("work.txt")).unwrap();
         let mut state = State::default();
         let pass = auto_resolve_nopr(&ctx, &project, &settings, &mut state, at(now));
         assert_eq!(pass.resolved, [committed.id.clone()], "{:#?}", pass.errors);
         assert!(!worktree.exists(), "the worktree is removed");
         assert_eq!(thread::load(&project, &committed.id).unwrap().resolved_reason, "auto-nopr");
+        assert!(!branch_exists(&repo, "hp/demo/t-0001-test"), "the empty branch goes with the thread");
+        assert_eq!(pass.branches.len(), 1, "{:#?}", pass.branches);
+        assert!(pass.branches[0].contains("deleted the empty branch hp/demo/t-0001-test"), "{}", pass.branches[0]);
+    }
+
+    /// A branch git will not delete (checked out in another worktree) is a
+    /// warning line, never an error: the thread is still resolved, the branch
+    /// stays, and no remote is touched.
+    #[test]
+    fn a_branch_git_refuses_to_delete_is_a_warning_not_a_failure() {
+        let (home, repo, worktree) = repo_with_worktree();
+        let root = home.path().join("root");
+        let project = project::create(&root, "demo", vec![]).unwrap();
+        let settings = Settings { auto_resolve_nopr: crate::project::NoprWindow::Minutes(15), ..Default::default() };
+        let env = crate::paths::Env::for_test(home.path(), &[]);
+        let runner = crate::runner::RealRunner;
+        let ctx = Ctx { env: &env, root, config_dir: home.path().join("cfg"), runner: &runner, detached_ticker: false };
+
+        // The thread's worktree is a detached one below `base` (nothing on it),
+        // and its branch is checked out in the repository's own worktree, so
+        // `git branch -D` has to refuse once the thread's worktree is gone.
+        git_run(&repo, &["worktree", "remove", worktree.to_str().unwrap()]);
+        git_run(&repo, &["worktree", "add", "-q", "--detach", worktree.to_str().unwrap(), "base"]);
+        git_run(&repo, &["checkout", "-q", "hp/demo/t-0001-test"]);
+        let t = worktree_waiting(&project, &repo, &worktree);
+
+        let mut state = State::default();
+        let pass = auto_resolve_nopr(&ctx, &project, &settings, &mut state, at("2026-11-23T10:30:00Z"));
+        assert_eq!(pass.resolved, [t.id.clone()], "the thread is resolved either way: {:#?}", pass.errors);
+        assert!(pass.errors.is_empty(), "a refused deletion is not an error: {:#?}", pass.errors);
+        assert_eq!(thread::load(&project, &t.id).unwrap().status, Status::Resolved);
+        assert!(branch_exists(&repo, "hp/demo/t-0001-test"), "the branch git would not delete stays");
+        assert_eq!(pass.branches.len(), 1, "{:#?}", pass.branches);
+        assert!(pass.branches[0].contains("warning: kept the empty branch hp/demo/t-0001-test"), "{}", pass.branches[0]);
     }
 
     /// Off is the default and the whole promise of "nothing changes": no
