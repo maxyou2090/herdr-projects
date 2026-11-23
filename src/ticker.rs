@@ -2047,6 +2047,19 @@ fn tick_slow(ctx: &Ctx, project: &Project, seen: &Seen, memory: &mut Memory, log
     timings.stage(slug, "routines");
     errors.extend(routine_pass(project, &mut state, seen.coordinator));
     if let Ok((settings, _)) = project.read_project_md() {
+        // First the close a reader is likelier to be surprised by (a thread
+        // that produced nothing, resolved after `auto_resolve_nopr`), then the
+        // week-long idle rule.
+        let nopr = steps::auto_resolve_nopr(ctx, project, &settings, &mut state, now);
+        if !nopr.resolved.is_empty() {
+            log.line(&format!(
+                "{}: resolved {} automatically (no pull request, no commit of its own, its report unchanged for {}): `auto_resolve_nopr`",
+                project.slug,
+                nopr.resolved.join(", "),
+                settings.auto_resolve_nopr
+            ));
+        }
+        errors.extend(nopr.errors);
         errors.extend(steps::auto_resolve(ctx, project, &settings, memory, now));
     }
     // Backstop for inbox items whose thread is long resolved: they can no

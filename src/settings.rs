@@ -11,11 +11,12 @@ use crate::paths::Ctx;
 use crate::project::{self, Project, Settings};
 
 /// The keys `set` accepts, with what they hold.
-pub const KEYS: [(&str, &str); 9] = [
+pub const KEYS: [(&str, &str); 10] = [
     ("name", "text"),
     ("coordinator_profile", "profile name"),
     ("thread_profile", "profile name"),
     ("auto_resolve_days", "number (0 = never)"),
+    ("auto_resolve_nopr", "15m, 30m or off"),
     ("nudge", "true/false"),
     ("coordinator_turn_limit", "20m, 5m or off"),
     ("base", "git ref a worktree thread starts from"),
@@ -93,6 +94,10 @@ pub fn set_in(text: &str, key: &str, value: &str) -> Result<String> {
             doc[key] = toml_edit::value(n);
         }
         "nudge" => doc[key] = toml_edit::value(parse_bool(value)?),
+        "auto_resolve_nopr" => {
+            let window = crate::project::NoprWindow::parse(value).map_err(|why| anyhow::anyhow!(why))?;
+            doc[key] = toml_edit::value(window.text());
+        }
         "coordinator_turn_limit" => {
             let limit = crate::project::TurnLimit::parse(value).map_err(|why| anyhow::anyhow!(why))?;
             doc[key] = toml_edit::value(limit.text());
@@ -280,6 +285,15 @@ mod tests {
         assert_eq!(project::parse_project_md(&set_in(MD, "coordinator_turn_limit", "5m").unwrap()).unwrap().0.coordinator_turn_limit.secs(), Some(300));
         assert!(set_in(MD, "coordinator_turn_limit", "abc").is_err());
         assert!(set_in(MD, "coordinator_turn_limit", "0m").is_err());
+        // `auto_resolve_nopr` is the same shape (`15m`, `off`), and off is the
+        // default: a project that never sets it reads as off.
+        let nopr = set_in(MD, "auto_resolve_nopr", "15m").unwrap();
+        assert!(nopr.contains("auto_resolve_nopr = \"15m\""), "{nopr}");
+        assert_eq!(project::parse_project_md(&nopr).unwrap().0.auto_resolve_nopr.secs(), Some(900));
+        assert_eq!(project::parse_project_md(&set_in(&nopr, "auto_resolve_nopr", "off").unwrap()).unwrap().0.auto_resolve_nopr, crate::project::NoprWindow::Off);
+        assert_eq!(project::parse_project_md(MD).unwrap().0.auto_resolve_nopr, crate::project::NoprWindow::Off, "unset reads as off");
+        assert!(set_in(MD, "auto_resolve_nopr", "soon").is_err());
+        assert!(set_in(MD, "auto_resolve_nopr", "0m").is_err());
         // `base` is the ref a worktree thread starts from: a ref, so no
         // whitespace, and never empty — the line is the setting, and removing
         // it is a hand edit.

@@ -143,6 +143,11 @@ pub struct Settings {
     #[serde(alias = "thread_agent")]
     pub thread_profile: String,
     pub auto_resolve_days: u32,
+    /// How long a thread that produced nothing (no pull request, no commit of
+    /// its own, a report nobody changed) must sit still before the ticker
+    /// resolves it (`15m`, `90m`, `off`). See [`NoprWindow`].
+    #[serde(default, skip_serializing_if = "nopr_is_off")]
+    pub auto_resolve_nopr: NoprWindow,
     pub nudge: bool,
     /// How long one turn of the project's own coordinator may run before the
     /// ticker interrupts it (`20m`, `5m`, `off`). See [`TurnLimit`].
@@ -226,6 +231,90 @@ impl std::fmt::Display for TurnLimit {
     }
 }
 
+/// `auto_resolve_nopr` in PROJECT.md: how long a thread that produced nothing
+/// waits before the ticker resolves it by itself.
+///
+/// "Produced nothing" is a hard test (§[`crate::steps::auto_resolve_nopr`]):
+/// no pull request, no commit on a branch of its own, a clean worktree, a
+/// report that has not changed, an agent that is not working. The threads it
+/// is for are the smoke tests, checks and investigations that end with a
+/// report and nothing else — they used to sit in `Idle` until a person
+/// resolved them by hand or `auto_resolve_days` (a week) passed.
+///
+/// `off` — the default — leaves every project exactly as it was: no record,
+/// no git call, no item. Fifteen minutes is the value to start with: a thread
+/// that lands a commit or opens a pull request a quarter of an hour after its
+/// report is a shape nobody has seen, and `thread resolve --reopen` undoes a
+/// resolve in one command.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NoprWindow {
+    /// `off`: nothing is resolved by this rule.
+    Off,
+    /// Minutes, from the `15m` shape.
+    Minutes(i64),
+}
+
+impl Default for NoprWindow {
+    fn default() -> Self {
+        NoprWindow::Off
+    }
+}
+
+impl NoprWindow {
+    /// Parses `off` or `<minutes>m`. Minutes only, like [`TurnLimit`]: `15`
+    /// without a unit reads as an absolute time as easily as a duration.
+    pub fn parse(text: &str) -> Result<NoprWindow, String> {
+        let text = text.trim();
+        if text.eq_ignore_ascii_case("off") {
+            return Ok(NoprWindow::Off);
+        }
+        let Some(minutes) = text.strip_suffix('m').and_then(|n| n.trim().parse::<i64>().ok()) else {
+            return Err(format!("`{text}` is not an auto_resolve_nopr; write `15m` or `off`"));
+        };
+        if !(1..=1440).contains(&minutes) {
+            return Err(format!("`{text}` is not an auto_resolve_nopr; write 1m to 1440m, or `off`"));
+        }
+        Ok(NoprWindow::Minutes(minutes))
+    }
+
+    /// How long the report must stand still, `None` for `off`.
+    pub fn secs(self) -> Option<i64> {
+        match self {
+            NoprWindow::Off => None,
+            NoprWindow::Minutes(minutes) => Some(minutes * 60),
+        }
+    }
+
+    /// What PROJECT.md says, so a rewrite keeps the same value.
+    pub fn text(self) -> String {
+        match self {
+            NoprWindow::Off => "off".into(),
+            NoprWindow::Minutes(minutes) => format!("{minutes}m"),
+        }
+    }
+}
+
+impl std::fmt::Display for NoprWindow {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.text())
+    }
+}
+
+impl Serialize for NoprWindow {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error> {
+        serializer.serialize_str(&self.text())
+    }
+}
+
+impl<'de> Deserialize<'de> for NoprWindow {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> std::result::Result<NoprWindow, D::Error> {
+        let text = String::deserialize(deserializer)?;
+        // A bad value is a `config-error` item, never a panic and never a
+        // silent fallback to a window the project did not ask for.
+        NoprWindow::parse(&text).map_err(serde::de::Error::custom)
+    }
+}
+
 impl Serialize for TurnLimit {
     fn serialize<S: serde::Serializer>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error> {
         serializer.serialize_str(&self.text())
@@ -242,6 +331,10 @@ impl<'de> Deserialize<'de> for TurnLimit {
     }
 }
 
+fn nopr_is_off(window: &NoprWindow) -> bool {
+    *window == NoprWindow::Off
+}
+
 impl Default for Settings {
     fn default() -> Self {
         Settings {
@@ -249,6 +342,7 @@ impl Default for Settings {
             coordinator_profile: "claude".into(),
             thread_profile: "claude".into(),
             auto_resolve_days: 7,
+            auto_resolve_nopr: NoprWindow::Off,
             // On by default (W15): the ticker prompts only a coordinator that
             // has been idle for a quarter minute and whose input box has looked
             // empty for ten seconds, because on herdr 0.9.1 a prompt merges with
