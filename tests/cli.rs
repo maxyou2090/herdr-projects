@@ -476,3 +476,63 @@ fn the_old_kind_names_still_work_and_say_so() {
         assert!(!err.contains(&format!("`{old}` is not a thread kind")), "`--kind {old}` is not refused: {err}");
     }
 }
+
+/// An on-request profile (`on_request = true`) is the user's to name: no
+/// project's allow-list has to carry it, and nothing else may pick it — not
+/// the project default, not `open`, not a task owner. `context` says all of
+/// this on its own line (t-0088).
+#[test]
+fn an_on_request_profile_is_listed_apart_and_never_a_default_or_an_owner() {
+    let home = tempfile::tempdir().unwrap();
+    let cfg = home.path().join(".config/herdr-projects");
+    std::fs::create_dir_all(&cfg).unwrap();
+    std::fs::write(
+        cfg.join("config.toml"),
+        "[profiles.sol]\nagent = \"codex\"\nmodel = \"gpt-6.2-sol\"\neffort = \"medium\"\ndescription = \"Sol at medium effort\"\non_request = true\n\n[profiles.luna]\nagent = \"omp\"\ndescription = \"Cheap tier\"\n\n[defaults]\nthread_profile = \"luna\"\ncoordinator_profile = \"luna\"\n\n[safety.default]\nthread_profiles = [\"luna\"]\ncoordinator_profiles = [\"luna\"]\n",
+    )
+    .unwrap();
+    let root = home.path().join("root");
+    let root_arg = root.to_str().unwrap();
+    assert!(hp(home.path(), &["--root", root_arg, "new", "demo"]).status.success());
+
+    // `context`: its own line, and the ordinary list is untouched.
+    let out = hp(home.path(), &["--root", root_arg, "context", "demo", "--peek"]);
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    let text = String::from_utf8(out.stdout).unwrap();
+    let line = text.lines().find(|l| l.starts_with("On request only:")).unwrap_or_else(|| panic!("no on-request line: {text}"));
+    assert!(line.contains("sol (codex gpt-6.2-sol, medium) — Sol at medium effort"), "{line}");
+    assert!(!line.contains("luna"), "{line}");
+    assert!(text.contains("- luna: omp · default model — Cheap tier"), "{text}");
+    assert!(text.contains("Assignable (agent owners): luna"), "{text}");
+
+    // `profile list` marks it at the end of its line.
+    let out = hp(home.path(), &["--root", root_arg, "profile", "list"]);
+    let text = String::from_utf8(out.stdout).unwrap();
+    let line = text.lines().find(|l| l.trim_start().starts_with("sol ")).unwrap_or_else(|| panic!("no `sol` line: {text}"));
+    assert!(line.trim_end().ends_with("· on request"), "{line}");
+    assert!(!text.lines().any(|l| l.trim_start().starts_with("luna ") && l.contains("on request")), "{text}");
+
+    // Never a default, not even by a coordinator's own hand.
+    let out = hp(home.path(), &["--root", root_arg, "set", "demo", "thread_profile", "sol"]);
+    assert!(!out.status.success(), "an on-request profile cannot be a project default");
+    assert!(String::from_utf8_lossy(&out.stderr).contains("is not allowed for threads"), "{}", String::from_utf8_lossy(&out.stderr));
+
+    // Never an owner.
+    let out = hp(home.path(), &["--root", root_arg, "task", "add", "demo", "Backlog", "Do a thing", "--owner", "sol"]);
+    assert!(!out.status.success(), "an on-request profile cannot own a task");
+    assert!(String::from_utf8_lossy(&out.stderr).contains("`sol` is on request only"), "{}", String::from_utf8_lossy(&out.stderr));
+    assert!(!root.join("demo/TASKS.md").exists() || !std::fs::read_to_string(root.join("demo/TASKS.md")).unwrap().contains("Do a thing"));
+    assert!(hp(home.path(), &["--root", root_arg, "task", "add", "demo", "Backlog", "Do another thing"]).status.success());
+    let out = hp(home.path(), &["--root", root_arg, "task", "thread", "demo", "Do another thing", "t-0001", "--owner", "sol"]);
+    assert!(!out.status.success(), "an on-request profile cannot own a task");
+    assert!(String::from_utf8_lossy(&out.stderr).contains("`sol` is on request only"), "{}", String::from_utf8_lossy(&out.stderr));
+    // `assignable --check` refuses it too.
+    let out = hp(home.path(), &["--root", root_arg, "assignable", "demo", "--check", "sol"]);
+    assert!(!out.status.success(), "`assignable --check` refuses an on-request profile");
+    assert!(String::from_utf8_lossy(&out.stderr).contains("assignable: luna"), "{}", String::from_utf8_lossy(&out.stderr));
+
+    // A coordinator may not be opened with it.
+    let out = hp(home.path(), &["--root", root_arg, "open", "demo", "--profile", "sol"]);
+    assert!(!out.status.success(), "an on-request profile is not for coordinators");
+    assert!(String::from_utf8_lossy(&out.stderr).contains("is not allowed for the coordinator"), "{}", String::from_utf8_lossy(&out.stderr));
+}
