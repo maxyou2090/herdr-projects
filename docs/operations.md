@@ -65,6 +65,27 @@ no extra call. To measure the real root without disturbing it, stop its ticker,
 run `HP_TICK_TIMINGS=1 hp --root ~/.herdr-projects ticker run` in the foreground
 for a few rounds, then `hp ticker start`.
 
+The per-stage breakdown is the *second* question. The first — how long is a round
+at all — is always recorded, with no environment variable: every round writes its
+milliseconds to `<root>/.state/ticker.json` (`round_ms` and `round_ms_recent`, the
+last ten, oldest dropped), and `hp doctor` and `hp ticker status` print the same
+line from that file:
+
+```
+[ok  ] ticker round: last 93ms, median of 10 110ms (TICK 15000ms)
+[warn] ticker round: last 21840ms, median of 10 19300ms (TICK 15000ms) — over the
+       15000ms TICK; set HP_TICK_TIMINGS=1 for the per-stage breakdown
+[ok  ] ticker round: no round recorded yet
+```
+
+A last round over `TICK`, or a median over it, is a `[warn]`: news about a loop
+that cannot keep up (every start, brief and nudge then waits for the next round),
+never a `FAIL`, and never a reason for `doctor` to exit unhealthy. With no file —
+a fresh root, or a ticker that has not finished a round — the line says so rather
+than print a zero. The file is per root, not per project, because a round is one
+pass over every project under the root; each project's own `.state/ticker.json`
+stays what it was.
+
 ## Where things live
 
 ```
@@ -97,6 +118,7 @@ for a few rounds, then `hp ticker start`.
   .state/ticker.json      ticker state; with lanes, `nudged`, `renudged_at`, `box_pane` and
                           `box_empty_since` are maps keyed by lane id instead of one value
 ~/.herdr-projects/.ticker.lock  .ticker.log  .progress/  .trash/
+~/.herdr-projects/.state/ticker.json            how long the last rounds took (read by doctor and ticker status)
 
 herdr:  <display name>            the project's own Space, with the `coordinator` tab
         <display name> Threads    one Space for every thread, a `t-00xx` tab each

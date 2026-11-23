@@ -155,6 +155,107 @@ fn log_path(root: &Path) -> PathBuf {
     root.join(".ticker.log")
 }
 
+/// How many rounds [`Rounds::round_ms_recent`] keeps: enough for a median that
+/// one slow round cannot move, short enough that the file stays a few lines.
+pub const ROUNDS_KEPT: usize = 10;
+
+/// `<root>/.state/ticker.json`: what the last rounds cost.
+///
+/// One file per root, not per project: a round is one pass over every project
+/// under the root, and `TICK` is the loop's own 15 seconds, so the number is
+/// about the loop and not about any one project. Each project's own
+/// `.state/ticker.json` stays what it always was (what that project compares
+/// against last tick). Written once per round, next to the round's line in
+/// `.ticker.log` and without `HP_TICK_TIMINGS` having to be on.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Rounds {
+    /// The last round, in milliseconds.
+    pub round_ms: u64,
+    /// The last [`ROUNDS_KEPT`] rounds, oldest first, for the median. Missing
+    /// in a file written before this existed, which reads as no history.
+    pub round_ms_recent: Vec<u64>,
+}
+
+pub fn rounds_path(root: &Path) -> PathBuf {
+    root.join(".state").join("ticker.json")
+}
+
+/// The rounds recorded for `root`; the default (no round yet) when the file is
+/// missing, unreadable or older than these fields. Never an error: `doctor`
+/// asks a root that may have no ticker at all.
+pub fn load_rounds(root: &Path) -> Rounds {
+    crate::project::read_json(&rounds_path(root)).unwrap_or_default()
+}
+
+/// Records one round: one read, one write, in the same 15-second beat as
+/// `tick_at` (no `Instant::now()` and no file of its own).
+fn record_round(root: &Path, took: Duration) -> Result<Rounds> {
+    let mut rounds = load_rounds(root);
+    let ms = u64::try_from(took.as_millis()).unwrap_or(u64::MAX);
+    rounds.round_ms = ms;
+    rounds.round_ms_recent.push(ms);
+    let excess = rounds.round_ms_recent.len().saturating_sub(ROUNDS_KEPT);
+    rounds.round_ms_recent.drain(..excess);
+    let path = rounds_path(root);
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
+    crate::project::write_json(&path, &rounds)?;
+    Ok(rounds)
+}
+
+fn median_of(values: &[u64]) -> u64 {
+    if values.is_empty() {
+        return 0;
+    }
+    let mut sorted = values.to_vec();
+    sorted.sort_unstable();
+    let middle = sorted.len() / 2;
+    if sorted.len().is_multiple_of(2) { (sorted[middle - 1] + sorted[middle]) / 2 } else { sorted[middle] }
+}
+
+/// How the last rounds look against the `TICK` the loop must keep up with.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RoundHealth {
+    /// No round recorded: a fresh root, or a ticker that has not finished one.
+    /// Not a zero-millisecond round, and said as such.
+    NoData,
+    Fine,
+    /// The last round, or the median of the recent ones, is over the tick.
+    Slow,
+}
+
+/// The one line about round times: `doctor` prints it as `ticker round` and
+/// `ticker status` as `round`, so the two can never disagree.
+pub fn round_line(root: &Path) -> (RoundHealth, String) {
+    rounds_line(&load_rounds(root))
+}
+
+pub fn rounds_line(rounds: &Rounds) -> (RoundHealth, String) {
+    let recent = &rounds.round_ms_recent;
+    // No file, or one written before this existed: say so rather than print a
+    // zero that would read as a very fast round.
+    if recent.is_empty() && rounds.round_ms == 0 {
+        return (RoundHealth::NoData, "no round recorded yet".to_string());
+    }
+    let last = rounds.round_ms;
+    let median = if recent.is_empty() { last } else { median_of(recent) };
+    let tick = u64::try_from(TICK.as_millis()).unwrap_or(u64::MAX);
+    let mut text = format!("last {last}ms");
+    if !recent.is_empty() {
+        text.push_str(&format!(", median of {} {median}ms", recent.len()));
+    }
+    text.push_str(&format!(" (TICK {tick}ms)"));
+    let over = last > tick || median > tick;
+    if over {
+        text.push_str(&format!(
+            " — over the {tick}ms TICK; set {TIMINGS_VAR}=1 for the per-stage breakdown"
+        ));
+    }
+    (if over { RoundHealth::Slow } else { RoundHealth::Fine }, text)
+}
+
 /// What the lock holder writes into the lock file, for `ticker status` and
 /// `doctor`. The pid is for display only; nothing signals it.
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
@@ -821,6 +922,8 @@ fn status_with(ctx: &Ctx, wait: Duration) -> Result<()> {
             }
         }
     }
+    let (_, round) = round_line(&ctx.root);
+    println!("round:  {round}");
     let agent = status_agent(ctx, wait);
     if !agent.is_empty() {
         println!("{agent}");
@@ -1073,11 +1176,14 @@ fn run_logged(ctx: &Ctx, log: &Log) -> Result<()> {
                 // Timed like a tick when `HP_TICK_TIMINGS` asks: a brief pass
                 // that reads every project's threads is part of what a person
                 // waits for after `thread start`.
-                let at = Instant::now();
                 brief_timings.stage("brief", "pass");
                 briefs = brief_pass(ctx, log);
                 brief_timings.stop();
-                for line in brief_timings.drain(Some(at.elapsed())) {
+                // No round line: a brief pass is not a round, and its own line
+                // already carries its wall time. Printing "timings round" here
+                // put a second, much smaller number under the same word as the
+                // tick's round, which is the number `doctor` now reports.
+                for line in brief_timings.drain(None) {
                     log.line(&line);
                 }
                 next_brief = Instant::now() + BRIEF_POLL;
@@ -1165,8 +1271,15 @@ pub fn tick_with(ctx: &Ctx, log: &Log, memory: &mut Memory, timings: &mut Timing
     timings.stop();
     crate::core::view::end();
     crate::app::end();
-    for line in timings.drain(Some(round_at.elapsed())) {
+    let took = round_at.elapsed();
+    for line in timings.drain(Some(took)) {
         log.line(&line);
+    }
+    // The standing measurement: no `HP_TICK_TIMINGS`, one small write per round,
+    // so `doctor` and `ticker status` can answer "how long is a round" without
+    // anybody having planned ahead to ask.
+    if let Err(error) = record_round(&ctx.root, took) {
+        log.line(&format!("the round's own time was not recorded: {error:#}"));
     }
     any_reachable
 }
@@ -2680,6 +2793,73 @@ mod tests {
         assert!(loud.contains("timings demo: "), "a line per project: {loud}");
         assert!(loud.contains("(load "), "with its stages: {loud}");
         assert!(loud.lines().any(|line| line.contains("timings round: ")), "and one for the round: {loud}");
+
+        // The same round, in the file `doctor` and `ticker status` read, and
+        // without `HP_TICK_TIMINGS` having been asked for it: this round only
+        // went through `Timings::on` because a test wanted the lines, and the
+        // standing measurement is not the switch's business.
+        let rounds = load_rounds(&root);
+        let printed: u64 = loud
+            .lines()
+            .find_map(|line| line.split_once("timings round: ").map(|(_, rest)| rest))
+            .and_then(|rest| rest.strip_suffix("ms"))
+            .unwrap()
+            .parse()
+            .unwrap();
+        assert_eq!(rounds.round_ms, printed, "the file says what the round printed: {rounds:?}");
+        assert_eq!(rounds.round_ms_recent.last(), Some(&rounds.round_ms), "{rounds:?}");
+        assert!(rounds.round_ms_recent.len() >= 2, "every round is kept, not only timed ones: {rounds:?}");
+    }
+
+    /// The standing measurement, with no ticker and no environment variable:
+    /// an old file reads as "no round yet", every round is kept once, and only
+    /// the last ten stay.
+    #[test]
+    fn every_round_is_remembered_and_only_the_last_ten() {
+        let home = tempfile::tempdir().unwrap();
+        let root = home.path().join("root");
+        std::fs::create_dir(&root).unwrap();
+        assert_eq!(load_rounds(&root), Rounds::default(), "no file, no round");
+        assert_eq!(round_line(&root), (RoundHealth::NoData, "no round recorded yet".to_string()));
+
+        // A file written before these fields existed — or a project's own
+        // `.state/ticker.json` — still reads: it simply has no round in it.
+        std::fs::create_dir_all(root.join(".state")).unwrap();
+        std::fs::write(rounds_path(&root), "{\n  \"tick_at\": \"20261101T000000Z\"\n}\n").unwrap();
+        assert_eq!(load_rounds(&root), Rounds::default());
+        assert_eq!(round_line(&root).1, "no round recorded yet");
+
+        for ms in 1..=12u64 {
+            record_round(&root, Duration::from_millis(ms * 100)).unwrap();
+        }
+        let rounds = load_rounds(&root);
+        assert_eq!(rounds.round_ms, 1200, "the last round");
+        assert_eq!(rounds.round_ms_recent, (3..=12).map(|ms| ms * 100).collect::<Vec<u64>>(), "the oldest two dropped");
+        assert_eq!(rounds.round_ms_recent.len(), ROUNDS_KEPT);
+    }
+
+    /// What `doctor` and `ticker status` print, and what counts as slow: the
+    /// last round or the median of the last ten, against the loop's own tick.
+    #[test]
+    fn a_round_over_the_tick_is_a_warning_with_the_way_to_the_stages() {
+        let normal = Rounds { round_ms: 93, round_ms_recent: vec![110; 10] };
+        assert_eq!(rounds_line(&normal), (RoundHealth::Fine, "last 93ms, median of 10 110ms (TICK 15000ms)".to_string()));
+        // An even count is the mean of the two middles, so one slow round
+        // cannot claim the median by itself.
+        assert!(rounds_line(&Rounds { round_ms: 10, round_ms_recent: vec![1, 2, 3, 4] }).1.contains("median of 4 2ms"));
+
+        let slow = Rounds { round_ms: 21840, round_ms_recent: vec![19300; 10] };
+        let (health, text) = rounds_line(&slow);
+        assert_eq!(health, RoundHealth::Slow, "over the tick is a warning: {text}");
+        assert_eq!(
+            text,
+            format!("last 21840ms, median of 10 19300ms (TICK 15000ms) — over the 15000ms TICK; set {TIMINGS_VAR}=1 for the per-stage breakdown")
+        );
+        // Either half over the tick means the loop cannot keep up: a slow last
+        // round, and a median that stays slow while the last round was quick.
+        assert_eq!(rounds_line(&Rounds { round_ms: 16000, round_ms_recent: vec![16000, 100, 100, 100] }).0, RoundHealth::Slow);
+        assert_eq!(rounds_line(&Rounds { round_ms: 900, round_ms_recent: vec![100, 21000, 21000, 21000] }).0, RoundHealth::Slow);
+        assert_eq!(rounds_line(&Rounds { round_ms: 15000, round_ms_recent: vec![15000] }).0, RoundHealth::Fine, "exactly the tick still keeps up");
     }
 
     #[test]
