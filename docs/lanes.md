@@ -1044,8 +1044,9 @@ Explicitly out of scope for plan B:
 - **Memory partitioning (plan C).** Today `thread::brief_for` (`src/thread.rs`)
   inlines the whole `MEMORY.md` plus every `memory/*.md` (except index-only ones
   such as `memory/decisions.md`) into every brief, capped at
-  `MEMORY_CAP_CHARS = 32_000` (`src/thread.rs`; the cap is applied inside
-  `brief_for`). `law` is at 14 KB of `MEMORY.md` and 29 memory files, so a
+  `MEMORY_CAP_BYTES = 30_000` bytes since 2026-11-23 (before that, 32_000
+  characters — about 96 KB under Chinese) (`src/thread.rs`; the cap is applied
+  inside `brief_for`). `law` is at 14 KB of `MEMORY.md` and 29 memory files, so a
   lane-specific memory split (e.g. `memory/<lane>/` or a `lane:` tag on each
   file) is where this goes next —
   including the "not inlined because over the cap" line in `brief_for` (`src/thread.rs`),
