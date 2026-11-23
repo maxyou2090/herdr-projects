@@ -84,7 +84,13 @@ const NUDGE_SUBJECTS: usize = 5;
 /// each standing finding once, so without this reminder that one item could
 /// sit unread for days.
 const RE_NUDGE_KINDS: [&str; 3] = ["thread-state", "routine", AUDIT_KIND];
-pub const PR_INTERVAL_SECS: i64 = 120;
+/// How often the ticker asks `gh` about a project's pull requests. Five
+/// minutes, not two: a pull request's state may lag five minutes without
+/// anybody acting on a stale fact, while one `gh pr list` costs 2–8 seconds of
+/// network and the check only runs for a project whose origin is github.com and
+/// whose open threads name no pull request yet — the one stage that could still
+/// stretch a ticker round to its worst case. Widened 120 → 300 on 2026-11-23.
+pub const PR_INTERVAL_SECS: i64 = 300;
 /// A merged thread whose agent is not busy, reports no progress and wrote no
 /// report since the merge is resolved after this long.
 pub const MERGE_GRACE_SECS: i64 = 600;
@@ -1217,7 +1223,8 @@ pub fn write_coordinator_lost_items(project: &Project, state: &mut State, lost: 
     Ok(())
 }
 
-/// Step 2, every two minutes.
+/// Step 2, every five minutes ([`PR_INTERVAL_SECS`]): a pull request may lag
+/// that long, and asking `gh` more often is what made a round long.
 /// What happened to a pull request between two polls, in the words `pr`
 /// routines use: opened, checks-failed, review, merged.
 pub fn pr_events(old: Option<&pr::Summary>, new: &pr::Summary, own_login: Option<&str>) -> Vec<&'static str> {
@@ -2714,6 +2721,30 @@ mod tests {
         let prompt = pr_routine_prompt("pr-followup", "Fix it.", "https://github.com/o/r/pull/4", &["checks-failed"], &failing);
         assert_eq!(prompt, "[hp routine pr-followup] Your pull request https://github.com/o/r/pull/4 changed: 1 check(s) fail (`gh pr checks https://github.com/o/r/pull/4`).\n\nFix it.");
         assert!(!prompt.contains("lint"), "check names are GitHub text and never reach a prompt");
+    }
+
+    /// The pull-request check runs on its own clock: still skipped one tick
+    /// short of five minutes, run once five minutes have passed. Nothing about
+    /// it may depend on the network: a project with no open threads asks `gh`
+    /// nothing, so the only evidence is whether the clock moved.
+    #[test]
+    fn the_pull_request_check_waits_five_minutes_and_then_runs() {
+        let root = tempfile::tempdir().unwrap();
+        let project = project::create(root.path(), "demo", vec![]).unwrap();
+        let env = crate::paths::Env::for_test(root.path(), &[]);
+        let runner = FakeRunner::new();
+        let ctx = Ctx { env: &env, root: root.path().to_path_buf(), config_dir: root.path().join("cfg"), runner: &runner, detached_ticker: false };
+        let mut memory = Memory::new(&ctx);
+        assert_eq!(PR_INTERVAL_SECS, 300);
+
+        let mut state = State { last_pr_check: "2026-11-23T10:00:00Z".into(), ..State::default() };
+        // 240 seconds in: still waiting, and the clock is left where it was.
+        assert!(pull_requests(&ctx, &project, &mut state, &mut memory, at("2026-11-23T10:04:00Z")).is_empty());
+        assert_eq!(state.last_pr_check, "2026-11-23T10:00:00Z");
+        // 301 seconds in: the check runs and records the new time.
+        assert!(pull_requests(&ctx, &project, &mut state, &mut memory, at("2026-11-23T10:05:01Z")).is_empty());
+        assert_eq!(state.last_pr_check, "2026-11-23T10:05:01Z");
+        assert!(runner.calls.borrow().is_empty(), "a project with no open threads asks nothing: {:?}", runner.calls.borrow());
     }
 
     #[test]
