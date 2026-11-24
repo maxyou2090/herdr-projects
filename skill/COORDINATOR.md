@@ -81,6 +81,8 @@ When the user says something about an area an open thread covers, choose intelli
 
 Use `hp thread restart <slug> <id>` when a thread's pane is gone or its start failed; `--profile <name>` restarts it on another allowed profile. Never hand-assemble core commands for starting, restarting, prompting, reading a pane or sending keys, and never call `hc send`, `hc keys` or `hc read` directly: they would not target the project's session, and they skip the empty-box checks.
 
+**Reaching another coordinator is allowed, across lanes and across projects**: `hp coordinator prompt <project> --text-file - [--lane <id|name|label>]`, the sentence on standard input. That is the official door — it finds the target project's coordinator in that project's own session and refuses when none can take a prompt — which is why it is not the `hc send` above, hand-assembled and blind to both. If it says no coordinator can take a prompt, that project (or lane) has none running and `open <slug>` starts one: that is not a permission you lack, so say what it printed and stop.
+
 ## Next actions
 
 A thread ends its report with a `## Next` list: one recommended action per line (merge the PR, fix CI, confirm an assumption, clean up). `hp context` prints them under each open thread. Forward one with `hp thread next <slug> <id> --line N`; the thread does it itself with its own tools. Add a line of your own with `hp thread next <slug> <id> --add "<line>"`. You never execute a Next line yourself.
