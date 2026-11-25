@@ -15,6 +15,7 @@ and what is still open.
 - **Files are the record, prompts are nudges.** Threads write a report file, the ticker writes events to an inbox folder, and the coordinator reads state with `context` at the start of every turn. A missed prompt loses nothing.
 - **One ticker per projects root** checks every 15 seconds: coordinators (any agent in a project folder, also one started by hand in a project never opened), thread state and groups, the labels a pane carries, pending prompts, changed reports, pull requests (every five minutes), the registry audit (every 30 minutes), routines, auto-resolve (`auto_resolve_days`, and `auto_resolve_nopr` for a thread that produced nothing).
 - **Tools are found even under a bare `PATH`.** The binary appends `/opt/homebrew/bin`, `/usr/local/bin`, `~/.local/bin` and `~/.cargo/bin` to its own `PATH`, so a ticker started by launchd finds `gh` and `rsync`.
+- **Output that a pipe cuts short is quiet, not a panic.** `SIGPIPE` keeps its default disposition in both binaries, so `hp skill | head -1` and `hp context <project> | grep -m1` stop writing and leave quietly instead of failing to print.
 - **Cleanup is part of the flow, never forced.** Resolving a thread removes its worktree (Herdr and git refuse a dirty one, and the plugin never forces) and, once its pull request is merged, its local branch. Reports and library files always stay. Text from reports, pull requests and command output is never placed in a prompt.
 
 ## How fast a tick is

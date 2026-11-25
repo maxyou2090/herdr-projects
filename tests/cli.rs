@@ -1,9 +1,11 @@
 //! End-to-end checks of the built binary with a scrubbed environment.
 
+use std::io::{BufRead, BufReader, Read};
 use std::path::Path;
-use std::process::Command;
+use std::process::{Command, Stdio};
 
 const BIN: &str = env!("CARGO_BIN_EXE_hp");
+const AGENT: &str = env!("CARGO_BIN_EXE_hp-agent");
 
 fn hp(home: &Path, args: &[&str]) -> std::process::Output {
     Command::new(BIN)
@@ -12,6 +14,40 @@ fn hp(home: &Path, args: &[&str]) -> std::process::Output {
         .args(args)
         .output()
         .unwrap()
+}
+
+/// Runs `bin` with a reader that takes the first `lines` lines and then closes
+/// its end of the pipe, which is what `| head -1` does: the next write has to
+/// land on a pipe with no reader. Returns the stderr and the exit code, which
+/// is `None` when a signal ended the process (`SIGPIPE` = 13).
+fn through_head(bin: &str, home: &Path, args: &[&str], lines: usize) -> (String, Option<i32>) {
+    let mut child = Command::new(bin)
+        .env_clear()
+        .env("HOME", home)
+        .args(args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut errors = child.stderr.take().unwrap();
+    let collected = std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        let _ = errors.read_to_end(&mut buf);
+        String::from_utf8_lossy(&buf).into_owned()
+    });
+    let mut out = BufReader::new(child.stdout.take().unwrap());
+    let mut line = String::new();
+    for _ in 0..lines {
+        line.clear();
+        if out.read_line(&mut line).unwrap_or(0) == 0 {
+            break;
+        }
+    }
+    assert!(!line.trim().is_empty(), "`{bin} {}` printed nothing to truncate", args.join(" "));
+    drop(out);
+    let status = child.wait().unwrap();
+    (collected.join().unwrap(), status.code())
 }
 
 #[test]
@@ -589,4 +625,61 @@ fn an_on_request_profile_is_listed_apart_and_never_a_default_or_an_owner() {
     let out = hp(home.path(), &["--root", root_arg, "open", "demo", "--profile", "sol"]);
     assert!(!out.status.success(), "an on-request profile is not for coordinators");
     assert!(String::from_utf8_lossy(&out.stderr).contains("is not allowed for the coordinator"), "{}", String::from_utf8_lossy(&out.stderr));
+}
+
+#[test]
+fn a_pipe_closed_early_is_not_a_panic() {
+    let home = tempfile::tempdir().unwrap();
+    let root = home.path().join("root");
+    let root_arg = root.to_str().unwrap();
+    assert!(hp(home.path(), &["--root", root_arg, "new", "demo"]).status.success());
+
+    // `| head` truncates the output and the writer finds out only by writing
+    // into a pipe nobody reads any more. Twenty rounds because that is a race:
+    // the write has to land after the reader has gone (against a writer that
+    // ignored `SIGPIPE` this lost every round, with a panic on stderr and exit
+    // code 101), so one quiet round would prove little.
+    for _ in 0..20 {
+        for (args, lines) in [
+            (vec!["--root", root_arg, "skill"], 1),
+            (vec!["--root", root_arg, "context", "demo"], 2),
+        ] {
+            let shown = args.join(" ");
+            let (stderr, code) = through_head(BIN, home.path(), &args, lines);
+            assert!(!stderr.contains("panicked"), "hp {shown} | head -{lines}: {stderr}");
+            assert!(!stderr.contains("failed printing to stdout"), "hp {shown} | head -{lines}: {stderr}");
+            assert_ne!(code, Some(101), "hp {shown} | head -{lines} exited 101: {stderr}");
+            assert!(matches!(code, None | Some(0)), "hp {shown} | head -{lines} exited {code:?}: {stderr}");
+        }
+    }
+
+    // A pipe that is gone is not an error: the whole output still arrives intact
+    // when nobody closes it.
+    let out = hp(home.path(), &["--root", root_arg, "skill"]);
+    assert!(out.status.success());
+    let lines = String::from_utf8(out.stdout).unwrap().lines().count();
+    let piped = Command::new("/bin/sh")
+        .env_clear()
+        .env("HOME", home.path())
+        .args(["-c", &format!("'{BIN}' --root '{root_arg}' skill | wc -l")])
+        .output()
+        .unwrap();
+    assert!(piped.status.success(), "{}", String::from_utf8_lossy(&piped.stderr));
+    assert_eq!(String::from_utf8_lossy(&piped.stdout).trim(), lines.to_string());
+}
+
+#[test]
+fn the_agent_wrapper_leaves_quietly_when_its_terminal_is_gone() {
+    let home = tempfile::tempdir().unwrap();
+    // `hp-agent` writes OSC 7501 to the terminal it was given; a terminal whose
+    // reader is gone must end it without a panic, not with one.
+    for _ in 0..20 {
+        let (stderr, code) = through_head(AGENT, home.path(), &["/bin/sh", "-c", "echo hello"], 1);
+        assert!(!stderr.contains("panicked"), "{stderr}");
+        assert!(!stderr.contains("failed printing to stdout"), "{stderr}");
+        assert_ne!(code, Some(101), "hp-agent exited 101: {stderr}");
+        // `SIGPIPE` (a signal, so no code), `0` when the wrapper got its record
+        // out first, and `1` when the child it waits for was itself cut off.
+        assert!(matches!(code, None | Some(0) | Some(1)), "hp-agent exited {code:?}: {stderr}");
+    }
 }

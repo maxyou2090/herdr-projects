@@ -31,6 +31,8 @@
 mod agent_state;
 #[path = "prompt_box.rs"]
 mod prompt_box;
+#[path = "sigpipe.rs"]
+mod sigpipe;
 #[path = "trust_screen.rs"]
 mod trust_screen;
 
@@ -163,6 +165,9 @@ fn watch(child: &mut Child, kind: &str, app: &str) -> std::io::Result<ExitStatus
 }
 
 fn main() -> ExitCode {
+    // Before anything is printed: `hp-agent` writes OSC 7501 to the terminal
+    // and must leave quietly when that pipe is gone.
+    sigpipe::restore();
     let mut args: Vec<String> = std::env::args().skip(1).collect();
     // `hp-agent -- cmd` is what a shell writes; `hp-agent cmd` is what a
     // template writes. Both mean the same thing.
