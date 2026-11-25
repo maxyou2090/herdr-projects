@@ -1638,6 +1638,14 @@ fn digest_for(ctx: &Ctx, project: &Project, prefix: &str) -> Result<(String, Vec
     let _ = writeln!(out, "Commands: {prefix}");
     let _ = writeln!(out, "Project: {slug}");
     let _ = writeln!(out, "Folder: {}", project.dir().display());
+    // Fixed place, every turn, whatever the project's state (and with `--peek`):
+    // a coordinator whose skill text does not start with this version read an
+    // old copy — a resumed session answers from memory — so it re-reads it.
+    let _ = writeln!(
+        out,
+        "Skill: {} — if the skill you read does not start with this version, re-read it with `hp skill` before acting",
+        crate::VERSION
+    );
     // Read once: the identity line and the thread rows use the same view, so
     // a turn costs no more Herdr than it did before.
     let view = crate::threads::session_view(ctx, project);
@@ -1852,6 +1860,11 @@ mod tests {
         assert!(text.contains("Project: demo\n"), "{text}");
         assert!(!text.contains("Goal"), "{text}");
         assert!(!text.contains("monthly invoices"), "{text}");
+        // The version line sits in one fixed place, whatever the project's
+        // state, so a coordinator can compare it with its own skill text.
+        let lines: Vec<&str> = text.lines().collect();
+        let folder = lines.iter().position(|l| l.starts_with("Folder: ")).unwrap_or_else(|| panic!("{text}"));
+        assert_eq!(lines[folder + 1], format!("Skill: {} — if the skill you read does not start with this version, re-read it with `hp skill` before acting", crate::VERSION), "{text}");
     }
 
     /// The coordinator's own turn, measured by the ticker and printed straight

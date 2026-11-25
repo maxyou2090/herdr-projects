@@ -56,6 +56,43 @@ fn peek_records_nothing_and_context_records_seen_items() {
 }
 
 #[test]
+fn the_skill_version_line_matches_the_binary_in_both_places() {
+    let home = tempfile::tempdir().unwrap();
+    let root = home.path().join("root");
+    let root_arg = root.to_str().unwrap();
+    assert!(hp(home.path(), &["--root", root_arg, "new", "demo"]).status.success());
+
+    let out = hp(home.path(), &["--root", root_arg, "--version"]);
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    let printed = String::from_utf8(out.stdout).unwrap();
+    let version = printed.trim().strip_prefix("hp ").unwrap_or_else(|| panic!("`hp --version` names the binary: {printed}")).to_string();
+    assert!(version.contains('+'), "the version carries the build id: {version}");
+
+    // `hp skill`: the version is the first line, so the text a coordinator read
+    // can be compared with what `context` prints now.
+    let out = hp(home.path(), &["--root", root_arg, "skill"]);
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    let skill = String::from_utf8(out.stdout).unwrap();
+    let first = skill.lines().next().unwrap_or_default();
+    assert_eq!(first, format!("Skill version {version}"), "{first}");
+    assert!(skill.contains("Every turn, compare versions before you act"), "the skill says what to do about a mismatch: {skill}");
+
+    // `context`, with and without `--peek`: the same line, in the same place.
+    let skill_line = format!("Skill: {version} — if the skill you read does not start with this version, re-read it with `hp skill` before acting");
+    let mut positions = Vec::new();
+    for args in [&["--root", root_arg, "context", "demo"][..], &["--root", root_arg, "context", "demo", "--peek"][..]] {
+        let out = hp(home.path(), &args);
+        assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+        let text = String::from_utf8(out.stdout).unwrap();
+        let at: Vec<usize> = text.lines().enumerate().filter(|(_, l)| l.starts_with("Skill: ")).map(|(i, _)| i).collect();
+        assert_eq!(at.len(), 1, "exactly one `Skill:` line, whatever the project's state: {text}");
+        assert_eq!(text.lines().nth(at[0]), Some(skill_line.as_str()), "{text}");
+        positions.push(at[0]);
+    }
+    assert_eq!(positions[0], positions[1], "`--peek` prints the same digest: {positions:?}");
+}
+
+#[test]
 fn routine_toggle_leaves_a_journal_line() {
     let home = tempfile::tempdir().unwrap();
     let root = home.path().join("root");

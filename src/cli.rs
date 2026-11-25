@@ -1009,6 +1009,10 @@ pub fn run() -> Result<()> {
             SafetyCommand::Set { target, key, value } => crate::safety::set_cli(&ctx, &target, &key, &value),
         },
         Command::Skill => {
+            // The version is the first line so a coordinator that read this text
+            // in an earlier turn can tell it holds an old copy: `context` prints
+            // the same string on its `Skill:` line every turn.
+            println!("Skill version {}", crate::VERSION);
             print!("{}", include_str!("../skill/COORDINATOR.md"));
             // Every harness learns to report from this text; nothing is installed.
             let pane = crate::progress::current(ctx.env, ctx.runner).map(|p| p.pane_id);
