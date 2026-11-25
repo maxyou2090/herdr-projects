@@ -1802,14 +1802,20 @@ fn turn_line(project: &Project, view: &crate::lanes::View, items: &[inbox::Item]
             crate::steps::turn_text(waited)
         ));
     }
-    // The one thing the turn's owner can still do about it: the ticker stops a
-    // turn that runs past `PROJECT.md`'s `coordinator_turn_limit`. Said only
-    // once the turn is already past it, because before that it is not news.
+    // What the ticker does with a turn that stops moving, said only once the
+    // turn is already past `coordinator_turn_limit`, because before that it is
+    // not news. No time is promised any more: a turn that keeps producing new
+    // output is never stopped however long it runs (see
+    // `steps::interrupt_long_turns`).
     if let (Ok((settings, _)), Some(secs)) = (project.read_project_md(), clock.working_secs)
         && let Some(limit) = settings.coordinator_turn_limit.secs()
         && secs >= limit
     {
-        parts.push(format!("the ticker will stop this turn at {}", settings.coordinator_turn_limit));
+        parts.push(format!(
+            "the ticker stops a turn that stops moving (no new output for {}, or one command shape {} times) and leaves a turn that keeps progressing alone",
+            crate::steps::turn_text(crate::steps::SCREEN_STUCK_SECS),
+            crate::steps::REPEAT_SHAPES
+        ));
     }
     Some(format!("This pane: {}\n", parts.join(" · ")))
 }
@@ -1899,6 +1905,11 @@ mod tests {
         assert!(lines[identity + 1].contains("working 12m"), "{text}");
         assert!(lines[identity + 1].contains("longest turn today 18m42s"), "{text}");
         assert!(lines[identity + 1].contains("1 inbox item held 4h10m"), "{text}");
+        // Past the limit the line says what stops a turn and promises no time:
+        // length alone ends nothing (2026-11-25).
+        assert!(lines[identity + 1].contains("stops a turn that stops moving"), "{text}");
+        assert!(lines[identity + 1].contains("leaves a turn that keeps progressing alone"), "{text}");
+        assert!(!lines[identity + 1].contains("will stop this turn at"), "{text}");
 
         // A ticker that has recorded nothing for this pane prints no line at
         // all, and neither does a thread's pane: zeros would read as a

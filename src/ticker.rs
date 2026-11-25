@@ -1310,7 +1310,7 @@ pub fn tick_with(ctx: &Ctx, log: &Log, memory: &mut Memory, timings: &mut Timing
                     log.line(&format!("{slug}: lane {}'s coordinator repaired on pane {}: {}", fixed.lane, fixed.pane, fixed.why));
                 }
                 for stop in &seen.interrupted {
-                    log.line(&format!("{slug}: {}", steps::interrupt_note(stop.secs)));
+                    log.line(&format!("{slug}: {}", steps::interrupt_note(stop)));
                 }
                 reachable.push((project, seen))
             }
@@ -1871,13 +1871,15 @@ fn tick_cheap_body(ctx: &Ctx, project: &Project, sessions: &mut Sessions, state:
     let live_panes: Vec<String> = panes.iter().map(|p| p.pane_id.clone()).collect();
     steps::track_coordinator_turns(state, &working, &live_panes, jiff::Timestamp::now());
 
-    // A turn past the project's limit is stopped here, on the same measurement
-    // the audit warns about at ten minutes (`PROJECT.md`'s
-    // `coordinator_turn_limit`, twenty minutes by default). The warning alone
-    // cannot reach a coordinator that is inside the turn it is about — the nudge
-    // waits for an empty input box in a quiet pane — so a runaway turn used to
-    // need a person to press Escape (2026-11-21, rexa: 41 minutes of ssh retries
-    // in one turn).
+    // A turn that stops moving is stopped here (`PROJECT.md`'s
+    // `coordinator_turn_limit`, ten minutes by default, is the earliest a turn
+    // is judged): the pane's screen frozen for ten minutes, or the same command
+    // shape three times in one turn. A turn that keeps producing new output is
+    // left alone however long it runs (2026-11-25: time alone is not a
+    // judgement). The audit's warning cannot reach a coordinator that is inside
+    // the turn it is about — the nudge waits for an empty input box in a quiet
+    // pane — so before this a stuck turn needed a person to press Escape
+    // (2026-11-21, rexa: 41 minutes of ssh retries in one turn).
     let mut interrupted = Vec::new();
     timings.stage(slug, "turns");
     if let Ok((settings, _)) = project.read_project_md() {
@@ -2773,12 +2775,14 @@ mod tests {
     /// silence. `no coordinator is idle long enough` would send a reader
     /// looking for a busy coordinator that does not exist.
     /// The 2026-11-21 incident end to end: a coordinator 41 minutes into one
-    /// turn, a ticker that stops it exactly once, the log line a person can act
-    /// on, and the `thread-audit` item the warning path still writes — the
-    /// warning could never reach a coordinator inside the turn it is about.
-    /// A thread's pane, however long it works, is never the ticker's to stop.
+    /// turn, a ticker that stops it exactly once because its screen says the
+    /// same command again and again, the log line a person can act on, and the
+    /// `thread-audit` item the warning path still writes — the warning could
+    /// never reach a coordinator inside the turn it is about. A thread's pane
+    /// showing the very same screen, however long it works, is never the
+    /// ticker's to stop (`interrupt_long_turns` is handed coordinator panes).
     #[test]
-    fn a_coordinator_turn_past_the_limit_is_interrupted_once() {
+    fn a_spinning_coordinator_turn_is_interrupted_once() {
         let home = tempfile::tempdir().unwrap();
         let root = home.path().join("root");
         let project = project::create(&root, "rexa", vec![]).unwrap();
@@ -2788,12 +2792,21 @@ mod tests {
         core.terminal(pane, &dir, &[("hp_agent", "hpc-rexa"), ("hp_kind", "pi"), ("hp_project", "rexa")]);
         core.set_status(pane, "working");
         core.set_turn(pane, 7);
-        // A thread's pane, working since long before: the audit may look at it,
-        // the ticker must not stop it.
+        // The shape the rule exists for: `sleep …; ssh …` over and over. One
+        // retry is on the screen when the ticker first looks, four by the next
+        // tick — the transcript above the turn carries no accusation, only what
+        // the turn itself adds does.
+        let polling = |times: usize| -> String {
+            (0..times).map(|n| format!("$ sleep {}; ssh root@10.0.0.{} uptime\nstill closed\n", 30 + n * 15, n + 1)).collect()
+        };
+        core.set_screen(pane, &polling(1));
+        // A thread's pane, working since long before and showing the identical
+        // screen: the audit may look at it, the ticker must not stop it.
         let thread_pane = "hp-rexa-t-0001";
         core.terminal(thread_pane, &format!("{dir}/threads/t-0001"), &[("hp_agent", "hp-rexa-t-0001"), ("hp_kind", "pi")]);
         core.set_status(thread_pane, "working");
         core.set_turn(thread_pane, 3);
+        core.set_screen(thread_pane, &polling(4));
         project
             .update_coordinator(|c| {
                 c.pane_id = pane.into();
@@ -2828,8 +2841,13 @@ mod tests {
 
         let env = Env::for_test(home.path(), &[]);
         let ctx = Ctx { env: &env, root: root.clone(), config_dir: home.path().join("cfg"), runner: &core, detached_ticker: false };
+        // First look: the turn is already long, and one retry is on the screen.
         tick_project(&ctx, &project).unwrap();
         let interrupts = || core.calls.borrow().iter().filter(|call| call.contains("--json interrupt")).cloned().collect::<Vec<_>>();
+        assert!(interrupts().is_empty(), "one retry is not a loop: {:?}", core.calls.borrow());
+        // Three more retries in the same turn: now it is.
+        core.set_screen(pane, &polling(4));
+        tick_project(&ctx, &project).unwrap();
         assert_eq!(interrupts().len(), 1, "the coordinator, once: {:?}", core.calls.borrow());
         assert!(interrupts()[0].contains(&format!("interrupt {pane}")), "{:?}", interrupts());
         let state = steps::load_state(&project);
