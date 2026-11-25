@@ -31,6 +31,7 @@ mod skills;
 mod settings;
 mod labels;
 mod shell;
+mod sigpipe;
 mod spaces;
 mod steps;
 mod stuck;
@@ -76,6 +77,7 @@ fn extend_path() {
 }
 
 fn main() {
+    sigpipe::restore();
     extend_path();
     if let Err(error) = cli::run() {
         eprintln!("hp: {error:#}");
