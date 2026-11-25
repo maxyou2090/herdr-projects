@@ -18,7 +18,7 @@ pub const KEYS: [(&str, &str); 10] = [
     ("auto_resolve_days", "number (0 = never)"),
     ("auto_resolve_nopr", "15m, 30m or off"),
     ("nudge", "true/false"),
-    ("coordinator_turn_limit", "20m, 5m or off"),
+    ("coordinator_turn_limit", "10m, 5m or off"),
     ("base", "git ref a worktree thread starts from"),
     ("repos.add", "PATH or PATH@MACHINE"),
     ("repos.remove", "PATH"),
@@ -276,7 +276,7 @@ mod tests {
         let edited = set_in(MD, "auto_resolve_days", "9").unwrap();
         assert!(edited.contains("goal = \"\""), "{edited}");
         assert_eq!(project::parse_project_md(&edited).unwrap().0.auto_resolve_days, 9);
-        // `coordinator_turn_limit` is a string setting (`20m`, `5m`, `off`) and
+        // `coordinator_turn_limit` is a string setting (`10m`, `5m`, `off`) and
         // an unreadable value is refused here rather than written for the
         // ticker to complain about on every tick.
         let limited = set_in(MD, "coordinator_turn_limit", "off").unwrap();

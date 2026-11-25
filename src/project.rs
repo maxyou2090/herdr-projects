@@ -149,8 +149,9 @@ pub struct Settings {
     #[serde(default, skip_serializing_if = "nopr_is_off")]
     pub auto_resolve_nopr: NoprWindow,
     pub nudge: bool,
-    /// How long one turn of the project's own coordinator may run before the
-    /// ticker interrupts it (`20m`, `5m`, `off`). See [`TurnLimit`].
+    /// How far into one turn of the project's own coordinator the ticker starts
+    /// judging it (`10m`, `5m`, `off`); a turn is only stopped when it has
+    /// stopped moving, never for its length. See [`TurnLimit`].
     #[serde(default)]
     pub coordinator_turn_limit: TurnLimit,
     /// The ref a new worktree thread starts from when `--base` is not given
@@ -163,22 +164,32 @@ pub struct Settings {
     pub repos: Vec<Repo>,
 }
 
-/// `coordinator_turn_limit` in PROJECT.md: the point at which the ticker stops
-/// a coordinator that is still working on one turn.
+/// `coordinator_turn_limit` in PROJECT.md: **the earliest** a coordinator's
+/// turn is judged, not the point at which it is cut.
 ///
 /// A coordinator's turn is supposed to be an answer, an `hp task`, an
 /// `hp thread start`. The 2026-11-21 incident was 41 minutes of `sleep 45; ssh`
 /// retries in a coordinator's own turn, 28 dollars of tokens, and a
 /// ten-minute warning that could not be delivered into the busy turn it was
-/// about. Ten minutes is the audit's warning ([`crate::audit::COORDINATOR_LONG_TURN_SECS`]);
-/// twenty is where a turn stops being a slow answer and starts being the
-/// thread's work done in the wrong place, while still leaving room for a
-/// legitimate slow `hp` action (`thread resolve` copying a big tree, `open`).
+/// about. But a turn only ran 20 minutes and was cut in the middle of work a
+/// person was waiting for (2026-11-25), which is the opposite failure: the
+/// length of a turn is not evidence of anything. What the ticker stops is a
+/// turn that stops **moving** — a pane whose screen has not changed for ten
+/// minutes, or one command shape three times (see
+/// [`crate::steps::interrupt_long_turns`]) — and this setting is when that look
+/// starts. Off means nothing is ever stopped, not even a frozen pane.
+///
+/// Ten minutes, matching the audit's warning band
+/// ([`crate::audit::COORDINATOR_LONG_TURN_SECS`]): the warning says the turn is
+/// long, the stop is for one that is stuck. A legitimate slow `hp` action
+/// (`thread resolve` copying a big tree, `open` starting an agent) prints
+/// nothing for a while, so raising this value delays the judgement; it cannot
+/// make a working turn be cut.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TurnLimit {
     /// `off`: no turn is ever interrupted.
     Off,
-    /// Minutes, from the `20m` shape.
+    /// Minutes, from the `10m` shape.
     Minutes(i64),
 }
 
@@ -189,8 +200,9 @@ impl Default for TurnLimit {
 }
 
 impl TurnLimit {
-    /// The default: twenty minutes, the value docs/operations.md explains.
-    pub const DEFAULT_MINUTES: i64 = 20;
+    /// The default: ten minutes, the value docs/operations.md explains, and the
+    /// same ten the audit's warning uses.
+    pub const DEFAULT_MINUTES: i64 = 10;
 
     /// Parses `off` or `<minutes>m`. Minutes only: a turn is measured and read
     /// in minutes, and `20` without a unit would be as ambiguous as it looks.
@@ -200,7 +212,7 @@ impl TurnLimit {
             return Ok(TurnLimit::Off);
         }
         let Some(minutes) = text.strip_suffix('m').and_then(|n| n.trim().parse::<i64>().ok()) else {
-            return Err(format!("`{text}` is not a coordinator_turn_limit; write `20m` or `off`"));
+            return Err(format!("`{text}` is not a coordinator_turn_limit; write `10m` or `off`"));
         };
         if !(1..=1440).contains(&minutes) {
             return Err(format!("`{text}` is not a coordinator_turn_limit; write 1m to 1440m, or `off`"));
@@ -208,7 +220,8 @@ impl TurnLimit {
         Ok(TurnLimit::Minutes(minutes))
     }
 
-    /// How many seconds a turn may run, `None` for `off`.
+    /// How many seconds into a turn the ticker starts judging it, `None` for
+    /// `off` (nothing is stopped at all, a frozen pane included).
     pub fn secs(self) -> Option<i64> {
         match self {
             TurnLimit::Off => None,
@@ -927,10 +940,10 @@ mod tests {
     /// The three shapes `coordinator_turn_limit` takes, and the fourth: a value
     /// nobody can read. A bad one must fail the PROJECT.md parse (the ticker
     /// then writes one `config-error` item, like every other unusable setting)
-    /// rather than panic or silently fall back to twenty minutes.
+    /// rather than panic or silently fall back to ten minutes.
     #[test]
     fn the_coordinator_turn_limit_reads_minutes_off_and_nothing_else() {
-        assert_eq!(TurnLimit::default(), TurnLimit::Minutes(20));
+        assert_eq!(TurnLimit::default(), TurnLimit::Minutes(10));
         let read = |text: &str| parse_project_md(&format!("+++\ncoordinator_turn_limit = \"{text}\"\n+++\n\nBody\n")).map(|(s, _)| s.coordinator_turn_limit);
         assert_eq!(read("20m").unwrap(), TurnLimit::Minutes(20));
         assert_eq!(read("5m").unwrap(), TurnLimit::Minutes(5));
@@ -943,10 +956,10 @@ mod tests {
         // A file without the key keeps the default; writing it back keeps the
         // value in the same `20m` shape a person typed.
         let (settings, _) = parse_project_md("+++\nname = \"X\"\n+++\n").unwrap();
-        assert_eq!(settings.coordinator_turn_limit, TurnLimit::Minutes(20));
+        assert_eq!(settings.coordinator_turn_limit, TurnLimit::Minutes(10));
         assert_eq!(TurnLimit::Minutes(5).text(), "5m");
         assert_eq!(TurnLimit::Off.text(), "off");
-        assert_eq!(TurnLimit::Minutes(20).secs(), Some(1200));
+        assert_eq!(TurnLimit::Minutes(10).secs(), Some(600));
         assert_eq!(TurnLimit::Off.secs(), None);
     }
 
@@ -1058,7 +1071,7 @@ mod tests {
         assert_eq!(settings.coordinator_profile, "claude");
         assert_eq!(settings.auto_resolve_days, 7);
         assert!(settings.nudge);
-        assert_eq!(settings.coordinator_turn_limit, TurnLimit::Minutes(20), "twenty minutes unless PROJECT.md says otherwise");
+        assert_eq!(settings.coordinator_turn_limit, TurnLimit::Minutes(10), "ten minutes unless PROJECT.md says otherwise");
         assert_eq!(settings.base, "", "`new` names no base: the remote's default branch, as before");
         let front = std::fs::read_to_string(project.project_md()).unwrap();
         assert!(!front.contains("base = "), "the key is not written at all, not written empty: {front}");

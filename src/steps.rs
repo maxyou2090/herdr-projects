@@ -213,6 +213,12 @@ pub struct State {
     /// runaway turn running).
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub interrupted_turns: BTreeMap<String, u64>,
+    /// coordinator pane id -> the last look the ticker took at that pane's
+    /// screen ([`interrupt_long_turns`]): the fingerprint, when it started
+    /// standing, and this turn's command shapes. Written only for a project
+    /// whose `coordinator_turn_limit` is not `off`, and dropped with the pane.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub screens: BTreeMap<String, Screen>,
     /// The default lane in force for this load. Not part of the file: the
     /// per-lane maps are keyed by lane id, and an empty lane argument reads as
     /// this one. `State::default()` (a test or a fresh ticker) falls back to
@@ -249,6 +255,38 @@ impl Turn {
     fn longest_today(&self, today: &str) -> i64 {
         if self.day == today { self.longest } else { 0 }
     }
+}
+
+/// The ticker's last look at one coordinator pane's screen: what the text
+/// looked like, since when it has looked like that, and how often each command
+/// shape has stood on it during the current turn.
+///
+/// The fingerprint is what tells a pane that is *doing* something from one
+/// that is only redrawing itself: a coordinator in a `sleep 60; ssh …` retry
+/// loop prints one line a minute, so its turn looks alive by its length and by
+/// the clock, while the text that matters has not moved. The shapes are the
+/// other half: a loop that does print (a fresh timestamp each time) still runs
+/// the same command over and over, which `hc read` shows as repetition.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Screen {
+    /// FNV-1a over the normalized text ([`screen_digest`]).
+    pub hash: u64,
+    /// When `hash` was first seen, UTC. Empty until the first tick records one.
+    pub since: String,
+    /// core's `turn` this record belongs to. A different turn starts the record
+    /// again: its fingerprint and its shapes are the previous turn's work.
+    pub turn: u64,
+    /// command shape -> the most times it stood on the screen in one tick of
+    /// this turn. The max and not a sum: one tick's screen holds the turn's
+    /// transcript, so counting the same screen again would double it, while a
+    /// screen that scrolls keeps what has already passed out of view.
+    pub shapes: BTreeMap<String, u32>,
+    /// The same counts as they stood on the turn's first screen. A harness
+    /// draws the conversation above the turn too, and those commands are not
+    /// this turn's work: a shape only reads as repeating once it has grown past
+    /// what the new turn inherited.
+    pub before: BTreeMap<String, u32>,
 }
 
 /// One coordinator pane's turn as a reader sees it: how long the turn has run
@@ -348,6 +386,18 @@ pub struct Interrupted {
     pub pane: String,
     /// How long the turn had run when it was stopped.
     pub secs: i64,
+    /// Which judgement stopped it, so the log line says what a person can act
+    /// on rather than only that the turn ended.
+    pub cause: Cause,
+}
+
+/// Why a coordinator turn was stopped ([`interrupt_long_turns`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Cause {
+    /// The pane's screen has not changed for this long.
+    Stuck { unchanged_secs: i64 },
+    /// One command shape this many times on the screen during this turn.
+    Repeating { shape: String, times: u32 },
 }
 
 /// What one pass over the coordinator panes did: the turns it stopped, and the
@@ -359,37 +409,82 @@ pub struct TurnStops {
 }
 
 /// The ticker's log line after a stop. `slug: ` is the caller's, and the
-/// second half is what a person reading the log can act on.
-pub fn interrupt_note(secs: i64) -> String {
-    format!("interrupted the coordinator's turn after {} (set coordinator_turn_limit to change this)", turn_text(secs))
+/// second half names the judgement that ended the turn: "ran long" was never
+/// the rule, and a reader has to be able to tell a frozen pane from a poll
+/// loop.
+///
+/// `rexa: interrupted the coordinator's turn after 23m00s (no new output for
+/// 11m00s): `coordinator_turn_limit``
+pub fn interrupt_note(stop: &Interrupted) -> String {
+    let why = match &stop.cause {
+        Cause::Stuck { unchanged_secs } => format!("no new output for {}", turn_text(*unchanged_secs)),
+        Cause::Repeating { shape, times } => format!("repeating `{shape}` {times} times in this turn"),
+    };
+    format!("interrupted the coordinator's turn after {} ({why}): `coordinator_turn_limit`", turn_text(stop.secs))
 }
 
-/// Stop a coordinator turn that has run past `PROJECT.md`'s
-/// `coordinator_turn_limit` (twenty minutes by default, `off` to never).
+/// How long a coordinator pane's screen must stand unchanged, while its agent
+/// still says `working`, before the turn reads as frozen rather than slow.
 ///
-/// The measurement is [`turn_clock`], the same one `hp context` prints and the
-/// audit warns on at ten minutes: the warning says the turn is long, this ends
-/// it. Only a pane the resolver made **this tick's** coordinator is touched
-/// (`coordinators` comes from `coordinator::discover`, never a guess), only
-/// while its program says `working` — `blocked` waits for a person and `idle`
-/// is not a turn — and only when it has a lane: an `Ambiguous` pane is never
-/// prompted, so it is never interrupted either.
+/// Ten minutes, the same number as the audit's warning band: a pane that prints
+/// nothing for ten minutes while claiming to work is the shape `SIGSTOP` and a
+/// hung `ssh` both leave behind, and a legitimate command that prints nothing
+/// for that long belongs in a thread, where nothing is stopped.
+pub const SCREEN_STUCK_SECS: i64 = 600;
+
+/// How many times one command shape must stand on a coordinator pane's screen
+/// during one turn before that turn reads as a poll loop rather than work.
+/// Three, not two: a command run twice can be a retry after a real failure; a
+/// third identical one, on a turn already past its limit, is `sleep; ssh`
+/// against a host that is not coming back.
+pub const REPEAT_SHAPES: u32 = 3;
+
+/// Stop a coordinator turn that is **stuck or spinning**, not one that has run
+/// long (`PROJECT.md`'s `coordinator_turn_limit`, ten minutes by default,
+/// `off` to never).
+///
+/// The limit is when the ticker starts judging, not when it acts: past it a
+/// turn is stopped when either judgement holds, and left alone when neither
+/// does — a coordinator that keeps producing new output runs for forty minutes
+/// untouched, while the 2026-11-21 shape (`sleep 45; ssh …` retries into a host
+/// that kept closing the connection) ends at the first tick past the limit that
+/// sees it. Time alone stops nothing.
+///
+/// 1. **Stuck**: the pane's screen has not changed for [`SCREEN_STUCK_SECS`].
+///    The fingerprint is [`screen_digest`], on the normalized text, so a
+///    spinner's frame and a border drawing itself are not "output".
+/// 2. **Spinning**: one command shape ([`command_shapes`]) has stood on the
+///    screen [`REPEAT_SHAPES`] times during this turn.
+///
+/// The measurement of the turn itself is [`turn_clock`], the same one `hp
+/// context` prints and the audit warns on at ten minutes: the warning says the
+/// turn is long, these two end it. Only a pane the resolver made **this tick's**
+/// coordinator is touched (`coordinators` comes from `coordinator::discover`,
+/// never a guess), only while its program says `working` (`blocked` waits for a
+/// person and `idle` is not a turn), and only when it has a lane: an `Ambiguous`
+/// pane is never prompted, so it is never interrupted either. A thread's pane is
+/// never in `coordinators` at all.
 ///
 /// Once per turn, keyed by core's own `turn` counter
 /// ([`State::interrupted_turns`]): a successful stop records the turn, the next
 /// tick of the same turn stays its hand, and a turn that advanced (the harness
-/// started another) may be stopped again once it is long enough.
+/// started another) may be stopped again once it is past the limit and stuck or
+/// spinning again.
+///
+/// The screen is read once per candidate pane per tick, and never when a person
+/// set the limit to `off`: `off` costs nothing at all, not even a read.
 ///
 /// Nothing here writes an item, logs or prints: the caller does that, so this
 /// stays usable from the ticker and from a test.
 pub fn interrupt_long_turns(project: &Project, state: &mut State, settings: &Settings, hc: &crate::core::Core, coordinators: &[crate::coordinator::LivePane], now: jiff::Timestamp) -> TurnStops {
     let mut stops = TurnStops::default();
+    let Some(limit) = settings.coordinator_turn_limit.secs() else {
+        return stops; // `off`: a person has turned the hard stop off, a stuck pane included
+    };
     // A pane that is gone keeps no record of a turn: its id can be reused by a
     // later coordinator, and that one's turns are its own.
     state.interrupted_turns.retain(|pane, _| coordinators.iter().any(|c| &c.pane_id == pane));
-    let Some(limit) = settings.coordinator_turn_limit.secs() else {
-        return stops; // `off`: a person has turned the hard stop off
-    };
+    state.screens.retain(|pane, _| coordinators.iter().any(|c| &c.pane_id == pane));
     let split = crate::lanes::split_in_use(project);
     for pane in coordinators {
         if pane.agent_status != "working" {
@@ -411,13 +506,39 @@ pub fn interrupt_long_turns(project: &Project, state: &mut State, settings: &Set
         let Some(secs) = turn_clock(state, &pane.pane_id, now).and_then(|clock| clock.working_secs) else {
             continue;
         };
+        // Read before the limit is applied: "unchanged for ten minutes" only
+        // means something if the screen was watched from the start of the
+        // turn, and a pane first seen past its limit would be judged on a
+        // reading it never had. One read per pane per tick.
+        let screen = match hc.agent_screen(&pane.pane_id) {
+            Ok(screen) => screen,
+            // No screen is no evidence: nothing is stopped on it, and the
+            // failure is reported so a pane that cannot be read is visible.
+            Err(error) => {
+                stops.errors.push(anyhow::anyhow!("{error}").context(format!("read {}", pane.pane_id)));
+                continue;
+            }
+        };
+        let (unchanged_secs, repeated) = {
+            let watch = watch_screen(state, pane, &screen, now);
+            (crate::thread::seconds_since(&watch.since, now), repeated_shape(watch))
+        };
+        // `coordinator_turn_limit` is the earliest a turn is judged, not the
+        // point it is cut: before it, even a frozen screen is left alone.
         if secs < limit {
             continue;
         }
+        let cause = if unchanged_secs >= SCREEN_STUCK_SECS {
+            Cause::Stuck { unchanged_secs }
+        } else if let Some((shape, times)) = repeated {
+            Cause::Repeating { shape, times }
+        } else {
+            continue;
+        };
         match hc.interrupt(&pane.pane_id) {
             Ok(()) => {
                 state.interrupted_turns.insert(pane.pane_id.clone(), pane.state_change_seq);
-                stops.stopped.push(Interrupted { pane: pane.pane_id.clone(), secs });
+                stops.stopped.push(Interrupted { pane: pane.pane_id.clone(), secs, cause });
             }
             // Recorded as a failure and retried on a later tick: the pane may
             // be at its last breath, and a stop that never happened must not
@@ -426,6 +547,156 @@ pub fn interrupt_long_turns(project: &Project, state: &mut State, settings: &Set
         }
     }
     stops
+}
+
+/// The record of `pane`'s screen, brought up to date with what this tick read:
+/// a hash that changed restarts its `since`, a turn that advanced (or a pane
+/// seen for the first time) starts the whole record again, and this screen's
+/// command shapes join the turn's counts.
+fn watch_screen<'a>(state: &'a mut State, pane: &crate::coordinator::LivePane, screen: &str, now: jiff::Timestamp) -> &'a Screen {
+    // This screen's own count, kept as a maximum: the same screen read on two
+    // ticks is one screen, while a screen that scrolls keeps what has already
+    // passed out of view and would otherwise be forgotten.
+    let mut now_shapes: BTreeMap<String, u32> = BTreeMap::new();
+    for shape in command_shapes(screen) {
+        *now_shapes.entry(shape).or_insert(0) += 1;
+    }
+    let hash = screen_digest(screen);
+    let entry = state.screens.entry(pane.pane_id.clone()).or_default();
+    if entry.turn != pane.state_change_seq || entry.since.is_empty() {
+        *entry = Screen { hash, since: now.to_string(), turn: pane.state_change_seq, shapes: now_shapes.clone(), before: now_shapes };
+        return entry;
+    }
+    if entry.hash != hash {
+        entry.hash = hash;
+        entry.since = now.to_string();
+    }
+    for (shape, times) in now_shapes {
+        let seen = entry.shapes.entry(shape).or_insert(0);
+        *seen = (*seen).max(times);
+    }
+    entry
+}
+
+/// The one shape that has stood [`REPEAT_SHAPES`] times **in this turn**, with
+/// how many times, or `None`.
+///
+/// The count has to have grown past what the turn started with
+/// ([`Screen::before`]): the screen above the turn is the harness's transcript
+/// of earlier work, and stopping a coordinator because the *previous* turn ran
+/// `hp task list` three times would be the same mistake as stopping it for
+/// being long.
+fn repeated_shape(screen: &Screen) -> Option<(String, u32)> {
+    screen
+        .shapes
+        .iter()
+        .filter(|(shape, times)| **times >= REPEAT_SHAPES && **times > screen.before.get(*shape).copied().unwrap_or(0))
+        .max_by_key(|(_, times)| **times)
+        .map(|(shape, times)| (shape.clone(), *times))
+}
+
+/// The screen's text, normalized so that decoration is not output: styling and
+/// the line's own breaks are gone ([`crate::trust_screen::plain_text`]),
+/// whitespace is squeezed, and a spinner's braille frame and a box's drawn
+/// border are dropped — they change with the animation, not with what the
+/// coordinator did.
+///
+/// Numbers are deliberately kept: a moving number is output. A test counter, a
+/// `built in 43s` line and a progress bar's filled segment are how a compiling
+/// turn says it is alive, and normalizing them away would call an honest build
+/// frozen ten minutes in.
+fn digest_text(screen: &str) -> String {
+    let mut lines: Vec<String> = Vec::new();
+    for line in crate::trust_screen::plain_text(screen).lines() {
+        let kept: String = line
+            .chars()
+            // Spinner frames (braille) and box drawing: a glyph, not a word.
+            .filter(|c| !matches!(c, '\u{2800}'..='\u{28ff}' | '\u{2500}'..='\u{257f}'))
+            .collect();
+        let kept = kept.split_whitespace().collect::<Vec<_>>().join(" ");
+        if !kept.is_empty() {
+            lines.push(kept);
+        }
+    }
+    lines.join("\n")
+}
+
+/// A fingerprint of the normalized screen. FNV-1a by hand rather than
+/// `DefaultHasher`, which promises nothing about being the same number in the
+/// next build: a hash that changed on upgrade would read as a new screen.
+fn screen_digest(screen: &str) -> u64 {
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for byte in digest_text(screen).as_bytes() {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    hash
+}
+
+/// The command shapes on a screen, in the order they appear: one per line that
+/// carries a command, which is how a harness shows what it ran (`$ …`, or a
+/// `Bash(…)` tool call).
+///
+/// Prose is not a command, and a screen is mostly prose: a line counts only
+/// when a marker is the first thing on it once decoration (box drawing, a
+/// reply arrow, a bullet) is stripped.
+pub fn command_shapes(screen: &str) -> Vec<String> {
+    crate::trust_screen::plain_text(screen).lines().filter_map(command_shape).collect()
+}
+
+/// Glyphs a harness puts in front of a line it shows: box drawing, an arrow, a
+/// bullet. Spaces are decoration too.
+fn is_decoration(c: char) -> bool {
+    c.is_whitespace() || matches!(c, '|' | '\u{2502}' | '\u{2503}' | '\u{250f}' | '\u{2517}' | '\u{250c}' | '\u{2514}' | '\u{251c}' | '\u{258e}' | '\u{258c}' | '\u{2022}' | '\u{25cf}' | '\u{23fa}' | '\u{276f}' | '>' | '`' | '*' | '-' | '+')
+}
+
+/// One line's shape, or `None` when the line is not a command
+/// ([`command_shapes`]).
+fn command_shape(line: &str) -> Option<String> {
+    const MARKERS: [&str; 4] = ["$ ", "Bash(", "bash(", "Shell("];
+    let line = line.trim();
+    for marker in MARKERS {
+        let Some(at) = line.find(marker) else { continue };
+        // Only decoration may precede a marker: `cost $ 5` is a sentence.
+        if !line[..at].chars().all(is_decoration) {
+            continue;
+        }
+        let rest = line[at + marker.len()..].trim();
+        let rest = rest.strip_suffix(')').unwrap_or(rest).trim();
+        if let Some(shape) = shape_of(rest) {
+            return Some(shape);
+        }
+    }
+    None
+}
+
+/// A command's shape: its words, with every argument replaced by `…`, so
+/// `sleep 60; ssh root@host uptime` and `sleep 45; ssh other@host uptime` are
+/// one shape. The parameters are exactly what a retry loop changes, so keeping
+/// them would make every attempt look like new work.
+///
+/// The first two words are kept when the second is a bare word: `git fetch`
+/// stays `git fetch`, while `ssh root@host` and `./check.sh` are a target, not
+/// a subcommand, and are cut to the command alone.
+fn shape_of(command: &str) -> Option<String> {
+    let mut parts: Vec<String> = Vec::new();
+    for segment in command.split([';', '&', '|']) {
+        let words: Vec<&str> = segment.split_whitespace().collect();
+        let Some(first) = words.first() else { continue };
+        if !first.chars().next().is_some_and(|c| c.is_ascii_alphanumeric()) {
+            continue;
+        }
+        let mut shape = first.to_string();
+        if let Some(second) = words.get(1)
+            && second.chars().all(|c| c.is_ascii_alphabetic())
+        {
+            shape.push(' ');
+            shape.push_str(second);
+        }
+        shape.push_str(" …");
+        parts.push(shape);
+    }
+    (!parts.is_empty()).then(|| parts.join("; "))
 }
 
 /// Accepts both the pre-lanes scalar shape and the per-lane map of §4.4. A
@@ -513,6 +784,7 @@ pub fn save_state(project: &Project, state: &State) -> Result<()> {
         coordinator_lost: &'a BTreeMap<String, String>,
         coordinator_turns: &'a BTreeMap<String, Turn>,
         interrupted_turns: &'a BTreeMap<String, u64>,
+        screens: &'a BTreeMap<String, Screen>,
     }
     project::write_json(
         &path,
@@ -542,6 +814,7 @@ pub fn save_state(project: &Project, state: &State) -> Result<()> {
             coordinator_lost: &state.coordinator_lost,
             coordinator_turns: &state.coordinator_turns,
             interrupted_turns: &state.interrupted_turns,
+            screens: &state.screens,
         },
     )
 }
@@ -2085,6 +2358,17 @@ mod tests {
             Some(12 * 60 + 41),
             "{text}"
         );
+        // The screen watch is a new field of the same file, and the hand-written
+        // legacy shape is the one place a field goes missing for every project
+        // without `lanes.json`.
+        let mut state = State::default();
+        let mut shapes = BTreeMap::new();
+        shapes.insert("sleep …; ssh …".to_string(), 4u32);
+        state.screens.insert(pane.clone(), Screen { hash: 42, since: "2026-11-20T09:00:00Z".into(), turn: 3, shapes: shapes.clone(), before: BTreeMap::new() });
+        save_state(&project, &state).unwrap();
+        let text = std::fs::read_to_string(project.state_dir().join("ticker.json")).unwrap();
+        assert!(text.contains("screens"), "{text}");
+        assert_eq!(load_state(&project).screens.get(&pane).map(|s| (s.hash, s.turn, s.shapes.clone())), Some((42, 3, shapes)));
     }
 
     /// One coordinator pane as `coordinator::discover` hands it over: its
@@ -2108,11 +2392,80 @@ mod tests {
         state
     }
 
-    /// The default twenty minutes is where a coordinator's turn stops: once it
-    /// is past, the pane gets one `hc interrupt`, the same turn is never
-    /// stopped twice, and a turn that advanced may be stopped again.
+    /// A screen as a coordinator in a `sleep …; ssh …` loop leaves it: the same
+    /// command again and again, with only its parameters and its clock moving.
+    fn polling_screen(times: usize) -> String {
+        let mut text = String::from("I'll keep checking the host until it opens.\n");
+        for n in 0..times {
+            text.push_str(&format!("$ sleep {}; ssh root@10.0.0.{} uptime\n\u{23fa} still closed, try {} of {times}\n", 30 + n * 15, n + 1, n + 1));
+        }
+        text
+    }
+
+    /// The default is when the ticker **starts judging**, so a turn is stopped
+    /// for a screen that stopped moving — never for its length. Two readings of
+    /// the same text, one spinner frame and a ticking counter apart, are the
+    /// same reading: a pane that only redraws itself has produced nothing.
     #[test]
-    fn a_turn_past_the_limit_is_stopped_once_per_turn() {
+    fn a_screen_that_stops_changing_is_stopped_as_stuck_and_only_once_per_turn() {
+        let root = tempfile::tempdir().unwrap();
+        let project = project::create(root.path(), "rexa", vec![]).unwrap();
+        let pane = "hp-rexa-coordinator";
+        let core = crate::fake_hc::FakeCore::new();
+        core.terminal(pane, &project.canonical_dir().to_string_lossy(), &[("hp_agent", "hpc-rexa")]);
+        core.set_status(pane, "working");
+        core.set_turn(pane, 7);
+        core.set_screen(pane, "\u{280b} Building the site …\n\u{2502} $ npm run build\n\u{2502} waiting for the bundler\n");
+        let hc = crate::core::Core::new("hc", "", &core);
+        let settings = Settings::default();
+        let panes = [live_coordinator(pane, "working", 7, "2026-11-21T07:00:00Z")];
+        let mut state = turn_started_at(pane, "2026-11-21T07:00:00Z");
+        let interrupts = |core: &crate::fake_hc::FakeCore| core.calls.borrow().iter().filter(|call| call.contains("interrupt")).count();
+
+        // The first reading only starts the clock: nothing is stopped on a
+        // screen the ticker has just met, however old the turn is.
+        let stops = interrupt_long_turns(&project, &mut state, &settings, &hc, &panes, at("2026-11-21T07:45:00Z"));
+        assert!(stops.stopped.is_empty() && stops.errors.is_empty(), "{stops:#?}");
+        assert_eq!(interrupts(&core), 0);
+
+        // Eleven minutes later the pane shows the same text under another
+        // spinner frame: the animation moved, the coordinator said nothing.
+        core.set_screen(pane, "\u{2819} Building the site …\n\u{2502} $ npm run build\n\u{2502} waiting for the bundler\n");
+        let stops = interrupt_long_turns(&project, &mut state, &settings, &hc, &panes, at("2026-11-21T07:56:00Z"));
+        assert!(stops.errors.is_empty(), "{:#?}", stops.errors);
+        assert_eq!(
+            stops.stopped,
+            [Interrupted { pane: pane.into(), secs: 56 * 60, cause: Cause::Stuck { unchanged_secs: 11 * 60 } }]
+        );
+        let note = interrupt_note(&stops.stopped[0]);
+        assert!(note.contains("no new output for 11m00s"), "{note}");
+        assert!(note.contains("`coordinator_turn_limit`"), "{note}");
+        assert_eq!(state.interrupted_turns.get(pane), Some(&7), "the turn that was stopped is remembered");
+        assert_eq!(interrupts(&core), 1, "{:?}", core.calls.borrow());
+
+        // The same turn, one tick later and still saying `working`: the hand
+        // that already stopped it stays its hand.
+        let stops = interrupt_long_turns(&project, &mut state, &settings, &hc, &panes, at("2026-11-21T07:56:15Z"));
+        assert!(stops.stopped.is_empty(), "{:#?}", stops.stopped);
+        assert_eq!(interrupts(&core), 1, "once per turn: {:?}", core.calls.borrow());
+
+        // A turn that advanced is a new turn: it is judged on its own screen,
+        // so it takes its own ten minutes to be frozen — not the last turn's.
+        core.set_turn(pane, 8);
+        let panes = [live_coordinator(pane, "working", 8, "2026-11-21T07:00:00Z")];
+        let stops = interrupt_long_turns(&project, &mut state, &settings, &hc, &panes, at("2026-11-21T07:57:00Z"));
+        assert!(stops.stopped.is_empty(), "a new turn starts with a fresh screen clock: {:#?}", stops.stopped);
+        let stops = interrupt_long_turns(&project, &mut state, &settings, &hc, &panes, at("2026-11-21T08:08:00Z"));
+        assert_eq!(stops.stopped.len(), 1, "{:#?}", stops.stopped);
+        assert_eq!(interrupts(&core), 2, "{:?}", core.calls.borrow());
+    }
+
+    /// The other half of the rule: a turn that keeps producing new output is
+    /// never stopped, however long it runs. This is the case the old
+    /// time-only rule got wrong (2026-11-25: a coordinator was cut in the middle
+    /// of work the user was waiting for).
+    #[test]
+    fn a_screen_that_keeps_changing_is_never_stopped() {
         let root = tempfile::tempdir().unwrap();
         let project = project::create(root.path(), "rexa", vec![]).unwrap();
         let pane = "hp-rexa-coordinator";
@@ -2121,38 +2474,166 @@ mod tests {
         core.set_status(pane, "working");
         core.set_turn(pane, 7);
         let hc = crate::core::Core::new("hc", "", &core);
-        let settings = Settings::default();
-        let now = at("2026-11-21T07:45:00Z");
-        // The pair the ticker watches is as old as the turn: this working
-        // state is the one it measured, not a restart of the same pane.
-        let panes = [live_coordinator(pane, "working", 7, "2026-11-21T07:04:00Z")];
-        let mut state = turn_started_at(pane, "2026-11-21T07:04:00Z");
-
-        let stops = interrupt_long_turns(&project, &mut state, &settings, &hc, &panes, now);
-        assert!(stops.errors.is_empty(), "{:#?}", stops.errors);
-        assert_eq!(stops.stopped, [Interrupted { pane: pane.into(), secs: 41 * 60 }]);
-        assert_eq!(state.interrupted_turns.get(pane), Some(&7), "the turn that was stopped is remembered");
+        let panes = [live_coordinator(pane, "working", 7, "2026-11-21T07:00:00Z")];
+        let mut state = turn_started_at(pane, "2026-11-21T07:00:00Z");
         let interrupts = |core: &crate::fake_hc::FakeCore| core.calls.borrow().iter().filter(|call| call.contains("interrupt")).count();
-        assert_eq!(interrupts(&core), 1, "{:?}", core.calls.borrow());
-        assert!(core.calls.borrow().iter().any(|call| call.contains(&format!("interrupt {pane}"))), "{:?}", core.calls.borrow());
 
-        // The same turn, one tick later and still saying `working`: the hand
-        // that already stopped it stays its hand.
-        let stops = interrupt_long_turns(&project, &mut state, &settings, &hc, &panes, at("2026-11-21T07:45:15Z"));
-        assert!(stops.stopped.is_empty(), "{:#?}", stops.stopped);
-        assert_eq!(interrupts(&core), 1, "once per turn: {:?}", core.calls.borrow());
+        // Thirty minutes of ordered progress, one new line a minute: the turn
+        // is three times the limit before it ends and nothing stops it.
+        for minute in 0..30 {
+            core.set_screen(pane, &format!("step {minute}: src/lib.rs edited, tests 3 passed\n\u{2502} $ cargo build\n\u{2502} finished in {minute}s\n"));
+            let now = at("2026-11-21T07:00:00Z").checked_add(jiff::SignedDuration::from_secs(60 + minute * 60)).unwrap();
+            let stops = interrupt_long_turns(&project, &mut state, &Settings::default(), &hc, &panes, now);
+            assert!(stops.stopped.is_empty(), "minute {minute} was stopped: {:#?}", stops.stopped);
+        }
+        assert!(turn_clock(&state, pane, at("2026-11-21T07:31:00Z")).unwrap().working_secs.unwrap() > 3 * 600);
+        assert_eq!(interrupts(&core), 0);
+    }
 
-        // A turn that advanced is a new turn; long again, it is stopped again.
-        core.set_turn(pane, 8);
-        let panes = [live_coordinator(pane, "working", 8, "2026-11-21T07:04:00Z")];
-        let stops = interrupt_long_turns(&project, &mut state, &settings, &hc, &panes, at("2026-11-21T07:46:00Z"));
-        assert_eq!(stops.stopped.len(), 1, "{:#?}", stops.stopped);
-        assert_eq!(interrupts(&core), 2, "{:?}", core.calls.borrow());
+    /// A turn whose screen says the same thing again and again is a poll loop,
+    /// which is what rexa did for four hours: `sleep 60; ssh …`, `curl …`, `git
+    /// fetch` on a clock. The log names the command so the reader knows which.
+    #[test]
+    fn a_repeated_command_shape_is_stopped_as_spinning() {
+        let root = tempfile::tempdir().unwrap();
+        let project = project::create(root.path(), "rexa", vec![]).unwrap();
+        let pane = "hp-rexa-coordinator";
+        let core = crate::fake_hc::FakeCore::new();
+        core.terminal(pane, &project.canonical_dir().to_string_lossy(), &[("hp_agent", "hpc-rexa")]);
+        core.set_status(pane, "working");
+        core.set_turn(pane, 7);
+        core.set_screen(pane, &polling_screen(1));
+        let hc = crate::core::Core::new("hc", "", &core);
+        let panes = [live_coordinator(pane, "working", 7, "2026-11-21T07:00:00Z")];
+        let mut state = turn_started_at(pane, "2026-11-21T07:00:00Z");
 
+        // A first reading inside the limit: the shapes are counted, nothing is
+        // stopped yet.
+        let stops = interrupt_long_turns(&project, &mut state, &Settings::default(), &hc, &panes, at("2026-11-21T07:05:00Z"));
+        assert!(stops.stopped.is_empty() && stops.errors.is_empty(), "{stops:#?}");
+
+        // Seven minutes on it has retried again and again: twelve minutes in
+        // the limit is the earliest look, and the fourth identical shape is
+        // what ends it.
+        core.set_screen(pane, &polling_screen(4));
+
+        let stops = interrupt_long_turns(&project, &mut state, &Settings::default(), &hc, &panes, at("2026-11-21T07:12:00Z"));
         assert_eq!(
-            interrupt_note(21 * 60),
-            "interrupted the coordinator's turn after 21m00s (set coordinator_turn_limit to change this)"
+            stops.stopped,
+            [Interrupted {
+                pane: pane.into(),
+                secs: 12 * 60,
+                cause: Cause::Repeating { shape: "sleep …; ssh …".into(), times: 4 }
+            }]
         );
+        let note = interrupt_note(&stops.stopped[0]);
+        assert!(note.contains("repeating `sleep …; ssh …` 4 times in this turn"), "{note}");
+        assert_eq!(note, "interrupted the coordinator's turn after 12m00s (repeating `sleep …; ssh …` 4 times in this turn): `coordinator_turn_limit`");
+    }
+
+    /// The transcript above the turn is not the turn's work: a new turn
+    /// inherits the last one's commands on its screen, and three of them must
+    /// not stop it before it has run any command of its own.
+    #[test]
+    fn commands_the_new_turn_inherited_are_not_counted_against_it() {
+        let root = tempfile::tempdir().unwrap();
+        let project = project::create(root.path(), "rexa", vec![]).unwrap();
+        let pane = "hp-rexa-coordinator";
+        let core = crate::fake_hc::FakeCore::new();
+        core.terminal(pane, &project.canonical_dir().to_string_lossy(), &[("hp_agent", "hpc-rexa")]);
+        core.set_status(pane, "working");
+        core.set_turn(pane, 8);
+        // Four retries of the previous turn are still drawn above this one.
+        core.set_screen(pane, &polling_screen(4));
+        let hc = crate::core::Core::new("hc", "", &core);
+        let panes = [live_coordinator(pane, "working", 8, "2026-11-21T07:00:00Z")];
+        let mut state = turn_started_at(pane, "2026-11-21T07:00:00Z");
+
+        let stops = interrupt_long_turns(&project, &mut state, &Settings::default(), &hc, &panes, at("2026-11-21T07:20:00Z"));
+        assert!(stops.stopped.is_empty(), "the last turn's retries are not this turn's: {:#?}", stops.stopped);
+        let stops = interrupt_long_turns(&project, &mut state, &Settings::default(), &hc, &panes, at("2026-11-21T07:26:00Z"));
+        assert!(stops.stopped.is_empty(), "and neither is the same screen read twice: {:#?}", stops.stopped);
+
+        // A retry this turn really ran is a new line, and the shape grows.
+        core.set_screen(pane, &polling_screen(5));
+        let stops = interrupt_long_turns(&project, &mut state, &Settings::default(), &hc, &panes, at("2026-11-21T07:27:00Z"));
+        assert_eq!(stops.stopped.len(), 1, "one more retry of the same shape: {:#?}", stops.stopped);
+    }
+
+    /// Four different commands and a 30-minute turn: work, not a loop. Nothing
+    /// repeated, nothing stuck, nothing stopped.
+    #[test]
+    fn different_commands_on_a_long_turn_are_left_alone() {
+        let root = tempfile::tempdir().unwrap();
+        let project = project::create(root.path(), "rexa", vec![]).unwrap();
+        let pane = "hp-rexa-coordinator";
+        let core = crate::fake_hc::FakeCore::new();
+        core.terminal(pane, &project.canonical_dir().to_string_lossy(), &[("hp_agent", "hpc-rexa")]);
+        core.set_status(pane, "working");
+        core.set_turn(pane, 7);
+        core.set_screen(pane, "Checking the repo and the tests.\n$ git status\nclean\n$ cargo test --locked\nok\n");
+        let hc = crate::core::Core::new("hc", "", &core);
+        let panes = [live_coordinator(pane, "working", 7, "2026-11-21T07:00:00Z")];
+        let mut state = turn_started_at(pane, "2026-11-21T07:00:00Z");
+
+        // Two commands, then two more twenty-five minutes later: four different
+        // commands, output in between, a turn three times the limit long.
+        let stops = interrupt_long_turns(&project, &mut state, &Settings::default(), &hc, &panes, at("2026-11-21T07:05:00Z"));
+        assert!(stops.stopped.is_empty(), "{stops:#?}");
+        let more = "Checking the repo and the tests.\n$ git status\nclean\n$ cargo test --locked\nok\n$ rg -n todo src/\nnone\n$ cargo build --release\nbuilt\n";
+        core.set_screen(pane, more);
+        let stops = interrupt_long_turns(&project, &mut state, &Settings::default(), &hc, &panes, at("2026-11-21T07:30:00Z"));
+        assert!(stops.stopped.is_empty(), "a 30-minute turn of four different commands: {:#?}", stops.stopped);
+        let shapes = command_shapes(more);
+        assert_eq!(shapes, ["git status …", "cargo test …", "rg …", "cargo build …"], "{shapes:?}");
+    }
+
+    /// `off` is the whole rule off, a frozen pane included, and it costs
+    /// nothing at all: not one screen is read.
+    #[test]
+    fn off_stops_nothing_not_even_a_frozen_screen() {
+        let root = tempfile::tempdir().unwrap();
+        let project = project::create(root.path(), "rexa", vec![]).unwrap();
+        let pane = "hp-rexa-coordinator";
+        let core = crate::fake_hc::FakeCore::new();
+        core.terminal(pane, &project.canonical_dir().to_string_lossy(), &[("hp_agent", "hpc-rexa")]);
+        core.set_status(pane, "working");
+        core.set_turn(pane, 7);
+        core.set_screen(pane, &polling_screen(6));
+        let hc = crate::core::Core::new("hc", "", &core);
+        let panes = [live_coordinator(pane, "working", 7, "2026-11-21T07:00:00Z")];
+        let mut state = turn_started_at(pane, "2026-11-21T07:00:00Z");
+        let off = Settings { coordinator_turn_limit: crate::project::TurnLimit::Off, ..Settings::default() };
+
+        for now in ["2026-11-21T07:45:00Z", "2026-11-21T08:30:00Z"] {
+            let stops = interrupt_long_turns(&project, &mut state, &off, &hc, &panes, at(now));
+            assert!(stops.stopped.is_empty() && stops.errors.is_empty(), "{stops:#?}");
+        }
+        assert!(state.screens.is_empty(), "off records no screen: {:#?}", state.screens);
+        assert!(!core.calls.borrow().iter().any(|call| call.contains(" read ")), "{:?}", core.calls.borrow());
+        assert!(!core.calls.borrow().iter().any(|call| call.contains("interrupt")), "{:?}", core.calls.borrow());
+    }
+
+    /// A screen read with the fingerprint and the shapes in it: prose is not a
+    /// command, decoration in front of one does not hide it, and the same
+    /// command with other arguments is the same shape.
+    #[test]
+    fn command_shapes_are_read_from_commands_and_not_from_prose() {
+        let screen = "The host is down, so I'll retry.\n\u{2502} $ sleep 60; ssh root@10.0.0.2 uptime\n\u{2502} \u{23fa} connection closed\n\u{2502} $ sleep 30 && ssh 10.0.0.9 \"uptime\"\n\u{2502} Bash(cargo test --all)\ncost $ 5 of tokens\n\u{2502} $ git fetch origin\n";
+        assert_eq!(command_shapes(screen), ["sleep …; ssh …", "sleep …; ssh …", "cargo test …", "git fetch …"]);
+        // The same commands with other parameters are the same shapes: that is
+        // what a retry loop changes and nothing else.
+        let later = screen.replace("10.0.0.2", "10.0.0.77").replace("sleep 60", "sleep 45").replace("git fetch origin", "git fetch --all");
+        assert_eq!(command_shapes(&later), command_shapes(screen));
+        // The shape pi and claude actually draw (captured from a live pane):
+        // a command line is ` $ …` under a line of prose, and the footer's
+        // spinner, counters and percentages are not commands.
+        let live = " Thinking...\n\n $ sleep 60; ssh root@10.0.0.2 uptime\n ... (1 earlier lines, ctrl+o to expand)\n\n Elapsed 0.0s\n\n\u{2500}\u{2500} \u{2827} Working \u{2500}\u{2500}\n~/.herdr/worktrees/x (hp/x/t-0107)\n\u{2191}143k \u{2193}56k R5.2M CH99.5% $0.071 13.9%/1.0M (auto)\n";
+        assert_eq!(command_shapes(live), ["sleep …; ssh …"], "{:?}", command_shapes(live));
+        // A spinner frame and a drawn border are not output; a new line is.
+        assert_eq!(screen_digest("\u{280b} waiting\n\u{2502} $ npm run build\n"), screen_digest("\u{2819} waiting\n\u{2502} $ npm run build\n"));
+        assert_ne!(screen_digest(screen), screen_digest(&format!("{screen}\n\u{2502} $ cargo build\n")));
+        assert_ne!(screen_digest("built in 43s"), screen_digest("built in 44s"), "a moving number is output");
     }
 
     /// The warning band, the `off` switch, a program that waits for a person,
