@@ -772,6 +772,13 @@ fn open_target(project: &Project, options: &OpenOptions, agents: &[Agent]) -> Re
     crate::lanes::Registry::ensure_written(project)?;
     let registry = crate::lanes::Registry::load(project)
         .with_context(|| format!("could not read {}", crate::lanes::registry_path(project).display()))?;
+    // Two lanes answering to one id cannot be told apart by anything below
+    // this line (every lookup is by id), so picking either one is a guess --
+    // and `--lane` used to pick the first and carry on. Refuse with the same
+    // sentence `lane list` prints and the ticker files as a `config-error`.
+    if let Some(message) = registry.duplicate_message() {
+        bail!("{message}");
+    }
     let Some(handle) = options.lane.as_deref() else {
         let lane = registry.default_lane().cloned().with_context(|| format!("`{}` has no default lane", project.slug))?;
         return Ok((registry, lane));
@@ -802,7 +809,9 @@ fn open_target(project: &Project, options: &OpenOptions, agents: &[Agent]) -> Re
     Ok((registry, lane))
 }
 
-/// `--lane` with no name: reopen a line that is free, or make one.
+/// `--lane` with no name: pick the line that has no coordinator right now, so
+/// the bare flag never starts a second one beside a running coordinator (plain
+/// `open` is the command that focuses).
 ///
 /// 1. The **default lane**, when it has no live coordinator. The everyday loop
 ///    is "open it, close the tab, open it again", and the tasks and threads are
@@ -810,26 +819,23 @@ fn open_target(project: &Project, options: &OpenOptions, agents: &[Agent]) -> Re
 ///    leave the new coordinator blind to all of it.
 /// 2. Else the lowest-numbered automatic lane (`coordinator<N>`) that has no
 ///    live coordinator: a lane can be closed but never deleted, so "a new one
-///    every time" would fill `lane list` forever.
+///    every time" would fill `lane list` forever. This is the "open another
+///    coordinator" case: the default line is busy, so the next free (or the
+///    next new) `coordinator<N>` line is used.
 /// 3. Else a new lane: the smallest N from 2 that no lane uses as its `name` or
 ///    its `label`, so a lane the user named by hand is never shadowed. Both name
 ///    and label are that handle (unless `--lane-name` says otherwise).
+///
+/// So `hdlnew <slug>` twice really does give two coordinators, and once the
+/// extra tab is closed the third call reuses that lane instead of adding one.
+/// A closed lane is never reopened here — `lane open` is how it is undone —
+/// and `closed_lines_note` says so out loud.
 ///
 /// Under the project lock, like every other registry write.
 fn auto_lane(project: &Project, options: &OpenOptions, agents: &[Agent]) -> Result<(crate::lanes::Registry, crate::lanes::Lane)> {
     let _lock = project.lock()?;
     let mut registry = crate::lanes::Registry::load(project)
         .with_context(|| format!("could not read {}", crate::lanes::registry_path(project).display()))?;
-    // A bare `--lane` on a project whose default line already runs its
-    // coordinator is plain `open`: focus it, never start a second one beside it.
-    if !options.new
-        && let Some(lane) = registry.get(&registry.default).cloned()
-        && agents.iter().any(|agent| {
-            crate::lanes::resolve(&registry, agent, &crate::lanes::project_home(project), &project.slug).lane_id() == Some(lane.id.as_str())
-        })
-    {
-        return Ok((registry, lane));
-    }
     if let Some(lane) = reusable_lane(&registry, project, agents).cloned() {
         return Ok((registry, lane));
     }
@@ -896,6 +902,45 @@ fn free_lane_handle(registry: &crate::lanes::Registry) -> String {
         }
         n = n.saturating_add(1);
     }
+}
+
+/// The note a bare `--lane` prints when an automatic line is closed: it is
+/// about to use (or make) a different line, and this is the command that brings
+/// the closed one back. Closing is a person's decision, so `--lane` never
+/// undoes it — but losing `coordinator2` after closing its tab is exactly when
+/// the question "where did it go" is asked, and `lane open` is the answer.
+fn closed_lines_note(registry: &crate::lanes::Registry, prefix: &str) -> Option<String> {
+    let closed: Vec<String> = registry
+        .lanes
+        .iter()
+        .filter(|lane| !lane.is_open())
+        .filter(|lane| auto_lane_number(&lane.name).is_some())
+        .map(|lane| format!("line {} ({}) is closed; `{prefix} lane open {}` reopens it", lane.name, lane.id, lane.id))
+        .collect();
+    (!closed.is_empty()).then(|| closed.join("; "))
+}
+
+/// The one line `open` prints when it focused a running coordinator instead of
+/// starting one: the two ways to really get another (a named line, or a second
+/// coordinator of this one), and, when there is one, the way back to a closed
+/// line. One line on purpose: a person who ran `open` twice wants the next
+/// command, not a paragraph.
+fn another_line_hint(registry: &crate::lanes::Registry, project: &Project, prefix: &str) -> String {
+    let slug = &project.slug;
+    let mut hint = format!(
+        "another line: `{prefix} open {slug} --lane <name>` · another coordinator on this line: `{prefix} open {slug} --new`"
+    );
+    let closed: Vec<String> = registry
+        .lanes
+        .iter()
+        .filter(|lane| !lane.is_open())
+        .map(|lane| if lane.name.is_empty() { lane.id.clone() } else { lane.name.clone() })
+        .collect();
+    if !closed.is_empty() {
+        let commands: Vec<String> = closed.iter().map(|handle| format!("`{prefix} lane open {handle}`")).collect();
+        hint.push_str(&format!(" · closed lines can be reopened: {}", commands.join(" ")));
+    }
+    hint
 }
 
 /// The panes `open` must not start a coordinator beside: each runs an agent
@@ -1015,6 +1060,14 @@ pub fn open(ctx: &Ctx, slug: &str, options: &OpenOptions) -> Result<()> {
     let profile = crate::profiles::resolve(&config, &safety, &settings, Role::Coordinator, options.profile.as_deref().or(lane_profile.as_deref()), slug)?;
     let kind = profile.agent().to_string();
     let prefix = current_prefix(&ctx.root)?;
+    // A bare `--lane` is on its way to a line with no coordinator; a closed
+    // automatic line is not eligible (only `lane open` undoes a close), so say
+    // where it went and what brings it back.
+    if options.lane.as_deref().is_some_and(|handle| handle.trim().is_empty())
+        && let Some(note) = closed_lines_note(&lane_registry, &prefix)
+    {
+        println!("{note}");
+    }
     // The priming files are what make an agent in this folder the coordinator.
     project::write_priming(&project, &prefix, "open")?;
 
@@ -1141,7 +1194,12 @@ pub fn open(ctx: &Ctx, slug: &str, options: &OpenOptions) -> Result<()> {
         crate::lanes::sync_instance(&project, &target_lane.id, &record.pane_id, &record.agent_session, &record.profile, &project::now())?;
         report_tokens(&herdr, &project, &record.pane_id);
         ticker::start(ctx)?;
-        println!("coordinator is running in pane {} ({} more: pass --new to start another)", record.pane_id, running.len() - 1);
+        println!(
+            "coordinator is running in pane {} ({} more on this line; use --new for another one here)",
+            record.pane_id,
+            running.len() - 1
+        );
+        println!("{}", another_line_hint(&lane_registry, &project, &prefix));
         println!("Commands: {prefix}");
         return Ok(());
     }
@@ -1189,6 +1247,7 @@ pub fn open(ctx: &Ctx, slug: &str, options: &OpenOptions) -> Result<()> {
             "coordinator is running in pane {} (its `hp_agent`/`hp_kind` labels were missing and are written back)",
             record.pane_id
         );
+        println!("{}", another_line_hint(&lane_registry, &project, &prefix));
         println!("Commands: {prefix}");
         return Ok(());
     }
@@ -3129,6 +3188,153 @@ mod tests {
         // An `Ambiguous` pane has no lane and is never a target, however idle.
         let ambiguous = vec![pane("w9:p9", "", "idle", 99)];
         assert!(nudge_target(&project, &ambiguous, now).is_empty(), "no lane, no nudge");
+    }
+
+    // -------------------------------------------------- bare `--lane`
+
+    /// A pane that names its lane the way a coordinator's own token does (§5.2
+    /// rule 1), so none of these cases depends on folders or records.
+    fn claiming(pane: &str, lane: &str) -> Agent {
+        let mut tokens = std::collections::BTreeMap::new();
+        tokens.insert(crate::lanes::TOKEN.to_string(), lane.to_string());
+        Agent { pane_id: pane.into(), tokens, ..Agent::default() }
+    }
+
+    fn lane_row(id: &str, name: &str, status: crate::lanes::Status) -> crate::lanes::Lane {
+        crate::lanes::Lane { id: id.into(), name: name.into(), label: name.into(), status, ..Default::default() }
+    }
+
+    fn save_lanes(project: &Project, lanes: Vec<crate::lanes::Lane>, default: &str, next: u32) {
+        crate::lanes::Registry {
+            lanes,
+            default: default.into(),
+            next,
+        }
+        .save(project)
+        .unwrap();
+    }
+
+    /// `hp open <slug> --lane`: the flag with no value.
+    fn bare_lane() -> OpenOptions {
+        OpenOptions { lane: Some(String::new()), ..OpenOptions::default() }
+    }
+
+    #[test]
+    fn a_bare_lane_leaves_a_busy_default_line_for_the_next_free_coordinator_line() {
+        let (_root, project) = project();
+        save_lanes(
+            &project,
+            vec![
+                lane_row("c-1", "default", crate::lanes::Status::Open),
+                lane_row("c-2", "coordinator2", crate::lanes::Status::Open),
+                lane_row("c-3", "coordinator3", crate::lanes::Status::Closed),
+            ],
+            "c-1",
+            4,
+        );
+        // The default line is coordinated, the other open line is not.
+        let agents = vec![claiming("w1:p1", "c-1")];
+        let (registry, lane) = auto_lane(&project, &bare_lane(), &agents).unwrap();
+        assert_eq!((lane.id.as_str(), lane.name.as_str()), ("c-2", "coordinator2"), "the free line, not the busy default");
+        // A closed line is never reopened here, and the note names the command
+        // that does reopen it.
+        assert_eq!(registry.get("c-3").unwrap().status, crate::lanes::Status::Closed);
+        let note = closed_lines_note(&registry, "hp").expect("a closed line is explained");
+        assert_eq!(note, "line coordinator3 (c-3) is closed; `hp lane open c-3` reopens it");
+    }
+
+    #[test]
+    fn a_bare_lane_creates_the_next_coordinator_line_when_every_line_is_busy() {
+        let (_root, project) = project();
+        save_lanes(
+            &project,
+            vec![lane_row("c-1", "default", crate::lanes::Status::Open), lane_row("c-2", "coordinator2", crate::lanes::Status::Open)],
+            "c-1",
+            3,
+        );
+        // `hdlnew` twice: the default line, then coordinator2.
+        let first = auto_lane(&project, &bare_lane(), &[claiming("w1:p1", "c-1"), claiming("w2:p1", "c-2")]).unwrap();
+        assert_eq!((first.1.id.as_str(), first.1.name.as_str()), ("c-3", "coordinator3"), "the next new line");
+        assert_eq!(first.0.next, 4, "the counter moved on");
+        // A third time: coordinator4, still one line per call.
+        let live = [claiming("w1:p1", "c-1"), claiming("w2:p1", "c-2"), claiming("w3:p1", "c-3")];
+        let third = auto_lane(&project, &bare_lane(), &live).unwrap();
+        assert_eq!((third.1.id.as_str(), third.1.name.as_str()), ("c-4", "coordinator4"));
+        let registry = crate::lanes::Registry::load(&project).unwrap();
+        assert_eq!(registry.lanes.len(), 4, "nothing was duplicated");
+        assert!(registry.duplicate_ids().is_empty());
+    }
+
+    #[test]
+    fn a_coordinator_line_whose_tab_was_closed_is_reused_instead_of_piling_up() {
+        let (_root, project) = project();
+        let mut stale = lane_row("c-2", "coordinator2", crate::lanes::Status::Open);
+        stale.pane_id = "w2:p9".into();
+        stale.agent_session = "sess-gone".into();
+        save_lanes(
+            &project,
+            vec![lane_row("c-1", "default", crate::lanes::Status::Open), stale],
+            "c-1",
+            3,
+        );
+        // Only the default line still runs (the extra tab was closed, not the
+        // lane): the next bare `--lane` takes coordinator2 back.
+        let (registry, lane) = auto_lane(&project, &bare_lane(), &[claiming("w1:p1", "c-1")]).unwrap();
+        assert_eq!(lane.id, "c-2", "the empty line comes back, no c-3 is made");
+        assert_eq!(registry.next, 3, "no id was spent");
+        assert_eq!(registry.lanes.len(), 2);
+    }
+
+    #[test]
+    fn open_without_a_lane_still_stays_on_the_default_line() {
+        let (_root, project) = project();
+        save_lanes(
+            &project,
+            vec![lane_row("c-1", "default", crate::lanes::Status::Open), lane_row("c-2", "coordinator2", crate::lanes::Status::Open)],
+            "c-1",
+            3,
+        );
+        // `hdopen`: the default line, even though it is coordinated and c-2 is
+        // free — the focus branch of `open` then focuses it.
+        let (_, lane) = open_target(&project, &OpenOptions::default(), &[claiming("w1:p1", "c-1")]).unwrap();
+        assert_eq!(lane.id, "c-1");
+    }
+
+    #[test]
+    fn the_focus_message_names_both_ways_to_get_another_coordinator() {
+        let (_root, project) = project();
+        let registry = crate::lanes::Registry {
+            lanes: vec![
+                lane_row("c-1", "default", crate::lanes::Status::Open),
+                lane_row("c-2", "coordinator2", crate::lanes::Status::Closed),
+            ],
+            default: "c-1".into(),
+            next: 3,
+        };
+        let hint = another_line_hint(&registry, &project, "hp");
+        assert!(hint.contains("hp open demo --lane <name>"), "{hint}");
+        assert!(hint.contains("hp open demo --new"), "{hint}");
+        assert!(hint.contains("hp lane open coordinator2"), "{hint}");
+        assert_eq!(hint.lines().count(), 1, "one line, not a paragraph: {hint}");
+    }
+
+    #[test]
+    fn open_refuses_a_registry_that_names_one_id_twice() {
+        let (_root, project) = project();
+        save_lanes(
+            &project,
+            vec![
+                lane_row("c-1", "default", crate::lanes::Status::Open),
+                lane_row("c-1", "coordinator2", crate::lanes::Status::Closed),
+            ],
+            "c-1",
+            2,
+        );
+        let error = open_target(&project, &bare_lane(), &[]).unwrap_err().to_string();
+        assert!(error.contains("lane ids are not unique: c-1 appears twice (default, coordinator2)"), "{error}");
+        // Refused, not repaired: both records are still there to be fixed by
+        // hand, and no lane was picked.
+        assert_eq!(crate::lanes::Registry::load(&project).unwrap().lanes.len(), 2);
     }
 }
 

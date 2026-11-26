@@ -412,8 +412,60 @@ impl Registry {
         self.default_lane().is_some_and(|lane| lane.id == id)
     }
 
+    /// The ids more than one lane holds, in registry order, each with the
+    /// handles (`name`, else the id) of every lane that holds it. Empty when
+    /// the file is sane.
+    ///
+    /// An id is the identity, so two records answering to `c-1` are not a
+    /// tidiness problem: every lookup by id (`get`, `lane_of`, `sync_instance`,
+    /// the ticker's route) silently lands on the first of them, and a token
+    /// `hp_lane=c-1` names both. law's `lanes.json` held two on 2026-11-26
+    /// (a `default` open lane and a `coordinator2` closed one), so this is
+    /// reported instead of resolved: `lane list` prints it, `open` refuses, and
+    /// the ticker writes one `config-error` item.
+    pub fn duplicate_ids(&self) -> Vec<(String, Vec<String>)> {
+        let mut out: Vec<(String, Vec<String>)> = Vec::new();
+        for lane in self.lanes.iter().filter(|lane| !lane.id.is_empty()) {
+            let handle = if lane.name.is_empty() { lane.id.clone() } else { lane.name.clone() };
+            match out.iter_mut().find(|(id, _)| id == &lane.id) {
+                Some((_, handles)) => handles.push(handle),
+                None => out.push((lane.id.clone(), vec![handle])),
+            }
+        }
+        out.retain(|(_, handles)| handles.len() > 1);
+        out
+    }
+
+    /// The sentence `lane list`, `context` and `open` print for a registry that
+    /// names one id twice — `None` when there is nothing to fix. The fix is
+    /// deliberately manual: which of the two records is the real lane is the
+    /// user's knowledge, not something a renumbering guess may decide.
+    pub fn duplicate_message(&self) -> Option<String> {
+        let duplicates = self.duplicate_ids();
+        if duplicates.is_empty() {
+            return None;
+        }
+        let shown: Vec<String> = duplicates
+            .iter()
+            .map(|(id, handles)| {
+                let times = if handles.len() == 2 { "twice".to_string() } else { format!("{} times", handles.len()) };
+                format!("{id} appears {times} ({})", handles.join(", "))
+            })
+            .collect();
+        Some(format!(
+            "lane ids are not unique: {}; fix .state/{REGISTRY_FILE} by hand or with the coordinator's help",
+            shown.join("; ")
+        ))
+    }
+
     /// Allocate `c-<n>` and append the lane; the caller fills in what a
     /// registry cannot know and holds `project.lock()`.
+    ///
+    /// The id always comes from [`Registry::alloc_id`]: `next` moves on and an
+    /// id the registry already holds is never handed out again, whatever the
+    /// new lane's name or label is. A `create` that reused an existing lane by
+    /// name would break the one promise ids make (a quoted `c-2` means that
+    /// lane forever); it is what produced law's two `c-1` records.
     pub fn create(&mut self, name: &str, label: &str) -> &mut Lane {
         let id = self.alloc_id();
         self.lanes.push(Lane {
@@ -1127,6 +1179,12 @@ impl View {
     /// coordinator is missing entirely").
     pub fn list_text(&self) -> String {
         let mut out = identity_line(self);
+        // A registry that names one id twice is broken, not merely untidy: say
+        // so before the rows, because the rows themselves look normal (the same
+        // id printed twice is easy to read as a rendering quirk).
+        if let Some(message) = self.registry.duplicate_message() {
+            let _ = writeln!(out, "{message}");
+        }
         let sightings = self.sightings();
         for row in views(&self.registry, &sightings) {
             let panes: Vec<String> = row
@@ -2318,6 +2376,85 @@ mod tests {
         let mut stale = reg(vec![lane("c-1", "default")], "c-1", 0);
         assert_eq!(stale.alloc_id(), "c-2");
         assert_eq!(stale.next, 3);
+    }
+
+    #[test]
+    fn create_never_reuses_an_id_whatever_the_name_or_label_says() {
+        // Two lanes with the same name and label are two lanes: the id is what
+        // identifies one, so `create` must allocate, never match. Reusing an id
+        // here is how law ended up with two `c-1` records.
+        let mut registry = reg(vec![lane_named("c-1", "default", "Demo")], "c-1", 2);
+        let first = registry.create("books", "收藏").id.clone();
+        let second = registry.create("books", "收藏").id.clone();
+        assert_eq!((first.as_str(), second.as_str()), ("c-2", "c-3"));
+        assert_eq!(registry.next, 4);
+        assert_eq!(registry.lanes.len(), 3);
+        for id in ["c-1", "c-2", "c-3"] {
+            assert_eq!(registry.lanes.iter().filter(|lane| lane.id == id).count(), 1, "{id}");
+        }
+        assert!(registry.duplicate_ids().is_empty());
+    }
+
+    #[test]
+    fn a_registry_that_names_one_id_twice_is_reported_and_never_silently_resolved() {
+        let duplicate = reg(
+            vec![
+                lane_named("c-1", "default", "Demo"),
+                Lane { status: Status::Closed, ..lane_named("c-1", "coordinator2", "coordinator2") },
+            ],
+            "c-1",
+            2,
+        );
+        assert_eq!(
+            duplicate.duplicate_ids(),
+            vec![("c-1".to_string(), vec!["default".to_string(), "coordinator2".to_string()])]
+        );
+        let message = duplicate.duplicate_message().expect("a duplicate is reported");
+        assert!(message.starts_with("lane ids are not unique: c-1 appears twice (default, coordinator2);"), "{message}");
+        assert!(message.contains("fix .state/lanes.json by hand or with the coordinator's help"), "{message}");
+        // A sane registry says nothing, and names every handle that collides.
+        assert!(reg(vec![lane("c-1", "default"), lane("c-2", "books")], "c-1", 3).duplicate_message().is_none());
+        let three = reg(
+            vec![lane_named("c-1", "a", "A"), lane_named("c-1", "b", "B"), lane_named("c-1", "c", "C")],
+            "c-1",
+            2,
+        );
+        assert!(three.duplicate_message().unwrap().contains("c-1 appears 3 times (a, b, c)"));
+    }
+
+    #[test]
+    fn lane_list_prints_the_duplicate_verdict_before_its_rows() {
+        let duplicate = reg(
+            vec![
+                lane_named("c-1", "default", "Demo"),
+                Lane { status: Status::Closed, ..lane_named("c-1", "coordinator2", "coordinator2") },
+            ],
+            "c-1",
+            2,
+        );
+        let text = view(&duplicate, vec![], "", false).list_text();
+        let lines: Vec<&str> = text.lines().collect();
+        assert!(
+            lines.iter().any(|line| line.starts_with("lane ids are not unique: c-1 appears twice (default, coordinator2)")),
+            "{text}"
+        );
+        // Both records are still printed: the point is to expose them, not to
+        // hide one behind the other.
+        assert_eq!(lines.iter().filter(|line| line.starts_with("c-1\t")).count(), 2, "{text}");
+    }
+
+    #[test]
+    fn a_lane_file_that_names_one_id_twice_loads_and_says_so() {
+        let (_world, project) = temp_project("demo");
+        std::fs::write(
+            registry_path(&project),
+            r#"{"lanes":[{"id":"c-1","name":"default"},{"id":"c-1","name":"coordinator2","status":"closed"}],"default":"c-1","next":2}"#,
+        )
+        .unwrap();
+        let loaded = Registry::load(&project).expect("a duplicate id still reads");
+        assert!(loaded.duplicate_message().is_some(), "the file is reported, not repaired in memory");
+        // Reading it writes nothing: the fix is the user's decision.
+        assert_eq!(std::fs::read_to_string(registry_path(&project)).unwrap().matches("\"id\":\"c-1\"").count(), 2);
     }
 
     #[test]

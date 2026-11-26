@@ -1489,6 +1489,33 @@ pub fn write_ambiguous_lane_items(project: &Project, state: &mut State, ambiguou
     Ok(())
 }
 
+/// One `config-error` item for a `lanes.json` that names one id twice
+/// (`Registry::duplicate_ids`). An id is the identity, so two records holding
+/// it silently merge: every lookup by id lands on the first, a token
+/// `hp_lane=c-1` names both, and the ticker nudges one of them. law's registry
+/// held two `c-1` lanes from 2026-11-17 until a coordinator fixed them by hand
+/// on 2026-11-26 — nothing reported it, because nothing checked. One item per
+/// distinct sentence (`State::config_errors`), so an unfixed file does not
+/// repeat, and a changed list is news again. `lane list` prints the same
+/// sentence and `open --lane` refuses on it.
+pub fn write_lane_duplicate_items(project: &Project, state: &mut State) -> Result<()> {
+    if !crate::lanes::split_in_use(project) {
+        return Ok(());
+    }
+    let Some(registry) = crate::lanes::Registry::load(project) else {
+        return Ok(());
+    };
+    let Some(message) = registry.duplicate_message() else {
+        return Ok(());
+    };
+    let key = format!("lanes-dup:{}", thread::sha256_hex(message.as_bytes()));
+    if state.config_errors.insert(key) {
+        let default_lane = crate::lanes::default_lane_id(project);
+        inbox::write_in(project, &default_lane, "config-error", crate::lanes::REGISTRY_FILE, "lane ids repeat", &message, "")?;
+    }
+    Ok(())
+}
+
 /// The `coordinator` items: one per lane whose recorded coordinator terminal is
 /// gone and whose agent could not be found either (`coordinator::repair`'s
 /// `lost`, lane id -> one line).
@@ -3273,6 +3300,37 @@ mod tests {
         write_lane_items(&plain, &mut state, &[(crate::lanes::Lane { id: "c-9".into(), ..Default::default() }, 3)]).unwrap();
         assert!(inbox::unhandled(&plain).is_empty());
         assert!(state.lane_items.is_empty());
+    }
+
+    /// A `lanes.json` that names one id twice is a config error: one item per
+    /// distinct sentence, addressed to the default lane, and a project without
+    /// a registry never writes one.
+    #[test]
+    fn a_registry_that_names_one_id_twice_is_reported_as_a_config_error_once() {
+        let (_root, project) = two_lane_project();
+        let mut registry = crate::lanes::Registry::load(&project).unwrap();
+        // The shape law had on 2026-11-26: a `default` lane and a
+        // `coordinator2` lane both answering to `c-1`.
+        registry.lanes[1].id = "c-1".into();
+        registry.save(&project).unwrap();
+        let mut state = State::default();
+        write_lane_duplicate_items(&project, &mut state).unwrap();
+        let items = inbox::unhandled(&project);
+        assert_eq!(items.len(), 1, "{items:?}");
+        assert_eq!((items[0].kind.as_str(), items[0].subject.as_str(), items[0].event.as_str()), ("config-error", "lanes.json", "lane ids repeat"));
+        assert_eq!(items[0].lane, "c-1", "addressed to the default lane");
+        assert!(items[0].summary.contains("lane ids are not unique: c-1 appears twice (default, books)"), "{}", items[0].summary);
+        // The standing sentence is not repeated on every tick.
+        write_lane_duplicate_items(&project, &mut state).unwrap();
+        assert_eq!(inbox::unhandled(&project).len(), 1);
+        // A sane registry writes nothing at all.
+        let root = tempfile::tempdir().unwrap();
+        let clean = project::create(root.path(), "clean", vec![]).unwrap();
+        crate::lanes::Registry::ensure_written(&clean).unwrap();
+        let mut state = State::default();
+        write_lane_duplicate_items(&clean, &mut state).unwrap();
+        assert!(inbox::unhandled(&clean).is_empty());
+        assert!(state.config_errors.is_empty());
     }
 
     #[test]
