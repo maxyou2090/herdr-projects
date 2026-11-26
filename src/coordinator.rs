@@ -1902,9 +1902,10 @@ fn turn_line(project: &Project, view: &crate::lanes::View, items: &[inbox::Item]
         && secs >= limit
     {
         parts.push(format!(
-            "the ticker stops a turn that stops moving (no new output for {}, or one command shape {} times) and leaves a turn that keeps progressing alone",
+            "the ticker stops a turn that stops moving (no new output for {}, or the same command {} times in {}) and leaves a turn that keeps progressing alone",
             crate::steps::turn_text(crate::steps::SCREEN_STUCK_SECS),
-            crate::steps::REPEAT_SHAPES
+            crate::steps::REPEAT_COMMANDS,
+            crate::steps::window_text()
         ));
     }
     Some(format!("This pane: {}\n", parts.join(" · ")))

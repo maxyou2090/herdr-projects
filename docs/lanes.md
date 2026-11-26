@@ -536,7 +536,8 @@ So visibility is a standing output, not an event:
   (`coordinator-long-turn`, ten minutes). The same number is when the ticker
   starts *judging* the turn (`coordinator_turn_limit` in `PROJECT.md`, ten
   minutes by default; `off` to never) — but what stops a turn is a screen that
-  stopped changing, or one command shape three times, not its length (see
+  stopped changing, or the same command three times in three minutes (a wait by
+  its family shape, work by its whole line), not its length (see
   `operations.md`, Nudges). Once the turn is past that limit the line adds
   `· the ticker stops a turn that stops moving … and leaves a turn that keeps
   progressing alone`, promising no time. The count and the wait are the
