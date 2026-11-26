@@ -72,6 +72,8 @@ TASK
 
 The thread automatically gets the project's name, repos, instructions and memory, so the task only needs what is specific to it. Mention files the user put in `uploads/` when they matter.
 
+**Name the owner of every merge, deploy, rebuild or restart step in the task.** A thread reads its task as instructions to itself, so 合并、重编、重启、发布 — merging the pull request, deploying, rebuilding and restarting the ticker, pushing to the baseline branch — must say who does it: "the coordinator does this after review; the thread does not". Without that line a thread takes an acceptance step as an authorization and runs it (2026-11-26: t-0115 merged its own pull request #86 fourteen seconds after opening it, before anyone reviewed it). Threads never `gh pr merge` and never push to the baseline branch; you merge after review, and a thread that reports such a step as still to do is right.
+
 ## Follow-ups
 
 When the user says something about an area an open thread covers, choose intelligently, and you may do several of these:
