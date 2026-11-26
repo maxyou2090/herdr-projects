@@ -75,10 +75,14 @@ enum Command {
         /// Move the project to this session when the session it was opened in no longer runs
         #[arg(long)]
         rebind: bool,
-        /// Open or focus this lane's coordinator (default: the default lane).
-        /// Without a name (`--lane`) it reopens the default lane when that is
-        /// idle, else the lowest idle `coordinator<N>` lane, and only when every
-        /// one of them is running does it create the next one
+        /// Open or focus this lane's coordinator. `--lane <name>` names the
+        /// line: created when it does not exist, focused when its coordinator
+        /// runs, refused when it is closed (`lane open <id>` reopens it).
+        /// Without a name (`--lane`) it picks a line nobody coordinates right
+        /// now: the default lane when it is idle, else the lowest open
+        /// `coordinator<N>` line that has none, else a new `coordinator<N>` —
+        /// so running it twice gives two coordinators, while plain `open`
+        /// (no `--lane`) focuses the one that runs
         #[arg(long, value_name = "NAME", num_args = 0..=1, default_missing_value = "")]
         lane: Option<String>,
         /// The display label when --lane creates a new lane (default: the name)

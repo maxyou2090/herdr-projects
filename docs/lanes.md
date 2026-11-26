@@ -243,6 +243,9 @@ default lane (§10).
   in the same file (like `inbox-counter.json`), never derived from the name, and
   never reused — not after a close either, so `c-2` is `c-2` forever and a
   `lane assign c-1` quoted in an old report can never hit some other lane.
+  `Registry::create` always allocates: it never matches an existing lane by
+  name or label, and `alloc_id` skips any id the file already holds, so a stale
+  counter cannot hand one out twice.
 - `name` is what commands take, and is what changes when the user renames a
   lane's *handle*. `label` is what humans see. `hp lane rename` changes `label`
   only (the `id` never moves), and may optionally change `name` with an explicit
@@ -256,6 +259,21 @@ default lane (§10).
 - The file is written only under `project.lock()`, with the same
   `read_json`/`write_json`/`write_atomic` helpers the rest of the state uses
   (all three in `src/project.rs`).
+
+**Duplicate ids are reported, never resolved.** If a hand-edited file has two
+lanes with one id (law had two `c-1` records from 2026-11-17 until a coordinator
+fixed them on 2026-11-26), nothing can tell the records apart — every lookup is
+by id. So `lane list` prints
+
+```text
+lane ids are not unique: c-1 appears twice (default, coordinator2); fix .state/lanes.json by hand or with the coordinator's help
+```
+
+before its rows, the ticker writes the same sentence as one `config-error` item
+(to avoid the first record's data becoming invisible by accident), and
+`open [--lane ...]` refuses on it instead of picking one of them. The fix is
+manual on purpose: which record is the real lane is the user's knowledge, not a
+renumbering guess.
 
 ### 4.2 `Thread.lane`
 
@@ -566,20 +584,30 @@ The CLI keeps its shape: `hp` below is the printed prefix
 
 - No `--lane`: the default lane, exactly today's behaviour (`--new`, `--profile`,
   `--tab`, `--rebind`, `--session` unchanged). Projects that never use lanes see
-  no difference at all.
-- `--lane` with no value picks the line itself: **the default lane** when it has
-  no live coordinator (close the tab, run it again, and you are back on the line
-  your tasks and threads are filed under), else the lowest `coordinator<N>` lane
-  that is open and idle, else the next new one — the smallest N from 2 that no
-  lane uses as its name or its label. A closed lane is never reopened this way
-  (`lane open` is), and a handle the user chose is never automatic.
+  no difference at all. When it finds that line's coordinator already running it
+  focuses it and prints one line with the two ways to get another —
+  `another line: hp open <slug> --lane <name>` · `another coordinator on this
+  line: hp open <slug> --new` — plus, when there is one, `closed lines can be
+  reopened: hp lane open <id>`.
+- `--lane` with no value picks the line that has **no coordinator right now**:
+  **the default lane** when it has no live coordinator (close the tab, run it
+  again, and you are back on the line your tasks and threads are filed under),
+  else the lowest `coordinator<N>` lane that is open and idle, else the next new
+  one — the smallest N from 2 that no lane uses as its name or its label. **This
+  is the "open another coordinator" flag**: `hp open law --lane` twice gives two
+  coordinators (the default line, then `coordinator2`), a third call gives
+  `coordinator3`, and once the extra tab is closed the next call reuses that
+  empty line instead of adding one. A closed lane is never reopened this way
+  (`lane open` is), and when such a line exists the output says so:
+  `line coordinator2 (c-2) is closed; hp lane open c-2 reopens it`. A handle the
+  user chose is never automatic.
 - `--lane <name>` that does not exist: create it (`c-<next>`), with
   `--lane-name` as its label if given, else the name as the label. Then open a
   coordinator for it — a new tab in the project's home Space when the default
   lane's home Space exists, else the current workspace-creation path.
 - `--lane <name>` that exists and has a live coordinator: focus that pane (the
   existing "running" branch of `open` in `src/coordinator.rs`, but scoped to the
-  lane).
+  lane). The same one-line hint as plain `open` says how to get another.
   `--new` starts another instance for the same lane — allowed, but the lane still
   has one record; the last one to speak wins rule 2, and rule 1 keeps the other
   one honest.
@@ -674,7 +702,7 @@ do.
 
 | Command | Effect | 作用 |
 | --- | --- | --- |
-| `hp open <slug> --lane <name> [--lane-name <label>] [--profile P] [--new]` | Open or focus that lane's coordinator. A missing lane is created; an existing live one is focused. No `--lane`: the default lane, today's behaviour. | 打开或聚焦该 lane 的协调器：不存在就创建，存在且活着就聚焦。不传 `--lane` 就是默认 lane，即现有行为。 |
+| `hp open <slug> --lane <name> [--lane-name <label>] [--profile P] [--new]` | Open or focus that lane's coordinator. A missing lane is created; an existing live one is focused. Without a name, `--lane` picks a line with no coordinator (the default line when idle, else the lowest idle `coordinator<N>`, else a new one); plain `open` focuses the default lane. | 打开或聚焦该 lane 的协调器：不存在就创建，存在且活着就聚焦。`--lane` 不带名字时选一条**现在没有协调器**的线（默认线空闲就用它，否则最低的空闲 `coordinator<N>`，都没有就新建）；不传 `--lane` 则聚焦默认 lane。 |
 | `hp lane adopt <lane> [--project <slug>]` | Claim **the terminal this command runs in** as lane `<lane>`'s coordinator (reads `HC_TERMINAL_ID`, `HC_SESSION` and the agent session). For a tab the user started by hand. | 把**当前终端** 认领为 lane 的协调器（读 `HC_TERMINAL_ID`、`HC_SESSION` 和 agent session），用于用户手动开 tab 起 agent。 |
 | `hp lane list <slug> [--json]` | Every lane with the rule each live pane matched, thread and inbox counts, `last_active`, and `closed` lanes. | 列出所有 lane，含每个 live pane 命中的解析规则、线程数与 inbox 数、`last_active`，以及已 closed 的 lane。 |
 | `hp lane assign <lane> <pane> [--project <slug>]` | The explicit handover: point the lane (and its threads) at another coordinator pane. The **only** thing that moves ownership. | 显式接手：把该 lane 及其线程交给另一个协调器 pane。这是**唯一**会转移归属的命令。 |

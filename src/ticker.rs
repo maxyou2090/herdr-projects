@@ -2031,6 +2031,9 @@ fn tick_slow(ctx: &Ctx, project: &Project, seen: &Seen, memory: &mut Memory, log
         Ok(_) => {}
         Err(error) => errors.push(error.context("audit")),
     }
+    // A registry that names one id twice is a config error, not a lane: no
+    // lookup can tell the two records apart, so report it once per sentence.
+    errors.extend(steps::write_lane_duplicate_items(project, &mut state).err());
     // §7: an open lane with live threads and no live coordinator gets one
     // `lane` item, addressed to the default lane, deduplicated on its thread
     // count. A project without a registry has no lane that can be orphaned.
