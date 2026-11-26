@@ -215,8 +215,9 @@ pub struct State {
     pub interrupted_turns: BTreeMap<String, u64>,
     /// coordinator pane id -> the last look the ticker took at that pane's
     /// screen ([`interrupt_long_turns`]): the fingerprint, when it started
-    /// standing, and this turn's command shapes. Written only for a project
-    /// whose `coordinator_turn_limit` is not `off`, and dropped with the pane.
+    /// standing, and when each of this turn's commands ran. Written only for a
+    /// project whose `coordinator_turn_limit` is not `off`, and dropped with the
+    /// pane.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub screens: BTreeMap<String, Screen>,
     /// The default lane in force for this load. Not part of the file: the
@@ -258,15 +259,17 @@ impl Turn {
 }
 
 /// The ticker's last look at one coordinator pane's screen: what the text
-/// looked like, since when it has looked like that, and how often each command
-/// shape has stood on it during the current turn.
+/// looked like, since when it has looked like that, and when each command ran
+/// during the current turn.
 ///
 /// The fingerprint is what tells a pane that is *doing* something from one
 /// that is only redrawing itself: a coordinator in a `sleep 60; ssh …` retry
 /// loop prints one line a minute, so its turn looks alive by its length and by
-/// the clock, while the text that matters has not moved. The shapes are the
+/// the clock, while the text that matters has not moved. The sightings are the
 /// other half: a loop that does print (a fresh timestamp each time) still runs
-/// the same command over and over, which `hc read` shows as repetition.
+/// the same command over and over, which `hc read` shows as repetition — and
+/// the times are what tell that loop from a coordinator querying the same tool
+/// with different arguments.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Screen {
@@ -275,18 +278,36 @@ pub struct Screen {
     /// When `hash` was first seen, UTC. Empty until the first tick records one.
     pub since: String,
     /// core's `turn` this record belongs to. A different turn starts the record
-    /// again: its fingerprint and its shapes are the previous turn's work.
+    /// again: its fingerprint and its sightings are the previous turn's work.
     pub turn: u64,
-    /// command shape -> the most times it stood on the screen in one tick of
-    /// this turn. The max and not a sum: one tick's screen holds the turn's
-    /// transcript, so counting the same screen again would double it, while a
-    /// screen that scrolls keeps what has already passed out of view.
-    pub shapes: BTreeMap<String, u32>,
-    /// The same counts as they stood on the turn's first screen. A harness
-    /// draws the conversation above the turn too, and those commands are not
-    /// this turn's work: a shape only reads as repeating once it has grown past
-    /// what the new turn inherited.
-    pub before: BTreeMap<String, u32>,
+    /// command key -> this turn's sightings of it ([`Repeat`], [`repeat_key`]).
+    pub repeats: BTreeMap<String, Repeat>,
+}
+
+/// One command's sightings during a turn ([`Screen::repeats`]).
+///
+/// The key is the whole command line for ordinary work, and a wait's family
+/// shape only for a line that is itself a wait or a retry ([`repeat_key`]): two
+/// `eye-cli write mongo exec …` calls with different arguments are two
+/// different commands, while `sleep 45; ssh …` and `sleep 60; ssh …` are the
+/// same loop.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Repeat {
+    /// The most times this key stood on one screen during this turn. The max
+    /// and not a sum: one tick's screen holds the turn's transcript, so counting
+    /// the same screen again would double it. On the turn's first screen this is
+    /// only the baseline — a harness draws the conversation above the turn too,
+    /// and those commands are not this turn's work.
+    pub seen: u32,
+    /// Seconds (UTC) of every occurrence this turn's own work added, inside the
+    /// repeat window. The times are what tell a loop (three in three minutes)
+    /// from a command a coordinator happened to run again half an hour later.
+    pub sightings: Vec<i64>,
+    /// The line as it was last read, for the log.
+    pub line: String,
+    /// Whether the key is a wait's family rather than a whole line.
+    pub wait: bool,
 }
 
 /// One coordinator pane's turn as a reader sees it: how long the turn has run
@@ -396,8 +417,10 @@ pub struct Interrupted {
 pub enum Cause {
     /// The pane's screen has not changed for this long.
     Stuck { unchanged_secs: i64 },
-    /// One command shape this many times on the screen during this turn.
-    Repeating { shape: String, times: u32 },
+    /// One command this many times inside [`REPEAT_WINDOW_SECS`] during this
+    /// turn. `line` is the command as read (the log cuts it), and `wait` says
+    /// whether it was matched as a wait's family rather than as a whole line.
+    Repeating { line: String, times: u32, wait: bool },
 }
 
 /// What one pass over the coordinator panes did: the turns it stopped, and the
@@ -415,10 +438,18 @@ pub struct TurnStops {
 ///
 /// `rexa: interrupted the coordinator's turn after 23m00s (no new output for
 /// 11m00s): `coordinator_turn_limit``
+/// `law: interrupted the coordinator's turn after 11m21s (the same command 3
+/// times in 3m: `ls -la`): `coordinator_turn_limit``
 pub fn interrupt_note(stop: &Interrupted) -> String {
     let why = match &stop.cause {
         Cause::Stuck { unchanged_secs } => format!("no new output for {}", turn_text(*unchanged_secs)),
-        Cause::Repeating { shape, times } => format!("repeating `{shape}` {times} times in this turn"),
+        Cause::Repeating { line, times, wait } => {
+            // Two judgements in one family, and the log has to say which: a
+            // whole line that came back is a poll, a wait's family is a retry
+            // loop whose arguments never stand still.
+            let what = if *wait { "the same wait command" } else { "the same command" };
+            format!("{what} {times} times in {}: `{}`", window_text(), log_line(line))
+        }
     };
     format!("interrupted the coordinator's turn after {} ({why}): `coordinator_turn_limit`", turn_text(stop.secs))
 }
@@ -432,12 +463,23 @@ pub fn interrupt_note(stop: &Interrupted) -> String {
 /// for that long belongs in a thread, where nothing is stopped.
 pub const SCREEN_STUCK_SECS: i64 = 600;
 
-/// How many times one command shape must stand on a coordinator pane's screen
-/// during one turn before that turn reads as a poll loop rather than work.
+/// How many times one command must run inside [`REPEAT_WINDOW_SECS`] before
+/// that turn reads as a poll loop rather than work.
+///
 /// Three, not two: a command run twice can be a retry after a real failure; a
-/// third identical one, on a turn already past its limit, is `sleep; ssh`
-/// against a host that is not coming back.
-pub const REPEAT_SHAPES: u32 = 3;
+/// third one, on a turn already past its limit, is `sleep; ssh` against a host
+/// that is not coming back.
+pub const REPEAT_COMMANDS: u32 = 3;
+
+/// The window the count is taken over: a polling turn is a *dense* retry, so
+/// three runs inside this window is a loop while three spread over eleven
+/// minutes is a coordinator coming back to a command it already used.
+pub const REPEAT_WINDOW_SECS: i64 = 180;
+
+/// How much of a command the log carries. A terminal line is wider than a log
+/// line, and a mongo pipeline can be hundreds of characters: enough to name the
+/// command, not enough to bury the rest of the tick.
+pub const LOG_LINE_CHARS: usize = 80;
 
 /// Stop a coordinator turn that is **stuck or spinning**, not one that has run
 /// long (`PROJECT.md`'s `coordinator_turn_limit`, ten minutes by default,
@@ -453,8 +495,16 @@ pub const REPEAT_SHAPES: u32 = 3;
 /// 1. **Stuck**: the pane's screen has not changed for [`SCREEN_STUCK_SECS`].
 ///    The fingerprint is [`screen_digest`], on the normalized text, so a
 ///    spinner's frame and a border drawing itself are not "output".
-/// 2. **Spinning**: one command shape ([`command_shapes`]) has stood on the
-///    screen [`REPEAT_SHAPES`] times during this turn.
+/// 2. **Spinning**: one command has run [`REPEAT_COMMANDS`] times inside
+///    [`REPEAT_WINDOW_SECS`] during this turn ([`command_lines`]). For ordinary
+///    work the command is **the whole line**: `--stype aggregate` and
+///    `--stype find`, `--limit 20` and `--limit 50` are different commands, and
+///    a coordinator asking six different questions in a row is working, not
+///    polling (2026-11-26, law: eleven minutes of `eye-cli write mongo exec …`
+///    with different arguments was stopped as "repeating"). Only a line that is
+///    itself a wait or a retry ([`is_wait_command`]: `sleep`, `while`,
+///    `until`, `timeout`, `curl --retry`) is matched by its family shape, since
+///    its arguments are the one thing a retry loop changes.
 ///
 /// The measurement of the turn itself is [`turn_clock`], the same one `hp
 /// context` prints and the audit warns on at ten minutes: the warning says the
@@ -521,7 +571,7 @@ pub fn interrupt_long_turns(project: &Project, state: &mut State, settings: &Set
         };
         let (unchanged_secs, repeated) = {
             let watch = watch_screen(state, pane, &screen, now);
-            (crate::thread::seconds_since(&watch.since, now), repeated_shape(watch))
+            (crate::thread::seconds_since(&watch.since, now), repeated_command(watch, now))
         };
         // `coordinator_turn_limit` is the earliest a turn is judged, not the
         // point it is cut: before it, even a frozen screen is left alone.
@@ -530,8 +580,8 @@ pub fn interrupt_long_turns(project: &Project, state: &mut State, settings: &Set
         }
         let cause = if unchanged_secs >= SCREEN_STUCK_SECS {
             Cause::Stuck { unchanged_secs }
-        } else if let Some((shape, times)) = repeated {
-            Cause::Repeating { shape, times }
+        } else if let Some((line, times, wait)) = repeated {
+            Cause::Repeating { line, times, wait }
         } else {
             continue;
         };
@@ -551,48 +601,77 @@ pub fn interrupt_long_turns(project: &Project, state: &mut State, settings: &Set
 
 /// The record of `pane`'s screen, brought up to date with what this tick read:
 /// a hash that changed restarts its `since`, a turn that advanced (or a pane
-/// seen for the first time) starts the whole record again, and this screen's
-/// command shapes join the turn's counts.
+/// seen for the first time) starts the whole record again, and every command
+/// this screen added to the turn gets one sighting at `now`.
 fn watch_screen<'a>(state: &'a mut State, pane: &crate::coordinator::LivePane, screen: &str, now: jiff::Timestamp) -> &'a Screen {
-    // This screen's own count, kept as a maximum: the same screen read on two
-    // ticks is one screen, while a screen that scrolls keeps what has already
-    // passed out of view and would otherwise be forgotten.
-    let mut now_shapes: BTreeMap<String, u32> = BTreeMap::new();
-    for shape in command_shapes(screen) {
-        *now_shapes.entry(shape).or_insert(0) += 1;
+    // This screen's own count per command, with the line it was read from: the
+    // same screen read on two ticks is one screen, while a screen that scrolls
+    // keeps what has already passed out of view and would otherwise be
+    // forgotten.
+    let mut counts: BTreeMap<String, (u32, String, bool)> = BTreeMap::new();
+    for line in command_lines(screen) {
+        let wait = is_wait_command(&line);
+        let entry = counts.entry(repeat_key(&line)).or_insert_with(|| (0, String::new(), wait));
+        entry.0 += 1;
+        entry.1 = line;
     }
     let hash = screen_digest(screen);
+    let second = now.as_second();
+    let from = second - REPEAT_WINDOW_SECS;
     let entry = state.screens.entry(pane.pane_id.clone()).or_default();
     if entry.turn != pane.state_change_seq || entry.since.is_empty() {
-        *entry = Screen { hash, since: now.to_string(), turn: pane.state_change_seq, shapes: now_shapes.clone(), before: now_shapes };
+        // A new turn (or a pane met for the first time) starts the record
+        // again: what is already drawn above the turn is the harness's
+        // transcript of earlier work, so it only sets the baseline and no
+        // sighting. Stopping a turn because the *previous* one ran a command
+        // three times would be the same mistake as stopping it for its length.
+        let repeats = counts
+            .into_iter()
+            .map(|(key, (times, line, wait))| (key, Repeat { seen: times, sightings: Vec::new(), line, wait }))
+            .collect();
+        *entry = Screen { hash, since: now.to_string(), turn: pane.state_change_seq, repeats };
         return entry;
     }
     if entry.hash != hash {
         entry.hash = hash;
         entry.since = now.to_string();
     }
-    for (shape, times) in now_shapes {
-        let seen = entry.shapes.entry(shape).or_insert(0);
-        *seen = (*seen).max(times);
+    for (key, (times, line, wait)) in counts {
+        let repeat = entry.repeats.entry(key).or_insert_with(|| Repeat { line: line.clone(), wait, ..Repeat::default() });
+        repeat.line = line;
+        repeat.wait = wait;
+        // Only growth past what the turn has already seen is a new occurrence:
+        // the same line read again on the next tick is the same line still on
+        // the screen, and counting it again would stop any slow turn.
+        if times > repeat.seen {
+            let fresh = times - repeat.seen;
+            repeat.sightings.extend(std::iter::repeat_n(second, fresh as usize));
+            // Older than the window is of no use to the judgement, and keeping
+            // it would grow the state for the length of a turn.
+            repeat.sightings.retain(|at| *at >= from);
+        }
+        // A screen that scrolled no longer holds every line it held before, so
+        // the next time one comes back it is new again.
+        repeat.seen = times;
     }
     entry
 }
 
-/// The one shape that has stood [`REPEAT_SHAPES`] times **in this turn**, with
-/// how many times, or `None`.
+/// The one command that has run [`REPEAT_COMMANDS`] times inside
+/// [`REPEAT_WINDOW_SECS`] of `now`, with its line, how many times, and whether
+/// it was matched as a wait's family — or `None`.
 ///
-/// The count has to have grown past what the turn started with
-/// ([`Screen::before`]): the screen above the turn is the harness's transcript
-/// of earlier work, and stopping a coordinator because the *previous* turn ran
-/// `hp task list` three times would be the same mistake as stopping it for
-/// being long.
-fn repeated_shape(screen: &Screen) -> Option<(String, u32)> {
+/// The count is taken over the sightings, never over the screen: a line still
+/// drawn from ten minutes ago has one sighting, not one per tick.
+fn repeated_command(screen: &Screen, now: jiff::Timestamp) -> Option<(String, u32, bool)> {
+    let from = now.as_second() - REPEAT_WINDOW_SECS;
     screen
-        .shapes
-        .iter()
-        .filter(|(shape, times)| **times >= REPEAT_SHAPES && **times > screen.before.get(*shape).copied().unwrap_or(0))
-        .max_by_key(|(_, times)| **times)
-        .map(|(shape, times)| (shape.clone(), *times))
+        .repeats
+        .values()
+        .map(|repeat| (repeat, repeat.sightings.iter().filter(|at| **at >= from).count() as u32))
+        .filter(|(_, times)| *times >= REPEAT_COMMANDS)
+        .max_by_key(|(_, times)| *times)
+        .map(|(repeat, times)| (repeat.line.clone(), times, repeat.wait))
 }
 
 /// The screen's text, normalized so that decoration is not output: styling and
@@ -633,15 +712,15 @@ fn screen_digest(screen: &str) -> u64 {
     hash
 }
 
-/// The command shapes on a screen, in the order they appear: one per line that
+/// The command lines on a screen, in the order they appear: one per line that
 /// carries a command, which is how a harness shows what it ran (`$ …`, or a
 /// `Bash(…)` tool call).
 ///
 /// Prose is not a command, and a screen is mostly prose: a line counts only
 /// when a marker is the first thing on it once decoration (box drawing, a
 /// reply arrow, a bullet) is stripped.
-pub fn command_shapes(screen: &str) -> Vec<String> {
-    crate::trust_screen::plain_text(screen).lines().filter_map(command_shape).collect()
+pub fn command_lines(screen: &str) -> Vec<String> {
+    crate::trust_screen::plain_text(screen).lines().filter_map(command_line).collect()
 }
 
 /// Glyphs a harness puts in front of a line it shows: box drawing, an arrow, a
@@ -650,9 +729,13 @@ fn is_decoration(c: char) -> bool {
     c.is_whitespace() || matches!(c, '|' | '\u{2502}' | '\u{2503}' | '\u{250f}' | '\u{2517}' | '\u{250c}' | '\u{2514}' | '\u{251c}' | '\u{258e}' | '\u{258c}' | '\u{2022}' | '\u{25cf}' | '\u{23fa}' | '\u{276f}' | '>' | '`' | '*' | '-' | '+')
 }
 
-/// One line's shape, or `None` when the line is not a command
-/// ([`command_shapes`]).
-fn command_shape(line: &str) -> Option<String> {
+/// One line's command, or `None` when the line is not a command
+/// ([`command_lines`]).
+///
+/// The line is the command **as it was run**, its arguments included: two calls
+/// of the same tool with different arguments are two commands, and the clock a
+/// command prints is the only thing normalized away ([`normalize_clock`]).
+fn command_line(line: &str) -> Option<String> {
     const MARKERS: [&str; 4] = ["$ ", "Bash(", "bash(", "Shell("];
     let line = line.trim();
     for marker in MARKERS {
@@ -663,9 +746,11 @@ fn command_shape(line: &str) -> Option<String> {
         }
         let rest = line[at + marker.len()..].trim();
         let rest = rest.strip_suffix(')').unwrap_or(rest).trim();
-        if let Some(shape) = shape_of(rest) {
-            return Some(shape);
+        // `$ 5` and `$ (1 earlier lines…)` are a price and a harness's note.
+        if !rest.chars().next().is_some_and(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '/' | '~' | '_')) {
+            continue;
         }
+        return Some(normalize_clock(rest));
     }
     None
 }
@@ -697,6 +782,110 @@ fn shape_of(command: &str) -> Option<String> {
         parts.push(shape);
     }
     (!parts.is_empty()).then(|| parts.join("; "))
+}
+
+/// Whether a command line is itself a wait or a retry: `sleep 45; ssh …`,
+/// `while ! ssh …; do sleep 5; done`, `timeout 20 ssh …`,
+/// `curl --retry 5 …`.
+///
+/// Only these are matched by family ([`repeat_key`]) instead of by their whole
+/// line. Their arguments are the one thing a retry loop changes, so requiring an
+/// identical line would let a loop run for ever — while two calls of a query
+/// tool with different arguments must stay two commands.
+pub fn is_wait_command(line: &str) -> bool {
+    for segment in line.split([';', '&', '|']) {
+        let words: Vec<&str> = segment.split_whitespace().collect();
+        let Some(first) = words.first() else { continue };
+        let first = first.trim_matches(|c: char| matches!(c, '\'' | '"' | '(' | ')' | '$' | '!' | '{'));
+        // The request's own repeat and timeout flags.
+        let retrying = first == "curl"
+            && words.iter().any(|word| word.starts_with("--retry") || word.starts_with("--max-time") || word.starts_with("--connect-timeout") || *word == "-m");
+        if retrying {
+            return true;
+        }
+        match first {
+            // A wait, a loop header, a loop body, or a wait around something.
+            "sleep" | "wait" | "while" | "until" | "for" | "timeout" | "watch" => return true,
+            _ => {}
+        }
+    }
+    false
+}
+
+/// The key a command is counted under ([`Repeat`]): its whole line, or — only
+/// for a line that is itself a wait or a retry — its family shape.
+fn repeat_key(line: &str) -> String {
+    if is_wait_command(line) && let Some(shape) = shape_of(line) {
+        return format!("wait: {shape}");
+    }
+    line.to_string()
+}
+
+/// The clock a command printed, normalized away: a timestamp or a wall clock in
+/// the command's own text says when it ran, not what it did, so a poll loop that
+/// stamps each attempt is still the same command.
+///
+/// Nothing else is normalized. A number that is an argument stays, because
+/// `--limit 20` and `--limit 50` are two different queries and a coordinator
+/// that asked a different one made progress (2026-11-26, law).
+fn normalize_clock(line: &str) -> String {
+    line.split_whitespace().map(clock_free).collect::<Vec<_>>().join(" ")
+}
+
+/// One word with a leading or embedded stamp replaced by `<time>`.
+fn clock_free(word: &str) -> String {
+    match stamp_at(word) {
+        Some((at, len)) => format!("{}<time>{}", &word[..at], &word[at + len..]),
+        None => word.to_string(),
+    }
+}
+
+/// Where a clock starts in a word and how long it is: `2026-11-26T02:28:25Z`,
+/// `2026-11-26`, `02:28:25`, `02:28:25.123`.
+fn stamp_at(word: &str) -> Option<(usize, usize)> {
+    let bytes = word.as_bytes();
+    let digits = |at: usize, n: usize| at + n <= bytes.len() && bytes[at..at + n].iter().all(u8::is_ascii_digit);
+    for at in 0..bytes.len() {
+        let date = digits(at, 4) && bytes.get(at + 4) == Some(&b'-') && digits(at + 5, 2) && bytes.get(at + 7) == Some(&b'-') && digits(at + 8, 2);
+        let clock = |t: usize| digits(t, 2) && bytes.get(t + 2) == Some(&b':') && digits(t + 3, 2) && bytes.get(t + 5) == Some(&b':') && digits(t + 6, 2);
+        if date {
+            let mut len = 10;
+            // `2026-11-26T02:28:25`, and the fraction and zone a log adds.
+            if bytes.get(at + 10) == Some(&b'T') && clock(at + 11) {
+                len = 19;
+                if bytes.get(at + 19) == Some(&b'.') && digits(at + 20, 3) {
+                    len = 23;
+                }
+                if bytes.get(at + len) == Some(&b'Z') {
+                    len += 1;
+                }
+            }
+            return Some((at, len));
+        }
+        if clock(at) {
+            return Some((at, 8));
+        }
+    }
+    None
+}
+
+/// A command as a log line carries it: one line, cut to [`LOG_LINE_CHARS`]
+/// with `…` where it was longer.
+fn log_line(line: &str) -> String {
+    if line.chars().count() <= LOG_LINE_CHARS {
+        return line.to_string();
+    }
+    let cut: String = line.chars().take(LOG_LINE_CHARS - 1).collect();
+    format!("{cut}…")
+}
+
+/// The repeat window as the log and `hp context` say it: `3m`.
+pub fn window_text() -> String {
+    if REPEAT_WINDOW_SECS % 60 == 0 {
+        format!("{}m", REPEAT_WINDOW_SECS / 60)
+    } else {
+        format!("{REPEAT_WINDOW_SECS}s")
+    }
 }
 
 /// Accepts both the pre-lanes scalar shape and the per-lane map of §4.4. A
@@ -2417,13 +2606,16 @@ mod tests {
         // legacy shape is the one place a field goes missing for every project
         // without `lanes.json`.
         let mut state = State::default();
-        let mut shapes = BTreeMap::new();
-        shapes.insert("sleep …; ssh …".to_string(), 4u32);
-        state.screens.insert(pane.clone(), Screen { hash: 42, since: "2026-11-20T09:00:00Z".into(), turn: 3, shapes: shapes.clone(), before: BTreeMap::new() });
+        let mut repeats = BTreeMap::new();
+        repeats.insert(
+            "wait: sleep …; ssh …".to_string(),
+            Repeat { seen: 4, sightings: vec![1_765_000_000, 1_765_000_040], line: "sleep 45; ssh build uptime".into(), wait: true },
+        );
+        state.screens.insert(pane.clone(), Screen { hash: 42, since: "2026-11-20T09:00:00Z".into(), turn: 3, repeats: repeats.clone() });
         save_state(&project, &state).unwrap();
         let text = std::fs::read_to_string(project.state_dir().join("ticker.json")).unwrap();
         assert!(text.contains("screens"), "{text}");
-        assert_eq!(load_state(&project).screens.get(&pane).map(|s| (s.hash, s.turn, s.shapes.clone())), Some((42, 3, shapes)));
+        assert_eq!(load_state(&project).screens.get(&pane).map(|s| (s.hash, s.turn, s.repeats.clone())), Some((42, 3, repeats)));
     }
 
     /// One coordinator pane as `coordinator::discover` hands it over: its
@@ -2453,6 +2645,16 @@ mod tests {
         let mut text = String::from("I'll keep checking the host until it opens.\n");
         for n in 0..times {
             text.push_str(&format!("$ sleep {}; ssh root@10.0.0.{} uptime\n\u{23fa} still closed, try {} of {times}\n", 30 + n * 15, n + 1, n + 1));
+        }
+        text
+    }
+
+    /// The 2026-11-21 shape from the docs: one retry line with nothing moving
+    /// in it but the count of attempts.
+    fn ssh_poll_screen(times: usize) -> String {
+        let mut text = String::from("The build host is not answering docker yet.\n");
+        for n in 0..times {
+            text.push_str(&format!("$ sleep 45; ssh build 'sudo docker ps'\n\u{23fa} no answer yet, attempt {} of {times}\n", n + 1));
         }
         text
     }
@@ -2548,8 +2750,13 @@ mod tests {
     /// A turn whose screen says the same thing again and again is a poll loop,
     /// which is what rexa did for four hours: `sleep 60; ssh …`, `curl …`, `git
     /// fetch` on a clock. The log names the command so the reader knows which.
+    ///
+    /// This is the wait/retry half of the judgement: a loop changes its sleep,
+    /// its host and its timestamp on every attempt, so the line is matched by
+    /// its family (`sleep …; ssh build …`) — and only three of those inside
+    /// three minutes is a loop.
     #[test]
-    fn a_repeated_command_shape_is_stopped_as_spinning() {
+    fn a_wait_loop_is_stopped_as_spinning_and_the_log_names_the_command() {
         let root = tempfile::tempdir().unwrap();
         let project = project::create(root.path(), "rexa", vec![]).unwrap();
         let pane = "hp-rexa-coordinator";
@@ -2557,38 +2764,131 @@ mod tests {
         core.terminal(pane, &project.canonical_dir().to_string_lossy(), &[("hp_agent", "hpc-rexa")]);
         core.set_status(pane, "working");
         core.set_turn(pane, 7);
-        core.set_screen(pane, &polling_screen(1));
+        // Eleven minutes in the pane is in the loop: the limit (ten minutes) is
+        // already behind it when the first screen is read, so the baseline is
+        // the only reading the turn is not judged on.
+        let panes = [live_coordinator(pane, "working", 7, "2026-11-21T06:50:00Z")];
+        let mut state = turn_started_at(pane, "2026-11-21T06:50:00Z");
         let hc = crate::core::Core::new("hc", "", &core);
-        let panes = [live_coordinator(pane, "working", 7, "2026-11-21T07:00:00Z")];
-        let mut state = turn_started_at(pane, "2026-11-21T07:00:00Z");
 
-        // A first reading inside the limit: the shapes are counted, nothing is
-        // stopped yet.
-        let stops = interrupt_long_turns(&project, &mut state, &Settings::default(), &hc, &panes, at("2026-11-21T07:05:00Z"));
+        core.set_screen(pane, &ssh_poll_screen(1));
+        let stops = interrupt_long_turns(&project, &mut state, &Settings::default(), &hc, &panes, at("2026-11-21T07:04:00Z"));
         assert!(stops.stopped.is_empty() && stops.errors.is_empty(), "{stops:#?}");
 
-        // Seven minutes on it has retried again and again: twelve minutes in
-        // the limit is the earliest look, and the fourth identical shape is
-        // what ends it.
-        core.set_screen(pane, &polling_screen(4));
-
-        let stops = interrupt_long_turns(&project, &mut state, &Settings::default(), &hc, &panes, at("2026-11-21T07:12:00Z"));
+        // Two more attempts inside three minutes: the third is the loop.
+        for (times, now) in [(2, "2026-11-21T07:05:30Z"), (3, "2026-11-21T07:07:00Z")] {
+            core.set_screen(pane, &ssh_poll_screen(times));
+            let stops = interrupt_long_turns(&project, &mut state, &Settings::default(), &hc, &panes, at(now));
+            assert!(stops.stopped.is_empty(), "{times} attempts is still a retry: {:#?}", stops.stopped);
+        }
+        core.set_screen(pane, &ssh_poll_screen(4));
+        let stops = interrupt_long_turns(&project, &mut state, &Settings::default(), &hc, &panes, at("2026-11-21T07:08:00Z"));
+        assert_eq!(stops.stopped.len(), 1, "four attempts, three in the window: {:#?}", stops.stopped);
         assert_eq!(
-            stops.stopped,
-            [Interrupted {
-                pane: pane.into(),
-                secs: 12 * 60,
-                cause: Cause::Repeating { shape: "sleep …; ssh …".into(), times: 4 }
-            }]
+            stops.stopped[0].cause,
+            Cause::Repeating { line: "sleep 45; ssh build 'sudo docker ps'".into(), times: 3, wait: true }
         );
         let note = interrupt_note(&stops.stopped[0]);
-        assert!(note.contains("repeating `sleep …; ssh …` 4 times in this turn"), "{note}");
-        assert_eq!(note, "interrupted the coordinator's turn after 12m00s (repeating `sleep …; ssh …` 4 times in this turn): `coordinator_turn_limit`");
+        assert_eq!(
+            note,
+            "interrupted the coordinator's turn after 18m00s (the same wait command 3 times in 3m: `sleep 45; ssh build 'sudo docker ps'`): `coordinator_turn_limit`"
+        );
+
+        // Once per turn, however many ticks the loop keeps printing.
+        core.set_screen(pane, &ssh_poll_screen(5));
+        let stops = interrupt_long_turns(&project, &mut state, &Settings::default(), &hc, &panes, at("2026-11-21T07:08:15Z"));
+        assert!(stops.stopped.is_empty(), "{:#?}", stops.stopped);
+    }
+
+    /// The other half, and the 2026-11-26 fault: a coordinator asking six
+    /// different `eye-cli write mongo exec …` questions in a row is working.
+    /// The arguments are what changed, so none of these lines repeats — and a
+    /// shape like `eye-cli write …` must never be what ends a turn.
+    #[test]
+    fn a_run_of_the_same_tool_with_different_arguments_is_never_stopped() {
+        let root = tempfile::tempdir().unwrap();
+        let project = project::create(root.path(), "law", vec![]).unwrap();
+        let pane = "hp-law-coordinator";
+        let core = crate::fake_hc::FakeCore::new();
+        core.terminal(pane, &project.canonical_dir().to_string_lossy(), &[("hp_agent", "hpc-law")]);
+        core.set_status(pane, "working");
+        core.set_turn(pane, 4);
+        let panes = [live_coordinator(pane, "working", 4, "2026-11-26T02:18:00Z")];
+        let mut state = turn_started_at(pane, "2026-11-26T02:18:00Z");
+        let hc = crate::core::Core::new("hc", "", &core);
+
+        // The six queries of the real turn, 45 seconds apart, on a turn already
+        // eleven minutes past the limit.
+        const EYE: [&str; 6] = [
+            "$ eye-cli write mongo exec --project law_office_api --env prod --col file --stype aggregate --pipeline '[{\"$match\":{\"caseId\":\"A-1024\"}}]'",
+            "$ eye-cli write mongo exec --project law_office_api --env prod --col file --stype aggregate --pipeline '[{\"$group\":{\"_id\":\"$kind\",\"n\":{\"$sum\":1}}}]'",
+            "$ eye-cli write mongo exec --project law_office_api --env prod --col file --stype find --limit 20",
+            "$ eye-cli write mongo exec --project law_office_api --env prod --col file --stype aggregate --pipeline '[{\"$match\":{\"kind\":\"pdf\"}}]'",
+            "$ eye-cli write mongo exec --project law_office_api --env prod --col file --stype find --limit 50",
+            "$ eye-cli write mongo exec --project law_office_api --env prod --col file --stype find --limit 5 --sort '{\"at\":-1}'",
+        ];
+        core.set_screen(pane, &EYE[..3].join("\n"));
+        let stops = interrupt_long_turns(&project, &mut state, &Settings::default(), &hc, &panes, at("2026-11-26T02:28:25Z"));
+        assert!(stops.stopped.is_empty() && stops.errors.is_empty(), "{stops:#?}");
+        core.set_screen(pane, &EYE.join("\n"));
+        let stops = interrupt_long_turns(&project, &mut state, &Settings::default(), &hc, &panes, at("2026-11-26T02:29:10Z"));
+        assert!(stops.stopped.is_empty(), "six different queries are work: {:#?}", stops.stopped);
+
+        // The same query brought back later is still only a second sighting.
+        core.set_screen(pane, &format!("{}\n{}", EYE.join("\n"), EYE[0]));
+        let stops = interrupt_long_turns(&project, &mut state, &Settings::default(), &hc, &panes, at("2026-11-26T02:30:08Z"));
+        assert!(stops.stopped.is_empty(), "{:#?}", stops.stopped);
+    }
+
+    /// A plain command is judged on its whole line: three identical `ls` in
+    /// three minutes is a loop, the same three spread over eleven minutes is a
+    /// coordinator coming back to a command it already used.
+    #[test]
+    fn the_same_plain_command_stops_only_when_it_is_dense() {
+        let root = tempfile::tempdir().unwrap();
+        let project = project::create(root.path(), "rexa", vec![]).unwrap();
+        let pane = "hp-rexa-coordinator";
+        let core = crate::fake_hc::FakeCore::new();
+        core.terminal(pane, &project.canonical_dir().to_string_lossy(), &[("hp_agent", "hpc-rexa")]);
+        core.set_status(pane, "working");
+        core.set_turn(pane, 7);
+        let panes = [live_coordinator(pane, "working", 7, "2026-11-21T06:50:00Z")];
+        let hc = crate::core::Core::new("hc", "", &core);
+
+        // Three readings in eleven minutes: 07:00 empty, then the same line
+        // once at 07:04, twice at 07:08, three times at 07:11 — never two
+        // inside one window.
+        let mut state = turn_started_at(pane, "2026-11-21T06:50:00Z");
+        let spread = String::from("Looking for the file again. Nothing here yet.\n");
+        for (count, now) in [(0, "2026-11-21T07:00:00Z"), (1, "2026-11-21T07:04:00Z"), (2, "2026-11-21T07:08:00Z"), (3, "2026-11-21T07:11:00Z")] {
+            core.set_screen(pane, &format!("{spread}{}", "$ ls -la /tmp\n".repeat(count)));
+            let stops = interrupt_long_turns(&project, &mut state, &Settings::default(), &hc, &panes, at(now));
+            assert!(stops.stopped.is_empty(), "{count} readings in eleven minutes is not a loop: {:#?}", stops.stopped);
+        }
+
+        // The same command three times inside three minutes is.
+        let mut state = turn_started_at(pane, "2026-11-21T06:50:00Z");
+        core.set_screen(pane, &spread);
+        let stops = interrupt_long_turns(&project, &mut state, &Settings::default(), &hc, &panes, at("2026-11-21T07:04:00Z"));
+        assert!(stops.stopped.is_empty(), "{stops:#?}");
+        for (count, now) in [(1, "2026-11-21T07:04:40Z"), (2, "2026-11-21T07:05:20Z")] {
+            core.set_screen(pane, &format!("{spread}{}", "$ ls -la /tmp\n".repeat(count)));
+            let stops = interrupt_long_turns(&project, &mut state, &Settings::default(), &hc, &panes, at(now));
+            assert!(stops.stopped.is_empty(), "{count} is a retry: {:#?}", stops.stopped);
+        }
+        core.set_screen(pane, &format!("{spread}{}", "$ ls -la /tmp\n".repeat(3)));
+        let stops = interrupt_long_turns(&project, &mut state, &Settings::default(), &hc, &panes, at("2026-11-21T07:06:00Z"));
+        assert_eq!(
+            stops.stopped,
+            [Interrupted { pane: pane.into(), secs: 16 * 60, cause: Cause::Repeating { line: "ls -la /tmp".into(), times: 3, wait: false } }]
+        );
+        let note = interrupt_note(&stops.stopped[0]);
+        assert!(note.contains("the same command 3 times in 3m: `ls -la /tmp`"), "{note}");
     }
 
     /// The transcript above the turn is not the turn's work: a new turn
-    /// inherits the last one's commands on its screen, and three of them must
-    /// not stop it before it has run any command of its own.
+    /// inherits the last one's commands on its screen, and they must not stop it
+    /// before it has run any command of its own.
     #[test]
     fn commands_the_new_turn_inherited_are_not_counted_against_it() {
         let root = tempfile::tempdir().unwrap();
@@ -2609,10 +2909,16 @@ mod tests {
         let stops = interrupt_long_turns(&project, &mut state, &Settings::default(), &hc, &panes, at("2026-11-21T07:26:00Z"));
         assert!(stops.stopped.is_empty(), "and neither is the same screen read twice: {:#?}", stops.stopped);
 
-        // A retry this turn really ran is a new line, and the shape grows.
-        core.set_screen(pane, &polling_screen(5));
-        let stops = interrupt_long_turns(&project, &mut state, &Settings::default(), &hc, &panes, at("2026-11-21T07:27:00Z"));
-        assert_eq!(stops.stopped.len(), 1, "one more retry of the same shape: {:#?}", stops.stopped);
+        // A retry this turn really ran is a new line, and the family grows —
+        // but three of them inside the window is what ends it, not the first.
+        for (times, now) in [(5, "2026-11-21T07:26:30Z"), (6, "2026-11-21T07:27:00Z")] {
+            core.set_screen(pane, &polling_screen(times));
+            let stops = interrupt_long_turns(&project, &mut state, &Settings::default(), &hc, &panes, at(now));
+            assert!(stops.stopped.is_empty(), "{times} attempts is still a retry: {:#?}", stops.stopped);
+        }
+        core.set_screen(pane, &polling_screen(7));
+        let stops = interrupt_long_turns(&project, &mut state, &Settings::default(), &hc, &panes, at("2026-11-21T07:27:30Z"));
+        assert_eq!(stops.stopped.len(), 1, "three retries of this turn: {:#?}", stops.stopped);
     }
 
     /// Four different commands and a 30-minute turn: work, not a loop. Nothing
@@ -2639,8 +2945,8 @@ mod tests {
         core.set_screen(pane, more);
         let stops = interrupt_long_turns(&project, &mut state, &Settings::default(), &hc, &panes, at("2026-11-21T07:30:00Z"));
         assert!(stops.stopped.is_empty(), "a 30-minute turn of four different commands: {:#?}", stops.stopped);
-        let shapes = command_shapes(more);
-        assert_eq!(shapes, ["git status …", "cargo test …", "rg …", "cargo build …"], "{shapes:?}");
+        let lines = command_lines(more);
+        assert_eq!(lines, ["git status", "cargo test --locked", "rg -n todo src/", "cargo build --release"], "{lines:?}");
     }
 
     /// `off` is the whole rule off, a frozen pane included, and it costs
@@ -2669,26 +2975,59 @@ mod tests {
         assert!(!core.calls.borrow().iter().any(|call| call.contains("interrupt")), "{:?}", core.calls.borrow());
     }
 
-    /// A screen read with the fingerprint and the shapes in it: prose is not a
-    /// command, decoration in front of one does not hide it, and the same
-    /// command with other arguments is the same shape.
+    /// A screen read with the fingerprint and the commands in it: prose is not a
+    /// command, decoration in front of one does not hide it, an argument is part
+    /// of the command, and only a wait is matched by its family.
     #[test]
-    fn command_shapes_are_read_from_commands_and_not_from_prose() {
+    fn command_lines_are_read_from_commands_and_not_from_prose() {
         let screen = "The host is down, so I'll retry.\n\u{2502} $ sleep 60; ssh root@10.0.0.2 uptime\n\u{2502} \u{23fa} connection closed\n\u{2502} $ sleep 30 && ssh 10.0.0.9 \"uptime\"\n\u{2502} Bash(cargo test --all)\ncost $ 5 of tokens\n\u{2502} $ git fetch origin\n";
-        assert_eq!(command_shapes(screen), ["sleep …; ssh …", "sleep …; ssh …", "cargo test …", "git fetch …"]);
-        // The same commands with other parameters are the same shapes: that is
-        // what a retry loop changes and nothing else.
+        assert_eq!(
+            command_lines(screen),
+            ["sleep 60; ssh root@10.0.0.2 uptime", "sleep 30 && ssh 10.0.0.9 \"uptime\"", "cargo test --all", "git fetch origin"]
+        );
+        // The same command with other parameters is another line: that is a
+        // retry loop's signature, and only the wait family may ignore it.
         let later = screen.replace("10.0.0.2", "10.0.0.77").replace("sleep 60", "sleep 45").replace("git fetch origin", "git fetch --all");
-        assert_eq!(command_shapes(&later), command_shapes(screen));
+        assert_ne!(command_lines(&later)[..3], command_lines(screen)[..3]);
+        assert_eq!(repeat_key(&command_lines(&later)[0]), repeat_key(&command_lines(screen)[0]));
+        assert_eq!(repeat_key(&command_lines(screen)[0]), "wait: sleep …; ssh …");
+        // A query tool's arguments are its identity: `--stype aggregate` and
+        // `--stype find`, `--limit 20` and `--limit 50`, are four commands, and
+        // none of them is a wait.
+        let query = "eye-cli write mongo exec --project law_office_api --col file --stype find --limit 20";
+        let other = query.replace("--limit 20", "--limit 50");
+        let kind = query.replace("find", "aggregate");
+        assert!(!is_wait_command(query));
+        assert_ne!(repeat_key(query), repeat_key(&other));
+        assert_ne!(repeat_key(query), repeat_key(&kind));
+        assert_eq!(repeat_key(query), query);
+        // A command's own clock is normalized away, and nothing else is: a
+        // `built in 44s` is still output.
+        assert_eq!(normalize_clock("$ watch -n5 date +%FT%TZ 2026-11-26T02:28:25Z"), "$ watch -n5 date +%FT%TZ <time>");
+        assert_eq!(normalize_clock("echo 02:28:25"), "echo <time>");
+        assert_eq!(normalize_clock("echo 2026-11-26"), "echo <time>");
+        assert_ne!(normalize_clock("echo 44s"), normalize_clock("echo 45s"));
         // The shape pi and claude actually draw (captured from a live pane):
         // a command line is ` $ …` under a line of prose, and the footer's
         // spinner, counters and percentages are not commands.
         let live = " Thinking...\n\n $ sleep 60; ssh root@10.0.0.2 uptime\n ... (1 earlier lines, ctrl+o to expand)\n\n Elapsed 0.0s\n\n\u{2500}\u{2500} \u{2827} Working \u{2500}\u{2500}\n~/.herdr/worktrees/x (hp/x/t-0107)\n\u{2191}143k \u{2193}56k R5.2M CH99.5% $0.071 13.9%/1.0M (auto)\n";
-        assert_eq!(command_shapes(live), ["sleep …; ssh …"], "{:?}", command_shapes(live));
+        assert_eq!(command_lines(live), ["sleep 60; ssh root@10.0.0.2 uptime"], "{:?}", command_lines(live));
         // A spinner frame and a drawn border are not output; a new line is.
         assert_eq!(screen_digest("\u{280b} waiting\n\u{2502} $ npm run build\n"), screen_digest("\u{2819} waiting\n\u{2502} $ npm run build\n"));
         assert_ne!(screen_digest(screen), screen_digest(&format!("{screen}\n\u{2502} $ cargo build\n")));
         assert_ne!(screen_digest("built in 43s"), screen_digest("built in 44s"), "a moving number is output");
+    }
+
+    /// The log carries the command, not a shape a person cannot act on, and it
+    /// stays one line: a mongo pipeline is longer than a log line.
+    #[test]
+    fn the_log_names_the_command_and_cuts_it_at_eighty_characters() {
+        assert_eq!(log_line("sleep 45; ssh build 'sudo docker ps'"), "sleep 45; ssh build 'sudo docker ps'");
+        let long = format!("eye-cli write mongo exec --pipeline '{}'", "{\"$match\":{\"kind\":\"pdf\"}},".repeat(6));
+        let cut = log_line(&long);
+        assert_eq!(cut.chars().count(), LOG_LINE_CHARS);
+        assert!(cut.ends_with('…'), "{cut}");
+        assert_eq!(window_text(), "3m");
     }
 
     /// The warning band, the `off` switch, a program that waits for a person,
