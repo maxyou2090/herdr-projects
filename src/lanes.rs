@@ -73,6 +73,27 @@ pub fn default_lane_id(project: &Project) -> String {
         .unwrap_or_else(|| FALLBACK_ID.to_string())
 }
 
+/// Whether a write belongs in `coordinator.json`: that file is the **default
+/// lane's** single-record view (§10) — what an older binary and
+/// [`Project::coordinator`](crate::project::Project::coordinator)'s
+/// no-registry fallback read — so only the default lane writes it. Every other
+/// lane's instance lives in `lanes.json` alone.
+///
+/// A project with no registry has one lane, and that lane *is* the file: the
+/// old behavior, byte for byte. An empty `lane_id` means the default lane,
+/// like an empty `Thread.lane`.
+///
+/// This is the guard that was missing on 2026-11-26: `open law --lane` opened a
+/// second coordinator and rewrote the default line's pane, session and profile
+/// with its own, so the next `open law` resumed **another coordinator's**
+/// conversation and the 4.8MB original was unreachable.
+pub fn writes_default_record(project: &Project, lane_id: &str) -> bool {
+    if !exists(project) {
+        return true;
+    }
+    lane_id.is_empty() || Registry::for_project(project).is_default(lane_id)
+}
+
 /// The project home as an identity question sees it: the folder
 /// `coordinator.json` records (the canonical path `open` wrote), else the
 /// canonical folder. The same string the old `works_in` test compared against.
@@ -1593,21 +1614,25 @@ pub fn lane_adopt(ctx: &Ctx, project: Option<&str>, handle: &str) -> Result<()> 
         }
     })?;
     // The single-record view follows too, so an older binary and every
-    // `Project::coordinator()` caller keep reading the same pane.
-    project.update_coordinator(|record| {
-        *record = Coordinator {
-            socket: socket.clone(),
-            workspace_id: agent.workspace_id.clone(),
-            tab_id: agent.tab_id.clone(),
-            pane_id: pane.clone(),
-            agent_name: agent_name.clone(),
-            cwd: home.clone(),
-            agent: agent.agent.clone(),
-            profile: lane.profile.clone(),
-            agent_session: session_id.clone(),
-            updated: String::new(),
-        }
-    })?;
+    // `Project::coordinator()` caller keep reading the same pane — but only
+    // when this is the default lane: `coordinator.json` is that lane's view,
+    // and adopting a second lane used to overwrite it (2026-11-26).
+    if writes_default_record(&project, &lane.id) {
+        project.update_coordinator(|record| {
+            *record = Coordinator {
+                socket: socket.clone(),
+                workspace_id: agent.workspace_id.clone(),
+                tab_id: agent.tab_id.clone(),
+                pane_id: pane.clone(),
+                agent_name: agent_name.clone(),
+                cwd: home.clone(),
+                agent: agent.agent.clone(),
+                profile: lane.profile.clone(),
+                agent_session: session_id.clone(),
+                updated: String::new(),
+            }
+        })?;
+    }
     crate::labels::report_pane(&herdr, &pane, &crate::labels::coordinator_display(&project, Some(&lane.id)), &project.slug, Some(&lane.id));
     let prefix = crate::coordinator::current_prefix(&ctx.root)?;
     println!("lane `{}` ({}) is coordinated by pane {pane}", lane.label, lane.id);

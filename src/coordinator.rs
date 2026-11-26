@@ -1175,28 +1175,37 @@ pub fn open(ctx: &Ctx, slug: &str, options: &OpenOptions) -> Result<()> {
         // made has only those (t-0051).
         let (space, tab) = keep_names(&herdr, &project, &agent.pane_id);
         let _ = herdr.agent_focus(&agent.pane_id);
-        let record = project.update_coordinator(|c| {
-            // Another pane's profile is not known: the built-in of its kind.
-            if c.pane_id != agent.pane_id {
-                c.profile = agent.agent.clone();
-            }
-            c.socket = socket.clone();
-            c.workspace_id = if space.is_empty() { agent.workspace_id.clone() } else { space };
-            c.tab_id = if tab.is_empty() { agent.tab_id.clone() } else { tab };
-            c.pane_id = agent.pane_id.clone();
-            c.agent_name = agent.name.clone();
-            c.cwd = cwd.clone();
-            c.agent = agent.agent.clone();
-            if !agent.session_id().is_empty() {
-                c.agent_session = agent.session_id().to_string();
-            }
-        })?;
-        crate::lanes::sync_instance(&project, &target_lane.id, &record.pane_id, &record.agent_session, &record.profile, &project::now())?;
-        report_tokens(&herdr, &project, &record.pane_id);
+        // `coordinator.json` is the default lane's view, so a second lane's
+        // `open` writes `lanes.json` alone (2026-11-26). The pane, session and
+        // profile this branch records are the lane's then, not the file's —
+        // reading them back from a file that was deliberately left alone is
+        // how the default line came to inherit another lane's session.
+        let pane_id = agent.pane_id.clone();
+        let agent_session = if agent.session_id().is_empty() { target_lane.agent_session.clone() } else { agent.session_id().to_string() };
+        let lane_profile = if target_lane.pane_id != pane_id { agent.agent.clone() } else { target_lane.profile.clone() };
+        if crate::lanes::writes_default_record(&project, &target_lane.id) {
+            project.update_coordinator(|c| {
+                // Another pane's profile is not known: the built-in of its kind.
+                if c.pane_id != agent.pane_id {
+                    c.profile = agent.agent.clone();
+                }
+                c.socket = socket.clone();
+                c.workspace_id = if space.is_empty() { agent.workspace_id.clone() } else { space };
+                c.tab_id = if tab.is_empty() { agent.tab_id.clone() } else { tab };
+                c.pane_id = agent.pane_id.clone();
+                c.agent_name = agent.name.clone();
+                c.cwd = cwd.clone();
+                c.agent = agent.agent.clone();
+                if !agent.session_id().is_empty() {
+                    c.agent_session = agent.session_id().to_string();
+                }
+            })?;
+        }
+        crate::lanes::sync_instance(&project, &target_lane.id, &pane_id, &agent_session, &lane_profile, &project::now())?;
+        report_tokens(&herdr, &project, &pane_id);
         ticker::start(ctx)?;
         println!(
-            "coordinator is running in pane {} ({} more on this line; use --new for another one here)",
-            record.pane_id,
+            "coordinator is running in pane {pane_id} ({} more on this line; use --new for another one here)",
             running.len() - 1
         );
         println!("{}", another_line_hint(&lane_registry, &project, &prefix));
@@ -1231,21 +1240,23 @@ pub fn open(ctx: &Ctx, slug: &str, options: &OpenOptions) -> Result<()> {
             .with_context(|| format!("could not write the agent labels of pane {}", record.pane_id))?;
         let (space, tab) = keep_names(&herdr, &project, &record.pane_id);
         let _ = herdr.agent_focus(&record.pane_id);
-        let record = project.update_coordinator(|c| {
-            c.socket = socket.clone();
-            c.workspace_id = if space.is_empty() { c.workspace_id.clone() } else { space };
-            c.tab_id = if tab.is_empty() { c.tab_id.clone() } else { tab };
-            c.pane_id = record.pane_id.clone();
-            c.agent_name = name.clone();
-            c.cwd = cwd.clone();
-            c.agent = kind.clone();
-        })?;
-        crate::lanes::sync_instance(&project, &target_lane.id, &record.pane_id, &record.agent_session, &record.profile, &project::now())?;
-        report_tokens(&herdr, &project, &record.pane_id);
+        let (pane_id, agent_session, lane_profile) = (record.pane_id.clone(), record.agent_session.clone(), record.profile.clone());
+        if crate::lanes::writes_default_record(&project, &target_lane.id) {
+            project.update_coordinator(|c| {
+                c.socket = socket.clone();
+                c.workspace_id = if space.is_empty() { c.workspace_id.clone() } else { space };
+                c.tab_id = if tab.is_empty() { c.tab_id.clone() } else { tab };
+                c.pane_id = record.pane_id.clone();
+                c.agent_name = name.clone();
+                c.cwd = cwd.clone();
+                c.agent = kind.clone();
+            })?;
+        }
+        crate::lanes::sync_instance(&project, &target_lane.id, &pane_id, &agent_session, &lane_profile, &project::now())?;
+        report_tokens(&herdr, &project, &pane_id);
         ticker::start(ctx)?;
         println!(
-            "coordinator is running in pane {} (its `hp_agent`/`hp_kind` labels were missing and are written back)",
-            record.pane_id
+            "coordinator is running in pane {pane_id} (its `hp_agent`/`hp_kind` labels were missing and are written back)"
         );
         println!("{}", another_line_hint(&lane_registry, &project, &prefix));
         println!("Commands: {prefix}");
@@ -1344,26 +1355,30 @@ pub fn open(ctx: &Ctx, slug: &str, options: &OpenOptions) -> Result<()> {
     // agent starts, so a command killed midway still leaves one to resume, and
     // the same id then opens the existing session or creates it.
     let fresh = fresh_session(&kind, &base_args, !resume.is_empty());
-    let record = project.update_coordinator_locked(|c| {
-        *c = Coordinator {
-            socket: socket.clone(),
-            workspace_id,
-            tab_id,
-            pane_id,
-            agent_name: name.clone(),
-            cwd: cwd.clone(),
-            agent: kind.clone(),
-            profile: profile.name.clone(),
-            // The session this launch has to resume, or the id `hp` made up for
-            // the one it starts; the ticker records a fresh agent's own.
-            agent_session: match (&resume, &fresh) {
-                (args, _) if !args.is_empty() => previous.as_ref().map(|r| r.agent_session.clone()).unwrap_or_default(),
-                (_, Some((id, _))) => id.clone(),
-                _ => String::new(),
-            },
-            updated: String::new(),
-        }
-    })?;
+    let record = Coordinator {
+        socket: socket.clone(),
+        workspace_id,
+        tab_id,
+        pane_id,
+        agent_name: name.clone(),
+        cwd: cwd.clone(),
+        agent: kind.clone(),
+        profile: profile.name.clone(),
+        // The session this launch has to resume, or the id `hp` made up for
+        // the one it starts; the ticker records a fresh agent's own.
+        agent_session: match (&resume, &fresh) {
+            (args, _) if !args.is_empty() => previous.as_ref().map(|r| r.agent_session.clone()).unwrap_or_default(),
+            (_, Some((id, _))) => id.clone(),
+            _ => String::new(),
+        },
+        updated: String::new(),
+    };
+    // Only the default line writes `coordinator.json`; a second lane records
+    // itself in `lanes.json` and leaves the default line's pane, session and
+    // profile exactly as they were (2026-11-26).
+    let write_view = crate::lanes::writes_default_record(&project, &target_lane.id);
+    let stored = record.clone();
+    let record = if write_view { project.update_coordinator_locked(|c| *c = stored)? } else { record };
     crate::lanes::sync_instance_locked(&project, &target_lane.id, &record.pane_id, &record.agent_session, &record.profile, &project::now())?;
     drop(lock);
 
@@ -1401,9 +1416,11 @@ pub fn open(ctx: &Ctx, slug: &str, options: &OpenOptions) -> Result<()> {
             let reported = agent.session_id().to_string();
             let session_id = if reported.is_empty() { retry.clone().unwrap_or_default() } else { reported };
             if !session_id.is_empty() {
-                project.update_coordinator(|c| {
-                    c.agent_session = session_id.clone();
-                })?;
+                if crate::lanes::writes_default_record(&project, &target_lane.id) {
+                    project.update_coordinator(|c| {
+                        c.agent_session = session_id.clone();
+                    })?;
+                }
                 crate::lanes::sync_instance(&project, &target_lane.id, &record.pane_id, &session_id, &record.profile, &project::now())?;
             }
             if resume.is_empty() {
@@ -1464,7 +1481,9 @@ fn run_here(ctx: &Ctx, herdr: &Core, project: &Project, run: HereRun<'_>) -> Res
         let (minted, retry_args) = fresh_retry(kind, run.base_args);
         let (code, detected) = launch(&retry_args)?;
         if let Some(id) = minted.filter(|_| detected || code == Some(0)) {
-            let _ = project.update_coordinator(|c| c.agent_session = id.clone());
+            if run.lane_id.is_none_or(|lane| crate::lanes::writes_default_record(project, lane)) {
+                let _ = project.update_coordinator(|c| c.agent_session = id.clone());
+            }
             if let Some(lane) = run.lane_id.filter(|lane| !lane.is_empty()) {
                 let _ = crate::lanes::sync_instance(project, lane, &record.pane_id, &id, &record.profile, &project::now());
             }
@@ -1500,11 +1519,15 @@ fn adopt_here(herdr: &Core, project: &Project, record: &Coordinator, lane_id: Op
         let _ = herdr.agent_rename(&agent.pane_id, &record.agent_name);
     }
     let session_id = agent.session_id().to_string();
-    let _ = project.update_coordinator(|c| {
-        if !session_id.is_empty() {
-            c.agent_session = session_id.clone();
-        }
-    });
+    // The lane this run belongs to: a second lane's launch records itself in
+    // `lanes.json` and leaves the default line's file alone (2026-11-26).
+    if lane_id.is_none_or(|lane| crate::lanes::writes_default_record(project, lane)) {
+        let _ = project.update_coordinator(|c| {
+            if !session_id.is_empty() {
+                c.agent_session = session_id.clone();
+            }
+        });
+    }
     if let Some(lane_id) = lane_id
         && !session_id.is_empty()
     {
@@ -3480,5 +3503,188 @@ mod here_tests {
         assert_eq!(here_pane(&ctx(home.path(), &runner, "t9"), &options, "hp-dev", &[]), None);
         // Outside a core terminal there is no address to start in.
         assert_eq!(here_pane(&ctx(home.path(), &runner, ""), &options, "", &[]), None);
+    }
+}
+
+/// Who writes `coordinator.json`: the default lane, and only the default lane
+/// (2026-11-26, law). It is the default line's single-record view, so a second
+/// lane's `open` used to overwrite its pane, session and profile with its own —
+/// and the default line then resumed **another coordinator's** conversation.
+#[cfg(test)]
+mod default_line_tests {
+    use super::*;
+    use crate::fake_hc::FakeCore;
+
+    fn ctx<'a>(home: &Path, root: &Path, core: &'a FakeCore) -> Ctx<'a> {
+        let env: &'static crate::paths::Env = Box::leak(Box::new(crate::paths::Env::for_test(home, &[])));
+        Ctx { env, root: root.to_path_buf(), config_dir: home.join("cfg"), runner: core, detached_ticker: false }
+    }
+
+    /// `--profile pi` names a built-in, so the kind and the profile in the
+    /// records are both `pi` and a resume needs nothing from the machine.
+    fn as_pi() -> OpenOptions {
+        OpenOptions { profile: Some("pi".into()), ..OpenOptions::default() }
+    }
+
+    fn lane(id: &str, name: &str, pane: &str, session: &str) -> crate::lanes::Lane {
+        crate::lanes::Lane {
+            id: id.into(),
+            name: name.into(),
+            label: name.into(),
+            pane_id: pane.into(),
+            agent_session: session.into(),
+            profile: "pi".into(),
+            ..Default::default()
+        }
+    }
+
+    /// Two open lanes, each recording its own pane and native session, and the
+    /// single-record view naming the default one — the shape `open` leaves.
+    fn recorded_lines(project: &Project, a: &str, b: &str, default: &str) {
+        crate::lanes::Registry {
+            lanes: vec![lane("c-1", "default", "w1:p1", a), lane("c-2", "books", "w2:p1", b)],
+            default: default.into(),
+            next: 3,
+        }
+        .save(project)
+        .unwrap();
+        project
+            .update_coordinator(|c| {
+                *c = Coordinator {
+                    pane_id: "w1:p1".into(),
+                    agent_name: "hpc-demo".into(),
+                    agent: "pi".into(),
+                    profile: "pi".into(),
+                    agent_session: a.into(),
+                    cwd: project.canonical_dir().to_string_lossy().into_owned(),
+                    ..Coordinator::default()
+                }
+            })
+            .unwrap();
+    }
+
+    /// The bug: `open demo --lane <new>` rewrote the default line's pane,
+    /// session and profile with the new coordinator's. The file must come back
+    /// byte for byte, `updated` included, and the new lane must be in
+    /// `lanes.json` with a pane and a session of its own.
+    #[test]
+    fn opening_a_second_lane_leaves_the_default_lines_record_byte_for_byte() {
+        let home = tempfile::tempdir().unwrap();
+        let root = home.path().join("root");
+        let project = crate::project::create(&root, "demo", vec![]).unwrap();
+        let fake = FakeCore::new();
+
+        open(&ctx(home.path(), &root, &fake), "demo", &as_pi()).unwrap();
+        let before = std::fs::read(project.coordinator_path()).unwrap();
+        let first = crate::lanes::Registry::load(&project)
+            .unwrap()
+            .default_lane()
+            .cloned()
+            .unwrap();
+        assert!(!first.pane_id.is_empty() && !first.agent_session.is_empty(), "the default line runs: {first:?}");
+
+        open(
+            &ctx(home.path(), &root, &fake),
+            "demo",
+            &OpenOptions { lane: Some("books".into()), ..as_pi() },
+        )
+        .unwrap();
+
+        assert_eq!(
+            std::fs::read(project.coordinator_path()).unwrap(),
+            before,
+            "the default line's view is untouched: pane, session, profile and `updated`"
+        );
+        let registry = crate::lanes::Registry::load(&project).unwrap();
+        let kept = registry.get(&first.id).unwrap();
+        assert_eq!(
+            (kept.pane_id.as_str(), kept.agent_session.as_str()),
+            (first.pane_id.as_str(), first.agent_session.as_str()),
+            "and the default lane still records its own coordinator"
+        );
+        let books = registry.find("books").unwrap();
+        assert_ne!(books.id, first.id);
+        assert!(!books.pane_id.is_empty() && books.pane_id != first.pane_id, "the new line has a pane of its own: {books:?}");
+        assert!(!books.agent_session.is_empty() && books.agent_session != first.agent_session, "and a session of its own: {books:?}");
+    }
+
+    /// `open --lane <default>` is a plain `open`: the file follows the pane it
+    /// starts, as it always did.
+    #[test]
+    fn opening_the_default_lane_itself_still_writes_the_view() {
+        let home = tempfile::tempdir().unwrap();
+        let root = home.path().join("root");
+        let project = crate::project::create(&root, "demo", vec![]).unwrap();
+        let fake = FakeCore::new();
+        recorded_lines(&project, "sess-a", "sess-b", "c-1");
+
+        open(&ctx(home.path(), &root, &fake), "demo", &as_pi()).unwrap();
+
+        let view = project.coordinator().unwrap();
+        assert_ne!(view.pane_id, "w1:p1", "the recorded pane is gone, so the file names the one just started");
+        assert!(
+            fake.terminals.borrow().iter().any(|t| t.name == view.pane_id || t.address == view.pane_id),
+            "and that pane is live: {}",
+            view.pane_id
+        );
+        let file = crate::project::read_json::<Coordinator>(&project.coordinator_path()).unwrap();
+        assert_eq!(file.pane_id, view.pane_id, "the file itself, not only the lane synthesis");
+    }
+
+    /// A project with no registry is the single-lane case: the file is its one
+    /// record, written exactly as before lanes existed.
+    #[test]
+    fn a_project_without_a_registry_still_owns_the_single_record() {
+        let home = tempfile::tempdir().unwrap();
+        let root = home.path().join("root");
+        let project = crate::project::create(&root, "demo", vec![]).unwrap();
+        let fake = FakeCore::new();
+        assert!(!crate::lanes::exists(&project), "a project made by `create` has no lanes.json");
+        assert!(crate::lanes::writes_default_record(&project, "c-1"));
+        assert!(
+            crate::lanes::writes_default_record(&project, "anything"),
+            "with no registry every lane id is that one record's"
+        );
+
+        open(&ctx(home.path(), &root, &fake), "demo", &as_pi()).unwrap();
+
+        let file = crate::project::read_json::<Coordinator>(&project.coordinator_path())
+            .expect("`open` writes coordinator.json for a project without a registry");
+        assert!(!file.pane_id.is_empty() && !file.agent_session.is_empty(), "{file:?}");
+    }
+
+    /// Two lines, two sessions: reopening one must resume its own conversation,
+    /// never the other line's.
+    #[test]
+    fn each_line_resumes_its_own_session() {
+        let home = tempfile::tempdir().unwrap();
+        let root = home.path().join("root");
+        let project = crate::project::create(&root, "demo", vec![]).unwrap();
+        let fake = FakeCore::new();
+        recorded_lines(&project, "sess-a", "sess-b", "c-1");
+
+        let launched = |calls: &[String]| -> Vec<String> {
+            calls.iter().filter(|line| line.contains("hp-agent")).cloned().collect()
+        };
+
+        let before = fake.calls.borrow().len();
+        open(&ctx(home.path(), &root, &fake), "demo", &as_pi()).unwrap();
+        let default_launch = launched(&fake.calls.borrow()[before..]);
+        assert!(
+            default_launch.iter().any(|line| line.contains("sess-a")),
+            "the default line resumes its own session: {default_launch:?}"
+        );
+        assert!(!default_launch.iter().any(|line| line.contains("sess-b")), "and not the other line's: {default_launch:?}");
+
+        let before = fake.calls.borrow().len();
+        open(
+            &ctx(home.path(), &root, &fake),
+            "demo",
+            &OpenOptions { lane: Some("books".into()), ..as_pi() },
+        )
+        .unwrap();
+        let books_launch = launched(&fake.calls.borrow()[before..]);
+        assert!(books_launch.iter().any(|line| line.contains("sess-b")), "the books line resumes its own: {books_launch:?}");
+        assert!(!books_launch.iter().any(|line| line.contains("sess-a")), "and not the default line's: {books_launch:?}");
     }
 }
