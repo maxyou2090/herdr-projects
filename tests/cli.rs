@@ -575,6 +575,8 @@ fn an_on_request_profile_is_listed_apart_and_never_a_default_or_an_owner() {
     let line = text.lines().find(|l| l.starts_with("On request only:")).unwrap_or_else(|| panic!("no on-request line: {text}"));
     assert!(line.contains("sol (codex gpt-6.2-sol, medium) — Sol at medium effort"), "{line}");
     assert!(!line.contains("luna"), "{line}");
+    // The line says the allow it does not need, so a reader does not go looking.
+    assert!(line.contains("no `profile allow` needed"), "{line}");
     assert!(text.contains("- luna: omp · default model — Cheap tier"), "{text}");
     assert!(text.contains("Assignable (agent owners): luna"), "{text}");
 
@@ -599,10 +601,22 @@ fn an_on_request_profile_is_listed_apart_and_never_a_default_or_an_owner() {
     let out = hp(home.path(), &["--root", root_arg, "task", "thread", "demo", "Do another thing", "t-0001", "--owner", "sol"]);
     assert!(!out.status.success(), "an on-request profile cannot own a task");
     assert!(String::from_utf8_lossy(&out.stderr).contains("`sol` is on request only"), "{}", String::from_utf8_lossy(&out.stderr));
-    // `assignable --check` refuses it too.
+    // `assignable --check` refuses it as an owner, and says where it does work:
+    // a `--profile` on a named thread, with no allow needed.
     let out = hp(home.path(), &["--root", root_arg, "assignable", "demo", "--check", "sol"]);
     assert!(!out.status.success(), "`assignable --check` refuses an on-request profile");
-    assert!(String::from_utf8_lossy(&out.stderr).contains("assignable: luna"), "{}", String::from_utf8_lossy(&out.stderr));
+    let err = String::from_utf8_lossy(&out.stderr).into_owned();
+    assert!(err.contains("Assignable: luna"), "{err}");
+    assert!(err.contains("--profile sol") && err.contains("no `profile allow` is needed"), "{err}");
+    assert!(!err.contains("there is no profile"), "`sol` exists; it is just never an owner: {err}");
+
+    // `assignable` itself lists them apart from the owners.
+    let out = hp(home.path(), &["--root", root_arg, "assignable", "demo"]);
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    let text = String::from_utf8(out.stdout).unwrap();
+    let line = text.lines().find(|l| l.starts_with("On request")).unwrap_or_else(|| panic!("no on-request line: {text}"));
+    assert!(line.contains("never an owner") && line.contains("`--profile` works once the user names it") && line.contains("sol"), "{line}");
+    assert!(!line.contains("luna"), "the owner list stays on its own line: {line}");
 
     // `hp new` refuses it as a project default, on both flags: it would be
     // picked silently on every launch, and `set <slug> thread_profile` refuses
