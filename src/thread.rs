@@ -433,6 +433,15 @@ pub struct BriefInput<'a> {
     pub memory_files: &'a [(String, String)],
     pub task: &'a str,
     pub restart: bool,
+    /// The thread's repository: a worktree thread names the base its pull
+    /// request goes to. Empty for a local or adopted thread, which gets no
+    /// pull-request section.
+    pub repo: &'a str,
+    /// The ref the worktree was cut from (`threads/<id>.toml`); empty on an
+    /// older record.
+    pub base: &'a str,
+    /// The thread's own branch, the `--head` a pull request needs.
+    pub branch: &'a str,
     pub report_path: &'a str,
     pub library_path: &'a str,
     /// `<binary> --root <root>` for `report`; empty when no binary is known.
@@ -512,6 +521,11 @@ pub fn compose_brief(input: &BriefInput) -> String {
         body.push_str(&crate::progress::guidance(input.report_prefix, None));
         body.push('\n');
     }
+    // The base a pull request goes to is the brief's business: `gh pr create`
+    // without `--base` lands on the repository's default branch, which is not
+    // where a thread cut from another ref belongs. Only a worktree thread (one
+    // with a repository) has a base at all.
+    body.push_str(&pull_request_note(input));
     body.push_str(&format!(
         "\n# Paths\n\n- Report: `{}`\n- Library folder for files meant for the user: `{}`\n- Uploads from the user: `{}`\n",
         input.report_path, input.library_path, input.uploads_path
@@ -528,6 +542,25 @@ pub fn compose_brief(input: &BriefInput) -> String {
         bytes = total;
     };
     format!("{header}{note}{body}")
+}
+
+/// The `# Pull request` section: which base the pull request opens against.
+/// Empty for a thread with no repository, and for one without a recorded base
+/// it is the one warning that stops `gh pr create` from defaulting.
+fn pull_request_note(input: &BriefInput) -> String {
+    if input.repo.is_empty() {
+        return String::new();
+    }
+    if input.base.is_empty() {
+        return String::from(
+            "\n# Pull request\n\nYour base is the ref you were cut from; do not let `gh pr create` default to the repository's default branch.\n",
+        );
+    }
+    format!(
+        "\n# Pull request\n\nOpen it against `{base}`: `gh pr create --base {base} --head {branch}` (add the rest of its flags).\nThe repository's default branch is not this thread's base; a pull request opened against it lands in the wrong line.\n",
+        base = input.base,
+        branch = input.branch
+    )
 }
 
 /// Reads the project's instructions and memory and composes the brief.
@@ -566,6 +599,9 @@ pub fn brief_for(project: &Project, thread: &Thread, task: &str, restart: bool) 
         memory_files: &memory_files,
         task,
         restart,
+        repo: &thread.repo,
+        base: &thread.base,
+        branch: &thread.branch,
         report_path: &thread.report_path(),
         library_path: &thread.library_path(),
         report_prefix: &prefix,
@@ -1273,6 +1309,9 @@ mod tests {
             memory_files: &files,
             task: "Do the thing.",
             restart: true,
+            repo: "/srv/app",
+            base: "port/herdr-core",
+            branch: "hp/demo/t-0001",
             report_path: "/wt/.herdr-project/demo-t-0001/report.md",
             library_path: "/wt/.herdr-project/demo-t-0001/library",
             report_prefix: "/bin/hp --root /r",
@@ -1295,7 +1334,10 @@ mod tests {
         assert!(pos("Always run the tests.") < pos("# Memory"));
         assert!(pos("# Memory") < pos("alpha fact"));
         assert!(pos("alpha fact") < pos("# Progress"));
-        assert!(pos("# Progress") < pos("# Paths"));
+        // The pull request section sits between the progress note and the paths.
+        assert!(pos("\n# Pull request\n") < pos("# Paths"));
+        assert!(pos("# Progress") < pos("\n# Pull request\n"));
+        assert!(pos("alpha fact") < pos("\n# Pull request\n"));
         assert!(pos("# Task") < pos("# Project memory"));
         assert!(brief.contains("gamma fact"));
         assert!(brief.contains("Not inlined because project memory is over 30000 bytes: memory/b.md."));
@@ -1307,8 +1349,9 @@ mod tests {
             assert!(!brief.contains(word), "{word}");
         }
 
-        let fresh = compose_brief(&BriefInput { repos: &[], instructions: "", memory_index: "", memory_files: &[], task: "t", restart: false, report_path: "r", library_path: "l", report_prefix: "", ..input });
+        let fresh = compose_brief(&BriefInput { repos: &[], repo: "", base: "", branch: "", instructions: "", memory_index: "", memory_files: &[], task: "t", restart: false, report_path: "r", library_path: "l", report_prefix: "", ..input });
         assert!(!fresh.contains("previous attempt"));
+        assert!(!fresh.contains("\n# Pull request\n"), "no repository, no pull-request section");
         assert!(fresh.contains("- Repos: (none)\n"));
         assert!(fresh.contains("if that command exists on this machine"), "no prefix: the note is the fallback");
     }
@@ -1324,10 +1367,72 @@ mod tests {
             memory_files,
             task: "Do the thing.",
             restart: false,
+            repo: "",
+            base: "",
+            branch: "",
             report_path: "/wt/.herdr-project/demo-t-0001/report.md",
             library_path: "/wt/.herdr-project/demo-t-0001/library",
             report_prefix: "",
         })
+    }
+
+    /// The thread a worktree brief is composed for: a repository, a base and a
+    /// branch, which is what the pull-request section needs.
+    fn worktree_thread(base: &str) -> Thread {
+        Thread { repo: "/srv/app".into(), base: base.into(), branch: "hp/demo/t-0001".into(), ..Thread::default() }
+    }
+
+    #[test]
+    fn a_worktree_brief_names_the_base_its_pull_request_opens_against() {
+        let root = tempfile::tempdir().unwrap();
+        let project = project::create(root.path(), "demo", vec![]).unwrap();
+        let mut thread = worktree_thread("port/herdr-core");
+        thread.branch = "hp/x/t-0001".into();
+        let brief = brief_for(&project, &thread, "Do it.", false).unwrap();
+        assert!(brief.contains("# Pull request"), "{brief}");
+        assert!(brief.contains("Open it against `port/herdr-core`"), "{brief}");
+        // The command is spelled out, so a thread never has to guess.
+        assert!(brief.contains("gh pr create --base port/herdr-core --head hp/x/t-0001"), "{brief}");
+        // The section itself sits after the progress note and before the
+        // paths, and stays short: the brief has a size budget. The needle
+        // carries its newline because the skill text names the section too.
+        let section = pull_request_section(&brief);
+        assert!(section.starts_with("\n# Pull request\n"), "{section}");
+        assert!(brief.find("# Progress").unwrap() < brief.find("\n# Pull request\n").unwrap());
+        assert!(brief.find("\n# Pull request\n").unwrap() < brief.find("# Paths").unwrap());
+        assert!(section.lines().filter(|line| !line.trim().is_empty()).count() <= 3, "the section is {section:?}");
+        assert!(brief.len() < 51_200, "brief is {} bytes", brief.len());
+        assert!(brief.contains(&format!("> 本文件 {} 字节；`read` 上限 51200 字节 / 2000 行", brief.len())), "{brief}");
+    }
+
+    /// The `# Pull request` section itself, not the skill's mention of it.
+    fn pull_request_section(brief: &str) -> &str {
+        let start = brief.find("\n# Pull request\n").expect("no pull-request section");
+        let end = brief[start..].find("# Paths").map(|i| start + i).expect("no paths after it");
+        &brief[start..end]
+    }
+
+    #[test]
+    fn a_record_without_a_base_is_told_not_to_default() {
+        let root = tempfile::tempdir().unwrap();
+        let project = project::create(root.path(), "demo", vec![]).unwrap();
+        let brief = brief_for(&project, &worktree_thread(""), "Do it.", false).unwrap();
+        let section = pull_request_section(&brief);
+        assert!(section.contains("do not let `gh pr create` default to the repository's default branch"), "{section}");
+        assert!(!section.contains("--base"), "an empty base was spelled out: {section}");
+    }
+
+    #[test]
+    fn a_thread_without_a_repository_gets_no_pull_request_section() {
+        let root = tempfile::tempdir().unwrap();
+        let project = project::create(root.path(), "demo", vec![]).unwrap();
+        for thread in [Thread::default(), Thread { kind: Kind::Local, repo: String::new(), base: "port/herdr-core".into(), ..Thread::default() }] {
+            let brief = brief_for(&project, &thread, "Do it.", false).unwrap();
+            // The skill names the section in every brief; only a thread with a
+            // repository gets the section itself.
+            assert!(!brief.contains("\n# Pull request\n"), "{brief}");
+            assert!(!brief.contains("Open it against") && !brief.contains("do not let `gh pr create`"), "{brief}");
+        }
     }
 
     #[test]
