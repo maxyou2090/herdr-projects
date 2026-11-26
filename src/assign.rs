@@ -81,22 +81,47 @@ pub fn refuse_on_request(config: &crate::profiles::Config, owner: &Owner) -> Res
     if !config.profiles.get(profile).is_some_and(|entry| entry.on_request) {
         return Ok(());
     }
-    bail!("`{profile}` is on request only: the user names it in a request, it is never a task owner.")
+    bail!(
+        "`{profile}` is on request only: it can never own a task. Start a thread with it directly — `hp thread start <slug> --profile {profile}` — once the user names that profile; no `profile allow` is needed."
+    )
+}
+
+/// The `On request …` line of `assignable`, naming every on-request profile;
+/// `None` when this machine has none. Separate from the owner line because
+/// these are exactly the profiles that are never owners and never need an
+/// allow: the user naming one is enough for `--profile`.
+pub fn on_request_line(config: &crate::profiles::Config) -> Option<String> {
+    let names: Vec<String> = config.on_request().into_iter().map(|p| p.name).collect();
+    if names.is_empty() {
+        return None;
+    }
+    Some(format!("On request (never an owner; `--profile` works once the user names it): {}", names.join(", ")))
 }
 
 /// `assignable <slug> [--check OWNER]`.
 pub fn run(ctx: &Ctx, slug: &str, check: Option<&str>) -> Result<()> {
     let project = Project::load(&ctx.root, slug)?;
     let assignable = load(ctx, &project)?;
+    let config = crate::profiles::load(&ctx.config_dir)?;
     if let Some(owner) = check {
         let text = owner.trim().trim_start_matches('(').trim_end_matches(')');
-        assignable.check(&Owner::parse(text))?;
+        let parsed = Owner::parse(text);
+        // An on-request profile is refused as an owner, but it is not a
+        // missing profile: saying so sent a coordinator off to `profile
+        // allow` for something that needs no allow at all.
+        if let Err(error) = refuse_on_request(&config, &parsed) {
+            bail!("{error} Assignable: {}", assignable.line());
+        }
+        assignable.check(&parsed)?;
         println!("`{text}` is a valid owner");
         return Ok(());
     }
     let mut out = String::new();
     let _ = writeln!(out, "me: the user");
     let _ = writeln!(out, "Profiles here: {}", if assignable.local.is_empty() { "(none allowed)".to_string() } else { assignable.local.join(", ") });
+    if let Some(line) = on_request_line(&config) {
+        let _ = writeln!(out, "{line}");
+    }
     print!("{out}");
     Ok(())
 }
@@ -134,6 +159,11 @@ mod tests {
         let config: crate::profiles::Config = toml::from_str(text).unwrap();
         let error = refuse_on_request(&config, &agent(Some("sol"))).unwrap_err().to_string();
         assert!(error.contains("`sol` is on request only"), "{error}");
+        // It says how to use it anyway, so nobody goes looking for an allow.
+        assert!(error.contains("--profile sol"), "{error}");
+        assert!(error.contains("no `profile allow` is needed"), "{error}");
+        assert!(!error.contains("there is no profile"), "{error}");
+        assert_eq!(on_request_line(&config).unwrap(), "On request (never an owner; `--profile` works once the user names it): sol");
         assert!(refuse_on_request(&config, &agent(Some("luna"))).is_ok());
         for ok in [Owner::Me, Owner::Unassigned, agent(None), Owner::Person("Priya Rao".into())] {
             refuse_on_request(&config, &ok).unwrap();
@@ -144,5 +174,13 @@ mod tests {
         let assignable = Assignable { local };
         assert_eq!(assignable.line(), "luna");
         assert!(assignable.check(&agent(Some("sol"))).is_err());
+    }
+
+    /// `assignable` names the on-request profiles apart from the owners, and
+    /// prints nothing about them when there are none.
+    #[test]
+    fn the_on_request_line_is_there_only_when_there_are_such_profiles() {
+        let config: crate::profiles::Config = toml::from_str("[profiles.luna]\nagent = \"omp\"\n").unwrap();
+        assert_eq!(on_request_line(&config), None);
     }
 }

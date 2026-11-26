@@ -730,11 +730,13 @@ pub fn context_text_for(config: &Config, safety: &project::Safety, detected: &[S
         }
     }
     // Separate on purpose: these are the user's to name in a request, never
-    // the coordinator's to choose by task difficulty.
+    // the coordinator's to choose by task difficulty. The closing clause is
+    // there because a reader who takes this line for an owner list goes
+    // looking for an allow, and there is nothing to allow.
     let on_request = config.on_request();
     if !on_request.is_empty() {
         let notes: Vec<String> = on_request.iter().map(Profile::on_request_note).collect();
-        let _ = writeln!(out, "On request only: {}", notes.join(", "));
+        let _ = writeln!(out, "On request only: {} — no `profile allow` needed; the user naming one is enough", notes.join(", "));
     }
     out
 }
@@ -923,6 +925,7 @@ mod tests {
         assert!(line.contains("sol") && line.contains("Sol at medium effort"), "{line}");
         assert!(line.contains("neon"), "{line}");
         assert!(!line.contains("luna"), "only the on-request ones: {line}");
+        assert!(line.contains("no `profile allow` needed"), "the line says no allow is needed: {line}");
         assert_eq!(text.lines().filter(|l| l.starts_with("On request only:")).count(), 1);
         // Without any, the line is absent and nothing else changed.
         let plain_text = "[profiles.luna]\nagent = \"omp\"\n\n[safety.default]\nthread_profiles = [\"luna\"]\n";
