@@ -18,7 +18,7 @@
 //! transition to catch. So the line is printed whether or not anything
 //! resolved, and an ambiguous entry carries the command that fixes it.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
 use std::path::PathBuf;
 
@@ -230,6 +230,14 @@ pub struct Lane {
     /// The last known coordinator instance. A *hint* for rule 2, refreshed by
     /// the ticker — never the identity itself.
     pub pane_id: String,
+    /// The name this lane's coordinator was started under (`hpc-<slug>-N`),
+    /// recorded when the lane is opened, adopted or assigned. Without it a lane
+    /// whose terminal is gone forgets its own name, and the next lane is
+    /// handed the same one: law's `c-3` and `c-4` were both `hpc-law-1` on
+    /// 2026-11-26, which is what let a repair read one lane's pane as the
+    /// other's. Empty on a record written before this field existed; the
+    /// shared `coordinator.json` name stands in for it then.
+    pub agent_name: String,
     pub agent_session: String,
     /// When `hp lane close` ran.
     pub closed: String,
@@ -304,6 +312,7 @@ impl Registry {
                 profile: record.profile.clone(),
                 status: Status::Open,
                 pane_id: record.pane_id.clone(),
+                agent_name: record.agent_name.clone(),
                 agent_session: record.agent_session.clone(),
                 closed: String::new(),
                 last_active: record.updated.clone(),
@@ -457,6 +466,63 @@ impl Registry {
         out
     }
 
+    /// The open lanes that record the **same pane**, in registry order, each
+    /// with the handles of every lane that records it. Empty when every lane
+    /// has its own pane.
+    ///
+    /// Two lanes pointing at one pane is not a tidiness problem either: the
+    /// pane carries one `hp_lane` token, so one of the two lanes has no
+    /// coordinator at all while its record says it has one, and a repair pass
+    /// that trusts the records writes the label of whichever lane it visits
+    /// last. law's `lanes.json` held it on 2026-11-26 (`c-3` and `c-4` both on
+    /// `hp-coordinator-3eec69`, after a repair claimed one lane's pane for the
+    /// other). Reported, never resolved: which lane the pane serves is the
+    /// user's knowledge.
+    pub fn duplicate_panes(&self) -> Vec<(String, Vec<String>)> {
+        let mut out: Vec<(String, Vec<String>)> = Vec::new();
+        for lane in self.lanes.iter().filter(|lane| lane.is_open() && !lane.pane_id.is_empty()) {
+            let handle = if lane.name.is_empty() { lane.id.clone() } else { lane.name.clone() };
+            match out.iter_mut().find(|(pane, _)| pane == &lane.pane_id) {
+                Some((_, handles)) => handles.push(handle),
+                None => out.push((lane.pane_id.clone(), vec![handle])),
+            }
+        }
+        out.retain(|(_, handles)| handles.len() > 1);
+        out
+    }
+
+    /// The ids of every open lane that records a pane another open lane also
+    /// records. A repair or a refresh leaves those lanes exactly as they are:
+    /// moving the record or rewriting the label of a shared pane is how the
+    /// second lane would "win" the pane by accident.
+    pub fn lanes_sharing_a_pane(&self) -> BTreeSet<String> {
+        let shared: BTreeSet<String> = self.duplicate_panes().into_iter().map(|(pane, _)| pane).collect();
+        self.lanes
+            .iter()
+            .filter(|lane| lane.is_open() && shared.contains(&lane.pane_id))
+            .map(|lane| lane.id.clone())
+            .collect()
+    }
+
+    /// The sentence `lane list` prints for open lanes that record one pane —
+    /// `None` when there is nothing to fix. The two fixes are the user's
+    /// (`hp lane adopt` in that pane, or `hp lane close`), so this only says
+    /// what the file holds.
+    pub fn duplicate_pane_message(&self) -> Option<String> {
+        let duplicates = self.duplicate_panes();
+        if duplicates.is_empty() {
+            return None;
+        }
+        let shown: Vec<String> = duplicates
+            .iter()
+            .map(|(pane, handles)| format!("{pane} is recorded by {} lanes ({})", handles.len(), handles.join(", ")))
+            .collect();
+        Some(format!(
+            "lane records share a coordinator pane: {}; only the pane's own `{TOKEN}` says which lane runs in it — return the pane to its lane (`hp lane adopt <id>` in that pane) or retire the other (`hp lane close <id>`)",
+            shown.join("; ")
+        ))
+    }
+
     /// The sentence `lane list`, `context` and `open` print for a registry that
     /// names one id twice — `None` when there is nothing to fix. The fix is
     /// deliberately manual: which of the two records is the real lane is the
@@ -525,12 +591,16 @@ impl Registry {
     /// `Project::coordinator()` working while lanes exist.
     pub fn coordinator_for(&self, project: &Project, lane: &Lane) -> Coordinator {
         let shared = read_coordinator(project).unwrap_or_default();
+        // The lane's own name when it has one: `coordinator.json` describes the
+        // default lane's coordinator, and handing that name to every lane is
+        // how two lines came to answer to `hpc-law-1` at once.
+        let agent_name = if lane.agent_name.is_empty() { shared.agent_name } else { lane.agent_name.clone() };
         Coordinator {
             socket: shared.socket,
             workspace_id: shared.workspace_id,
             tab_id: shared.tab_id,
             pane_id: lane.pane_id.clone(),
-            agent_name: shared.agent_name,
+            agent_name,
             cwd: shared.cwd,
             agent: shared.agent,
             profile: lane.profile.clone(),
@@ -1206,6 +1276,11 @@ impl View {
         if let Some(message) = self.registry.duplicate_message() {
             let _ = writeln!(out, "{message}");
         }
+        // Two lanes recording one pane is the *result* of a repair claiming the
+        // wrong pane, so it is said here too, before the rows that look right.
+        if let Some(message) = self.registry.duplicate_pane_message() {
+            let _ = writeln!(out, "{message}");
+        }
         let sightings = self.sightings();
         for row in views(&self.registry, &sightings) {
             let panes: Vec<String> = row
@@ -1441,11 +1516,21 @@ pub fn project_for_command(ctx: &Ctx, handle: &str, explicit: Option<&str>) -> R
     }
 }
 
-/// Record the instance a lane just ran in (`pane_id`, `agent_session`,
-/// `last_active`, and the profile it was launched with). Read-modify-write
-/// under the project lock, never a whole-file overwrite from a stale copy.
-pub fn sync_instance(project: &Project, lane_id: &str, pane_id: &str, agent_session: &str, profile: &str, last_active: &str) -> Result<()> {
-    Registry::update(project, |registry| set_instance(registry, lane_id, pane_id, agent_session, profile, last_active))?;
+/// Record the instance a lane just ran in (`pane_id`, `agent_session`, the
+/// coordinator name it was started under, and the profile it was launched with).
+/// Read-modify-write under the project lock, never a whole-file overwrite from a
+/// stale copy. An empty `agent_name` leaves the recorded name alone: a caller
+/// that does not know it (the ticker's instance refresh) must not clear it.
+pub fn sync_instance(
+    project: &Project,
+    lane_id: &str,
+    pane_id: &str,
+    agent_session: &str,
+    profile: &str,
+    agent_name: &str,
+    last_active: &str,
+) -> Result<()> {
+    Registry::update(project, |registry| set_instance(registry, lane_id, pane_id, agent_session, profile, agent_name, last_active))?;
     Ok(())
 }
 
@@ -1453,24 +1538,43 @@ pub fn sync_instance(project: &Project, lane_id: &str, pane_id: &str, agent_sess
 /// which keeps the lock from making its Space to the lane instance that names
 /// it). A second `lock()` in one process waits on the first and never returns,
 /// so every write inside such a section has a `*_locked` form.
-pub fn sync_instance_locked(project: &Project, lane_id: &str, pane_id: &str, agent_session: &str, profile: &str, last_active: &str) -> Result<()> {
+pub fn sync_instance_locked(
+    project: &Project,
+    lane_id: &str,
+    pane_id: &str,
+    agent_session: &str,
+    profile: &str,
+    agent_name: &str,
+    last_active: &str,
+) -> Result<()> {
     if !exists(project) {
         return Ok(());
     }
     let Some(mut registry) = Registry::load(project) else {
         return Ok(());
     };
-    set_instance(&mut registry, lane_id, pane_id, agent_session, profile, last_active);
+    set_instance(&mut registry, lane_id, pane_id, agent_session, profile, agent_name, last_active);
     registry.save(project)
 }
 
-fn set_instance(registry: &mut Registry, lane_id: &str, pane_id: &str, agent_session: &str, profile: &str, last_active: &str) {
+fn set_instance(
+    registry: &mut Registry,
+    lane_id: &str,
+    pane_id: &str,
+    agent_session: &str,
+    profile: &str,
+    agent_name: &str,
+    last_active: &str,
+) {
     if let Some(lane) = registry.lanes.iter_mut().find(|lane| lane.id == lane_id) {
         lane.pane_id = pane_id.to_string();
         // A new instance with no session yet must clear the previous one,
         // exactly as `coordinator.json` is replaced: otherwise `--new`
         // would inherit a retired coordinator's session id.
         lane.agent_session = agent_session.to_string();
+        if !agent_name.is_empty() {
+            lane.agent_name = agent_name.to_string();
+        }
         if !profile.is_empty() {
             lane.profile = profile.to_string();
         }
@@ -1478,6 +1582,70 @@ fn set_instance(registry: &mut Registry, lane_id: &str, pane_id: &str, agent_ses
             lane.last_active = last_active.to_string();
         }
     }
+}
+
+/// Every coordinator name this project's records still speak for, whether or
+/// not a pane is behind it: the shared `coordinator.json` name, plus each lane's
+/// own recorded name (`Lane::agent_name`, else the shared one). A name stays
+/// taken while its lane exists, so a lane whose terminal is gone cannot hand its
+/// name to the next lane opened — two coordinators answering to one name is what
+/// let a repair claim the wrong pane (law, 2026-11-26).
+pub fn coordinator_names(project: &Project) -> Vec<String> {
+    let registry = Registry::for_project(project);
+    let shared = read_coordinator(project).map(|record| record.agent_name).unwrap_or_default();
+    let mut out: Vec<String> = Vec::new();
+    let mut push = |name: &str| {
+        if !name.is_empty() && !out.iter().any(|taken| taken == name) {
+            out.push(name.to_string());
+        }
+    };
+    push(&shared);
+    for lane in &registry.lanes {
+        push(if lane.agent_name.is_empty() { &shared } else { &lane.agent_name });
+    }
+    out
+}
+
+/// The coordinator names **other** lanes speak for, for `open`'s name
+/// allocation: every open lane except `lane_id`, plus the shared
+/// `coordinator.json` name when `lane_id` is not the default lane (that file is
+/// the default lane's view). A lane's own recorded name is not "taken" by
+/// itself, so reopening a lane keeps the name it had; a lane with no name of its
+/// own reads the shared one, as [`Registry::coordinator_for`] does.
+pub fn names_of_other_lanes(project: &Project, lane_id: &str) -> Vec<String> {
+    let registry = Registry::for_project(project);
+    let shared = read_coordinator(project).map(|record| record.agent_name).unwrap_or_default();
+    let mut out: Vec<String> = Vec::new();
+    let mut push = |name: &str| {
+        if !name.is_empty() && !out.iter().any(|taken| taken == name) {
+            out.push(name.to_string());
+        }
+    };
+    if !writes_default_record(project, lane_id) {
+        push(&shared);
+    }
+    for lane in registry.lanes.iter().filter(|lane| lane.is_open() && lane.id != lane_id) {
+        push(if lane.agent_name.is_empty() { &shared } else { &lane.agent_name });
+    }
+    out
+}
+
+/// The open lanes other than `except` that record the coordinator name `name`,
+/// by the same rule [`Registry::coordinator_for`] reads. Empty when the name
+/// says one lane, which is what makes it evidence in [`crate::coordinator::fate`].
+pub fn lanes_holding_name(project: &Project, except: &str, name: &str) -> Vec<String> {
+    if name.is_empty() {
+        return Vec::new();
+    }
+    let registry = Registry::for_project(project);
+    let shared = read_coordinator(project).map(|record| record.agent_name).unwrap_or_default();
+    registry
+        .lanes
+        .iter()
+        .filter(|lane| lane.is_open() && lane.id != except)
+        .filter(|lane| if lane.agent_name.is_empty() { shared == name } else { lane.agent_name == name })
+        .map(|lane| lane.id.clone())
+        .collect()
 }
 
 /// The ticker's refresh of §4.1's instance hints: for every open lane whose
@@ -1496,8 +1664,12 @@ pub fn refresh_instances(project: &Project, panes: &[crate::coordinator::LivePan
         return Ok(false);
     };
     let before = registry.clone();
+    // Lanes that record a pane another open lane also records are left exactly
+    // as they are: with one pane and two records, every refresh moves the same
+    // pane id between them (`duplicate_pane_message` is what reports it).
+    let shared = registry.lanes_sharing_a_pane();
     let mut newest: BTreeMap<&str, &crate::coordinator::LivePane> = BTreeMap::new();
-    for pane in panes.iter().filter(|pane| !pane.lane.is_empty()) {
+    for pane in panes.iter().filter(|pane| !pane.lane.is_empty() && !shared.contains(&pane.lane)) {
         match newest.get(pane.lane.as_str()) {
             Some(best) if best.state_change_seq > pane.state_change_seq => {}
             _ => {
@@ -1506,6 +1678,15 @@ pub fn refresh_instances(project: &Project, panes: &[crate::coordinator::LivePan
         }
     }
     for (lane_id, pane) in newest {
+        // A pane another open lane already records is not this lane's to take:
+        // the tick's lane for a pane is a resolution, and a resolution that is
+        // wrong must not move a *record* onto a neighbour's pane (`law`'s `c-4`
+        // got `c-3`'s pane id this way on 2026-11-26, and kept its own session,
+        // which is the shape `lane list` showed). Reported, not reassigned.
+        let taken = registry.lanes.iter().any(|other| other.is_open() && other.id != lane_id && !other.pane_id.is_empty() && other.pane_id == pane.pane_id);
+        if taken {
+            continue;
+        }
         let Some(lane) = registry.lanes.iter_mut().find(|lane| lane.id == lane_id && lane.is_open()) else {
             continue;
         };
@@ -1589,12 +1770,17 @@ pub fn lane_adopt(ctx: &Ctx, project: Option<&str>, handle: &str) -> Result<()> 
         bail!("pane {pane} already belongs to lane {other}; use `hp lane assign {claimed} {pane}` to move it");
     }
     let one_lane = registry.lanes.len() == 1;
-    let taken: Vec<String> = herdr
+    // The name this pane already has, plus the names the project's *other* lanes
+    // speak for: a lane whose terminal is gone keeps its name, so the next one
+    // cannot be given the same (`names::free_coordinator`). This lane's own name
+    // is not taken by itself.
+    let mut taken: Vec<String> = herdr
         .agent_list()
         .map_err(|error| anyhow::anyhow!("the herdr session at {socket} is not reachable: {error}"))?
         .into_iter()
         .map(|agent| agent.name)
         .collect();
+    taken.extend(names_of_other_lanes(&project, &lane.id));
     let agent_name = if agent.name.is_empty() { crate::names::free_coordinator(&project.slug, &taken) } else { agent.name.clone() };
     if agent.name != agent_name
         && let Err(error) = herdr.agent_rename(&pane, &agent_name)
@@ -1606,6 +1792,7 @@ pub fn lane_adopt(ctx: &Ctx, project: Option<&str>, handle: &str) -> Result<()> 
     Registry::update(&project, |registry| {
         if let Some(record) = registry.lanes.iter_mut().find(|record| record.id == lane.id) {
             record.pane_id = pane.clone();
+            record.agent_name = agent_name.clone();
             record.agent_session = session_id.clone();
             record.last_active = now.clone();
         }
@@ -1695,6 +1882,9 @@ pub fn lane_assign(ctx: &Ctx, project: &Project, handle: &str, pane: &str) -> Re
     Registry::update(project, |registry| {
         if let Some(record) = registry.lanes.iter_mut().find(|record| record.id == lane.id) {
             record.pane_id = pane.to_string();
+            if !agent.name.is_empty() {
+                record.agent_name = agent.name.clone();
+            }
             record.agent_session = session_id.clone();
             record.last_active = now.clone();
         }
@@ -2486,6 +2676,86 @@ mod tests {
     fn a_lane_serializes_no_goal() {
         let json = serde_json::to_value(Lane::default()).unwrap();
         assert!(json.get("goal").is_none(), "{json}");
+    }
+
+    /// A lane whose coordinator terminal is gone keeps its name: the next
+    /// `open --lane` must not be handed `hpc-demo-1` again, which is how law's
+    /// `c-3` and `c-4` came to answer to one name (2026-11-26).
+    #[test]
+    fn a_recorded_coordinator_name_stays_taken_while_its_lane_exists() {
+        let (_world, project) = temp_project("demo");
+        let mut registry = reg(vec![lane("c-1", "default")], "c-1", 2);
+        registry.lanes[0].agent_name = "hpc-demo".into();
+        // c-2 was opened and its pane is gone: the record keeps the name.
+        let second = registry.create("coordinator2", "coordinator2");
+        second.id = "c-2".into();
+        second.agent_name = "hpc-demo-1".into();
+        registry.next = 3;
+        registry.save(&project).unwrap();
+        let record = Coordinator { agent_name: "hpc-demo".into(), ..Coordinator::default() };
+        crate::project::write_json(&project.state_dir().join(COORDINATOR_FILE), &record).unwrap();
+
+        let taken = coordinator_names(&project);
+        assert_eq!(taken, vec!["hpc-demo".to_string(), "hpc-demo-1".to_string()], "both names are in use");
+        assert_eq!(crate::names::free_coordinator("demo", &taken), "hpc-demo-2");
+        // `open` asks about the *other* lanes only: a lane reopening keeps the
+        // name its own record holds, and a new lane gets the free one.
+        assert_eq!(names_of_other_lanes(&project, "c-2"), vec!["hpc-demo".to_string()]);
+        assert_eq!(names_of_other_lanes(&project, "c-1"), vec!["hpc-demo-1".to_string()]);
+        let mut fresh = vec!["hpc-demo".to_string(), "hpc-demo-1".to_string()];
+        assert_eq!(crate::names::free_coordinator("demo", &fresh), "hpc-demo-2");
+        fresh.truncate(1);
+        assert_eq!(crate::names::free_coordinator("demo", &fresh), "hpc-demo-1", "a lane may keep its own name");
+        // A name one lane answers to is not evidence for another lane.
+        assert_eq!(lanes_holding_name(&project, "c-3", "hpc-demo-1"), vec!["c-2".to_string()]);
+        assert!(lanes_holding_name(&project, "c-2", "hpc-demo-1").is_empty());
+        assert!(lanes_holding_name(&project, "c-3", "hpc-demo-2").is_empty());
+    }
+
+    /// The lane's own recorded name is the one its coordinator record reports;
+    /// `coordinator.json` only stands in for a record written before lanes
+    /// recorded names.
+    #[test]
+    fn a_lanes_own_name_beats_the_shared_record() {
+        let (_world, project) = temp_project("demo");
+        let registry = reg(vec![Lane { agent_name: "hpc-demo-1".into(), ..lane("c-2", "books") }], "c-2", 3);
+        let shared = Coordinator { agent_name: "hpc-demo".into(), ..Coordinator::default() };
+        crate::project::write_json(&project.state_dir().join(COORDINATOR_FILE), &shared).unwrap();
+        let record = registry.get("c-2").unwrap();
+        assert_eq!(registry.coordinator_for(&project, record).agent_name, "hpc-demo-1");
+        // A record with no name of its own reads the shared one, as before.
+        let old = reg(vec![lane("c-2", "books")], "c-2", 3);
+        assert_eq!(old.coordinator_for(&project, old.get("c-2").unwrap()).agent_name, "hpc-demo");
+    }
+
+    /// Two open lanes recording one pane is what the repair bug left behind:
+    /// `lane list` says so before the rows, and the fix stays the user's call.
+    #[test]
+    fn lane_list_reports_two_lanes_that_record_one_pane() {
+        let shared = reg(
+            vec![
+                Lane { pane_id: "hp-coordinator-3eec69".into(), ..lane("c-3", "coordinator3") },
+                Lane { pane_id: "hp-coordinator-3eec69".into(), ..lane("c-4", "coordinator4") },
+            ],
+            "c-3",
+            5,
+        );
+        let text = view(&shared, vec![], "", false).list_text();
+        assert!(text.contains("lane records share a coordinator pane"), "{text}");
+        assert!(text.contains("hp-coordinator-3eec69 is recorded by 2 lanes (coordinator3, coordinator4)"), "{text}");
+        // Both records are still printed.
+        assert_eq!(text.lines().filter(|line| line.starts_with("c-3\t") || line.starts_with("c-4\t")).count(), 2, "{text}");
+        // A closed lane's retired pane is not a second claim.
+        let retired = reg(
+            vec![
+                Lane { pane_id: "hp-1".into(), ..lane("c-1", "default") },
+                Lane { pane_id: "hp-1".into(), status: Status::Closed, ..lane("c-2", "old") },
+            ],
+            "c-1",
+            3,
+        );
+        assert!(retired.duplicate_panes().is_empty());
+        assert!(retired.duplicate_pane_message().is_none());
     }
 
     #[test]
