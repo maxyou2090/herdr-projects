@@ -1467,6 +1467,21 @@ fn discover_record(ctx: &Ctx, project: &Project, sessions: &mut Sessions) -> Res
             continue;
         };
         if let Some(found) = coordinator::found(project, &socket, agents) {
+            // `coordinator.json` is the default line's view: a pane the
+            // registry files under another lane records itself in
+            // `lanes.json` and leaves the default line's record alone
+            // (2026-11-26). The tick still runs on the discovered record — it
+            // is this project's coordinator, just not the default one's.
+            let registry = crate::lanes::Registry::for_project(project);
+            if let Some(lane) = registry
+                .lanes
+                .iter()
+                .find(|lane| lane.pane_id == found.pane_id)
+                .filter(|lane| !crate::lanes::writes_default_record(project, &lane.id))
+            {
+                crate::lanes::sync_instance(project, &lane.id, &found.pane_id, &found.agent_session, &lane.profile, &project::now())?;
+                return Ok(Some(found));
+            }
             return project.update_coordinator(|c| *c = found).map(Some);
         }
     }
@@ -1834,7 +1849,14 @@ fn tick_cheap_body(ctx: &Ctx, project: &Project, sessions: &mut Sessions, state:
     crate::lanes::refresh_instances(project, &coordinators, &now_text)?;
     let ambiguous = crate::lanes::ambiguous_panes(project, &record, &agents);
     // The primary pane's native session id, for a later resume by `open`.
-    if let Some(primary) = coordinators.iter().find(|c| c.pane_id == record.pane_id)
+    // `record` is the default lane's view, so a pane the resolver filed under
+    // another lane is not this file's: writing its session there is how the
+    // default line came to resume another coordinator's conversation
+    // (2026-11-26).
+    let own_lane = crate::lanes::default_lane_id(project);
+    if let Some(primary) = coordinators
+        .iter()
+        .find(|c| c.pane_id == record.pane_id && (c.lane.is_empty() || c.lane == own_lane))
         && !primary.agent_session.is_empty()
         && (primary.agent_session != record.agent_session || primary.agent != record.agent)
     {
