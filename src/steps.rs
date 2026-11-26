@@ -1526,8 +1526,14 @@ pub fn write_lane_duplicate_items(project: &Project, state: &mut State) -> Resul
 /// from "no thread finished". An item per loss, written once and kept while the
 /// loss stands (a re-run after the coordinator archives it writes nothing), and
 /// dropped when a coordinator runs again, so a later loss is news again.
-/// Nothing here restarts, kills or adopts anything: `open <slug>` is a
-/// person's call.
+/// Nothing here restarts, kills or adopts anything: `open <slug>` and `lane
+/// close <lane>` are a person's calls.
+///
+/// The item always goes to the **default** line's inbox, whichever lane was
+/// lost. That is deliberate and must stay: the lane whose coordinator is gone
+/// has no one to read its own inbox, and the default line's coordinator is the
+/// project's spokesperson. What changes per lane is only the wording
+/// ([`lost_summary`]).
 pub fn write_coordinator_lost_items(project: &Project, state: &mut State, lost: &BTreeMap<String, String>) -> Result<()> {
     state.coordinator_lost.retain(|lane, _| lost.contains_key(lane));
     let default_lane = crate::lanes::default_lane_id(project);
@@ -1535,15 +1541,37 @@ pub fn write_coordinator_lost_items(project: &Project, state: &mut State, lost: 
         if state.coordinator_lost.get(lane) == Some(detail) {
             continue;
         }
-        let named = if crate::lanes::split_in_use(project) { format!("Lane {lane}'s coordinator") } else { "The coordinator".to_string() };
-        let summary = format!(
-            "{named} of `{}` has no terminal to be prompted in: {detail}. Inbox items are held (not lost) until a coordinator runs again: run `hp open {}` in the project's session, and `hp context` shows what waited. This is written once per loss and `thread audit {}` reports the same. Nothing was restarted, killed or moved.",
-            project.slug, project.slug, project.slug
-        );
+        let summary = lost_summary(project, lane, detail);
         inbox::write_in(project, &default_lane, "coordinator", &project.slug, "coordinator terminal gone", &summary, "")?;
         state.coordinator_lost.insert(lane.clone(), detail.clone());
     }
     Ok(())
+}
+
+/// What the one `coordinator` item about a lost coordinator says, in two
+/// wordings — the *only* thing that differs between lanes.
+///
+/// The default line keeps the wording it has always had: `run hp open <slug>`
+/// really does bring it back, and it can be asked in the same breath.
+///
+/// A **non-default** lane cannot be helped by `hp open <slug>`: that focuses
+/// the default line and leaves the lost lane lost. The only two actions are
+/// `hp open <slug> --lane <id>` and `hp lane close <id>` — both lane lifecycle,
+/// which the skill puts in the user's hands, not a coordinator's. So the item
+/// says who has to act and what to run, instead of handing the reader a command
+/// it must not run and cannot make work (2026-11-26: law's c-1 was told to
+/// `run hp open law` about c-4, and could only forward it; t-0116).
+fn lost_summary(project: &Project, lane: &str, detail: &str) -> String {
+    let slug = &project.slug;
+    if !crate::lanes::split_in_use(project) || lane == crate::lanes::default_lane_id(project) {
+        let named = if crate::lanes::split_in_use(project) { format!("Lane {lane}'s coordinator") } else { "The coordinator".to_string() };
+        return format!(
+            "{named} of `{slug}` has no terminal to be prompted in: {detail}. Inbox items are held (not lost) until a coordinator runs again: run `hp open {slug}` in the project's session, and `hp context` shows what waited. This is written once per loss and `thread audit {slug}` reports the same. Nothing was restarted, killed or moved."
+        );
+    }
+    format!(
+        "Lane {lane}'s coordinator of `{slug}` has no terminal to be prompted in: {detail}. That lane's inbox items are held (not lost). Bringing it back or retiring it is the user's call: `hp open {slug} --lane {lane}` restarts its coordinator, `hp lane close {lane}` retires the lane. You cannot do either (lane lifecycle is the user's), so tell them and keep this item as data. This is written once per loss and `thread audit {slug}` reports the same. Nothing was restarted, killed or moved."
+    )
 }
 
 /// Step 2, every five minutes ([`PR_INTERVAL_SECS`]): a pull request may lag
@@ -3873,6 +3901,91 @@ mod tests {
         memory.started = at("2026-11-02T00:00:00Z");
         assert!(auto_resolve(&ctx, project, &nopr.settings, &memory, at("2026-11-20T00:00:00Z")).is_empty());
         assert_eq!(thread::load(project, &idle.id).unwrap().resolved_reason, "auto");
+    }
+
+    /// A project with a registry: `c-1` is the default line, `c-4` is a second
+    /// lane of its own.
+    fn lost_lane_project(root: &std::path::Path) -> Project {
+        let project = project::create(root, "law", vec![]).unwrap();
+        let registry = crate::lanes::Registry {
+            lanes: vec![
+                crate::lanes::Lane { id: "c-1".into(), name: "default".into(), label: "law".into(), ..Default::default() },
+                crate::lanes::Lane { id: "c-4".into(), name: "fix".into(), label: "law — fix".into(), ..Default::default() },
+            ],
+            default: "c-1".into(),
+            next: 5,
+        };
+        registry.save(&project).unwrap();
+        project
+    }
+
+    fn lost(lane: &str, detail: &str) -> BTreeMap<String, String> {
+        BTreeMap::from([(lane.to_string(), detail.to_string())])
+    }
+
+    /// The 2026-11-26 item was addressed to the default line and told it to
+    /// `run hp open law` about **another lane's** loss: that command only
+    /// focuses the default line, and lane lifecycle is the user's, so c-1 could
+    /// only forward it. A non-default loss now names the two commands the user
+    /// may run and says whose call it is (t-0116).
+    #[test]
+    fn a_lost_non_default_lane_item_states_the_users_commands_and_never_plain_open() {
+        let world = tempfile::tempdir().unwrap();
+        let project = lost_lane_project(&world.path().join("root"));
+        let mut state = State::default();
+        write_coordinator_lost_items(&project, &mut state, &lost("c-4", "the session no longer knows its terminal hp-coordinator-2844b9")).unwrap();
+
+        let items = inbox::unhandled(&project);
+        let item = items.iter().find(|item| item.kind == "coordinator").expect("one item");
+        assert_eq!(item.event, "coordinator terminal gone");
+        assert_eq!(item.subject, "law");
+        assert_eq!(item.lane, "c-1", "the lost lane has nobody to read it: the default line's coordinator is told");
+        assert!(item.summary.contains("`hp open law --lane c-4`"), "{}", item.summary);
+        assert!(item.summary.contains("`hp lane close c-4`"), "{}", item.summary);
+        assert!(item.summary.contains("is the user's call"), "{}", item.summary);
+        assert!(item.summary.contains("keep this item as data"), "{}", item.summary);
+        assert!(item.summary.contains("hp-coordinator-2844b9"), "{}", item.summary);
+        assert!(!item.summary.contains("run `hp open law`"), "that command cannot bring lane c-4 back: {}", item.summary);
+
+        // Still once per loss, not once per tick.
+        write_coordinator_lost_items(&project, &mut state, &lost("c-4", "the session no longer knows its terminal hp-coordinator-2844b9")).unwrap();
+        assert_eq!(inbox::unhandled(&project).iter().filter(|item| item.kind == "coordinator").count(), 1);
+
+        // A different detail is news again; the hold being over clears it.
+        write_coordinator_lost_items(&project, &mut state, &lost("c-4", "another reason")).unwrap();
+        assert_eq!(inbox::unhandled(&project).iter().filter(|item| item.kind == "coordinator").count(), 2);
+        write_coordinator_lost_items(&project, &mut state, &BTreeMap::new()).unwrap();
+        assert!(state.coordinator_lost.is_empty(), "a coordinator running again forgets the loss");
+    }
+
+    /// The default line keeps its wording word for word: `hp open <slug>` is
+    /// exactly the command that brings it back.
+    #[test]
+    fn a_lost_default_lane_item_keeps_the_wording_it_had() {
+        let world = tempfile::tempdir().unwrap();
+        let project = lost_lane_project(&world.path().join("root"));
+        let mut state = State::default();
+        write_coordinator_lost_items(&project, &mut state, &lost("c-1", "detail")).unwrap();
+        let items = inbox::unhandled(&project);
+        let item = items.iter().find(|item| item.kind == "coordinator").expect("one item");
+        assert_eq!(item.lane, "c-1");
+        assert_eq!(
+            item.summary,
+            "Lane c-1's coordinator of `law` has no terminal to be prompted in: detail. Inbox items are held (not lost) until a coordinator runs again: run `hp open law` in the project's session, and `hp context` shows what waited. This is written once per loss and `thread audit law` reports the same. Nothing was restarted, killed or moved."
+        );
+        assert!(!item.summary.contains("--lane"), "{}", item.summary);
+
+        // No registry at all (a pre-lane project) is the same lane and reads as
+        // it always did: `The coordinator`.
+        let plain = project::create(&world.path().join("root2"), "demo", vec![]).unwrap();
+        let mut state = State::default();
+        write_coordinator_lost_items(&plain, &mut state, &lost("c-1", "detail")).unwrap();
+        let items = inbox::unhandled(&plain);
+        let item = items.iter().find(|item| item.kind == "coordinator").expect("one item");
+        assert_eq!(
+            item.summary,
+            "The coordinator of `demo` has no terminal to be prompted in: detail. Inbox items are held (not lost) until a coordinator runs again: run `hp open demo` in the project's session, and `hp context` shows what waited. This is written once per loss and `thread audit demo` reports the same. Nothing was restarted, killed or moved."
+        );
     }
 }
 
