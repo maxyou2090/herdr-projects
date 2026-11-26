@@ -1479,7 +1479,7 @@ fn discover_record(ctx: &Ctx, project: &Project, sessions: &mut Sessions) -> Res
                 .find(|lane| lane.pane_id == found.pane_id)
                 .filter(|lane| !crate::lanes::writes_default_record(project, &lane.id))
             {
-                crate::lanes::sync_instance(project, &lane.id, &found.pane_id, &found.agent_session, &lane.profile, &project::now())?;
+                crate::lanes::sync_instance(project, &lane.id, &found.pane_id, &found.agent_session, &lane.profile, "", &project::now())?;
                 return Ok(Some(found));
             }
             return project.update_coordinator(|c| *c = found).map(Some);

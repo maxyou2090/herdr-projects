@@ -671,6 +671,31 @@ the wrong lane (the record is then reported as lost, never rewritten), or
 override `--new` (which always starts a second coordinator). An explicit
 `--profile` other than the record's also still starts one beside it.
 
+**A coordinator name belongs to one lane, and a name never adopts a pane.**
+Each lane records the name its coordinator was started under
+(`Lane::agent_name`, written by `open`, `lane adopt` and `lane assign`; a record
+from before that field reads `coordinator.json`'s name). `open` hands out the
+first `hpc-<slug>[-N]` that no *other* lane speaks for, so a lane whose terminal
+is gone keeps its name and the next lane cannot be given the same one; the lane
+being reopened keeps the name it had.
+
+The ticker's `coordinator::repair` moves a record only to a pane **no lane owns**:
+`lanes::resolve` must answer `None` for it — no `hp_lane` token, no lane record
+matching pane and native session, no folder claim. An `Ambiguous` pane is not
+free either (it is a coordinator whose lane nothing names), a name that two
+lanes answer to is not evidence, and a pane another open lane records is never
+relabelled. Without those three refusals one lane's record follows a *name* onto
+the other lane's live pane and rewrites its `hp_lane` — which is what happened to
+law's `c-3`/`c-4` on 2026-11-26 (both were `hpc-law-1`).
+
+**Two open lanes recording one pane** is that bug's result, and it is reported
+rather than repaired: `hp lane list` prints `lane records share a coordinator
+pane: <pane> is recorded by N lanes (…)` before its rows and the ticker writes
+one `config-error` item with the same sentence. Neither `repair` nor the tick's
+instance refresh touches either record or the pane's label while it stands: the
+pane's `hp_lane` and the user (`hp lane adopt <id>` in that pane, or `hp lane
+close <id>`) decide which lane it serves.
+
 ### 6.2 `hp lane adopt <name> [--project <slug>]`
 
 For the case where the user opened a tab and started an agent by hand. Adopt

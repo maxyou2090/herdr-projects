@@ -434,14 +434,35 @@ pub fn fate(herdr: &Core, project: &Project, record: &Coordinator, agents: &[Age
     // The recorded terminal is finished, or core does not know it any more: the
     // agent may have survived it in another pane, and its name is then the only
     // evidence there is.
+    //
+    // The candidate must be **free**: [`crate::lanes::resolve`] says no lane owns
+    // it — no `hp_lane` token, no lane record matching pane *and* session, no
+    // folder claim. An `Ambiguous` answer is not free either: the pane is a
+    // coordinator whose lane nothing names, so taking it would be a guess (it is
+    // exactly how `law`'s `c-4` claimed `c-3`'s live pane on 2026-11-26). And a
+    // name two lanes answer to is no evidence at all, so it adopts nothing.
     let mut candidates: Vec<Agent> = agents
         .iter()
         .zip(&identity)
-        .filter(|(agent, resolution)| resolution.lane_id().is_none() && named_coordinator(project, record, agent))
+        .filter(|(agent, resolution)| resolution.is_none() && named_coordinator(project, record, agent))
         .map(|(agent, _)| agent.clone())
         .collect();
     match candidates.len() {
-        1 => Fate::Moved(Box::new(candidates.remove(0))),
+        1 => {
+            let agent = candidates.remove(0);
+            let shared = crate::lanes::lanes_holding_name(project, lane, &agent.name);
+            if !shared.is_empty() {
+                return Fate::Lost {
+                    detail: format!(
+                        "its terminal is gone and the only live agent named `{}` is a name lane {} records as well, so the name does not say which lane that pane serves ({}); run `hp lane adopt <lane>` in it",
+                        agent.name,
+                        shared.join(", "),
+                        agent.pane_id
+                    ),
+                };
+            }
+            Fate::Moved(Box::new(agent))
+        }
         0 => Fate::Lost { detail: gone_detail(record, terminal.as_ref()) },
         n => {
             let names: Vec<&str> = candidates.iter().map(|agent| agent.name.as_str()).collect();
@@ -577,8 +598,17 @@ pub fn repair(project: &Project, herdr: &Core, agents: &[Agent], now: &str) -> R
         }
     }
     let mut claimed: Vec<String> = Vec::new();
+    // Lanes that record a pane another open lane also records: the result of
+    // this very bug. Which lane that pane serves is the pane's `hp_lane` and the
+    // user's call (`hp lane adopt` / `hp lane close`), so no record of them is
+    // moved and no label of it is rewritten here — `lane list` and the ticker's
+    // `config-error` item say what the file holds instead.
+    let shared_panes = registry.as_ref().map(|registry| registry.lanes_sharing_a_pane()).unwrap_or_default();
     for (lane, record) in records {
         if record.pane_id.is_empty() {
+            continue;
+        }
+        if shared_panes.contains(&lane) {
             continue;
         }
         match fate(herdr, project, &record, agents, &lane) {
@@ -606,6 +636,19 @@ pub fn repair(project: &Project, herdr: &Core, agents: &[Agent], now: &str) -> R
                     );
                     continue;
                 }
+                // The claim is checked here, not only by the name that picked the
+                // candidate: a pane another lane's record names must never have
+                // its `hp_lane` rewritten for this one, whatever the names say.
+                if let Some(other) = claimed_by_another_lane(project, &lane, &agent) {
+                    out.lost.insert(
+                        lane,
+                        format!(
+                            "its terminal is gone and the only live agent with its name runs in pane {}, which lane {other} records; that pane is left alone until a person says who it serves (`hp lane adopt <lane>` in it)",
+                            agent.pane_id
+                        ),
+                    );
+                    continue;
+                }
                 adopt(project, herdr, &record, &agent, &lane, now)?;
                 claimed.push(agent.pane_id.clone());
                 out.fixed.push(Fixed {
@@ -622,6 +665,28 @@ pub fn repair(project: &Project, herdr: &Core, agents: &[Agent], now: &str) -> R
     Ok(out)
 }
 
+/// The lane that owns `agent`'s pane when it is not `lane`: a `hp_lane` token,
+/// a lane record naming the pane, or the folder rule giving the pane to another
+/// lane. `None` when the pane is free or already this lane's.
+///
+/// This is the last line before a repair writes: a `Moved` candidate was picked
+/// by a name, and a name is weaker evidence than a claim. `law`'s `c-4` record
+/// was moved onto `c-3`'s live pane and relabelled `hp_lane=c-4` because nothing
+/// checked this (2026-11-26).
+fn claimed_by_another_lane(project: &Project, lane: &str, agent: &Agent) -> Option<String> {
+    let registry = crate::lanes::Registry::for_project(project);
+    if let Some(lane_id) = crate::lanes::resolve(&registry, agent, &crate::lanes::project_home(project), &project.slug).lane_id()
+        && lane_id != lane
+    {
+        return Some(lane_id.to_string());
+    }
+    registry
+        .lanes
+        .iter()
+        .find(|other| other.id != lane && !other.pane_id.is_empty() && other.pane_id == agent.pane_id)
+        .map(|other| other.id.clone())
+}
+
 /// Point one record at the live pane that is its coordinator, and say so on the
 /// pane. The lane keeps its id, its profile and every thread filed under it;
 /// only the instance fields move.
@@ -630,6 +695,9 @@ pub fn repair(project: &Project, herdr: &Core, agents: &[Agent], now: &str) -> R
 /// ([`crate::lanes::Registry::coordinator_for`]), so another lane's record is
 /// healed in `lanes.json` alone — the same rule `hp lane assign` follows.
 fn adopt(project: &Project, herdr: &Core, record: &Coordinator, agent: &Agent, lane: &str, now: &str) -> Result<()> {
+    if let Some(other) = claimed_by_another_lane(project, lane, agent) {
+        bail!("pane {} belongs to lane {other}, not to {lane}; nothing is moved onto it", agent.pane_id);
+    }
     let (space, tab) = herdr.locate(&agent.pane_id).unwrap_or_default();
     let session_id = agent.session_id().to_string();
     let is_primary = lane.is_empty() || crate::lanes::Registry::for_project(project).is_default(lane);
@@ -652,7 +720,7 @@ fn adopt(project: &Project, herdr: &Core, record: &Coordinator, agent: &Agent, l
         })?;
     }
     if !lane.is_empty() {
-        crate::lanes::sync_instance(project, lane, &agent.pane_id, &session_id, &record.profile, now)?;
+        crate::lanes::sync_instance(project, lane, &agent.pane_id, &session_id, &record.profile, &agent.name, now)?;
     }
     // The claim the resolver reads next: `hp_project` and the lane's
     // `hp_lane`, on the pane that is now the coordinator.
@@ -1201,7 +1269,7 @@ pub fn open(ctx: &Ctx, slug: &str, options: &OpenOptions) -> Result<()> {
                 }
             })?;
         }
-        crate::lanes::sync_instance(&project, &target_lane.id, &pane_id, &agent_session, &lane_profile, &project::now())?;
+        crate::lanes::sync_instance(&project, &target_lane.id, &pane_id, &agent_session, &lane_profile, &agent.name, &project::now())?;
         report_tokens(&herdr, &project, &pane_id);
         ticker::start(ctx)?;
         println!(
@@ -1252,7 +1320,7 @@ pub fn open(ctx: &Ctx, slug: &str, options: &OpenOptions) -> Result<()> {
                 c.agent = kind.clone();
             })?;
         }
-        crate::lanes::sync_instance(&project, &target_lane.id, &pane_id, &agent_session, &lane_profile, &project::now())?;
+        crate::lanes::sync_instance(&project, &target_lane.id, &pane_id, &agent_session, &lane_profile, &name, &project::now())?;
         report_tokens(&herdr, &project, &pane_id);
         ticker::start(ctx)?;
         println!(
@@ -1336,7 +1404,13 @@ pub fn open(ctx: &Ctx, slug: &str, options: &OpenOptions) -> Result<()> {
 
     // Ids are recorded before the agent is started, so a command killed midway
     // still leaves a record the ticker and a later `open` can act on.
-    let taken: Vec<String> = agents.iter().map(|a| a.name.clone()).collect();
+    // Every live name, plus every name this project's records still speak for: a
+    // lane whose terminal is gone keeps its name, and handing that name to the
+    // next lane is what made law's `c-3` and `c-4` indistinguishable
+    // (2026-11-26).
+    let mut taken: Vec<String> = agents.iter().map(|a| a.name.clone()).collect();
+    taken.extend(crate::lanes::coordinator_names(&project));
+    taken.extend(previous.as_ref().map(|record| record.agent_name.clone()).filter(|name| !name.is_empty()));
     let name = names::free_coordinator(slug, &taken);
     // With --new the recorded session belongs to a coordinator that stays
     // running: the new agent starts fresh and never inherits its session id.
@@ -1379,7 +1453,7 @@ pub fn open(ctx: &Ctx, slug: &str, options: &OpenOptions) -> Result<()> {
     let write_view = crate::lanes::writes_default_record(&project, &target_lane.id);
     let stored = record.clone();
     let record = if write_view { project.update_coordinator_locked(|c| *c = stored)? } else { record };
-    crate::lanes::sync_instance_locked(&project, &target_lane.id, &record.pane_id, &record.agent_session, &record.profile, &project::now())?;
+    crate::lanes::sync_instance_locked(&project, &target_lane.id, &record.pane_id, &record.agent_session, &record.profile, &name, &project::now())?;
     drop(lock);
 
     let mut args = base_args.clone();
@@ -1421,7 +1495,7 @@ pub fn open(ctx: &Ctx, slug: &str, options: &OpenOptions) -> Result<()> {
                         c.agent_session = session_id.clone();
                     })?;
                 }
-                crate::lanes::sync_instance(&project, &target_lane.id, &record.pane_id, &session_id, &record.profile, &project::now())?;
+                crate::lanes::sync_instance(&project, &target_lane.id, &record.pane_id, &session_id, &record.profile, &name, &project::now())?;
             }
             if resume.is_empty() {
                 match &fresh {
@@ -1485,7 +1559,7 @@ fn run_here(ctx: &Ctx, herdr: &Core, project: &Project, run: HereRun<'_>) -> Res
                 let _ = project.update_coordinator(|c| c.agent_session = id.clone());
             }
             if let Some(lane) = run.lane_id.filter(|lane| !lane.is_empty()) {
-                let _ = crate::lanes::sync_instance(project, lane, &record.pane_id, &id, &record.profile, &project::now());
+                let _ = crate::lanes::sync_instance(project, lane, &record.pane_id, &id, &record.profile, &record.agent_name, &project::now());
             }
         }
     }
@@ -1531,7 +1605,7 @@ fn adopt_here(herdr: &Core, project: &Project, record: &Coordinator, lane_id: Op
     if let Some(lane_id) = lane_id
         && !session_id.is_empty()
     {
-        let _ = crate::lanes::sync_instance(project, lane_id, &agent.pane_id, &session_id, &record.profile, &project::now());
+        let _ = crate::lanes::sync_instance(project, lane_id, &agent.pane_id, &session_id, &record.profile, &record.agent_name, &project::now());
     }
     true
 }
@@ -3128,6 +3202,156 @@ mod tests {
         let healed = fake.terminals.borrow().iter().find(|t| t.name == "hp-demo-c2-new").cloned().unwrap();
         assert_eq!(healed.labels.get(crate::lanes::TOKEN).map(String::as_str), Some("c-2"), "the moved pane claims the lane it serves");
         assert_eq!(project.coordinator().unwrap().pane_id, "hp-demo-c1", "the default lane's record is not stolen");
+    }
+
+    /// A two-lane project in the shape law had on 2026-11-26: `c-3` and `c-4`
+    /// were both given the coordinator name `hpc-law-1`, `c-3`'s pane is alive
+    /// but nothing resolves it (no `hp_lane` on it, and core writes no session
+    /// id, so the record rule cannot match either — two open lanes in one folder
+    /// is then `Ambiguous`), while `c-4`'s pane was killed.
+    fn same_name_pair(project: &Project, dir: &str) -> crate::lanes::Registry {
+        let registry = crate::lanes::Registry {
+            lanes: vec![
+                crate::lanes::Lane {
+                    id: "c-3".into(),
+                    name: "coordinator3".into(),
+                    label: "coordinator3".into(),
+                    pane_id: "hp-coordinator-3eec69".into(),
+                    agent_name: "hpc-law-1".into(),
+                    ..Default::default()
+                },
+                crate::lanes::Lane {
+                    id: "c-4".into(),
+                    name: "coordinator4".into(),
+                    label: "coordinator4".into(),
+                    pane_id: "hp-coordinator-2844b9".into(),
+                    agent_name: "hpc-law-1".into(),
+                    agent_session: "hp-67697bdbc0dc".into(),
+                    ..Default::default()
+                },
+            ],
+            default: "c-3".into(),
+            next: 5,
+        };
+        registry.save(project).unwrap();
+        project
+            .update_coordinator(|c| {
+                c.pane_id = "hp-coordinator-3eec69".into();
+                c.agent_name = "hpc-law-1".into();
+                c.cwd = dir.to_string();
+            })
+            .unwrap();
+        registry
+    }
+
+    /// The bug itself: `c-4`'s terminal was killed, and the repair pass adopted
+    /// `c-3`'s live pane — the only live agent carrying the name both lanes had —
+    /// rewrote its `hp_lane` to `c-4`, and left `lanes.json` with two lanes
+    /// recording one pane. The candidate was `Ambiguous`, which is not free.
+    #[test]
+    fn a_dead_lanes_shared_name_never_claims_the_live_pane_of_that_name() {
+        let (_root, project) = project();
+        let fake = crate::fake_hc::FakeCore::new();
+        let herdr = Core::new("hc", "", &fake);
+        let dir = project.canonical_dir().to_string_lossy().into_owned();
+        // c-3's coordinator: alive, reporting, in the project folder, no
+        // `hp_lane` and no session id — unresolvable, not free.
+        fake.terminal(
+            "hp-coordinator-3eec69",
+            &dir,
+            &[("hp_agent", "hpc-law-1"), ("hp_kind", "pi"), (crate::labels::PROJECT_TOKEN, "demo")],
+        );
+        fake.set_status("hp-coordinator-3eec69", "done");
+        fake.terminal("hp-coordinator-2844b9", &dir, &[("hp_agent", "hpc-law-1")]);
+        fake.finish("hp-coordinator-2844b9", "killed");
+        same_name_pair(&project, &dir);
+
+        let repaired = repair(&project, &herdr, &herdr.agent_list().unwrap(), "2026-11-26T02:47:00Z").unwrap();
+
+        assert!(repaired.fixed.is_empty(), "nothing is adopted on a name two lanes answer to: {:?}", repaired.fixed);
+        assert!(repaired.lost.contains_key("c-4"), "the dead lane is reported instead: {:?}", repaired.lost);
+        assert!(repaired.agents.is_none(), "nothing was written, so core is not relisted");
+        // The live pane is exactly as it was: no lane claim invented on it.
+        let live = fake.terminals.borrow().iter().find(|t| t.name == "hp-coordinator-3eec69").cloned().unwrap();
+        assert!(live.labels.get(crate::lanes::TOKEN).is_none(), "the pane claims no lane: {:?}", live.labels);
+        assert_eq!(live.labels.get(crate::core::L_AGENT).map(String::as_str), Some("hpc-law-1"));
+        // And the records still point where they did.
+        let registry = crate::lanes::Registry::for_project(&project);
+        assert_eq!(registry.get("c-3").unwrap().pane_id, "hp-coordinator-3eec69");
+        assert_eq!(registry.get("c-4").unwrap().pane_id, "hp-coordinator-2844b9", "the dead lane stays without a pane until `open --lane`");
+        assert_eq!(registry.get("c-4").unwrap().agent_session, "hp-67697bdbc0dc", "and keeps the session it retired");
+        assert!(registry.duplicate_panes().is_empty(), "no two lanes share a pane after the tick");
+    }
+
+    /// The same two records once the bug has already happened: both name one
+    /// pane. A repair pass has nothing to say about them — which lane the pane
+    /// serves is the token's answer and the user's call — and must not keep
+    /// rewriting the label or moving records around it.
+    #[test]
+    fn two_lanes_recording_one_pane_are_reported_and_left_alone() {
+        let (_root, project) = project();
+        let fake = crate::fake_hc::FakeCore::new();
+        let herdr = Core::new("hc", "", &fake);
+        let dir = project.canonical_dir().to_string_lossy().into_owned();
+        fake.terminal(
+            "hp-coordinator-3eec69",
+            &dir,
+            &[("hp_agent", "hpc-law-1"), ("hp_kind", "pi"), (crate::labels::PROJECT_TOKEN, "demo"), (crate::lanes::TOKEN, "c-4")],
+        );
+        fake.set_status("hp-coordinator-3eec69", "done");
+        let mut registry = same_name_pair(&project, &dir);
+        registry.lanes[1].pane_id = "hp-coordinator-3eec69".into();
+        registry.save(&project).unwrap();
+
+        assert_eq!(
+            registry.duplicate_panes(),
+            vec![("hp-coordinator-3eec69".to_string(), vec!["coordinator3".to_string(), "coordinator4".to_string()])]
+        );
+        let message = registry.duplicate_pane_message().expect("two records on one pane are reported");
+        assert!(message.contains("hp-coordinator-3eec69 is recorded by 2 lanes (coordinator3, coordinator4)"), "{message}");
+        assert!(message.contains("hp lane adopt") && message.contains("hp lane close"), "{message}");
+        // `lane list` says it too (the text is asserted in `lanes`' own test:
+        // its view needs a session the coordinator tests do not build).
+
+        let repaired = repair(&project, &herdr, &herdr.agent_list().unwrap(), "2026-11-26T02:47:00Z").unwrap();
+        assert!(repaired.fixed.is_empty(), "{:?}", repaired.fixed);
+        assert!(repaired.lost.is_empty(), "the pair is reported by `config-error`, not as a lost coordinator: {:?}", repaired.lost);
+        let live = fake.terminals.borrow()[0].clone();
+        assert_eq!(live.labels.get(crate::lanes::TOKEN).map(String::as_str), Some("c-4"), "the pane's own claim is not rewritten");
+        let after = crate::lanes::Registry::for_project(&project);
+        assert_eq!(after.get("c-3").unwrap().pane_id, "hp-coordinator-3eec69");
+        assert_eq!(after.get("c-4").unwrap().pane_id, "hp-coordinator-3eec69");
+    }
+
+    /// The tick's instance refresh writes a lane's pane from whatever lane the
+    /// resolver gave a pane. When that resolution is wrong the record must not
+    /// follow it onto a pane another open lane already records: that is how
+    /// `c-4`'s record came to name `c-3`'s pane while keeping its own session.
+    #[test]
+    fn a_refresh_never_moves_a_lane_record_onto_a_pane_another_lane_records() {
+        let (_root, project) = project();
+        let mut registry = crate::lanes::Registry {
+            lanes: vec![
+                crate::lanes::Lane { id: "c-1".into(), name: "fix".into(), pane_id: "hp-live".into(), ..Default::default() },
+                crate::lanes::Lane { id: "c-2".into(), name: "books".into(), pane_id: "hp-dead".into(), ..Default::default() },
+            ],
+            default: "c-1".into(),
+            next: 3,
+        };
+        registry.save(&project).unwrap();
+        // The wrong resolution: `c-2`'s record is dead, and the tick filed
+        // `c-1`'s live pane under `c-2`.
+        let live = LivePane {
+            pane_id: "hp-live".into(),
+            lane: "c-2".into(),
+            agent_status: "done".into(),
+            ..LivePane::default()
+        };
+        crate::lanes::refresh_instances(&project, &[live], "2026-11-26T02:47:00Z").unwrap();
+        let after = crate::lanes::Registry::for_project(&project);
+        assert_eq!(after.get("c-2").unwrap().pane_id, "hp-dead", "`c-2` keeps the pane it had: `c-1` records it");
+        assert_eq!(after.get("c-1").unwrap().pane_id, "hp-live");
+        assert!(after.duplicate_panes().is_empty());
     }
 
     #[test]

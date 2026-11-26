@@ -1694,13 +1694,23 @@ pub fn write_lane_duplicate_items(project: &Project, state: &mut State) -> Resul
     let Some(registry) = crate::lanes::Registry::load(project) else {
         return Ok(());
     };
-    let Some(message) = registry.duplicate_message() else {
-        return Ok(());
-    };
-    let key = format!("lanes-dup:{}", thread::sha256_hex(message.as_bytes()));
-    if state.config_errors.insert(key) {
-        let default_lane = crate::lanes::default_lane_id(project);
-        inbox::write_in(project, &default_lane, "config-error", crate::lanes::REGISTRY_FILE, "lane ids repeat", &message, "")?;
+    let default_lane = crate::lanes::default_lane_id(project);
+    if let Some(message) = registry.duplicate_message() {
+        let key = format!("lanes-dup:{}", thread::sha256_hex(message.as_bytes()));
+        if state.config_errors.insert(key) {
+            inbox::write_in(project, &default_lane, "config-error", crate::lanes::REGISTRY_FILE, "lane ids repeat", &message, "")?;
+        }
+    }
+    // Two open lanes recording one pane is the *result* of a repair claiming
+    // another lane's pane (law's `c-3`/`c-4`, 2026-11-26): one of the two lanes
+    // has no coordinator while its record says it has, and a repair pass that
+    // trusted the records wrote the other's label. Reported like a duplicate id;
+    // `lane list` prints the same sentence.
+    if let Some(message) = registry.duplicate_pane_message() {
+        let key = format!("lanes-shared-pane:{}", thread::sha256_hex(message.as_bytes()));
+        if state.config_errors.insert(key) {
+            inbox::write_in(project, &default_lane, "config-error", crate::lanes::REGISTRY_FILE, "two lanes share a pane", &message, "")?;
+        }
     }
     Ok(())
 }
